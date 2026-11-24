@@ -136,7 +136,7 @@ pub(crate) fn file_watcher(path: &Path, waker: Arc<Mutex<Option<Waker>>>) -> Rec
                     kind: EventKind::Remove(_),
                     ..
                 } => {
-                    log::debug!("file being watched was removed");
+                    tracing::debug!("file being watched was removed");
                 }
                 _ => {}
             }

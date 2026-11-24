@@ -148,7 +148,7 @@ impl SenderBuilder {
         // Guarantee that the queue exists:
         create_dir_all(base.as_ref())?;
 
-        log::trace!("created queue directory");
+        tracing::trace!("created queue directory");
 
         // Versioning stuff (this should be lightning-fast. Therefore, shameless block):
         check_queue_version(base.as_ref())?;
@@ -157,7 +157,7 @@ impl SenderBuilder {
         let file_guard = try_acquire_send_lock(base.as_ref())?;
         let state = QueueState::for_send_metadata(base.as_ref())?;
 
-        log::trace!("sender lock acquired. Sender state now is {:?}", state);
+        tracing::trace!("sender lock acquired. Sender state now is {:?}", state);
 
         // See the docs on OpenOptions::append for why the BufWriter here.
         let file = io::BufWriter::new(
@@ -167,7 +167,7 @@ impl SenderBuilder {
                 .open(segment_filename(base.as_ref(), state.segment))?,
         );
 
-        log::trace!("last segment opened for appending");
+        tracing::trace!("last segment opened for appending");
 
         Ok(Sender {
             segment_size: self.segment_size,
@@ -255,7 +255,7 @@ impl Sender {
             // Have to check if the number of segments is at least one. Otherwise, the queue will
             // deadlock.
             if queue_size.in_bytes >= max_queue_size.get() && queue_size.in_segments > 1 {
-                log::trace!(
+                tracing::trace!(
                     "oops! Directory size is {}, but max queue size is {}",
                     queue_size.in_bytes,
                     max_queue_size.get()
@@ -264,7 +264,7 @@ impl Sender {
             }
         }
 
-        log::trace!("there is enough space for a new segment. Let's cap off and move on!");
+        tracing::trace!("there is enough space for a new segment. Let's cap off and move on!");
 
         // Write EOF header:
         self.file.write(&HEADER_EOF)?;
@@ -282,11 +282,11 @@ impl Sender {
     fn maybe_cap_off_and_move<T>(&mut self, item: T) -> Result<T, TrySendError<T>> {
         // See if you are past the end of the file
         if self.is_past_end() {
-            log::trace!("is past the segment end. Trying to cap off and move");
+            tracing::trace!("is past the segment end. Trying to cap off and move");
 
             // If so, create a new file, if you are able to:
             if !self.try_cap_off_and_move()? {
-                log::trace!(
+                tracing::trace!(
                     "could not cap off and move. The queue `{:?}` is full",
                     self.base
                 );

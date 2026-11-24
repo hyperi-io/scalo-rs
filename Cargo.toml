@@ -95,8 +95,8 @@ auth = [
     "reqwest/form",
 ]
 http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
-spool = ["dep:notify", "dep:log", "dep:yaque-sysinfo", "dep:futures", "dep:lazy_static", "dep:rand", "dep:semver", "zstd", "dep:crc32c", "dep:jiff", "tokio"]
-tiered-sink = ["transport", "dep:notify", "dep:log", "dep:yaque-sysinfo", "dep:futures", "dep:lazy_static", "dep:rand", "dep:semver", "zstd", "lz4_flex", "snap", "tokio", "tokio-util", "libc", "tracing", "dep:crc32c", "dep:jiff"]
+spool = ["dep:notify", "sysinfo", "dep:futures-util", "dep:semver", "zstd", "dep:crc32c", "dep:jiff", "tokio", "tracing"]
+tiered-sink = ["transport", "dep:notify", "sysinfo", "dep:futures-util", "dep:semver", "zstd", "lz4_flex", "snap", "tokio", "tokio-util", "libc", "tracing", "dep:crc32c", "dep:jiff"]
 
 # docs/pipeline/sink-stack.md
 sink-stack = ["transport", "tower", "dep:backon", "governor", "tokio", "tracing"]
@@ -297,13 +297,8 @@ libc = { version = ">=0.2.191, <0.3", optional = true }
 flate2 = { version = ">=1.1.11, <2", optional = true }
 tar = { version = ">=0.4.46, <0.5", optional = true }
 
-# The crates yaque 0.6.6 declared, for its copy in src/yaque.
-notify = { version = ">=5.1.0, <6", optional = true }
-log = { version = ">=0.4.17, <0.5", optional = true }
-yaque-sysinfo = { package = "sysinfo", version = ">=0.28.0, <0.29", default-features = false, optional = true }
-futures = { version = ">=0.3.26, <0.4", optional = true }
-lazy_static = { version = ">=1.4.0, <2", optional = true }
-rand = { version = ">=0.8.5, <0.9", optional = true }
+# Wakes src/yaque's receiver when a segment grows, and its sender when one is removed.
+notify = { version = ">=8.2.2, <9", optional = true }
 # Checks a queue's version file before yaque, which panics on one it cannot read.
 semver = { version = ">=1.0.28, <2", optional = true }
 zstd = { version = ">=0.14.4, <0.15", optional = true }
@@ -338,7 +333,8 @@ aes-gcm = { version = ">=0.11.1, <0.12", optional = true }
 hkdf = { version = ">=0.13.0, <0.14", optional = true }
 sha2 = { version = ">=0.11.1, <0.12", optional = true }
 
-# FuturesUnordered for the per-record delivery approach. Already in the graph through tonic and tower.
+# FuturesUnordered for the per-record delivery approach, and select and now_or_never for src/yaque.
+# Already in the graph through tonic and tower.
 futures-util = { version = ">=0.3.34, <0.4", default-features = false, features = ["std"], optional = true }
 
 # Never below 1.11.1: RUSTSEC-2026-0007.

@@ -2,8 +2,8 @@
 // Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
 // Modified for scalo.
 
-use futures::FutureExt;
-use futures::future;
+use futures_util::FutureExt;
+use futures_util::future;
 use std::collections::VecDeque;
 use std::fs::*;
 use std::future::Future;
@@ -107,7 +107,7 @@ impl ReceiverBuilder {
         // Guarantee that the queue exists:
         create_dir_all(base.as_ref())?;
 
-        log::trace!("created queue directory");
+        tracing::trace!("created queue directory");
 
         // Versioning stuff (this should be lightning-fast. Therefore, shameless block):
         check_queue_version(base.as_ref())?;
@@ -117,14 +117,14 @@ impl ReceiverBuilder {
         let mut persistence = QueueStatePersistence::new();
         let state = persistence.open(base.as_ref())?;
 
-        log::trace!("receiver lock acquired. Receiver state now is {:?}", state);
+        tracing::trace!("receiver lock acquired. Receiver state now is {:?}", state);
 
         // Put the needle on the groove (oh! the 70's):
         let mut tail_follower =
             TailFollower::open(&segment_filename(base.as_ref(), state.segment))?;
         tail_follower.seek(io::SeekFrom::Start(state.position))?;
 
-        log::trace!("last segment opened fo reading");
+        tracing::trace!("last segment opened fo reading");
 
         Ok(Receiver {
             _file_guard: file_guard,
@@ -197,7 +197,7 @@ impl Receiver {
 
     /// Starts a transaction in the queue.
     fn begin(&mut self) {
-        log::debug!("begin transaction in {:?} at {:?}", self.base, self.state);
+        tracing::debug!("begin transaction in {:?} at {:?}", self.base, self.state);
     }
 
     /// Puts the queue in another position in another segment. This forcibly
@@ -206,11 +206,11 @@ impl Receiver {
     fn go_to(&mut self, state: QueueState) -> io::Result<()> {
         let different_segment = self.state.segment != state.segment;
 
-        log::debug!("going from {:?} to {:?}", self.state, state);
+        tracing::debug!("going from {:?} to {:?}", self.state, state);
         self.state = state;
 
         if different_segment {
-            log::debug!("opening segment {}", self.state.segment);
+            tracing::debug!("opening segment {}", self.state.segment);
             self.tail_follower =
                 TailFollower::open(&segment_filename(&self.base, self.state.segment))?;
         }
@@ -232,11 +232,11 @@ impl Receiver {
         );
 
         for segment_id in self.initial_state.segment..self.state.segment {
-            log::debug!("removing segment {} from {:?}", segment_id, self.base);
+            tracing::debug!("removing segment {} from {:?}", segment_id, self.base);
             remove_file(segment_filename(&self.base, segment_id))?;
         }
 
-        log::debug!(
+        tracing::debug!(
             "end transaction in {:?} at {:?} (from {:?})",
             self.base,
             self.state,
@@ -295,13 +295,13 @@ impl Receiver {
 
         // If the header is EOF, advance segment:
         if header == HEADER_EOF {
-            log::trace!("got EOF header. Advancing...");
+            tracing::trace!("got EOF header. Advancing...");
             let mut new_state = self.state.clone();
             new_state.advance_segment();
             self.go_to(new_state)?; // forces to open new segment.
 
             // Re-read the header:
-            log::trace!("re-reading new header from new file");
+            tracing::trace!("re-reading new header from new file");
             self.tail_follower.read_exact(&mut header).await?;
         }
 
@@ -310,7 +310,7 @@ impl Receiver {
         let decoded = Header::decode(header);
         self.state.advance_position(4);
 
-        log::trace!("got header {:?} (read {} bytes)", header, decoded.len());
+        tracing::trace!("got header {:?} (read {} bytes)", header, decoded.len());
 
         Ok(decoded)
     }
@@ -778,7 +778,7 @@ impl Receiver {
 impl Drop for Receiver {
     fn drop(&mut self) {
         if let Err(err) = self.save() {
-            log::error!(
+            tracing::error!(
                 "(probably) could not save queue state during `Drop`: {}",
                 err
             );
@@ -807,7 +807,7 @@ impl<'a, T> Drop for RecvGuard<'a, T> {
     fn drop(&mut self) {
         if !self.was_finished {
             if let Err(err) = self.rollback_mut() {
-                log::error!("unable to rollback on drop: {}", err);
+                tracing::error!("unable to rollback on drop: {}", err);
             }
         }
     }

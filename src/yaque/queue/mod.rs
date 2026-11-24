@@ -137,7 +137,7 @@ mod tests {
             sender.try_send(data).unwrap();
         }
 
-        log::trace!("enqueued");
+        tracing::trace!("enqueued");
 
         // Dequeue:
         block_on(async {
@@ -284,7 +284,8 @@ mod tests {
                 sender.try_send(data).unwrap();
                 // Try not to poll the future to the end.
                 let incomplete =
-                    futures::future::select(Box::pin(receiver.recv()), Box::pin(async {})).await;
+                    futures_util::future::select(Box::pin(receiver.recv()), Box::pin(async {}))
+                        .await;
                 drop(incomplete); // need to force this explicitly.
 
                 //

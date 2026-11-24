@@ -4,24 +4,25 @@
 
 //! Synchronization structures based on the filesystem.
 
-use lazy_static::lazy_static;
 use notify::RecommendedWatcher;
-use rand::Rng;
+use std::collections::hash_map::RandomState;
 use std::fs::*;
 use std::future::Future;
+use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use super::watcher::{file_removal_watcher, file_watcher, removal_watcher};
 
-lazy_static! {
-    /// A unique token to differentiate between processes which might have the
-    /// same PID, but are otherwise different instances.
-    pub(crate) static ref UNIQUE_PROCESS_TOKEN: u64 = rand::thread_rng().r#gen();
-}
+/// A unique token to differentiate between processes which might have the
+/// same PID, but are otherwise different instances. `RandomState` keys its
+/// hasher from the operating system's random source, so hashing nothing gives
+/// a random u64.
+pub(crate) static UNIQUE_PROCESS_TOKEN: LazyLock<u64> =
+    LazyLock::new(|| RandomState::new().build_hasher().finish());
 
 pub fn render_lock() -> String {
     format!(
@@ -46,12 +47,12 @@ impl Drop for FileGuard {
     fn drop(&mut self) {
         if let Err(err) = remove_file(&self.path) {
             if !self.ignore {
-                log::error!("unable to drop file lock: {}", err);
+                tracing::error!("unable to drop file lock: {}", err);
                 return;
             }
         }
 
-        log::trace!("file guard on `{:?}` dropped", self.path);
+        tracing::trace!("file guard on `{:?}` dropped", self.path);
     }
 }
 
@@ -117,7 +118,7 @@ fn open_new<P: AsRef<Path>>(path: P) -> io::Result<File> {
     let maybe_new = OpenOptions::new().create_new(true).append(true).open(&path);
 
     if maybe_new.is_ok() {
-        log::debug!("file `{:?}` didn't exist. Created new", path.as_ref());
+        tracing::debug!("file `{:?}` didn't exist. Created new", path.as_ref());
     }
 
     File::open(&path)
@@ -177,7 +178,7 @@ impl TailFollower {
     pub fn read_exact<'a>(&'a mut self, buffer: &'a mut [u8]) -> ReadExact<'a> {
         // Rewind if last invocation was not polled to conclusion:
         if self.read_and_unused != 0 {
-            log::trace!("found {} bytes read but unused", self.read_and_unused);
+            tracing::trace!("found {} bytes read but unused", self.read_and_unused);
             self.seek(io::SeekFrom::Current(-(self.read_and_unused as i64)))
                 .expect("could not seek back read and unused bytes");
             self.read_and_unused = 0;
@@ -226,32 +227,32 @@ pub struct ReadExact<'a> {
 
 impl<'a> ReadExact<'a> {
     fn read_until_you_drain(&mut self) -> Poll<io::Result<()>> {
-        log::trace!("reading until drained");
+        tracing::trace!("reading until drained");
         loop {
             break match self.file.read(&mut self.buffer[*self.read_and_unused..]) {
                 Ok(0) => {
-                    log::trace!("will have to wait for more");
+                    tracing::trace!("will have to wait for more");
                     Poll::Pending
                 }
                 Ok(i) => {
-                    log::trace!("read {} bytes", i);
+                    tracing::trace!("read {} bytes", i);
                     *self.read_and_unused += i;
                     if *self.read_and_unused == self.buffer.len() {
-                        log::trace!("enough! Done reading");
+                        tracing::trace!("enough! Done reading");
                         // Now, it is read _and_ used.
                         *self.read_and_unused = 0;
                         Poll::Ready(Ok(()))
                     } else {
-                        log::trace!("can read more");
+                        tracing::trace!("can read more");
                         continue;
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    log::trace!("got interrupted by eof");
+                    tracing::trace!("got interrupted by eof");
                     Poll::Pending
                 }
                 Err(err) => {
-                    log::trace!("oops! error");
+                    tracing::trace!("oops! error");
                     Poll::Ready(Err(err))
                 }
             };
@@ -282,7 +283,7 @@ impl<'a> Future for ReadExact<'a> {
 impl<'a> Drop for ReadExact<'a> {
     fn drop(&mut self) {
         if !self.was_polled {
-            log::warn!("read_exact future never polled");
+            tracing::warn!("read_exact future never polled");
         }
     }
 }

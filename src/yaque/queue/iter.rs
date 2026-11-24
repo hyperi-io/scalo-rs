@@ -53,7 +53,7 @@ impl QueueIter {
         // Guarantee that the queue exists:
         create_dir_all(base.as_ref())?;
 
-        log::trace!("created queue directory");
+        tracing::trace!("created queue directory");
 
         // Versioning stuff (this should be lightning-fast. Therefore, shameless block):
         check_queue_version(base.as_ref())?;
@@ -63,13 +63,13 @@ impl QueueIter {
         let mut persistence = QueueStatePersistence::new();
         let state = persistence.open(base.as_ref())?;
 
-        log::trace!("receiver lock acquired. Iter state now is {:?}", state);
+        tracing::trace!("receiver lock acquired. Iter state now is {:?}", state);
 
         // Put the needle on the groove (oh! the 70's):
         let mut sync_follower = SyncFollower::open(segment_filename(base.as_ref(), state.segment))?;
         sync_follower.seek(io::SeekFrom::Start(state.position))?;
 
-        log::trace!("last segment opened fo reading");
+        tracing::trace!("last segment opened fo reading");
 
         Ok(QueueIter {
             _file_guard: file_guard,
@@ -87,13 +87,13 @@ impl QueueIter {
         self.state.advance_segment();
         let next_segment = self.state.segment;
 
-        log::debug!(
+        tracing::debug!(
             "advanced segment from {:?} to {:?}",
             current_segment,
             next_segment
         );
 
-        log::debug!("opening segment {}", next_segment);
+        tracing::debug!("opening segment {}", next_segment);
         self.sync_follower = SyncFollower::open(segment_filename(&self.base, next_segment))?;
 
         Ok(())
@@ -107,18 +107,18 @@ impl QueueIter {
 
         // If the header is EOF, advance segment:
         if header == HEADER_EOF {
-            log::trace!("got EOF header. Advancing...");
+            tracing::trace!("got EOF header. Advancing...");
             self.advance_segment()?;
 
             // Re-read the header:
-            log::trace!("re-reading new header from new file");
+            tracing::trace!("re-reading new header from new file");
             self.sync_follower.read_exact(&mut header)?;
         }
 
         // Now, you set the header!
         let decoded = Header::decode(header);
 
-        log::trace!("got header {:?} (read {} bytes)", header, decoded.len());
+        tracing::trace!("got header {:?} (read {} bytes)", header, decoded.len());
 
         Ok(decoded)
     }
@@ -145,7 +145,7 @@ impl Iterator for QueueIter {
         match self.read_one() {
             Ok(item) => Some(Ok(item)),
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                log::trace!("got interrupted by eof");
+                tracing::trace!("got interrupted by eof");
                 None
             }
             Err(err) => Some(Err(err)),

@@ -30,7 +30,7 @@
 use std::fs::*;
 use std::io;
 use std::path::Path;
-use yaque_sysinfo::*;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use super::queue::{recv_lock_filename, send_lock_filename};
 use super::state::{QueueState, QueueStatePersistence};
@@ -58,7 +58,7 @@ pub fn unlock<P: AsRef<Path>>(lock_filename: P) -> io::Result<()> {
                 .chars()
                 .take_while(|ch| ch.is_digit(10))
                 .collect::<String>()
-                .parse::<yaque_sysinfo::Pid>()
+                .parse::<Pid>()
         })
         .expect("failed to parse recv lock file: no pid")
         .expect("failed to parse recv lock file: bad pid");
@@ -77,12 +77,19 @@ pub fn unlock<P: AsRef<Path>>(lock_filename: P) -> io::Result<()> {
         .expect("failed to parse recv lock file: no token")
         .expect("failed to parse recv lock file: bad token");
 
-    let system =
-        System::new_with_specifics(RefreshKind::new().with_processes(ProcessRefreshKind::new()));
+    // The owner's pid alone: a full refresh opens a /proc entry per process on the
+    // host. A process table that cannot be read counts as no owner running.
+    let owner_is_running = System::new().is_ok_and(|mut system| {
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[owner_pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        system.process(owner_pid).is_some()
+    });
 
     // Maybe somebody else is holding the lock:
-    let process_exists_and_is_not_me =
-        owner_pid.as_u32() != std::process::id() && system.process(owner_pid).is_some();
+    let process_exists_and_is_not_me = owner_pid.as_u32() != std::process::id() && owner_is_running;
     // I am holding the lock:
     let lock_is_the_same_and_is_me =
         owner_pid.as_u32() == std::process::id() && owner_token == *UNIQUE_PROCESS_TOKEN;

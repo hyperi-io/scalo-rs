@@ -53,7 +53,7 @@ impl QueueState {
     pub fn for_send_metadata<P: AsRef<Path>>(base: P) -> io::Result<QueueState> {
         match read_dir(base.as_ref()) {
             Ok(read_dir) => {
-                log::trace!("base {:?} exists", base.as_ref());
+                tracing::trace!("base {:?} exists", base.as_ref());
 
                 // Find greatest segment:
                 let mut max_segment = None;
@@ -91,12 +91,12 @@ impl QueueState {
 
                     Ok(queue_state)
                 } else {
-                    log::trace!("queue {:?} was empty", base.as_ref());
+                    tracing::trace!("queue {:?} was empty", base.as_ref());
                     Ok(QueueState::default())
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                log::trace!("base {:?} doesn't exist", base.as_ref());
+                tracing::trace!("base {:?} doesn't exist", base.as_ref());
                 Ok(QueueState::default())
             }
             Err(err) => Err(err),
