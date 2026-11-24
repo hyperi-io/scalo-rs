@@ -1508,8 +1508,10 @@ mod tests {
     #[tokio::test]
     async fn a_spooled_record_survives_a_server_error_and_is_delivered() {
         use crate::tiered_sink::{TieredSink, TieredSinkConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU16, Ordering};
 
-        let status = Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let status = Arc::new(AtomicU16::new(500));
         let addr = switchable_endpoint(Arc::clone(&status)).await;
         let sender = HttpTransport::new(&HttpTransportConfig::sender(&format!("http://{addr}")))
             .await
@@ -1554,8 +1556,9 @@ mod tests {
     /// holds at the time.
     #[cfg(feature = "tiered-sink")]
     async fn switchable_endpoint(
-        status: Arc<std::sync::atomic::AtomicU16>,
+        status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     ) -> std::net::SocketAddr {
+        use std::sync::atomic::Ordering;
         send_tests::Server::start(move |_| send_tests::reply(status.load(Ordering::SeqCst), &[]))
             .await
             .addr
