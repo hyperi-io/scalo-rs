@@ -734,6 +734,25 @@ async fn a_closed_sender_is_fatal_and_healthcheck_connects() {
     assert!(sender.healthcheck().await.is_err());
 }
 
+/// A syslog sender reports to readiness as `transport:syslog`: healthy while
+/// open, unhealthy once closed, and gone from the registry once dropped.
+#[cfg(feature = "health")]
+#[tokio::test]
+async fn a_sender_reports_to_readiness_until_dropped() {
+    use crate::health::{HealthRegistry, HealthStatus};
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sender =
+        SyslogTransport::new(&config(socket.local_addr().unwrap(), SyslogProtocol::Udp)).unwrap();
+    let id = sender.lifecycle.registration_id();
+    let entry = |status| Some(("transport:syslog".to_string(), status));
+    assert_eq!(HealthRegistry::entry(id), entry(HealthStatus::Healthy));
+    sender.close().await.unwrap();
+    assert_eq!(HealthRegistry::entry(id), entry(HealthStatus::Unhealthy));
+    drop(sender);
+    assert_eq!(HealthRegistry::entry(id), None);
+}
+
 /// The timestamp the peer's one message carries, taken from the message.
 fn peer_stamp(peer: &RelpPeer) -> String {
     peer.messages()[0][0]

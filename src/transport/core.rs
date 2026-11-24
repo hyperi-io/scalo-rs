@@ -203,6 +203,7 @@ impl<M: Meter> SendTimer<M> {
     feature = "transport-pipe",
     feature = "transport-http",
     feature = "transport-grpc",
+    feature = "transport-syslog",
     feature = "transport-otlp"
 ))]
 pub(crate) use lifecycle::Lifecycle;
@@ -212,6 +213,7 @@ pub(crate) use lifecycle::Lifecycle;
     feature = "transport-pipe",
     feature = "transport-http",
     feature = "transport-grpc",
+    feature = "transport-syslog",
     feature = "transport-otlp"
 ))]
 mod lifecycle {
@@ -285,7 +287,11 @@ mod lifecycle {
         }
 
         /// The registry entry this transport owns.
-        #[cfg(all(test, feature = "health", feature = "transport-file"))]
+        #[cfg(all(
+            test,
+            feature = "health",
+            any(feature = "transport-file", feature = "transport-syslog")
+        ))]
         #[allow(
             clippy::used_underscore_binding,
             reason = "the field is held only for its Drop, and the tests read its id"

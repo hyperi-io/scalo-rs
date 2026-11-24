@@ -41,7 +41,6 @@ pub use config::{
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rustls_pki_types::ServerName;
@@ -53,7 +52,7 @@ use self::format::Formatter;
 use self::relp::{Answer, RelpError, RelpSession};
 use self::stream::{ConnectError, Connector, Idle, Stream, check_idle};
 use super::ack::DeadLetterReason;
-use super::core::Meter;
+use super::core::{Lifecycle, Meter};
 use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::filter::{TransportFilterEngine, TransportFilterTierConfig};
@@ -93,8 +92,10 @@ pub struct SyslogTransport {
     connector: Connector,
     filter_engine: TransportFilterEngine,
     state: Mutex<State>,
-    closed: AtomicBool,
-    /// Whether the proxy is refusing CONNECT, which fails readiness until a send goes through.
+    /// Closed, or `refusals` refused: either fails readiness and the
+    /// `transport:syslog` health entry.
+    lifecycle: Lifecycle,
+    /// Whether the proxy is refusing CONNECT, which lasts until a send goes through.
     refusals: crate::transport::proxy::Refusals,
 }
 
@@ -132,6 +133,7 @@ impl SyslogTransport {
             &config.filters_out,
             &TransportFilterTierConfig::from_cascade()?,
         )?;
+        let refusals = crate::transport::proxy::Refusals::default();
         let escape_lf = matches!(config.protocol, SyslogProtocol::Tcp | SyslogProtocol::Tls)
             && config.framing == SyslogFraming::Lf;
         let transport = Self {
@@ -155,8 +157,11 @@ impl SyslogTransport {
             ),
             filter_engine,
             state: Mutex::new(State::default()),
-            closed: AtomicBool::new(false),
-            refusals: crate::transport::proxy::Refusals::default(),
+            lifecycle: {
+                let refusals = refusals.clone();
+                Lifecycle::new::<Self>(move || !refusals.is_refused())
+            },
+            refusals,
         };
         tracing::info!(
             address = %config.address,
@@ -501,7 +506,7 @@ impl TransportBase for SyslogTransport {
     /// Stop sending. A RELP session is closed with its `close` command, a
     /// stream shut down. Idempotent.
     async fn close(&self) -> TransportResult<()> {
-        self.closed.store(true, Ordering::Relaxed);
+        self.lifecycle.close();
         let session = self.state.lock().await.session.take();
         match session {
             Some(Session::Relp(session)) => session.close().await,
@@ -516,7 +521,7 @@ impl TransportBase for SyslogTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed) && !self.refusals.is_refused()
+        self.lifecycle.is_healthy()
     }
 
     fn name(&self) -> &'static str {
@@ -590,7 +595,7 @@ impl TransportSender for SyslogTransport {
 
     /// Format the block, write it as one unit, and answer by `deadline`.
     async fn send_batch_by(&self, records: &[Record], deadline: Instant) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
         let timer = Self::send_timer();
