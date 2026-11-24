@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/transport/proxy/tests.rs
-// Purpose:   Proxy setting, machine settings and the CONNECT tunnel against a local proxy
+// Purpose:   Proxy setting, machine settings and the CONNECT tunnel through a real Squid
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -9,8 +9,13 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::system::{Settings, from_winhttp, wildcard_to_rule};
-use super::test_proxy::{ConnectProxy, Credentials, Policy, credentials, echo};
-use super::{ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Scheme, refusal, rejected};
+use super::test_front::echo;
+use super::{ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Refusals, Scheme, refusal};
+#[cfg(all(feature = "transport-proxy-test-support", unix))]
+use super::{
+    squid::{Squid, TARGET_HOST, USER},
+    test_front::plain_front,
+};
 use crate::sensitive::SensitiveString;
 use crate::transport::error::TransportError;
 use crate::transport::types::SendResult;
@@ -224,38 +229,34 @@ fn the_os_proxy_store_reads() {
     assert!(dialer.is_ok(), "{settings:?}: {:?}", dialer.err());
 }
 
-/// The tunnel opens for an allowed CONNECT, with the configured auth, and a
-/// refusal comes back with the proxy's status and the target port.
+/// The tunnel opens through Squid for an allowed CONNECT, with the configured
+/// credentials, and a refusal comes back with the proxy's status and the target
+/// port.
+#[cfg(all(feature = "transport-proxy-test-support", unix))]
 #[tokio::test]
 async fn connect_through_the_proxy() {
-    let target = echo().await;
-    let good = credentials();
-    let bad = good.wrong_password();
-    let auth = || Policy::Auth(good.header.clone());
-    // (policy, credentials, wanted: Ok or the refusal status)
-    let rows: [(Policy, Option<&Credentials>, Result<(), u16>); 6] = [
-        (Policy::Allow, None, Ok(())),
-        (Policy::Refuse(403), None, Err(403)),
-        (auth(), None, Err(407)),
-        (auth(), Some(&good), Ok(())),
-        (auth(), Some(&bad), Err(407)),
-        (Policy::OnlyPort(443), None, Err(403)),
+    let Some(squid) = Squid::shared().await else {
+        return;
+    };
+    let target = plain_front(echo().await).await;
+    let wrong = format!("{}-wrong", squid.password());
+    // (name, proxy URL, wanted: Ok or the refusal status)
+    let rows: [(&str, String, Result<(), u16>); 5] = [
+        ("open", squid.open(), Ok(())),
+        ("port 443 only", squid.port_only(), Err(403)),
+        ("credentials wanted, none sent", squid.auth(), Err(407)),
+        (
+            "credentials sent",
+            squid.auth_with(USER, squid.password()),
+            Ok(()),
+        ),
+        ("wrong password", squid.auth_with(USER, &wrong), Err(407)),
     ];
-    for (policy, credentials, wanted) in rows {
-        let name = format!("{policy:?} credentials={}", credentials.is_some());
-        let proxy = ConnectProxy::start(policy).await;
-        let setting = match credentials {
-            Some(credentials) => url(&proxy.url_with(credentials)),
-            None => url(&proxy.url()),
-        };
-        let dialer = setting.dialer().unwrap();
+    for (name, proxy, wanted) in rows {
+        let dialer = url(&proxy).dialer().unwrap();
         let connected = dialer
-            .connect(Scheme::Plain, "127.0.0.1", target.port())
+            .connect(Scheme::Plain, TARGET_HOST, target.port())
             .await;
-        let seen = proxy.seen();
-        assert_eq!(seen.len(), 1, "{name}");
-        assert_eq!(seen[0].target, target.to_string(), "{name}");
-        assert_eq!(seen[0].auth.is_some(), credentials.is_some(), "{name}");
         match (connected, wanted) {
             (Ok(mut stream), Ok(())) => {
                 stream.write_all(b"through").await.unwrap();
@@ -264,19 +265,15 @@ async fn connect_through_the_proxy() {
                 assert_eq!(&back, b"through", "{name}");
             }
             (Err(ProxyError::Refused(refused)), Err(status)) => {
-                assert_eq!(
-                    refused,
-                    ProxyRefused {
-                        proxy: proxy.addr.to_string(),
-                        host: "127.0.0.1".into(),
-                        port: target.port(),
-                        status,
-                    },
-                    "{name}"
-                );
+                assert_eq!(refused.status, status, "{name}: {refused}");
+                assert_eq!(refused.host, TARGET_HOST, "{name}: {refused}");
+                assert_eq!(refused.port, target.port(), "{name}: {refused}");
                 let text = refused.to_string();
                 assert!(text.contains(&status.to_string()), "{name}: {text}");
-                assert!(!text.contains(&good.password), "{name}: {text}");
+                assert!(
+                    !text.contains(squid.password()) && !text.contains(&wrong),
+                    "{name}: {text}"
+                );
             }
             (got, _) => panic!("{name}: got {got:?}"),
         }
@@ -309,21 +306,23 @@ async fn none_and_an_unreachable_proxy() {
 }
 
 /// TLS runs over the tunnel with the target's name for SNI.
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "transport-proxy-test-support", feature = "tls", unix))]
 #[tokio::test]
 async fn tls_through_the_tunnel() {
-    let (front, ca) = super::test_proxy::tls_front(echo().await, &[]).await;
-    let proxy = ConnectProxy::start(Policy::Allow).await;
-    let stream = url(&proxy.url())
+    let Some(squid) = Squid::shared().await else {
+        return;
+    };
+    let (front, ca) = super::test_front::tls_front(echo().await, &[]).await;
+    let stream = url(&squid.open())
         .dialer()
         .unwrap()
-        .connect(Scheme::Tls, "localhost", front.port())
+        .connect(Scheme::Tls, TARGET_HOST, front.port())
         .await
         .unwrap();
     let connector = crate::tls::test_pki::connector(&ca, None, &[]);
     let mut tls = connector
         .connect(
-            rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+            rustls_pki_types::ServerName::try_from(TARGET_HOST).unwrap(),
             stream,
         )
         .await
@@ -332,14 +331,10 @@ async fn tls_through_the_tunnel() {
     let mut back = [0_u8; 6];
     tls.read_exact(&mut back).await.unwrap();
     assert_eq!(&back, b"sealed");
-    assert_eq!(
-        proxy.seen()[0].target,
-        format!("localhost:{}", front.port())
-    );
 }
 
 #[test]
-fn a_refusal_is_found_in_a_cause_chain_and_rejected() {
+fn a_refusal_is_found_in_a_cause_chain() {
     let refused = ProxyRefused {
         proxy: "p:3128".into(),
         host: "t.example".into(),
@@ -352,9 +347,30 @@ fn a_refusal_is_found_in_a_cause_chain_and_rejected() {
     assert_eq!(refusal(boxed.as_ref()), Some(&refused));
     assert_eq!(refusal(&chained), Some(&refused));
     assert_eq!(refusal(&std::io::Error::other("other")), None);
+}
 
-    let SendResult::Reject(TransportError::Connection(text)) = rejected(&refused, "test") else {
-        panic!("a refusal is not Reject");
+/// A refused CONNECT holds the records and fails readiness until a send goes
+/// through, and every clone of the state sees both.
+#[test]
+fn a_refusal_holds_the_records_until_a_send_goes_through() {
+    let refused = ProxyRefused {
+        proxy: "p:3128".into(),
+        host: "t.example".into(),
+        port: 6514,
+        status: 403,
     };
-    assert!(text.contains("403") && text.contains("6514"), "{text}");
+    let refusals = Refusals::default();
+    let shared = refusals.clone();
+    assert!(!shared.is_refused());
+
+    for _ in 0..2 {
+        assert!(matches!(
+            refusals.hold(&refused, "test"),
+            SendResult::Backpressured
+        ));
+        assert!(shared.is_refused());
+    }
+
+    shared.clear("test");
+    assert!(!refusals.is_refused());
 }

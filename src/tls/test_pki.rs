@@ -81,7 +81,9 @@ impl TestCa {
     }
 
     fn leaf(&self, name: &str, usage: ExtendedKeyUsagePurpose) -> Leaf {
-        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let mut params =
+            CertificateParams::new(vec!["localhost".to_string(), "target.test".to_string()])
+                .unwrap();
         params.distinguished_name.push(DnType::CommonName, name);
         params.extended_key_usages = vec![usage];
         let key = KeyPair::generate().unwrap();

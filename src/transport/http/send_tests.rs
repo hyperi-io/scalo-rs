@@ -19,7 +19,9 @@ use crate::framing::FramingConfig;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::TransportError;
 use crate::transport::proxy::ProxyConfig;
-use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, credentials, tls_front};
+#[cfg(all(feature = "transport-proxy-test-support", unix))]
+use crate::transport::proxy::squid::{Squid, TARGET_HOST, USER};
+use crate::transport::proxy::test_front::tls_front;
 use crate::transport::traits::TransportSender;
 use crate::transport::types::{PayloadFormat, SendResult};
 use crate::transport::{Record, RecordMeta};
@@ -831,51 +833,34 @@ async fn proxy_none_system_and_url() {
     );
 }
 
-/// An https endpoint goes through the proxy's CONNECT tunnel, and a refused
-/// CONNECT is `Reject` with the proxy's status and the endpoint's port.
+/// An https endpoint goes through a real Squid's CONNECT tunnel, with the
+/// proxy's credentials where it asks for them. The target name resolves only
+/// inside Squid, so a request that arrives went through it.
+#[cfg(all(feature = "transport-proxy-test-support", unix))]
 #[tokio::test]
 async fn https_goes_through_a_connect_proxy() {
+    let Some(squid) = Squid::shared().await else {
+        return;
+    };
     let target = Server::status(200).await;
     let (front, ca) = tls_front(target.addr, &[b"http/1.1"]).await;
     let ca_file = tempfile::NamedTempFile::new().unwrap();
     tokio::fs::write(ca_file.path(), &ca).await.unwrap();
-    let endpoint = format!("https://localhost:{}", front.port());
-    let tunnel = format!("localhost:{}", front.port());
-    let good = credentials();
-    let auth = good.header.clone();
-    // (policy, credentials, wanted, refusal status)
+    let endpoint = format!("https://{TARGET_HOST}:{}", front.port());
     let rows = [
-        (Policy::Allow, None, Got::Ok, None),
-        (Policy::Refuse(403), None, Got::Reject, Some(403)),
-        (Policy::Auth(auth.clone()), None, Got::Reject, Some(407)),
-        (Policy::Auth(auth), Some(&good), Got::Ok, None),
-        (Policy::OnlyPort(443), None, Got::Reject, Some(403)),
+        ("open", squid.open()),
+        ("credentials sent", squid.auth_with(USER, squid.password())),
     ];
-    for (policy, credentials, want, status) in rows {
-        let name = format!("{policy:?} credentials={}", credentials.is_some());
-        let proxy = ConnectProxy::start(policy).await;
-        let url = credentials.map_or_else(|| proxy.url(), |c| proxy.url_with(c));
+    for (name, proxy) in rows {
         let config = HttpTransportConfig {
-            proxy: ProxyConfig::Url(secret(&url)),
+            proxy: ProxyConfig::Url(secret(&proxy)),
             tls_ca_path: Some(ca_file.path().to_string_lossy().into_owned()),
             ..HttpTransportConfig::sender(&endpoint)
         };
         let result = sender(&config).await.send("ingest", "{}".into()).await;
-        assert_eq!(got(&result), want, "{name}");
-        let seen = proxy.seen();
-        assert!(
-            !seen.is_empty() && seen.iter().all(|c| c.target == tunnel),
-            "{name}: {seen:?}"
-        );
-        if let (Some(status), SendResult::Reject(error)) = (status, &result) {
-            let text = error.to_string();
-            assert!(
-                text.contains(&format!("HTTP {status}")) && text.contains(&tunnel),
-                "{name}: {text}"
-            );
-        }
+        assert_eq!(got(&result), Got::Ok, "{name}");
     }
-    assert_eq!(target.seen().len(), 2, "one request per allowed tunnel");
+    assert_eq!(target.seen().len(), 2, "one request per tunnel");
 }
 
 /// A failed TLS handshake is not retried: once no other endpoint takes the
