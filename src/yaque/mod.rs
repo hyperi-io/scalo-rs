@@ -130,7 +130,7 @@
 //!
 //! ## `Ctrl+C` and other unexpected events
 //!
-//! First of all, "Don't panic©"! Writing to the queue is an atomic operation.
+//! First of all, "Don't panic"! Writing to the queue is an atomic operation.
 //! Therefore, unless there is something really wrong with your OS, you should be
 //! fine in terms of data corruption most of the time.
 //!
