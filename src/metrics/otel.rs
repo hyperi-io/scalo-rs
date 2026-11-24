@@ -184,7 +184,7 @@ struct ResolvedOtelConfig {
     protocol: OtelProtocol,
     export_interval: Duration,
     export_timeout: Duration,
-    headers: std::collections::HashMap<String, String>,
+    headers: std::collections::HashMap<String, crate::sensitive::SensitiveString>,
     service_name: String,
     /// Deployment environment (dev/staging/prod), tagged on the OTel resource
     /// as the stable semconv attribute `deployment.environment.name`. Sourced
@@ -280,7 +280,13 @@ fn build_otlp_exporter(
                 "v1/metrics",
             ))
             .with_timeout(resolved.export_timeout)
-            .with_headers(resolved.headers.clone())
+            .with_headers(
+                resolved
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.expose().to_string()))
+                    .collect(),
+            )
             .build()
             .map_err(|e| MetricsError::BuildError(format!("OTel HTTP exporter: {e}"))),
     }

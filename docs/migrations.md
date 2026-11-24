@@ -8,9 +8,9 @@ release and the target before bumping.
 
 ## 2.14.35
 
-### `OtlpConfig.headers` holds `SensitiveString` values (API CHANGE)
+### `OtlpConfig.headers` and `OtelMetricsConfig.headers` hold `SensitiveString` values (API CHANGE)
 
-`OtlpConfig.headers` is a `BTreeMap<String, SensitiveString>`, where it was `BTreeMap<String, String>`, so `Debug` and logs show each value redacted. The YAML and env shape is unchanged.
+`OtlpConfig.headers` is a `BTreeMap<String, SensitiveString>`, where it was `BTreeMap<String, String>`, and `OtelMetricsConfig.headers` is a `HashMap<String, SensitiveString>`, where it was `HashMap<String, String>`. `Debug` and logs show each value redacted. The YAML and env shape is unchanged. `KafkaConfig`'s `Debug` redacts the value of any `librdkafka_overrides` or `extra_config` key containing `password` or `secret`.
 
 **Consumer adjustment** -- a struct literal builds each value with `.into()` (`From<&str>` and `From<String>` exist). Code that reads a value calls `.expose()`.
 

@@ -44,6 +44,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::str::FromStr;
 
 // ============================================================================
@@ -1231,7 +1232,7 @@ pub const LOW_LATENCY_CONSUMER_DEFAULTS: &[(&str, &str)] = &[
 ///
 /// Uses a profile-based system where profiles provide opinionated defaults,
 /// and `librdkafka_overrides` allows overriding any setting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[allow(clippy::struct_excessive_bools)] // Kafka config legitimately has many boolean flags
 pub struct KafkaConfig {
@@ -1523,6 +1524,88 @@ pub struct KafkaConfig {
     /// Outbound message filters (applied on send before transport dispatches).
     #[serde(default)]
     pub filters_out: Vec<crate::transport::filter::FilterRule>,
+}
+
+/// A raw librdkafka map for `Debug`, with the value of any key naming a
+/// password or secret redacted.
+struct RedactedRawMap<'a>(&'a HashMap<String, String>);
+
+impl fmt::Debug for RedactedRawMap<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Redacted;
+        impl fmt::Debug for Redacted {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(crate::sensitive::REDACTED)
+            }
+        }
+        f.debug_map()
+            .entries(self.0.iter().map(|(key, value)| {
+                let lower = key.to_ascii_lowercase();
+                let shown: &dyn fmt::Debug =
+                    if lower.contains("password") || lower.contains("secret") {
+                        &Redacted
+                    } else {
+                        value
+                    };
+                (key, shown)
+            }))
+            .finish()
+    }
+}
+
+impl fmt::Debug for KafkaConfig {
+    #[allow(deprecated)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KafkaConfig")
+            .field("profile", &self.profile)
+            .field("brokers", &self.brokers)
+            .field("group", &self.group)
+            .field("client_id", &self.client_id)
+            .field("client_rack", &self.client_rack)
+            .field("group_instance_id", &self.group_instance_id)
+            .field("consumer_protocol", &self.consumer_protocol)
+            .field(
+                "consumer_protocol_probe_ms",
+                &self.consumer_protocol_probe_ms,
+            )
+            .field("topics", &self.topics)
+            .field("auto_discover", &self.auto_discover)
+            .field("topic_include", &self.topic_include)
+            .field("topic_exclude", &self.topic_exclude)
+            .field("topic_refresh_secs", &self.topic_refresh_secs)
+            .field("topic_suppression_rules", &self.topic_suppression_rules)
+            .field("security_protocol", &self.security_protocol)
+            .field("provider", &self.provider)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &self.sasl_password)
+            .field("ssl_ca_location", &self.ssl_ca_location)
+            .field("ssl_certificate_location", &self.ssl_certificate_location)
+            .field("ssl_key_location", &self.ssl_key_location)
+            .field("ssl_skip_verify", &self.ssl_skip_verify)
+            .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("allow_auto_create_topics", &self.allow_auto_create_topics)
+            .field("auth_refusal_grace_secs", &self.auth_refusal_grace_secs)
+            .field("enable_auto_commit", &self.enable_auto_commit)
+            .field("auto_commit_interval_ms", &self.auto_commit_interval_ms)
+            .field("session_timeout_ms", &self.session_timeout_ms)
+            .field("heartbeat_interval_ms", &self.heartbeat_interval_ms)
+            .field("max_poll_interval_ms", &self.max_poll_interval_ms)
+            .field("fetch_min_bytes", &self.fetch_min_bytes)
+            .field("fetch_max_bytes", &self.fetch_max_bytes)
+            .field("max_partition_fetch_bytes", &self.max_partition_fetch_bytes)
+            .field("auto_offset_reset", &self.auto_offset_reset)
+            .field("enable_partition_eof", &self.enable_partition_eof)
+            .field("sizing", &self.sizing)
+            .field(
+                "librdkafka_overrides",
+                &RedactedRawMap(&self.librdkafka_overrides),
+            )
+            .field("extra_config", &RedactedRawMap(&self.extra_config))
+            .field("filters_in", &self.filters_in)
+            .field("filters_out", &self.filters_out)
+            .finish()
+    }
 }
 
 fn default_topic_exclude() -> Vec<String> {
@@ -2626,9 +2709,11 @@ mod tests {
         }
     }
 
+    /// Secure overrides pass, and `Debug` hides the value of every raw key
+    /// naming a password or secret.
     #[test]
     fn validate_passes_overrides_that_keep_the_client_secure() {
-        let config = KafkaConfig {
+        let mut config = KafkaConfig {
             security_protocol: "sasl_ssl".to_string(),
             sasl_mechanism: Some("PLAIN".to_string()),
             ..Default::default()
@@ -2636,9 +2721,22 @@ mod tests {
         .with_override("security.protocol", "SASL_SSL")
         .with_override("sasl.mechanism", "SCRAM-SHA-512")
         .with_override("enable.ssl.certificate.verification", "true")
-        .with_override("statistics.interval.ms", "0");
+        .with_override("statistics.interval.ms", "0")
+        .with_override("sasl.password", "override-pw")
+        .with_override("SSL.Keystore.Password", "keystore-pw")
+        .with_override("sasl.oauthbearer.client.secret", "oauth-secret");
+        #[allow(deprecated)]
+        config
+            .extra_config
+            .insert("ssl.key.password".to_string(), "legacy-pw".to_string());
         assert!(config.validate(false).is_ok());
         assert!(config.validate(true).is_ok());
+        let debug = format!("{config:?}");
+        for secret in ["override-pw", "keystore-pw", "oauth-secret", "legacy-pw"] {
+            assert!(!debug.contains(secret), "Debug shows {secret}: {debug}");
+        }
+        assert!(debug.contains("\"sasl.password\""), "Debug keeps key names");
+        assert!(debug.contains("SCRAM-SHA-512"), "Debug keeps other values");
     }
 
     /// librdkafka skips leading whitespace in an enum value, so ` plaintext`

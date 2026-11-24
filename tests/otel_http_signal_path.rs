@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, Uri};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use metrics::counter;
 use opentelemetry::trace::{Tracer as _, TracerProvider as _};
 use scalo::metrics::{MetricsConfig, MetricsManager, OtelMetricsConfig, OtelProtocol};
@@ -38,13 +38,21 @@ const OTEL_ENV: [(&str, Option<&str>); 4] = [
     ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", None),
 ];
 
-/// Request paths the listener received, in arrival order.
-type Paths = Arc<Mutex<Vec<String>>>;
+/// The header the metrics export sends, whose value `Debug` must not show.
+const API_KEY: (&str, &str) = ("x-api-key", "metrics-key-value");
 
-async fn record(State(paths): State<Paths>, uri: Uri) -> StatusCode {
+/// Request paths the listener received, in arrival order, each with its
+/// `API_KEY` header value.
+type Paths = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+async fn record(State(paths): State<Paths>, uri: Uri, headers: HeaderMap) -> StatusCode {
     let path = uri.path().to_string();
     let known = path == "/v1/traces" || path == "/v1/metrics";
-    paths.lock().unwrap().push(path);
+    let key = headers
+        .get(API_KEY.0)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    paths.lock().unwrap().push((path, key));
     if known {
         StatusCode::OK
     } else {
@@ -66,7 +74,12 @@ async fn collector() -> (SocketAddr, Paths) {
 }
 
 fn received(paths: &Paths) -> Vec<String> {
-    paths.lock().unwrap().clone()
+    paths
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -99,19 +112,27 @@ async fn http_span_export_posts_to_the_traces_path() {
 async fn http_metric_export_posts_to_the_metrics_path() {
     let (addr, paths) = collector().await;
     temp_env::async_with_vars(OTEL_ENV, async {
+        let otel = OtelMetricsConfig {
+            enabled: true,
+            endpoint: format!("http://{addr}/"),
+            protocol: OtelProtocol::Http,
+            export_interval_secs: 1,
+            export_timeout_secs: 2,
+            service_name: "scalo-http-path-test".to_string(),
+            headers: [(API_KEY.0.to_string(), API_KEY.1.into())]
+                .into_iter()
+                .collect(),
+            ..OtelMetricsConfig::default()
+        };
+        assert!(
+            !format!("{otel:?}").contains(API_KEY.1),
+            "Debug redacts header values"
+        );
         let mut manager = MetricsManager::with_config(MetricsConfig {
             namespace: String::new(),
             enable_process_metrics: false,
             enable_container_metrics: false,
-            otel: OtelMetricsConfig {
-                enabled: true,
-                endpoint: format!("http://{addr}/"),
-                protocol: OtelProtocol::Http,
-                export_interval_secs: 1,
-                export_timeout_secs: 2,
-                service_name: "scalo-http-path-test".to_string(),
-                ..OtelMetricsConfig::default()
-            },
+            otel,
             ..MetricsConfig::default()
         });
         counter!("otel_http_path_probe").increment(1);
@@ -125,5 +146,13 @@ async fn http_metric_export_posts_to_the_metrics_path() {
     assert!(
         seen.iter().all(|path| path == "/v1/metrics"),
         "a base endpoint with a trailing slash must carry the metrics signal path, got {seen:?}"
+    );
+    assert!(
+        paths
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, key)| key.as_deref() == Some(API_KEY.1)),
+        "every export carries the real header value"
     );
 }
