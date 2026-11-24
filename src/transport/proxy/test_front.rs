@@ -7,12 +7,24 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 use std::net::SocketAddr;
-#[cfg(feature = "tls")]
+#[cfg(all(
+    feature = "tls",
+    any(
+        feature = "transport-http",
+        all(feature = "transport-proxy-test-support", unix)
+    )
+))]
 use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
-#[cfg(feature = "tls")]
+#[cfg(all(
+    feature = "tls",
+    any(
+        feature = "transport-http",
+        all(feature = "transport-proxy-test-support", unix)
+    )
+))]
 /// A TLS listener on every interface, for `localhost` and the Squid target
 /// name, that relays each connection's plain bytes to `upstream`, offering
 /// `alpn`. Returns its address and the CA PEM to trust.
@@ -44,7 +56,7 @@ pub(crate) async fn tls_front(upstream: SocketAddr, alpn: &[&[u8]]) -> (SocketAd
                 let Ok(mut tls) = acceptor.accept(stream).await else {
                     return;
                 };
-                let Ok(mut plain) = TcpStream::connect(upstream).await else {
+                let Ok(mut plain) = tokio::net::TcpStream::connect(upstream).await else {
                     return;
                 };
                 let _ = tokio::io::copy_bidirectional(&mut tls, &mut plain).await;
@@ -69,6 +81,7 @@ pub(crate) async fn echo() -> SocketAddr {
     addr
 }
 
+#[cfg(all(feature = "transport-proxy-test-support", unix))]
 /// A listener on every interface that relays each connection's bytes to
 /// `upstream`, so the Squid container can dial a server bound to loopback.
 pub(crate) async fn plain_front(upstream: SocketAddr) -> SocketAddr {
@@ -77,7 +90,7 @@ pub(crate) async fn plain_front(upstream: SocketAddr) -> SocketAddr {
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
-                let Ok(mut onward) = TcpStream::connect(upstream).await else {
+                let Ok(mut onward) = tokio::net::TcpStream::connect(upstream).await else {
                     return;
                 };
                 let _ = tokio::io::copy_bidirectional(&mut stream, &mut onward).await;
