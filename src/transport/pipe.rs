@@ -269,6 +269,30 @@ impl TransportSender for PipeTransport {
             .then_some(super::ack::DeadLetterReason::OutboundFilter)
     }
 
+    /// Its outbound filters, which `send_screened` then skips. Filters that did
+    /// not compile screen nothing, and the send refuses the records.
+    fn screen(&self, record: &super::work_batch::Record) -> super::ack::Screened {
+        self.filter_engine
+            .as_ref()
+            .map_or(super::ack::Screened::Send, |engine| {
+                engine.screen(&record.payload)
+            })
+    }
+
+    /// The records its screen kept, without running their outbound filters
+    /// again.
+    async fn send_screened(
+        &self,
+        records: &[super::work_batch::Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
+        let send = super::traits::send_within(self, records, deadline);
+        match self.filter_engine.as_ref() {
+            Ok(engine) => engine.screened(send).await,
+            Err(_) => send.await,
+        }
+    }
+
     async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
         if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);

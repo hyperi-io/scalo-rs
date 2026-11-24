@@ -1222,17 +1222,44 @@ impl TransportSender for GrpcTransport {
     /// A record over `max_message_size` on its own, as a field of a
     /// `RouteBatch`, or one an outbound `dlq` filter matches.
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
-        // Measured as `send_batch` measures it: encoded, as a field of a batch.
-        let framed = as_field(record).len;
-        if framed > self.max_message_size {
-            return Some(DeadLetterReason::TooLarge {
-                bytes: framed,
-                limit: self.max_message_size,
-            });
+        self.too_large(record).or_else(|| {
+            self.filter_engine
+                .outbound_dead_letter(&record.payload)
+                .then_some(DeadLetterReason::OutboundFilter)
+        })
+    }
+
+    /// A record over `max_message_size` on its own, else its outbound filters,
+    /// which `send_screened` then skips.
+    fn screen(&self, record: &Record) -> super::ack::Screened {
+        match self.too_large(record) {
+            Some(reason) => super::ack::Screened::DeadLetter(reason),
+            None => self.filter_engine.screen(&record.payload),
         }
+    }
+
+    /// The records its screen kept, without running their outbound filters
+    /// again.
+    async fn send_screened(
+        &self,
+        records: &[Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
         self.filter_engine
-            .outbound_dead_letter(&record.payload)
-            .then_some(DeadLetterReason::OutboundFilter)
+            .screened(super::traits::send_within(self, records, deadline))
+            .await
+    }
+}
+
+impl GrpcTransport {
+    /// `record` over `max_message_size` on its own, measured as `send_batch`
+    /// measures it: encoded, as a field of a batch.
+    fn too_large(&self, record: &Record) -> Option<DeadLetterReason> {
+        let framed = as_field(record).len;
+        (framed > self.max_message_size).then_some(DeadLetterReason::TooLarge {
+            bytes: framed,
+            limit: self.max_message_size,
+        })
     }
 }
 

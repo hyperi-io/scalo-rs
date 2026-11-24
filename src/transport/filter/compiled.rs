@@ -586,7 +586,11 @@ thread_local! {
 }
 
 /// Filter evaluations on this thread so far.
-#[cfg(all(test, feature = "sink-stack", feature = "transport-memory"))]
+#[cfg(all(
+    test,
+    feature = "transport-memory",
+    any(feature = "sink-stack", feature = "worker-batch")
+))]
 pub(crate) fn evaluations() -> u64 {
     EVALUATIONS.with(std::cell::Cell::get)
 }

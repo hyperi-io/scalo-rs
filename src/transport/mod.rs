@@ -147,7 +147,7 @@ pub mod test_support;
 pub use crate::framing::FramingError;
 pub use ack::{
     AckControl, AckKind, AcknowledgementsConfig, AcknowledgingReceiver, DEAD_LETTER_REJECTED,
-    DeadLetter, DeadLetterReason, HeldAcks, SinkConfirmation, SourceAck, screen,
+    DeadLetter, DeadLetterReason, HeldAcks, Screened, SinkConfirmation, SourceAck, screen,
 };
 pub use codec::{CodecError, FieldRef, ParsedPayload, parse};
 pub use custom::{

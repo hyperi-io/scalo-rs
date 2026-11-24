@@ -658,6 +658,37 @@ impl TransportSender for SyslogTransport {
         if self.filter_engine.outbound_dead_letter(&record.payload) {
             return Some(DeadLetterReason::OutboundFilter);
         }
+        self.too_large(record)
+    }
+
+    /// Its outbound filters, which `send_screened` then skips, then a message
+    /// over `max_message_bytes` on a protocol that does not cut it.
+    fn screen(&self, record: &Record) -> super::ack::Screened {
+        match self.filter_engine.screen(&record.payload) {
+            super::ack::Screened::Send => self
+                .too_large(record)
+                .map_or(super::ack::Screened::Send, super::ack::Screened::DeadLetter),
+            handled => handled,
+        }
+    }
+
+    /// The records its screen kept, without running their outbound filters
+    /// again.
+    async fn send_screened(
+        &self,
+        records: &[Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
+        self.filter_engine
+            .screened(super::traits::send_within(self, records, deadline))
+            .await
+    }
+}
+
+impl SyslogTransport {
+    /// `record`'s message over `max_message_bytes`, on a protocol that does
+    /// not cut it.
+    fn too_large(&self, record: &Record) -> Option<DeadLetterReason> {
         if self.protocol == SyslogProtocol::Udp {
             return None;
         }

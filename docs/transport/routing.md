@@ -248,7 +248,8 @@ That holds for `send` and `send_to`. The block and fan-out forms (`send_batch`, 
 | `RoutedSender::send_fanout(&[destination], key, payload).await` | One payload to every named destination |
 | `RoutedSender::send_batch(records).await` | A block grouped by destination, one call per group |
 | `RoutedSender::send_batch_fanout(&[destination], records).await` | The whole block to every named destination |
-| `RoutedSender::dead_letter_reason(record)` | The screen of the route the record's key selects |
+| `RoutedSender::dead_letter_reason(record)` / `screen(record)` | The screen of the route the record's key selects |
+| `RoutedSender::send_screened(records, deadline).await` | A screened block grouped by destination, each group through its route's `send_screened` |
 | `RoutedSender::confirms_delivery()` | The weakest confirmation across every route and the default |
 | `RoutedSender::route_keys() -> Vec<&str>` | List configured route keys |
 | `RoutedSender::has_route(key) -> bool` | Check if a specific key has a route |

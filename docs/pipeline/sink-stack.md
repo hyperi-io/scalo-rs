@@ -90,8 +90,10 @@ flowchart LR
   `SendResult::Ok`. Retries may re-deliver records a failed attempt sent -- a
   prefix for the per-record default, any subset for Kafka's pipelined override
   (at-least-once: duplicates, never loss).
-- Records the sender names in `dead_letter_reason` are taken out before the
-  send. A send it answers `FilteredDlq` names no record, so the stack sends
+- Records the sender's `screen` would dead-letter are taken out before the
+  send, and the ones an outbound `drop` filter takes are left out. The rest go
+  through `send_screened`, so no outbound filter runs twice. A send it answers
+  `FilteredDlq` names no record, so the stack sends
   that batch's records again one at a time, and each one refused joins the dead
   letters as `DeadLetterReason::Rejected`. The resend repeats the records already
   sent. A `FilteredDlq` is never retried as a whole and never counts as sent.

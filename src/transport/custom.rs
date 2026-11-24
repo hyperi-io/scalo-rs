@@ -121,6 +121,14 @@ pub trait DynTransportSender: Send + Sync {
     fn dyn_confirms_delivery(&self) -> SinkConfirmation;
     /// [`TransportSender::dead_letter_reason`].
     fn dyn_dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason>;
+    /// [`TransportSender::screen`].
+    fn dyn_screen(&self, record: &Record) -> super::ack::Screened;
+    /// [`TransportSender::send_screened`].
+    fn dyn_send_screened<'a>(
+        &'a self,
+        records: &'a [Record],
+        deadline: Option<Instant>,
+    ) -> BoxSendFuture<'a, SendResult>;
 }
 
 impl<T: TransportSender> DynTransportSender for T {
@@ -164,6 +172,16 @@ impl<T: TransportSender> DynTransportSender for T {
     }
     fn dyn_dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
         self.dead_letter_reason(record)
+    }
+    fn dyn_screen(&self, record: &Record) -> super::ack::Screened {
+        self.screen(record)
+    }
+    fn dyn_send_screened<'a>(
+        &'a self,
+        records: &'a [Record],
+        deadline: Option<Instant>,
+    ) -> BoxSendFuture<'a, SendResult> {
+        Box::pin(self.send_screened(records, deadline))
     }
 }
 

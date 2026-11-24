@@ -349,7 +349,7 @@ fn unroutable(destination: &str) -> SendResult {
 /// the trait's own short-circuit contract, at group granularity instead of
 /// record granularity. A block that resolves to ONE route is handed to that
 /// sender as the caller's own slice, with no per-group copy.
-async fn send_grouped<'a, S, F>(records: &[Record], resolve: F) -> SendResult
+async fn send_grouped<'a, S, F>(records: &[Record], resolve: F, handoff: Handoff) -> SendResult
 where
     S: TransportSender + 'a,
     F: Fn(&str) -> Option<&'a S>,
@@ -373,7 +373,7 @@ where
         return SendResult::Ok; // empty block
     };
     if !mixed {
-        return first_sender.send_batch(records).await;
+        return handoff.send(first_sender, records).await;
     }
 
     // Mixed block: one Vec per sink, input order preserved within each group.
@@ -393,11 +393,30 @@ where
 
     let mut handled = BlockOutcome::default();
     for (sender, group) in groups {
-        if let Some(failed) = handled.add(sender.send_batch(&group).await) {
+        if let Some(failed) = handled.add(handoff.send(sender, &group).await) {
             return failed;
         }
     }
     handled.finish()
+}
+
+/// How [`send_grouped`] hands each group to its sender.
+#[derive(Debug, Clone, Copy)]
+enum Handoff {
+    /// [`send_batch`](TransportSender::send_batch), which filters.
+    Batch,
+    /// [`send_screened`](TransportSender::send_screened), by the deadline when
+    /// there is one.
+    Screened(Option<std::time::Instant>),
+}
+
+impl Handoff {
+    async fn send<S: TransportSender>(self, sender: &S, records: &[Record]) -> SendResult {
+        match self {
+            Self::Batch => sender.send_batch(records).await,
+            Self::Screened(deadline) => sender.send_screened(records, deadline).await,
+        }
+    }
 }
 
 impl TransportSender for RoutedSender {
@@ -429,7 +448,12 @@ impl TransportSender for RoutedSender {
         if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
-        send_grouped(records, |destination| self.resolve(destination)).await
+        send_grouped(
+            records,
+            |destination| self.resolve(destination),
+            Handoff::Batch,
+        )
+        .await
     }
 
     /// The weakest confirmation across every route and the default, since a
@@ -448,6 +472,34 @@ impl TransportSender for RoutedSender {
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
         self.resolve(record.key.as_deref().unwrap_or(""))?
             .dead_letter_reason(record)
+    }
+
+    /// The screen of the route the record's key selects. An unroutable record
+    /// is sent, and fails the block as `send_batch` fails it.
+    fn screen(&self, record: &Record) -> super::ack::Screened {
+        self.resolve(record.key.as_deref().unwrap_or(""))
+            .map_or(super::ack::Screened::Send, |sender| sender.screen(record))
+    }
+
+    /// Each route's group through that route's `send_screened`, grouped as
+    /// `send_batch` groups them.
+    async fn send_screened(
+        &self,
+        records: &[Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
+        if records.is_empty() {
+            return SendResult::Ok;
+        }
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return SendResult::Fatal(TransportError::Closed);
+        }
+        send_grouped(
+            records,
+            |destination| self.resolve(destination),
+            Handoff::Screened(deadline),
+        )
+        .await
     }
 }
 
@@ -797,7 +849,8 @@ mod tests {
             rec(Some("archiver"), b"a2"),
         ];
 
-        let result = send_grouped(&records, |k| resolve_fake(&routes, None, k)).await;
+        let result =
+            send_grouped(&records, |k| resolve_fake(&routes, None, k), Handoff::Batch).await;
         assert!(result.is_ok(), "every group accepted: {result:?}");
 
         let loader = &routes["loader"];
@@ -825,7 +878,8 @@ mod tests {
         routes.insert("loader".to_string(), CountingSender::default());
 
         let records = vec![rec(Some("loader"), b"one"), rec(Some("loader"), b"two")];
-        let result = send_grouped(&records, |k| resolve_fake(&routes, None, k)).await;
+        let result =
+            send_grouped(&records, |k| resolve_fake(&routes, None, k), Handoff::Batch).await;
 
         assert!(result.is_ok());
         assert_eq!(
@@ -843,11 +897,11 @@ mod tests {
         routes.insert("archiver".to_string(), CountingSender::default());
 
         let one = vec![rec(Some("loader"), b"one")];
-        let single = send_grouped(&one, |k| resolve_fake(&routes, None, k)).await;
+        let single = send_grouped(&one, |k| resolve_fake(&routes, None, k), Handoff::Batch).await;
         assert!(single.is_filtered_dlq(), "{single:?}");
 
         let mixed = vec![rec(Some("loader"), b"two"), rec(Some("archiver"), b"three")];
-        let both = send_grouped(&mixed, |k| resolve_fake(&routes, None, k)).await;
+        let both = send_grouped(&mixed, |k| resolve_fake(&routes, None, k), Handoff::Batch).await;
         assert!(both.is_filtered_dlq(), "{both:?}");
         assert_eq!(routes["archiver"].calls(), vec![vec!["three".to_string()]]);
     }
@@ -867,7 +921,8 @@ mod tests {
             rec(Some("archiver"), b"a2"),
         ];
 
-        let result = send_grouped(&records, |k| resolve_fake(&routes, None, k)).await;
+        let result =
+            send_grouped(&records, |k| resolve_fake(&routes, None, k), Handoff::Batch).await;
         assert!(
             result.is_backpressured(),
             "the failing destination's result is the block's result: {result:?}"
@@ -896,7 +951,8 @@ mod tests {
         // The routable record comes FIRST: the pre-flight resolve must still
         // stop it reaching the wire, so a retry cannot re-deliver a prefix.
         let records = vec![rec(Some("loader"), b"l1"), rec(Some("nowhere"), b"n1")];
-        let result = send_grouped(&records, |k| resolve_fake(&routes, None, k)).await;
+        let result =
+            send_grouped(&records, |k| resolve_fake(&routes, None, k), Handoff::Batch).await;
 
         assert!(result.is_fatal(), "unroutable block is fatal: {result:?}");
         assert!(
@@ -911,7 +967,12 @@ mod tests {
         let default = CountingSender::default();
 
         let records = vec![rec(None, b"d1"), rec(Some("unknown"), b"d2")];
-        let result = send_grouped(&records, |k| resolve_fake(&routes, Some(&default), k)).await;
+        let result = send_grouped(
+            &records,
+            |k| resolve_fake(&routes, Some(&default), k),
+            Handoff::Batch,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert_eq!(
@@ -933,7 +994,12 @@ mod tests {
             rec(Some("default"), b"named"),
             rec(Some("unknown"), b"fell"),
         ];
-        let result = send_grouped(&records, |k| resolve_fake(&routes, Some(&fallback), k)).await;
+        let result = send_grouped(
+            &records,
+            |k| resolve_fake(&routes, Some(&fallback), k),
+            Handoff::Batch,
+        )
+        .await;
 
         assert!(result.is_ok());
         assert_eq!(routes["default"].calls(), vec![vec!["named".to_string()]]);

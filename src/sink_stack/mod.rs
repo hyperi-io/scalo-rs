@@ -83,12 +83,12 @@ use tower::{BoxError, Layer, Service, ServiceBuilder, ServiceExt};
 
 use crate::governor::RateLimiter;
 use crate::transport::{
-    CommitToken, DeadLetter, DeadLetterReason, Record, SendResult, TransportError, TransportSender,
-    WorkBatch,
+    CommitToken, DeadLetter, DeadLetterReason, Record, Screened, SendResult, TransportError,
+    TransportSender, WorkBatch,
 };
 
-/// The sender's screen: why it would dead-letter a record, or `None`.
-type Screen = Arc<dyn Fn(&Record) -> Option<DeadLetterReason> + Send + Sync>;
+/// The sender's screen: what it does with a record.
+type Screen = Arc<dyn Fn(&Record) -> Screened + Send + Sync>;
 
 /// A batch of records to deliver, shared cheaply across retry attempts.
 ///
@@ -172,13 +172,29 @@ impl SinkOutcome {
 /// ecosystem -- everything else in the stack is a standard tower layer.
 pub struct SinkService<S> {
     sender: Arc<S>,
+    /// Whether every batch comes from the sender's screen, so it goes through
+    /// `send_screened` rather than `send_batch`.
+    screened: bool,
 }
 
 impl<S> SinkService<S> {
     /// Wrap a shared sender as a tower service.
     #[must_use]
     pub fn new(sender: Arc<S>) -> Self {
-        Self { sender }
+        Self {
+            sender,
+            screened: false,
+        }
+    }
+
+    /// As [`new`](Self::new), for batches the sender's
+    /// [`screen`](TransportSender::screen) kept: each goes through
+    /// [`send_screened`](TransportSender::send_screened).
+    fn screened(sender: Arc<S>) -> Self {
+        Self {
+            sender,
+            screened: true,
+        }
     }
 }
 
@@ -189,6 +205,7 @@ impl<S> Clone for SinkService<S> {
     fn clone(&self) -> Self {
         Self {
             sender: Arc::clone(&self.sender),
+            screened: self.screened,
         }
     }
 }
@@ -215,8 +232,14 @@ where
 
     fn call(&mut self, req: SinkBatch) -> Self::Future {
         let sender = Arc::clone(&self.sender);
+        let screened = self.screened;
         Box::pin(async move {
-            match sender.send_batch(&req.0).await {
+            let sent = if screened {
+                sender.send_screened(&req.0, None).await
+            } else {
+                sender.send_batch(&req.0).await
+            };
+            match sent {
                 SendResult::Ok => Ok(()),
                 SendResult::FilteredDlq => Err(SinkError::DeadLetter),
                 SendResult::Backpressured => Err(SinkError::Transient),
@@ -319,7 +342,7 @@ impl SinkStack {
     {
         let limiter = RateLimiter::new(cfg.rate_limit, "sink");
         let screened = Arc::clone(&sender);
-        let screen: Screen = Arc::new(move |record| screened.dead_letter_reason(record));
+        let screen: Screen = Arc::new(move |record| screened.screen(record));
 
         // In-attempt control core (Error = BoxError), one of two shapes:
         //
@@ -336,7 +359,7 @@ impl SinkStack {
                     cfg.attempt_timeout(),
                 ))
                 .timeout(cfg.attempt_timeout())
-                .service(SinkService::new(sender))
+                .service(SinkService::screened(sender))
                 .boxed_clone()
         } else {
             let concurrency = if cfg.max_concurrency == 0 {
@@ -348,7 +371,7 @@ impl SinkStack {
                 .layer(RateLimitLayer::new(limiter))
                 .timeout(cfg.attempt_timeout())
                 .concurrency_limit(concurrency)
-                .service(SinkService::new(sender))
+                .service(SinkService::screened(sender))
                 .boxed_clone()
         };
 
@@ -377,8 +400,12 @@ impl SinkStack {
     /// Deliver a batch through the full stack, retrying transient failures with
     /// backoff.
     ///
-    /// Records the sender names in `dead_letter_reason` are taken out before
-    /// the send and returned in [`SinkOutcome::dead_letters`]. A send the
+    /// Records the sender's [`screen`](TransportSender::screen) would
+    /// dead-letter are taken out before the send and returned in
+    /// [`SinkOutcome::dead_letters`], and the ones an outbound `drop` filter
+    /// takes are left out. The rest go through
+    /// [`send_screened`](TransportSender::send_screened), so no outbound filter
+    /// runs twice. A send the
     /// sender answers `FilteredDlq` names no record, so its records are sent
     /// again one at a time, and each it refuses joins the dead letters as
     /// [`DeadLetterReason::Rejected`]. Fire commit tokens only on
@@ -388,8 +415,9 @@ impl SinkStack {
         let mut kept = Vec::with_capacity(records.len());
         for record in records {
             match (self.screen)(&record) {
-                None => kept.push(record),
-                Some(reason) => dead_letters.push(DeadLetter { record, reason }),
+                Screened::Send => kept.push(record),
+                Screened::Dropped => {}
+                Screened::DeadLetter(reason) => dead_letters.push(DeadLetter { record, reason }),
             }
         }
         if kept.is_empty() {

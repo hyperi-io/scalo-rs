@@ -203,6 +203,7 @@ routes per record, and a sink stage sends 1:1. See [routing.md](routing.md).
 | `TransportReceiver::release(&tokens, status)` | Ack with the merged delivery status, which `Errored` withholds |
 | `TransportReceiver::ack_control()` / `hold_deadline(&tokens)` | Acknowledgement controls, and when a waiting sender must be answered |
 | `TransportSender::confirms_delivery()` / `dead_letter_reason(&record)` | What an `Ok` proves, and which records the sender would dead-letter |
+| `TransportSender::screen(&record)` / `send_screened(&records, deadline)` | Send, drop or dead-letter one record, then send the kept ones without running their outbound filters again |
 | `ack::{AcknowledgementsConfig, SourceAck, Tickets}` | The `acknowledgements` key, the hand-rolled release, listener admission |
 | `hold::{HoldLadder, hold_budget}` | Each hop's hold and next-hop deadline by depth, and the hold left under a sender's deadline ([backends.md](backends.md#hold-ladder)) |
 | `CommitToken` | `Clone + Send + Sync + Debug + Display`, `as_str()` |

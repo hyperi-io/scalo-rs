@@ -10,7 +10,7 @@
 
 use crate::compression::Compressor;
 use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
-use crate::transport::{Record, SendResult, TransportSender};
+use crate::transport::{Record, Screened, SendResult, TransportSender};
 use crate::yaque::{self, Receiver};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -550,10 +550,13 @@ async fn drain_once<S: TransportSender>(
     let stored: u64 = sizes.iter().take(taken).sum();
     let mut records = Vec::with_capacity(read_back.len());
     let mut dead = Vec::new();
+    // Records an outbound drop filter takes are settled, and count as delivered.
+    let mut dropped = 0;
     for record in read_back {
-        match sink.dead_letter_reason(&record) {
-            None => records.push(record),
-            Some(reason) => dead.push(Undeliverable {
+        match sink.screen(&record) {
+            Screened::Send => records.push(record),
+            Screened::Dropped => dropped += 1,
+            Screened::DeadLetter(reason) => dead.push(Undeliverable {
                 label: reason.as_str(),
                 reason: reason.to_string(),
                 record,
@@ -565,12 +568,12 @@ async fn drain_once<S: TransportSender>(
         None
     } else {
         let deadline = std::time::Instant::now() + send_timeout;
-        Some(sink.send_batch_by(&records, deadline).await)
+        Some(sink.send_screened(&records, Some(deadline)).await)
     };
     let delivered = match sent {
-        // Only unreadable entries and dead letters: nothing to send.
-        None => 0,
-        Some(SendResult::Ok) => records.len(),
+        // Only unreadable entries, dropped records and dead letters: nothing to send.
+        None => dropped,
+        Some(SendResult::Ok) => records.len() + dropped,
         // Backpressure, a named wait, an elapsed deadline (the batch may or
         // may not have reached the sink) and a closed or misconfigured sink
         // keep the whole batch spooled (at-least-once).

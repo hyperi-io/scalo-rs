@@ -1062,6 +1062,23 @@ impl TransportSender for HttpTransport {
             .then_some(super::ack::DeadLetterReason::OutboundFilter)
     }
 
+    /// Its outbound filters, which `send_screened` then skips.
+    fn screen(&self, record: &super::work_batch::Record) -> super::ack::Screened {
+        self.filter_engine.screen(&record.payload)
+    }
+
+    /// The records its screen kept, without running their outbound filters
+    /// again.
+    async fn send_screened(
+        &self,
+        records: &[super::work_batch::Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
+        self.filter_engine
+            .screened(super::traits::send_within(self, records, deadline))
+            .await
+    }
+
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
         self.send_block(std::iter::once((destination, &payload)), None)
             .await

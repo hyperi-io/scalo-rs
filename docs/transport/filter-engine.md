@@ -105,8 +105,11 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
   passes.
 - `drop` action silently discards. Every match, `drop` or `dlq`, counts
   in the `transport_filtered_total` counter, labelled `direction` and `action`.
-  A record a sender's `dead_letter_reason` screens and the send then filters
-  counts once: the screen counts only the `dlq` match it takes out.
+  A sender's `screen` runs a record's outbound filters and counts its match,
+  and `send_screened` does not run them again, so a screened record is
+  evaluated and counted once. A record a sender's `dead_letter_reason` screens
+  and `send_batch` then filters counts once too: `dead_letter_reason` counts
+  only the `dlq` match it takes out.
 - `dlq` action produces a `FilteredDlqEntry` returned **inline** in
   `recv()`'s `WorkBatch.dlq_entries` (alongside the passing
   `WorkBatch.records`) -- the transport does **not** route to a DLQ

@@ -183,6 +183,22 @@ impl TransportSender for AnySender {
             c => c.dyn_dead_letter_reason(record)
         )
     }
+
+    fn screen(&self, record: &Record) -> super::ack::Screened {
+        each_sender!(self, t => t.screen(record), c => c.dyn_screen(record))
+    }
+
+    async fn send_screened(
+        &self,
+        records: &[Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
+        each_sender!(
+            self,
+            t => t.send_screened(records, deadline).await,
+            c => c.dyn_send_screened(records, deadline).await
+        )
+    }
 }
 
 impl AnySender {

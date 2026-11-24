@@ -282,8 +282,18 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     ///   spilled, so a retry can deliver it twice
     pub async fn send(&self, record: &Record) -> Result<()> {
         // Never spooled: the drain would only meet it again.
-        if let Some(reason) = self.sink.dead_letter_reason(record) {
-            return Err(TieredSinkError::DeadLetter(reason.to_string()));
+        match self.sink.screen(record) {
+            crate::transport::Screened::Send => {}
+            // Taken by the sink's outbound drop filter: settled, and counted as the hot path.
+            crate::transport::Screened::Dropped => {
+                self.hot_path_count.fetch_add(1, AtomicOrdering::Relaxed);
+                #[cfg(feature = "metrics")]
+                ::metrics::counter!("spool_hot_path_total").increment(1);
+                return Ok(());
+            }
+            crate::transport::Screened::DeadLetter(reason) => {
+                return Err(TieredSinkError::DeadLetter(reason.to_string()));
+            }
         }
 
         // StrictFifo: serialise decision + send + enqueue against
@@ -390,7 +400,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
         match self
             .sink
-            .send_batch_by(std::slice::from_ref(record), deadline)
+            .send_screened(std::slice::from_ref(record), Some(deadline))
             .await
         {
             SendResult::Ok => {
@@ -1006,6 +1016,40 @@ mod tests {
         assert!(tiered.spool_is_empty().await);
         assert_eq!(tiered.inner().received_count().await, 1);
 
+        tiered.shutdown().await;
+    }
+
+    /// A record the sink's outbound `drop` filter takes is settled on the hot
+    /// path with no send and no spool. A kept one is sent.
+    #[cfg(feature = "transport-memory")]
+    #[tokio::test]
+    async fn a_dropped_record_is_settled_without_a_send_or_a_spool() {
+        use crate::transport::TransportReceiver;
+        use crate::transport::filter::{FilterAction, FilterRule, TransportFilterTierConfig};
+        use crate::transport::memory::{MemoryConfig, MemoryTransport};
+
+        let dir = tempdir().unwrap();
+        let config = MemoryConfig {
+            filters_out: vec![FilterRule {
+                expression: "has(noise)".into(),
+                action: FilterAction::Drop,
+            }],
+            ..Default::default()
+        };
+        let sink =
+            MemoryTransport::with_tiers(&config, &TransportFilterTierConfig::default()).unwrap();
+        let tiered = TieredSink::new(sink, TieredSinkConfig::new(dir.path().join("q")))
+            .await
+            .unwrap();
+
+        tiered.send(&rec(br#"{"noise":1}"#)).await.unwrap();
+        tiered.send(&rec(br#"{"seq":1}"#)).await.unwrap();
+
+        assert_eq!(tiered.hot_path_count(), 2);
+        assert!(tiered.spool_is_empty().await);
+        let sent = tiered.inner().recv(10).await.unwrap().records;
+        let payloads: Vec<&[u8]> = sent.iter().map(|r| r.payload.as_ref()).collect();
+        assert_eq!(payloads, [br#"{"seq":1}"#.as_slice()]);
         tiered.shutdown().await;
     }
 

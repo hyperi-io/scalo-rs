@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-use super::ack::{AckControl, DeadLetterReason, SinkConfirmation};
+use super::ack::{AckControl, DeadLetterReason, Screened, SinkConfirmation};
 use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::filter::FilteredDlqEntry;
@@ -343,6 +343,48 @@ pub trait TransportSender: TransportBase {
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
         let _ = record;
         None
+    }
+
+    /// What this sender does with `record`: send it, drop it for an outbound
+    /// `drop` filter, or dead-letter it. A caller that screens a block sends
+    /// the records answered [`Screened::Send`] through
+    /// [`send_screened`](Self::send_screened).
+    ///
+    /// Every in-tree sender runs its outbound filters here and counts a match
+    /// in `transport_filtered_total`, so `send_screened` does not run them
+    /// again. The default answers from
+    /// [`dead_letter_reason`](Self::dead_letter_reason), and drops none.
+    fn screen(&self, record: &Record) -> Screened {
+        self.dead_letter_reason(record)
+            .map_or(Screened::Send, Screened::DeadLetter)
+    }
+
+    /// Send `records`, every one of which [`screen`](Self::screen) answered
+    /// `Send` for, answering by `deadline` when there is one.
+    ///
+    /// An in-tree sender skips the outbound filters its screen ran, so a
+    /// record that did not come through the screen is sent unfiltered. The
+    /// default is [`send_batch`](Self::send_batch), or
+    /// [`send_batch_by`](Self::send_batch_by) with a deadline.
+    fn send_screened(
+        &self,
+        records: &[Record],
+        deadline: Option<std::time::Instant>,
+    ) -> impl Future<Output = SendResult> + Send {
+        send_within(self, records, deadline)
+    }
+}
+
+/// `records` through `sender`'s `send_batch`, or its `send_batch_by` when
+/// there is a `deadline`.
+pub(crate) async fn send_within<S: TransportSender + ?Sized>(
+    sender: &S,
+    records: &[Record],
+    deadline: Option<std::time::Instant>,
+) -> SendResult {
+    match deadline {
+        Some(deadline) => sender.send_batch_by(records, deadline).await,
+        None => sender.send_batch(records).await,
     }
 }
 

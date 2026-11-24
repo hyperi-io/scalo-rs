@@ -46,8 +46,15 @@ pub use config::{
 use compiled::CompiledFilter;
 use metrics::FilterMetrics;
 
+use crate::transport::ack::{DeadLetterReason, Screened};
 use crate::transport::error::TransportError;
 use crate::transport::types::{BlockOutcome, SendResult};
+
+tokio::task_local! {
+    /// The engine, by address, whose outbound filters a screen already ran for
+    /// the send this task is in.
+    static SCREENED_BY: usize;
+}
 
 /// Result of evaluating a filter against a message payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +323,50 @@ impl TransportFilterEngine {
         }
     }
 
+    /// A sender's [`screen`](crate::transport::TransportSender::screen) answer
+    /// for `payload` from its outbound filters, the match counted as the send
+    /// would count it.
+    #[must_use]
+    pub fn screen(&self, payload: &[u8]) -> Screened {
+        if !self.has_outbound_filters() {
+            return Screened::Send;
+        }
+        match self.apply_outbound(payload) {
+            FilterDisposition::Pass => Screened::Send,
+            FilterDisposition::Drop => Screened::Dropped,
+            FilterDisposition::Dlq => Screened::DeadLetter(DeadLetterReason::OutboundFilter),
+        }
+    }
+
+    /// Run `send` with this engine's outbound filters taken as run: within it,
+    /// [`outbound_one`](Self::outbound_one) and
+    /// [`partition_outbound`](Self::partition_outbound) pass every payload.
+    /// For a sender's `send_screened`, whose records its screen kept.
+    #[cfg(any(
+        feature = "transport-memory",
+        feature = "transport-file",
+        feature = "transport-pipe",
+        feature = "transport-http",
+        feature = "transport-grpc",
+        feature = "transport-kafka",
+        feature = "transport-syslog",
+        feature = "transport-otlp"
+    ))]
+    pub(crate) async fn screened<F: std::future::Future>(&self, send: F) -> F::Output {
+        SCREENED_BY.scope(self.address(), send).await
+    }
+
+    /// Whether this task is inside [`screened`](Self::screened) for this engine.
+    fn screened_here(&self) -> bool {
+        SCREENED_BY
+            .try_with(|engine| *engine == self.address())
+            .unwrap_or(false)
+    }
+
+    fn address(&self) -> usize {
+        std::ptr::from_ref(self).addr()
+    }
+
     /// Whether an outbound `dlq` filter takes `payload`: the answer a sender's
     /// `dead_letter_reason` gives for a filter match.
     ///
@@ -347,7 +398,7 @@ impl TransportFilterEngine {
     #[inline]
     #[must_use]
     pub fn outbound_one(&self, payload: &[u8]) -> Option<SendResult> {
-        if !self.has_outbound_filters() {
+        if !self.has_outbound_filters() || self.screened_here() {
             return None;
         }
         match self.apply_outbound(payload) {
@@ -366,7 +417,7 @@ impl TransportFilterEngine {
         items: impl IntoIterator<Item = T>,
         payload: impl Fn(&T) -> &[u8],
     ) -> (Vec<T>, SendResult) {
-        if !self.has_outbound_filters() {
+        if !self.has_outbound_filters() || self.screened_here() {
             return (items.into_iter().collect(), SendResult::Ok);
         }
         let mut outcome = BlockOutcome::default();
@@ -510,6 +561,50 @@ fn is_likely_msgpack(payload: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A screen answers each outbound disposition, and inside `screened` this
+    /// engine passes every payload while another engine's filters still run.
+    #[cfg(feature = "transport-memory")]
+    #[tokio::test]
+    async fn a_screen_answers_and_a_screened_send_skips_its_filters() {
+        let rules = [
+            FilterRule {
+                expression: "has(noise)".into(),
+                action: FilterAction::Drop,
+            },
+            FilterRule {
+                expression: "has(poison)".into(),
+                action: FilterAction::Dlq,
+            },
+        ];
+        let tiers = TransportFilterTierConfig::default();
+        let engine = TransportFilterEngine::new(&[], &rules, &tiers).unwrap();
+        let other = TransportFilterEngine::new(&[], &rules, &tiers).unwrap();
+        // (payload, screen, send outside the scope: None passes, Some(ok) is the answer's is_ok)
+        let cases: [(&[u8], Screened, Option<bool>); 3] = [
+            (br#"{"seq":1}"#, Screened::Send, None),
+            (br#"{"noise":1}"#, Screened::Dropped, Some(true)),
+            (
+                br#"{"poison":1}"#,
+                Screened::DeadLetter(DeadLetterReason::OutboundFilter),
+                Some(false),
+            ),
+        ];
+        for (payload, screened, sent) in &cases {
+            assert_eq!(engine.screen(payload), *screened);
+            assert_eq!(engine.outbound_one(payload).map(|r| r.is_ok()), *sent);
+            let inside = engine
+                .screened(async { engine.outbound_one(payload) })
+                .await;
+            assert!(inside.is_none(), "{inside:?}");
+            let others = engine.screened(async { other.outbound_one(payload) }).await;
+            assert_eq!(others.map(|r| r.is_ok()), *sent);
+        }
+        let (kept, handled) = engine
+            .screened(async { engine.partition_outbound(cases.iter().map(|(p, ..)| *p), |p| p) })
+            .await;
+        assert_eq!((kept.len(), handled.is_ok()), (3, true));
+    }
 
     #[test]
     fn engine_no_filters_always_passes() {

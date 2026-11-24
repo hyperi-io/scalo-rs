@@ -2345,16 +2345,43 @@ impl TransportSender for KafkaTransport {
     /// A record over `message.max.bytes`, less the framing librdkafka adds,
     /// or one an outbound `dlq` filter matches.
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
-        let limit = self.message_max_bytes.saturating_sub(RECORD_WIRE_OVERHEAD);
-        if record.payload.len() > limit {
-            return Some(DeadLetterReason::TooLarge {
-                bytes: record.payload.len(),
-                limit,
-            });
+        self.too_large(record).or_else(|| {
+            self.filter_engine
+                .outbound_dead_letter(&record.payload)
+                .then_some(DeadLetterReason::OutboundFilter)
+        })
+    }
+
+    /// A record over `message.max.bytes`, less the framing librdkafka adds,
+    /// else its outbound filters, which `send_screened` then skips.
+    fn screen(&self, record: &Record) -> super::ack::Screened {
+        match self.too_large(record) {
+            Some(reason) => super::ack::Screened::DeadLetter(reason),
+            None => self.filter_engine.screen(&record.payload),
         }
+    }
+
+    /// The records its screen kept, without running their outbound filters
+    /// again.
+    async fn send_screened(
+        &self,
+        records: &[Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
         self.filter_engine
-            .outbound_dead_letter(&record.payload)
-            .then_some(DeadLetterReason::OutboundFilter)
+            .screened(super::traits::send_within(self, records, deadline))
+            .await
+    }
+}
+
+impl KafkaTransport {
+    /// `record` over `message.max.bytes`, less the framing librdkafka adds.
+    fn too_large(&self, record: &Record) -> Option<DeadLetterReason> {
+        let limit = self.message_max_bytes.saturating_sub(RECORD_WIRE_OVERHEAD);
+        (record.payload.len() > limit).then_some(DeadLetterReason::TooLarge {
+            bytes: record.payload.len(),
+            limit,
+        })
     }
 }
 

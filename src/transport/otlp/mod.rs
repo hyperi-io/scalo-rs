@@ -415,6 +415,23 @@ impl TransportSender for OtlpTransport {
             .outbound_dead_letter(&record.payload)
             .then_some(DeadLetterReason::OutboundFilter)
     }
+
+    /// Its outbound filters, which `send_screened` then skips.
+    fn screen(&self, record: &Record) -> super::ack::Screened {
+        self.filter_engine.screen(&record.payload)
+    }
+
+    /// The records its screen kept, without running their outbound filters
+    /// again.
+    async fn send_screened(
+        &self,
+        records: &[Record],
+        deadline: Option<std::time::Instant>,
+    ) -> SendResult {
+        self.filter_engine
+            .screened(super::traits::send_within(self, records, deadline))
+            .await
+    }
 }
 
 /// The gRPC client for `url`, with every header as metadata.

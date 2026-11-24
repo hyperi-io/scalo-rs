@@ -4592,9 +4592,8 @@ async fn effective_guarantee_reports_at_least_once_for_kafka_to_grpc() {
 }
 
 /// A record an outbound `drop` filter matches counts once in
-/// `transport_filtered_total`, though the pipeline screens the block through
-/// the sender before the sink sends it. The `dlq` rule makes the screen read
-/// the filters, as it does for a sender that has one.
+/// `transport_filtered_total`: the pipeline's screen takes it out, and a sink
+/// sending through `send_screened` runs no filter again.
 #[cfg(feature = "metrics")]
 #[tokio::test(flavor = "current_thread")]
 async fn an_outbound_filtered_record_counts_once() {
@@ -4642,8 +4641,15 @@ async fn an_outbound_filtered_record_counts_once() {
                 stop.cancel();
                 let sender = &sender;
                 async move {
-                    let sent = sender.send_batch(&records).await;
+                    assert_eq!(
+                        records.len(),
+                        1,
+                        "the dropped record never reaches the sink"
+                    );
+                    let before = crate::transport::filter::compiled::evaluations();
+                    let sent = sender.send_screened(&records, None).await;
                     assert!(sent.is_ok(), "{sent:?}");
+                    assert_eq!(crate::transport::filter::compiled::evaluations(), before);
                     Ok(())
                 }
             },

@@ -70,7 +70,7 @@ transport:
     type: channel
 ```
 
-`AnySender::from_config("transport.output").await?` now builds it. The default `send_batch` sends each record through `send`, and `send_batch_by` bounds that by a deadline. Override either only when the destination does better in one call.
+`AnySender::from_config("transport.output").await?` now builds it. The default `send_batch` sends each record through `send`, and `send_batch_by` bounds that by a deadline. Override either only when the destination does better in one call. The default `screen` answers from `dead_letter_reason`, and the default `send_screened` is `send_batch`, so a sender with no filters of its own overrides neither.
 
 An app that builds its sender itself skips the registry: `AnySender::custom(ChannelSender(tx))`.
 

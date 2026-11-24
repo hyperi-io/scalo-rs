@@ -8,6 +8,14 @@ release and the target before bumping.
 
 ## 2.14.37
 
+### A sender screens a block once, and sends it with `send_screened` (API and BEHAVIOUR CHANGE)
+
+`TransportSender` gains two provided methods: `screen(&record) -> Screened` answers `Send`, `Dropped` or `DeadLetter(reason)`, and `send_screened(&records, deadline)` sends the records it answered `Send` for. Every in-tree sender runs its outbound filters in `screen` and skips them in `send_screened`, so a screened record's filters run, and count, once. The defaults answer from `dead_letter_reason` and send through `send_batch`, or `send_batch_by` with a deadline, so an implementor changes nothing. `DynTransportSender` gains `dyn_screen` and `dyn_send_screened`, which its blanket impl provides.
+
+`.sender(&sender)`, `SinkStack`, `TieredSink` and its drain screen through `screen`, so a record an outbound `drop` filter matches is settled there. The pipeline's sink never gets it. `TieredSink::send` answers `Ok` with no send and counts it on the hot path, even with the circuit open, where it was spooled. The drain commits it as delivered. `ack::screen` leaves it out of the kept records.
+
+**Consumer adjustment** -- a `BatchEngine` sink that writes to the transport passed to `.sender(&sender)` sends with `send_screened(&records, None)`, or the outbound filters run a second time. A sink that counts the records it gets no longer sees the dropped ones.
+
 ### A syslog sender fails readiness when closed or refused (BEHAVIOUR CHANGE)
 
 `SyslogTransport` registers a `transport:syslog` health entry, as the HTTP, OTLP and gRPC senders do. It is unhealthy once the sender is closed, and while the egress proxy refuses its CONNECT, until a send goes through. Dropping the sender removes the entry. Before, `/readyz` never saw a syslog sender, and only `is_healthy()` reported either state.

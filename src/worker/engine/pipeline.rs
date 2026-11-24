@@ -35,8 +35,8 @@ use super::driver::{
 use super::{BatchEngine, EngineError, FilterDlqPolicy};
 use crate::backoff::Backoff;
 use crate::transport::ack::{
-    AckControl, AckKind, DeadLetterReason, EffectiveGuarantee, SinkConfirmation, await_merged,
-    give_up_at, merged_channel, release_abandoned,
+    AckControl, AckKind, EffectiveGuarantee, Screened, SinkConfirmation, await_merged, give_up_at,
+    merged_channel, release_abandoned,
 };
 use crate::transport::filter::FilteredDlqEntry;
 use crate::transport::{
@@ -47,8 +47,8 @@ use crate::transport::{
 /// The ticker type of a pipeline with no periodic callback.
 pub type NoTicker = fn() -> std::future::Ready<Result<(), EngineError>>;
 
-/// A screen naming records the sink would dead-letter instead of sending.
-type Screen<'a> = Box<dyn Fn(&Record) -> Option<DeadLetterReason> + Send + Sync + 'a>;
+/// A screen saying what the sink's sender does with each record.
+type Screen<'a> = Box<dyn Fn(&Record) -> Screened + Send + Sync + 'a>;
 
 /// The `service` field of the dead letters the pipeline writes.
 #[cfg(feature = "dlq")]
@@ -209,12 +209,16 @@ impl<'a, R: TransportReceiver, T> Pipeline<'a, R, T> {
         self
     }
 
-    /// The transport the sink writes to: its delivery confirmation, and the
-    /// records it would dead-letter instead of sending, which the loop routes
-    /// to the DLQ itself.
+    /// The transport the sink writes to: its delivery confirmation, and its
+    /// [`screen`](TransportSender::screen) of each block. The loop routes the
+    /// records it would dead-letter to the DLQ itself and leaves out the ones
+    /// an outbound `drop` filter takes, so the sink gets only records to send.
+    /// A sink that sends them with
+    /// [`send_screened`](TransportSender::send_screened) runs no outbound
+    /// filter a second time.
     pub fn sender<S: TransportSender>(mut self, sender: &'a S) -> Self {
         self.confirms = Some(sender.confirms_delivery());
-        self.screen = Some(Box::new(move |record| sender.dead_letter_reason(record)));
+        self.screen = Some(Box::new(move |record| sender.screen(record)));
         self
     }
 
@@ -557,7 +561,7 @@ struct BlockRun<'r, R> {
     mode: AckMode,
     push: bool,
     commit: CommitMode,
-    screen: Option<&'r (dyn Fn(&Record) -> Option<DeadLetterReason> + Send + Sync)>,
+    screen: Option<&'r (dyn Fn(&Record) -> Screened + Send + Sync)>,
     retry: &'r RetryWindow<'r>,
 }
 
@@ -781,7 +785,8 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         Ok(SinkEnd::Sunk)
     }
 
-    /// Move out of `records` every record the sink would dead-letter.
+    /// Move out of `records` every record the sink would dead-letter, and drop
+    /// the ones an outbound `drop` filter takes.
     fn screen_out(&self, records: &mut Vec<Record>, dead: &mut Vec<DeadLetter>) {
         let Some(screen) = self.screen else {
             return;
@@ -789,8 +794,9 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
         let mut kept = Vec::with_capacity(records.len());
         for record in std::mem::take(records) {
             match screen(&record) {
-                None => kept.push(record),
-                Some(reason) => dead.push(DeadLetter {
+                Screened::Send => kept.push(record),
+                Screened::Dropped => {}
+                Screened::DeadLetter(reason) => dead.push(DeadLetter {
                     entry: FilteredDlqEntry {
                         payload: record.payload.to_vec(),
                         key: record.key.clone(),

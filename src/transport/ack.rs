@@ -230,8 +230,25 @@ pub struct DeadLetter {
     pub reason: DeadLetterReason,
 }
 
-/// Split `records` into those `sender` would send and those it names in
-/// [`dead_letter_reason`](super::TransportSender::dead_letter_reason).
+/// What a sender does with one record, from
+/// [`TransportSender::screen`](super::TransportSender::screen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Screened {
+    /// Send it, through
+    /// [`send_screened`](super::TransportSender::send_screened).
+    Send,
+    /// An outbound `drop` filter matched it: it is handled, and never sent.
+    Dropped,
+    /// Dead-letter it, for this reason.
+    DeadLetter(DeadLetterReason),
+}
+
+/// Split `records` into those `sender` would send and those it would
+/// dead-letter, leaving out the ones an outbound `drop` filter takes. Send the
+/// kept ones with
+/// [`send_screened`](super::TransportSender::send_screened), so their filters
+/// do not run again.
 pub fn screen<S: super::TransportSender + ?Sized>(
     sender: &S,
     records: Vec<super::work_batch::Record>,
@@ -239,9 +256,10 @@ pub fn screen<S: super::TransportSender + ?Sized>(
     let mut kept = Vec::with_capacity(records.len());
     let mut dead = Vec::new();
     for record in records {
-        match sender.dead_letter_reason(&record) {
-            None => kept.push(record),
-            Some(reason) => dead.push(DeadLetter { record, reason }),
+        match sender.screen(&record) {
+            Screened::Send => kept.push(record),
+            Screened::Dropped => {}
+            Screened::DeadLetter(reason) => dead.push(DeadLetter { record, reason }),
         }
     }
     (kept, dead)
