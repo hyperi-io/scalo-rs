@@ -12,6 +12,10 @@
 //! - **`otel-metrics` only:** OTLP push to OTel-compatible backends
 //! - **Both:** Fanout recorder sends to both Prometheus AND OTel
 //!
+//! OTLP push runs with or without the `/metrics` server, through its own
+//! exporter or, with `transport-otlp`, through an [`OtlpTransport`](crate::transport::OtlpTransport)
+//! ([`MetricsManager::with_otlp_transport`], `metrics.otel.via_transport`).
+//!
 //! Counter/Gauge/Histogram types, automatic process + cgroup container metrics,
 //! built-in HTTP server, liveness/readiness probes, optional scaling-pressure and
 //! memory-guard endpoints, custom routes via `start_server_with_routes` on
@@ -100,10 +104,8 @@ use thiserror::Error;
 #[cfg(feature = "metrics")]
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
-#[cfg(feature = "metrics")]
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-#[cfg(feature = "metrics")]
 use crate::concurrency::{PeriodicTask, PeriodicWorker, TickError};
 
 /// Readiness check callback type.
@@ -356,9 +358,13 @@ struct RecorderSetup {
 
 /// Install the metrics recorder(s) for the enabled features. When both
 /// `metrics` and `otel-metrics` are on, composes both into one global
-/// recorder via `metrics-util` `FanoutBuilder`.
+/// recorder via `metrics-util` `FanoutBuilder`. OTLP push goes through
+/// `transport` when one is given.
 #[allow(unused_variables)]
-fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
+fn install_recorders(
+    config: &MetricsConfig,
+    #[cfg(feature = "transport-otlp")] transport: Option<Arc<crate::transport::OtlpTransport>>,
+) -> RecorderSetup {
     // --- Prometheus only (no OTel) ---
     #[cfg(all(feature = "metrics", not(feature = "otel-metrics")))]
     {
@@ -400,7 +406,12 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
         // namespace so scope identity is preserved. Instrument-name prefixing
         // is done uniformly by the prefix layer below, so there is no
         // double-prefix on instrument names.
-        match otel::build_otel_recorder(&config.namespace, &config.otel) {
+        match otel::build_otel_recorder(
+            &config.namespace,
+            &config.otel,
+            #[cfg(feature = "transport-otlp")]
+            transport,
+        ) {
             Ok((otel_recorder, provider)) => {
                 opentelemetry::global::set_meter_provider(provider.clone());
                 let _ = OTEL_METER_PROVIDER.set(provider.clone());
@@ -450,7 +461,12 @@ fn install_recorders(config: &MetricsConfig) -> RecorderSetup {
         // Build OTel recorder. Scope name = real namespace (see OTel-only path);
         // instrument-name prefixing is done once by the prefix layer that wraps
         // the composed recorder, so there is no double-prefix.
-        match otel::build_otel_recorder(&config.namespace, &config.otel) {
+        match otel::build_otel_recorder(
+            &config.namespace,
+            &config.otel,
+            #[cfg(feature = "transport-otlp")]
+            transport,
+        ) {
             Ok((otel_recorder, provider)) => {
                 opentelemetry::global::set_meter_provider(provider.clone());
                 let _ = OTEL_METER_PROVIDER.set(provider.clone());
@@ -508,6 +524,9 @@ pub struct MetricsManager {
     memory_guard: MemoryGuardSlot,
     #[cfg(feature = "otel-metrics")]
     otel_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
+    /// Stops the process and container gauge refresh when dropped. It runs
+    /// while OTLP push or the server does, whichever started it.
+    gauge_refresh: Option<DropGuard>,
 }
 
 impl MetricsManager {
@@ -553,6 +572,7 @@ impl MetricsManager {
             memory_guard: MemoryGuardSlot::default(),
             #[cfg(feature = "otel-metrics")]
             otel_provider: None,
+            gauge_refresh: None,
         }
     }
 
@@ -562,10 +582,41 @@ impl MetricsManager {
     /// - `metrics` only: Prometheus recorder
     /// - `otel-metrics` only: OTel recorder (OTLP push)
     /// - Both: Fanout recorder (Prometheus scrape + OTel OTLP push)
+    ///
+    /// With OTLP push on, the process and container gauges refresh every
+    /// `update_interval` from here on, with no server needed.
     #[must_use]
     pub fn with_config(config: MetricsConfig) -> Self {
-        let setup = install_recorders(&config);
+        let setup = install_recorders(
+            &config,
+            #[cfg(feature = "transport-otlp")]
+            None,
+        );
+        Self::assemble(config, setup)
+    }
 
+    /// Create a metrics manager that pushes OTLP metrics through `transport`,
+    /// on its connection, TLS, proxy and headers, instead of
+    /// `config.otel.endpoint`, `protocol` and `headers`.
+    ///
+    /// Sets `config.otel.via_transport`. Push still follows
+    /// `config.otel.enabled`, needs a Tokio runtime, and runs with no
+    /// `/metrics` server, refreshing the process and container gauges itself.
+    /// The transport's logs are unaffected.
+    #[cfg(all(feature = "otel-metrics", feature = "transport-otlp"))]
+    #[must_use]
+    pub fn with_otlp_transport(
+        mut config: MetricsConfig,
+        transport: Arc<crate::transport::OtlpTransport>,
+    ) -> Self {
+        config.otel.via_transport = true;
+        let setup = install_recorders(&config, Some(transport));
+        Self::assemble(config, setup)
+    }
+
+    /// The manager around the installed recorders, its gauge refresh started
+    /// when OTLP push runs.
+    fn assemble(config: MetricsConfig, setup: RecorderSetup) -> Self {
         let process_metrics = if config.enable_process_metrics {
             Some(ProcessMetrics::new(&config.namespace))
         } else {
@@ -580,7 +631,7 @@ impl MetricsManager {
 
         let registry = MetricRegistry::new(&config.namespace);
 
-        Self {
+        let mut manager = Self {
             #[cfg(feature = "metrics")]
             handle: setup.prom_handle,
             registry,
@@ -595,7 +646,41 @@ impl MetricsManager {
             memory_guard: MemoryGuardSlot::default(),
             #[cfg(feature = "otel-metrics")]
             otel_provider: setup.otel_provider,
+            gauge_refresh: None,
+        };
+        if manager.exporting() {
+            manager.start_gauge_refresh();
         }
+        manager
+    }
+
+    /// Whether this manager's OTLP push is running.
+    fn exporting(&self) -> bool {
+        #[cfg(feature = "otel-metrics")]
+        let exporting = self.otel_provider.is_some();
+        #[cfg(not(feature = "otel-metrics"))]
+        let exporting = false;
+        exporting
+    }
+
+    /// Refresh the process and container gauges every `update_interval`, the
+    /// first at once, unless it already runs, there is nothing to refresh or
+    /// no Tokio runtime to run it on.
+    fn start_gauge_refresh(&mut self) {
+        let nothing_to_refresh = self.process_metrics.is_none() && self.container_metrics.is_none();
+        if self.gauge_refresh.is_some()
+            || nothing_to_refresh
+            || tokio::runtime::Handle::try_current().is_err()
+        {
+            return;
+        }
+        let stop = CancellationToken::new();
+        let gauges = GaugeRefresh {
+            process_metrics: self.process_metrics.clone(),
+            container_metrics: self.container_metrics.clone(),
+        };
+        PeriodicWorker::spawn_immediate(gauges, self.config.update_interval, stop.clone());
+        self.gauge_refresh = Some(stop.drop_guard());
     }
 
     /// Create a counter metric.
@@ -960,9 +1045,7 @@ impl MetricsManager {
                 )
             })?
             .clone();
-        let update_interval = self.config.update_interval;
-        let process_metrics = self.process_metrics.clone();
-        let container_metrics = self.container_metrics.clone();
+        self.start_gauge_refresh();
         let readiness_fn = self.readiness_fn.clone();
         #[cfg(feature = "scaling")]
         let scaling_pressure = self.scaling_pressure.clone();
@@ -975,9 +1058,6 @@ impl MetricsManager {
                 handle,
                 registry,
                 shutdown_rx,
-                update_interval,
-                process_metrics,
-                container_metrics,
                 readiness_fn,
                 #[cfg(feature = "scaling")]
                 scaling_pressure,
@@ -1035,23 +1115,12 @@ impl MetricsManager {
                 )
             })?
             .clone();
-        let update_interval = self.config.update_interval;
-        let process_metrics = self.process_metrics.clone();
-        let container_metrics = self.container_metrics.clone();
+        self.start_gauge_refresh();
 
         let app = self.build_router(handle.clone(), extra_routes);
 
         tokio::spawn(async move {
-            run_axum_server(
-                listener,
-                app,
-                handle,
-                shutdown_rx,
-                update_interval,
-                process_metrics,
-                container_metrics,
-            )
-            .await;
+            run_axum_server(listener, app, handle, shutdown_rx).await;
         });
 
         Ok(())
@@ -1134,7 +1203,7 @@ impl MetricsManager {
         app.merge(extra_routes)
     }
 
-    /// Stop the metrics server.
+    /// Stop the metrics server, and the gauge refresh unless OTLP push runs.
     ///
     /// # Errors
     ///
@@ -1142,13 +1211,17 @@ impl MetricsManager {
     pub async fn stop_server(&mut self) -> Result<(), MetricsError> {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+            if !self.exporting() {
+                self.gauge_refresh = None;
+            }
             Ok(())
         } else {
             Err(MetricsError::NotRunning)
         }
     }
 
-    /// Gracefully shut down the OTel provider (flushes pending exports).
+    /// Gracefully shut down the OTel provider (flushes pending exports), and
+    /// the gauge refresh unless the server runs.
     ///
     /// Call this before application exit to ensure all metrics are exported.
     #[cfg(feature = "otel-metrics")]
@@ -1157,6 +1230,9 @@ impl MetricsManager {
             && let Err(e) = provider.shutdown()
         {
             tracing::warn!(error = %e, "OTel provider shutdown error");
+        }
+        if self.shutdown_tx.is_none() {
+            self.gauge_refresh = None;
         }
     }
 
@@ -1209,24 +1285,15 @@ impl MetricsManager {
 
 /// Run the metrics HTTP server.
 #[cfg(feature = "metrics")]
-#[allow(clippy::too_many_arguments)]
 async fn run_server(
     listener: TcpListener,
     handle: PrometheusHandle,
     registry: MetricRegistry,
     mut shutdown_rx: oneshot::Receiver<()>,
-    update_interval: Duration,
-    process_metrics: Option<ProcessMetrics>,
-    container_metrics: Option<ContainerMetrics>,
     readiness_fn: ReadinessSlot,
     #[cfg(feature = "scaling")] scaling_pressure: ScalingPressureSlot,
 ) {
-    let _refresh = spawn_refresh(
-        handle.clone(),
-        update_interval,
-        process_metrics,
-        container_metrics,
-    );
+    let _upkeep = spawn_upkeep(handle.clone());
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     // Owned, so connections still open at shutdown are aborted with the loop.
     let mut tasks = tokio::task::JoinSet::new();
@@ -1273,33 +1340,21 @@ async fn run_server(
 #[cfg(feature = "metrics")]
 const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Refresh the process and container gauges every `update_interval`, and run
-/// the histogram [`Upkeep`] every [`PROMETHEUS_UPKEEP_INTERVAL`], each first
-/// at once, until the returned guard drops.
+/// Run the histogram [`Upkeep`] every [`PROMETHEUS_UPKEEP_INTERVAL`], the
+/// first at once, until the returned guard drops.
 #[cfg(feature = "metrics")]
-fn spawn_refresh(
-    handle: PrometheusHandle,
-    update_interval: Duration,
-    process_metrics: Option<ProcessMetrics>,
-    container_metrics: Option<ContainerMetrics>,
-) -> DropGuard {
+fn spawn_upkeep(handle: PrometheusHandle) -> DropGuard {
     let stop = CancellationToken::new();
     PeriodicWorker::spawn_immediate(Upkeep(handle), PROMETHEUS_UPKEEP_INTERVAL, stop.clone());
-    let gauges = GaugeRefresh {
-        process_metrics,
-        container_metrics,
-    };
-    PeriodicWorker::spawn_immediate(gauges, update_interval, stop.clone());
     stop.drop_guard()
 }
 
-#[cfg(feature = "metrics")]
+/// Sets the process and container gauges from the host on each tick.
 struct GaugeRefresh {
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
 }
 
-#[cfg(feature = "metrics")]
 impl PeriodicTask for GaugeRefresh {
     async fn tick(&mut self) -> Result<(), TickError> {
         if let Some(pm) = &self.process_metrics {
@@ -1538,11 +1593,8 @@ async fn run_axum_server(
     app: axum::Router,
     handle: PrometheusHandle,
     shutdown_rx: oneshot::Receiver<()>,
-    update_interval: Duration,
-    process_metrics: Option<ProcessMetrics>,
-    container_metrics: Option<ContainerMetrics>,
 ) {
-    let _refresh = spawn_refresh(handle, update_interval, process_metrics, container_metrics);
+    let _upkeep = spawn_upkeep(handle);
 
     // Run axum server with graceful shutdown
     axum::serve(listener, app)
@@ -1597,9 +1649,6 @@ mod tests {
             manager.handle.clone().expect("recorder handle"),
             manager.registry(),
             shutdown_rx,
-            Duration::from_secs(60),
-            None,
-            None,
             manager.readiness_fn.clone(),
             #[cfg(feature = "scaling")]
             manager.scaling_pressure.clone(),

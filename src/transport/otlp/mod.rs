@@ -1,21 +1,24 @@
 // Project:   scalo
 // File:      src/transport/otlp/mod.rs
-// Purpose:   OTLP logs transport (send over gRPC or HTTP/protobuf)
+// Purpose:   OTLP transport: logs and metrics over gRPC or HTTP/protobuf
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! # OTLP logs transport
+//! # OTLP transport
 //!
 //! Sends records to an OpenTelemetry collector as OTLP log records, over gRPC
 //! (`LogsService/Export`) or HTTP/protobuf (`POST /v1/logs`). Send only. A
 //! block goes as one export request, and `Ok` means the collector answered
-//! that it took every record.
+//! that it took every record. [`OtlpMetricExporter`] sends an OpenTelemetry
+//! SDK's metrics over the same client (`MetricsService/Export` or
+//! `POST /v1/metrics`).
 //!
 //! Each record's payload is the log body, a string when it is UTF-8 and bytes
-//! otherwise. Its timestamp is the log time, the [`SEVERITY_HEADER`] header
-//! its severity, and every other header an attribute. The resource carries
+//! otherwise. Its [`TIME_UNIX_NANO_HEADER`] header, else its timestamp, is the
+//! log time, the [`SEVERITY_HEADER`] header its severity, and every other
+//! header an attribute. The resource carries
 //! `service.name`, the replica identity and the configured attributes. An app
 //! that needs another mapping registers a custom transport.
 //!
@@ -27,18 +30,24 @@
 //! ```
 
 mod config;
+mod metrics;
 mod record;
 #[cfg(test)]
 mod tests;
 
 pub use config::{OTLP_ACCEPTS, OtlpConfig, OtlpProtocol};
-pub use record::SEVERITY_HEADER;
+pub use metrics::OtlpMetricExporter;
+pub use record::{SEVERITY_HEADER, TIME_UNIX_NANO_HEADER};
 
 use std::time::{Duration, Instant};
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use prost::Message as _;
 use tonic_types::StatusExt as _;
@@ -53,18 +62,19 @@ use super::traits::{TransportBase, TransportSender};
 use super::types::{PayloadFormat, SendResult};
 use super::work_batch::{Record, RecordMeta};
 use crate::compression::Compression;
-use record::LogResource;
+use record::OtlpResource;
 
 /// The most characters of a collector's error text a result carries.
 const MAX_DETAIL_CHARS: usize = 512;
 
-/// Sends records as OTLP log records to one collector.
+/// Sends records as OTLP log records to one collector, and metrics through
+/// [`OtlpMetricExporter`].
 ///
 /// Every send answers within `timeout_ms`, and `send_batch_by` within its
 /// deadline too, whichever comes first.
 pub struct OtlpTransport {
     wire: Wire,
-    resource: LogResource,
+    resource: OtlpResource,
     timeout: Duration,
     max_retry_delay: Duration,
     /// The endpoint with any user name and password left out, for logs.
@@ -78,19 +88,130 @@ pub struct OtlpTransport {
 
 /// The client for the configured protocol and what every request carries.
 enum Wire {
-    Grpc {
-        client: LogsServiceClient<tonic::transport::Channel>,
-        metadata: tonic::metadata::MetadataMap,
-    },
+    Grpc(Box<GrpcWire>),
     Http {
         client: reqwest::Client,
-        url: String,
+        logs_url: String,
+        metrics_url: String,
         headers: reqwest::header::HeaderMap,
         compression: Compression,
         dialer: crate::transport::ProxyDialer,
         /// The https collector's host and port, for reading a refused CONNECT.
         tunnel: Option<(String, u16)>,
     },
+}
+
+/// The gRPC logs and metrics clients, on one channel, and the metadata every
+/// call carries.
+struct GrpcWire {
+    logs: LogsServiceClient<tonic::transport::Channel>,
+    metrics: MetricsServiceClient<tonic::transport::Channel>,
+    metadata: tonic::metadata::MetadataMap,
+}
+
+/// The OTLP signals the transport sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    Logs,
+    Metrics,
+}
+
+impl Signal {
+    /// The OTLP/HTTP path, appended to the endpoint's base.
+    const fn path(self) -> &'static str {
+        match self {
+            Self::Logs => "v1/logs",
+            Self::Metrics => "v1/metrics",
+        }
+    }
+
+    /// What the collector refused, from the body of an HTTP response that took the export.
+    fn refused(self, body: &[u8]) -> Option<Refused> {
+        match self {
+            Self::Logs => ExportLogsServiceResponse::decode(body)
+                .ok()?
+                .partial_success
+                .map(Refused::from),
+            Self::Metrics => ExportMetricsServiceResponse::decode(body)
+                .ok()?
+                .partial_success
+                .map(Refused::from),
+        }
+    }
+}
+
+/// One export request.
+enum Export {
+    /// Log records, and how many there are for the refusal text.
+    Logs {
+        request: ExportLogsServiceRequest,
+        records: usize,
+    },
+    Metrics(ExportMetricsServiceRequest),
+}
+
+impl Export {
+    fn signal(&self) -> Signal {
+        match self {
+            Self::Logs { .. } => Signal::Logs,
+            Self::Metrics(_) => Signal::Metrics,
+        }
+    }
+
+    fn counted(&self) -> Counted {
+        match self {
+            Self::Logs { records, .. } => Counted::LogRecords(*records),
+            Self::Metrics(_) => Counted::DataPoints,
+        }
+    }
+
+    fn encode_to_vec(&self) -> Vec<u8> {
+        match self {
+            Self::Logs { request, .. } => request.encode_to_vec(),
+            Self::Metrics(request) => request.encode_to_vec(),
+        }
+    }
+}
+
+/// What a refusal's count is of, for its message.
+#[derive(Debug, Clone, Copy)]
+enum Counted {
+    /// The records the export carried.
+    LogRecords(usize),
+    DataPoints,
+}
+
+impl std::fmt::Display for Counted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LogRecords(records) => write!(f, "of {records} log records"),
+            Self::DataPoints => f.write_str("data points"),
+        }
+    }
+}
+
+/// What a collector that took an export said it refused of it.
+struct Refused {
+    count: i64,
+    message: String,
+}
+
+impl From<ExportLogsPartialSuccess> for Refused {
+    fn from(partial: ExportLogsPartialSuccess) -> Self {
+        Self {
+            count: partial.rejected_log_records,
+            message: partial.error_message,
+        }
+    }
+}
+
+impl From<ExportMetricsPartialSuccess> for Refused {
+    fn from(partial: ExportMetricsPartialSuccess) -> Self {
+        Self {
+            count: partial.rejected_data_points,
+            message: partial.error_message,
+        }
+    }
 }
 
 impl OtlpTransport {
@@ -104,13 +225,20 @@ impl OtlpTransport {
     /// does not compile, or a gRPC transport built outside a Tokio runtime.
     pub fn new(config: &OtlpConfig) -> TransportResult<Self> {
         config.validate()?;
-        let url = config.url()?;
+        let url = config.url(Signal::Logs)?;
         let parsed = reqwest::Url::parse(&url)
             .map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
         let tls = config.client_tls(&url)?;
+        let connect_to = config.connect_to()?;
         let wire = match config.protocol {
-            OtlpProtocol::Grpc => grpc_wire(config, &url, tls.as_ref())?,
-            OtlpProtocol::Http => http_wire(config, url, tls.as_ref())?,
+            OtlpProtocol::Grpc => grpc_wire(config, &url, tls.as_ref(), connect_to)?,
+            OtlpProtocol::Http => http_wire(
+                config,
+                url,
+                config.url(Signal::Metrics)?,
+                tls.as_ref(),
+                connect_to,
+            )?,
         };
         let filter_engine = TransportFilterEngine::new(
             &[],
@@ -126,6 +254,7 @@ impl OtlpTransport {
         let endpoint = loggable(&parsed);
         tracing::info!(
             endpoint = %endpoint,
+            connect_to = connect_to.map(|to| to.to_string()).as_deref(),
             protocol = config.protocol.as_str(),
             compression = %config.compression,
             timeout_ms = config.timeout_ms,
@@ -134,11 +263,11 @@ impl OtlpTransport {
             mutual_tls = tls.as_ref().is_some_and(|t| t.identity.is_some()),
             headers = config.headers.len(),
             guarantee = %DeliveryGuarantee::Acknowledged,
-            "OTLP logs transport built"
+            "OTLP transport built"
         );
         Ok(Self {
             wire,
-            resource: LogResource::new(config),
+            resource: OtlpResource::new(config),
             timeout: Duration::from_millis(config.timeout_ms),
             max_retry_delay: Duration::from_millis(config.max_retry_delay_ms),
             endpoint,
@@ -171,9 +300,13 @@ impl OtlpTransport {
         let sent = to_send.len();
         let bytes: usize = to_send.iter().map(|r| r.payload.len()).sum();
 
+        let request = Export::Logs {
+            request,
+            records: sent,
+        };
         // tokio's timeout polls the export once before it looks at the clock,
         // so a deadline already past still takes an answer that is ready.
-        let result = tokio::time::timeout(budget, self.export_on_wire(request, sent, budget))
+        let result = tokio::time::timeout(budget, self.export_on_wire(request, budget))
             .await
             .unwrap_or(SendResult::Backpressured);
         self.observe(&result, sent, bytes, started, budget);
@@ -186,20 +319,53 @@ impl OtlpTransport {
         }
     }
 
-    async fn export_on_wire(
-        &self,
-        request: ExportLogsServiceRequest,
-        sent: usize,
-        budget: Duration,
-    ) -> SendResult {
+    /// Send one metric export request, answering within `timeout_ms`.
+    ///
+    /// A metric export carries no records, so no filter runs and no record
+    /// counter moves. It is logged at debug: [`OtlpMetricExporter`] hands the
+    /// result to the SDK, which reports it.
+    async fn export_metrics(&self, request: ExportMetricsServiceRequest) -> SendResult {
+        if self.lifecycle.is_closed() {
+            return SendResult::Fatal(TransportError::Closed);
+        }
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            self.timeout,
+            self.export_on_wire(Export::Metrics(request), self.timeout),
+        )
+        .await
+        .unwrap_or(SendResult::Backpressured);
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::debug!(endpoint = %self.endpoint, result = ?result, elapsed_ms, "OTLP metric export answered");
+        if result.is_ok() {
+            self.refusals.clear("otlp");
+        }
+        result
+    }
+
+    async fn export_on_wire(&self, request: Export, budget: Duration) -> SendResult {
+        let counted = request.counted();
         match &self.wire {
-            Wire::Grpc { client, metadata } => {
-                let mut call = tonic::Request::new(request);
-                *call.metadata_mut() = metadata.clone();
-                // Sent as `grpc-timeout`, so the collector gives up when the sender does.
-                call.set_timeout(budget);
-                match client.clone().export(call).await {
-                    Ok(response) => accepted(response.into_inner().partial_success, sent),
+            Wire::Grpc(grpc) => {
+                let GrpcWire {
+                    logs,
+                    metrics,
+                    metadata,
+                } = grpc.as_ref();
+                let answer = match request {
+                    Export::Logs { request, .. } => logs
+                        .clone()
+                        .export(grpc_call(request, metadata, budget))
+                        .await
+                        .map(|response| response.into_inner().partial_success.map(Refused::from)),
+                    Export::Metrics(request) => metrics
+                        .clone()
+                        .export(grpc_call(request, metadata, budget))
+                        .await
+                        .map(|response| response.into_inner().partial_success.map(Refused::from)),
+                };
+                match answer {
+                    Ok(refused) => accepted(refused, counted),
                     Err(status) => match crate::transport::proxy::refusal(&status) {
                         Some(refused) => self.refusals.hold(refused, "otlp"),
                         None => grpc_failure(&status, self.max_retry_delay),
@@ -208,12 +374,18 @@ impl OtlpTransport {
             }
             Wire::Http {
                 client,
-                url,
+                logs_url,
+                metrics_url,
                 headers,
                 compression,
                 dialer,
                 tunnel,
             } => {
+                let signal = request.signal();
+                let url = match signal {
+                    Signal::Logs => logs_url,
+                    Signal::Metrics => metrics_url,
+                };
                 let body = request.encode_to_vec();
                 let encoded_len = body.len();
                 let body = if compression.is_none() {
@@ -237,7 +409,10 @@ impl OtlpTransport {
                     .await;
                 // reqwest's error text names the URL, which may carry a password.
                 match response.map_err(reqwest::Error::without_url) {
-                    Ok(response) => self.http_answer(response, sent, encoded_len).await,
+                    Ok(response) => {
+                        self.http_answer(response, signal, counted, encoded_len)
+                            .await
+                    }
                     Err(e) if e.is_builder() => SendResult::Fatal(TransportError::Send(format!(
                         "OTLP HTTP request could not be built: {e}"
                     ))),
@@ -264,12 +439,14 @@ impl OtlpTransport {
         }
     }
 
-    /// The result an HTTP response to a request of `encoded_len` bytes,
-    /// before compression, gives.
+    /// The result an HTTP response to a `signal` request of `encoded_len`
+    /// bytes, before compression, gives. `counted` names what a refusal's
+    /// count is of.
     async fn http_answer(
         &self,
         response: reqwest::Response,
-        sent: usize,
+        signal: Signal,
+        counted: Counted,
         encoded_len: usize,
     ) -> SendResult {
         let status = response.status();
@@ -285,12 +462,9 @@ impl OtlpTransport {
             .is_some_and(|v| v.contains("protobuf"));
         let body = response.bytes().await;
         if status.is_success() {
-            // A body that cannot be read or decoded still follows a status that took the records.
-            let partial = body
-                .ok()
-                .and_then(|b| ExportLogsServiceResponse::decode(b).ok())
-                .and_then(|r| r.partial_success);
-            return accepted(partial, sent);
+            // A body that cannot be read or decoded still follows a status that took the export.
+            let refused = body.ok().and_then(|b| signal.refused(&b));
+            return accepted(refused, counted);
         }
         let message = body.map_or_else(|_| String::new(), |b| error_text(&b, protobuf));
         http_failure(
@@ -417,11 +591,13 @@ impl TransportSender for OtlpTransport {
     }
 }
 
-/// The gRPC client for `url`, with every header as metadata.
+/// The gRPC logs and metrics clients for `url` on one channel, dialling
+/// `connect_to` when set, with every header as metadata.
 fn grpc_wire(
     config: &OtlpConfig,
     url: &str,
     tls: Option<&crate::tls::ClientTls>,
+    connect_to: Option<crate::transport::connect_to::ConnectTo>,
 ) -> TransportResult<Wire> {
     use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
 
@@ -431,22 +607,35 @@ fn grpc_wire(
             "a gRPC transport is built inside a Tokio runtime".to_string(),
         ));
     }
-    let mut endpoint = tonic::transport::Endpoint::from_shared(url.to_string())
-        .map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
-    if let Some(tls) = tls {
-        let tls = crate::tls::tonic_client_tls(tls).map_err(|e| config_error(e.to_string()))?;
-        endpoint = endpoint
-            .tls_config(tls)
-            .map_err(|e| config_error(format!("TLS: {e}")))?;
-    }
+    let tls = tls
+        .map(crate::tls::tonic_client_tls)
+        .transpose()
+        .map_err(|e| config_error(e.to_string()))?;
+    let endpoint = if let Some(to) = connect_to {
+        let parsed =
+            reqwest::Url::parse(url).map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
+        to.tonic_endpoint(&parsed, tls).map_err(config_error)?
+    } else {
+        let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())
+            .map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
+        match tls {
+            Some(tls) => endpoint
+                .tls_config(tls)
+                .map_err(|e| config_error(format!("TLS: {e}")))?,
+            None => endpoint,
+        }
+    };
     let channel =
         super::tonic_channel::lazy_channel(endpoint, config.timeout_ms, config.proxy.dialer()?);
-    let mut client = LogsServiceClient::new(channel);
+    let mut logs = LogsServiceClient::new(channel.clone());
+    let mut metrics = MetricsServiceClient::new(channel);
     for &accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
-        client = client.accept_compressed(accepted);
+        logs = logs.accept_compressed(accepted);
+        metrics = metrics.accept_compressed(accepted);
     }
     if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
-        client = client.send_compressed(encoding);
+        logs = logs.send_compressed(encoding);
+        metrics = metrics.send_compressed(encoding);
     }
 
     let mut metadata = MetadataMap::new();
@@ -459,17 +648,25 @@ fn grpc_wire(
         value.set_sensitive(true);
         metadata.insert(key, value);
     }
-    Ok(Wire::Grpc { client, metadata })
+    Ok(Wire::Grpc(Box::new(GrpcWire {
+        logs,
+        metrics,
+        metadata,
+    })))
 }
 
-/// The HTTP client for `url`, redirects off, and the headers every request
-/// carries.
+/// The HTTP client for the logs and metrics URLs, redirects off, dialling
+/// `connect_to` when set, and the headers every request carries.
 fn http_wire(
     config: &OtlpConfig,
-    url: String,
+    mut logs_url: String,
+    mut metrics_url: String,
     tls: Option<&crate::tls::ClientTls>,
+    connect_to: Option<crate::transport::connect_to::ConnectTo>,
 ) -> TransportResult<Wire> {
-    use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+    use reqwest::header::{
+        CONTENT_ENCODING, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue,
+    };
 
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(config.timeout_ms))
@@ -479,13 +676,28 @@ fn http_wire(
             .map_err(|e| config_error(e.to_string()))?;
         builder = builder.use_preconfigured_tls((*tls).clone());
     }
+    let mut host = None;
+    if let Some(to) = connect_to {
+        let parse = |url: &str| {
+            reqwest::Url::parse(url).map_err(|e| config_error(format!("invalid endpoint: {e}")))
+        };
+        let logs = parse(&logs_url)?;
+        builder = to.resolve(builder, &logs).map_err(config_error)?;
+        host = Some(
+            crate::transport::connect_to::ConnectTo::host_header(&logs).map_err(config_error)?,
+        );
+        logs_url = to.request_url(&logs).map_err(config_error)?;
+        metrics_url = to
+            .request_url(&parse(&metrics_url)?)
+            .map_err(config_error)?;
+    }
     let dialer = config.proxy.dialer()?;
     let client = crate::transport::proxy::reqwest_proxy(builder, &config.proxy, &dialer)
         .build()
         .map_err(|e| config_error(format!("HTTP client: {e}")))?;
     // reqwest's tunnel error carries no status, so a refused CONNECT is read
     // by one CONNECT of the transport's own to an https collector.
-    let tunnel = reqwest::Url::parse(&url)
+    let tunnel = reqwest::Url::parse(&logs_url)
         .ok()
         .filter(|u| u.scheme() == "https")
         .and_then(|u| Some((u.host_str()?.to_string(), u.port_or_known_default()?)));
@@ -504,6 +716,9 @@ fn http_wire(
         CONTENT_TYPE,
         HeaderValue::from_static("application/x-protobuf"),
     );
+    if let Some(host) = host {
+        headers.insert(HOST, host);
+    }
     if config.compression.is_none() {
         headers.remove(CONTENT_ENCODING);
     } else {
@@ -514,7 +729,8 @@ fn http_wire(
     }
     Ok(Wire::Http {
         client,
-        url,
+        logs_url,
+        metrics_url,
         headers,
         compression: config.compression,
         dialer,
@@ -522,19 +738,32 @@ fn http_wire(
     })
 }
 
-/// `Ok` when the collector took every record, `Reject` with its message when
-/// it refused any.
-fn accepted(partial: Option<ExportLogsPartialSuccess>, sent: usize) -> SendResult {
-    match partial {
-        Some(p) if p.rejected_log_records > 0 => SendResult::Reject(TransportError::Send(format!(
-            "OTLP collector rejected {} of {sent} log records: {}",
-            p.rejected_log_records,
-            truncated(&p.error_message)
+/// `message` as a gRPC call carrying `metadata`, limited to `budget`.
+fn grpc_call<T>(
+    message: T,
+    metadata: &tonic::metadata::MetadataMap,
+    budget: Duration,
+) -> tonic::Request<T> {
+    let mut call = tonic::Request::new(message);
+    *call.metadata_mut() = metadata.clone();
+    // Sent as `grpc-timeout`, so the collector gives up when the sender does.
+    call.set_timeout(budget);
+    call
+}
+
+/// `Ok` when the collector took all of an export, `Reject` with its message
+/// when it refused any. `counted` names what the count is of.
+fn accepted(refused: Option<Refused>, counted: Counted) -> SendResult {
+    match refused {
+        Some(r) if r.count > 0 => SendResult::Reject(TransportError::Send(format!(
+            "OTLP collector rejected {} {counted}: {}",
+            r.count,
+            truncated(&r.message)
         ))),
-        Some(p) if !p.error_message.is_empty() => {
+        Some(r) if !r.message.is_empty() => {
             tracing::warn!(
-                message = %truncated(&p.error_message),
-                "OTLP collector took every record with a warning"
+                message = %truncated(&r.message),
+                "OTLP collector took the export with a warning"
             );
             SendResult::Ok
         }

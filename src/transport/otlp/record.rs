@@ -19,17 +19,22 @@ use crate::transport::work_batch::Record;
 /// of an attribute.
 pub const SEVERITY_HEADER: &str = "severity";
 
-/// The resource every request carries, and its schema URL.
+/// The record header whose value, decimal nanoseconds since the epoch, becomes
+/// the log record's time in place of `metadata.timestamp_ms`, instead of an
+/// attribute.
+pub const TIME_UNIX_NANO_HEADER: &str = "time_unix_nano";
+
+/// The resource every log export carries, and its schema URL.
 #[derive(Debug, Clone)]
-pub(super) struct LogResource {
+pub(super) struct OtlpResource {
     resource: Resource,
     schema_url: String,
 }
 
-impl LogResource {
-    /// `service.name`, the replica identity, `OTEL_RESOURCE_ATTRIBUTES` and
-    /// the SDK's own attributes, with `config.resource_attributes` set last so
-    /// they win.
+impl OtlpResource {
+    /// `service.name`, the replica, host and version identity,
+    /// `OTEL_RESOURCE_ATTRIBUTES` and the SDK's own attributes, with
+    /// `config.resource_attributes` set last so they win.
     pub(super) fn new(config: &OtlpConfig) -> Self {
         let mut builder = opentelemetry_sdk::Resource::builder();
         if let Some(name) = config.service_name.as_deref().filter(|n| !n.is_empty()) {
@@ -73,7 +78,8 @@ impl LogResource {
     }
 }
 
-/// `record` as a log record: the payload as the body, the timestamp, the
+/// `record` as a log record: the payload as the body, the
+/// [`TIME_UNIX_NANO_HEADER`] or else the timestamp as the time, the
 /// [`SEVERITY_HEADER`] as the severity and every other header as an
 /// attribute. The key is not sent.
 pub(super) fn log_record(record: &Record, observed_unix_nano: u64) -> LogRecord {
@@ -89,6 +95,14 @@ pub(super) fn log_record(record: &Record, observed_unix_nano: u64) -> LogRecord 
         {
             log.severity_number = i32::from(severity(text));
             log.severity_text = text.to_string();
+            continue;
+        }
+        if name == TIME_UNIX_NANO_HEADER
+            && let Some(nanos) = std::str::from_utf8(value)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+        {
+            log.time_unix_nano = nanos;
             continue;
         }
         log.attributes.push(KeyValue {
@@ -265,6 +279,26 @@ mod tests {
                 (0, ""),
                 vec![("severity", raw(&[0xff]))],
             ),
+            (
+                "nanoseconds win over the millisecond timestamp",
+                record(
+                    b"x",
+                    &[("time_unix_nano", b"1700000000123456789")],
+                    Some(1_700_000_000_123),
+                ),
+                text("x"),
+                1_700_000_000_123_456_789,
+                (0, ""),
+                vec![],
+            ),
+            (
+                "nanoseconds that are not a number stay an attribute",
+                record(b"x", &[("time_unix_nano", b"-1")], Some(5)),
+                text("x"),
+                5_000_000,
+                (0, ""),
+                vec![("time_unix_nano", text("-1"))],
+            ),
         ];
         for (case, record, body, time, (number, severity_text), attributes) in cases {
             let log = log_record(&record, observed);
@@ -319,7 +353,7 @@ mod tests {
                 .collect(),
             ..OtlpConfig::default()
         };
-        let resource = LogResource::new(&config);
+        let resource = OtlpResource::new(&config);
         let records = [record(b"a", &[], None), record(b"b", &[], None)];
         let request = resource.request(&records, 7);
 

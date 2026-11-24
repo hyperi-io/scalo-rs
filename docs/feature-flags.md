@@ -79,7 +79,7 @@ Pick `metrics` for service binaries. scalo's series, the tiered sink's and the t
 | `transport-kafka-config` | `transport::kafka`'s config and token types with no client: `KafkaConfig` and `validate`, the provider presets, `KafkaToken`, `PartitionLease` and the profile constants. Builds and links no librdkafka. `transport-kafka` includes it |
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for a transform consumer |
 | `transport-syslog` | Syslog over TCP, TLS, UDP and RELP, send only ([transport/syslog.md](transport/syslog.md)). Pulls `tls`, `jiff` and `sysinfo` |
-| `transport-otlp` | OTLP log records to a collector over gRPC or HTTP/protobuf, send only ([transport/otlp.md](transport/otlp.md)). Pulls `tls`, `reqwest`, `tonic` and `opentelemetry-proto`, and needs no `protoc` |
+| `transport-otlp` | OTLP log records and metrics to a collector over gRPC or HTTP/protobuf, send only ([transport/otlp.md](transport/otlp.md)). Pulls `tls`, `reqwest`, `tonic`, `opentelemetry-proto` and `opentelemetry-resource-detectors`, and needs no `protoc` |
 | `transport-all` | All seven backends |
 
 Pick backends explicitly. `transport-all` is a convenience for tests. In
@@ -106,8 +106,8 @@ production apps list what you use.
 
 | Feature | Adds |
 | --------- | ------ |
-| `otel` | Umbrella -- SDK, OTLP exporter |
-| `otel-metrics` | Above + bridge `metrics` crate -> OTLP, with `dashmap` holding one handle per metric key |
+| `otel` | Umbrella -- SDK, OTLP exporter, and `opentelemetry-resource-detectors` for the host attributes |
+| `otel-metrics` | Above + bridge `metrics` crate -> OTLP, with `dashmap` holding one handle per metric key, and `concurrency` for the gauge refresh push runs without a server |
 | `otel-tracing` | Above + bridge `tracing` crate -> OTLP (closes the W3C distributed-tracing chain when paired with `transport-trace`) |
 
 For full distributed tracing through Kafka/gRPC, enable

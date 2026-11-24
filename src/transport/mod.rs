@@ -135,6 +135,9 @@ pub mod syslog;
 #[cfg(feature = "transport-otlp")]
 pub mod otlp;
 
+#[cfg(feature = "transport-otlp")]
+mod connect_to;
+
 #[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 mod tonic_channel;
 
@@ -196,4 +199,4 @@ pub use http::{HttpAuth, HttpEndpoint, HttpToken, HttpTransport, HttpTransportCo
 pub use syslog::{SyslogConfig, SyslogTransport};
 
 #[cfg(feature = "transport-otlp")]
-pub use otlp::{OTLP_ACCEPTS, OtlpConfig, OtlpProtocol, OtlpTransport};
+pub use otlp::{OTLP_ACCEPTS, OtlpConfig, OtlpMetricExporter, OtlpProtocol, OtlpTransport};

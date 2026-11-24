@@ -9,7 +9,8 @@
 //! OpenTelemetry metrics setup.
 //!
 //! Configures an OTel `SdkMeterProvider` with an OTLP periodic exporter
-//! via the `metrics-exporter-opentelemetry` crate. When both the `metrics`
+//! via the `metrics-exporter-opentelemetry` crate: opentelemetry-otlp's, or
+//! with `transport-otlp` the OTLP transport's. When both the `metrics`
 //! (Prometheus) and `otel-metrics` features are enabled, a `Fanout` recorder
 //! sends each measurement to both backends.
 
@@ -24,6 +25,7 @@ use metrics::{
 };
 use metrics_util::{KeyHasher, MetricKind};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 
 use super::MetricsError;
 use super::otel_types::{OtelMetricsConfig, OtelProtocol};
@@ -206,12 +208,12 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
         })
         .unwrap_or(config.protocol);
 
-    // Resolved after the protocol, as the default endpoint depends on it.
-    let endpoint =
-        super::otel_types::resolved_endpoint(crate::otel_endpoint::endpoint_for_protocol(
-            &config.endpoint,
-            protocol == OtelProtocol::Http,
-        ));
+    // Resolved after the protocol, as the port an endpoint takes depends on it.
+    let endpoint = crate::otel_endpoint::endpoint_for_protocol(
+        &super::otel_types::resolved_endpoint(&config.endpoint),
+        protocol == OtelProtocol::Http,
+    )
+    .into_owned();
 
     let export_interval = std::env::var("OTEL_METRIC_EXPORT_INTERVAL")
         .ok()
@@ -316,58 +318,81 @@ fn resource(resolved: &ResolvedOtelConfig) -> opentelemetry_sdk::Resource {
     builder.build()
 }
 
+/// The OTel recorder and the meter provider it records into.
+type OtelRecorder = (
+    SteadyRecorder<metrics_exporter_opentelemetry::Recorder>,
+    opentelemetry_sdk::metrics::SdkMeterProvider,
+);
+
 /// Build the OTel recorder (without installing it globally).
 ///
 /// Uses `metrics-exporter-opentelemetry` to create a `metrics::Recorder`
-/// backed by an OTel `SdkMeterProvider` with an OTLP periodic exporter.
+/// backed by an OTel `SdkMeterProvider` with an OTLP periodic exporter. With
+/// [`via_transport`](OtelMetricsConfig::via_transport) the exporter sends
+/// through `transport`, or one built from `transport.otlp` when none is given.
+/// The resource is the same either way.
 ///
 /// The recorder is returned but NOT installed -- the caller decides whether
 /// to install it directly or compose it with Prometheus via Fanout.
 pub(crate) fn build_otel_recorder(
     scope_name: &str,
     config: &OtelMetricsConfig,
-) -> Result<
-    (
-        SteadyRecorder<metrics_exporter_opentelemetry::Recorder>,
-        opentelemetry_sdk::metrics::SdkMeterProvider,
-    ),
-    MetricsError,
-> {
+    #[cfg(feature = "transport-otlp")] transport: Option<Arc<crate::transport::OtlpTransport>>,
+) -> Result<OtelRecorder, MetricsError> {
     let resolved = resolve_config(config);
+    let resource = resource(&resolved);
+    let interval = resolved.export_interval;
+
+    #[cfg(feature = "transport-otlp")]
+    if config.via_transport {
+        let transport = match transport {
+            Some(transport) => transport,
+            None => crate::transport::OtlpConfig::from_cascade()
+                .and_then(|otlp| crate::transport::OtlpTransport::new(&otlp))
+                .map(Arc::new)
+                .map_err(|e| MetricsError::BuildError(format!("transport.otlp: {e}")))?,
+        };
+        let exporter = crate::transport::OtlpMetricExporter::new(transport)
+            .map_err(|e| MetricsError::BuildError(format!("OTLP metric exporter: {e}")))?;
+        tracing::info!(
+            exporter = ?exporter,
+            export_interval_secs = interval.as_secs(),
+            "OTLP metric push enabled through the OTLP transport"
+        );
+        return Ok(periodic_recorder(scope_name, exporter, interval, resource));
+    }
 
     let exporter = build_otlp_exporter(&resolved)?;
-    // Backoff starts at one export interval so the first retry is the next
-    // scheduled tick, then doubles while the collector stays unreachable.
-    let exporter =
-        crate::otel_backoff::GatedMetricExporter::new(exporter, resolved.export_interval);
-    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-        .with_interval(resolved.export_interval)
-        .build();
-
-    let resource = resource(&resolved);
-
-    // Use with_meter_provider to attach our OTLP reader to the internal provider
-    let reader_for_closure = reader;
-    let resource_for_closure = resource;
-
-    // build() returns (SdkMeterProvider, Recorder) -- provider first
-    let (provider, recorder) =
-        metrics_exporter_opentelemetry::Recorder::builder(scope_name.to_string())
-            .with_meter_provider(move |mpb| {
-                mpb.with_reader(reader_for_closure)
-                    .with_resource(resource_for_closure)
-            })
-            .build();
-
     tracing::info!(
         endpoint = %resolved.endpoint,
         protocol = ?resolved.protocol,
-        export_interval_secs = resolved.export_interval.as_secs(),
+        export_interval_secs = interval.as_secs(),
         export_timeout_secs = resolved.export_timeout.as_secs(),
         "OTLP metric push enabled"
     );
+    Ok(periodic_recorder(scope_name, exporter, interval, resource))
+}
 
-    Ok((SteadyRecorder::new(recorder), provider))
+/// A recorder whose provider reads into `exporter` every `interval`, under
+/// `resource`.
+fn periodic_recorder<E: PushMetricExporter>(
+    scope_name: &str,
+    exporter: E,
+    interval: Duration,
+    resource: opentelemetry_sdk::Resource,
+) -> OtelRecorder {
+    // Backoff starts at one export interval so the first retry is the next
+    // scheduled tick, then doubles while the collector stays unreachable.
+    let exporter = crate::otel_backoff::GatedMetricExporter::new(exporter, interval);
+    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
+        .with_interval(interval)
+        .build();
+    // build() returns (SdkMeterProvider, Recorder) -- provider first
+    let (provider, recorder) =
+        metrics_exporter_opentelemetry::Recorder::builder(scope_name.to_string())
+            .with_meter_provider(move |mpb| mpb.with_reader(reader).with_resource(resource))
+            .build();
+    (SteadyRecorder::new(recorder), provider)
 }
 
 #[cfg(test)]

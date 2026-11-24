@@ -106,17 +106,19 @@ impl ConfigWatch {
     /// # Panics
     /// Panics if the process cannot register a SIGHUP handler.
     #[must_use]
-    pub fn with_sighup(mut self, enabled: bool) -> Self {
+    pub fn with_sighup(self, enabled: bool) -> Self {
         #[cfg(unix)]
-        {
-            self.sighup = enabled.then(|| {
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                    .expect("failed to register SIGHUP handler")
-            });
-        }
+        let sighup = enabled.then(|| {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .expect("failed to register SIGHUP handler")
+        });
         #[cfg(not(unix))]
         let _ = enabled;
-        self
+        Self {
+            #[cfg(unix)]
+            sighup,
+            ..self
+        }
     }
 
     /// Whether any trigger at all is enabled. With none, `next_trigger` never

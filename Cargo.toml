@@ -71,8 +71,8 @@ metrics-process = ["metrics-core", "sysinfo"]
 metrics = ["metrics-process", "concurrency", "metrics-exporter-prometheus", "dep:crossbeam-epoch", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
 
 # `metrics` enables `otel-metrics`, never the reverse: the other direction is a cargo feature cycle.
-otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing", "tracing-opentelemetry", "serde_json"]
-otel-metrics = ["otel", "metrics-process", "metrics-util", "metrics-exporter-opentelemetry", "opentelemetry_sdk/rt-tokio", "tokio", "dashmap"]
+otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "dep:opentelemetry-resource-detectors", "tracing", "tracing-opentelemetry", "serde_json"]
+otel-metrics = ["otel", "metrics-process", "concurrency", "metrics-util", "metrics-exporter-opentelemetry", "opentelemetry_sdk/rt-tokio", "tokio", "dashmap"]
 otel-tracing = ["otel", "opentelemetry_sdk/rt-tokio", "tokio", "tracing-subscriber"]
 
 service-metrics = ["metrics"]
@@ -180,8 +180,8 @@ transport-pipe = ["transport"]
 transport-http = ["transport", "transport-proxy", "http", "tls", "compression"]
 # RFC 5424 and 3164 over TCP, TLS, UDP and RELP: docs/transport/syslog.md
 transport-syslog = ["transport", "transport-proxy", "tls", "dep:jiff", "sysinfo"]
-# OTLP log records over gRPC or HTTP/protobuf, with no protoc to build: docs/transport/otlp.md
-transport-otlp = ["transport", "transport-proxy", "tls", "reqwest", "bytes", "tokio", "dep:tonic", "dep:hyper-util", "dep:prost", "dep:tonic-types", "dep:opentelemetry-proto", "dep:opentelemetry", "opentelemetry_sdk", "dep:flate2", "tonic/gzip"]
+# OTLP log records and metrics over gRPC or HTTP/protobuf, with no protoc to build: docs/transport/otlp.md
+transport-otlp = ["transport", "transport-proxy", "tls", "reqwest", "bytes", "tokio", "dep:tonic", "dep:hyper-util", "dep:prost", "dep:tonic-types", "dep:opentelemetry-proto", "dep:opentelemetry", "opentelemetry_sdk", "dep:opentelemetry-resource-detectors", "dep:flate2", "tonic/gzip"]
 # One egress proxy setting for the stream transports: src/transport/proxy.rs
 transport-proxy = ["transport", "tokio", "dep:http", "dep:hyper-util", "hyper-util/client-proxy", "dep:system-configuration", "dep:windows", "windows/Win32_Networking_WinHttp"]
 # A real Squid for proxy tests. Needs a Docker daemon at test time.
@@ -235,13 +235,16 @@ tracing-subscriber = { version = ">=0.3.23, <0.4", features = ["json", "env-filt
 owo-colors = { version = ">=4.4.0, <5", optional = true }
 tracing-throttle = { version = ">=0.4.4, <0.5", default-features = false, optional = true }
 
-# The otel crates do not interoperate across a minor, so these six move together, and
+# The otel crates do not interoperate across a minor, so these seven move together, and
 # metrics-exporter-opentelemetry changes SDK line in patch releases, hence its patch ceiling.
 opentelemetry = { version = ">=0.33.1, <0.34", optional = true }
 opentelemetry_sdk = { version = ">=0.33.1, <0.34", features = ["rt-tokio"], optional = true }
 opentelemetry-otlp = { version = ">=0.33.1, <0.34", features = ["grpc-tonic", "http-proto", "metrics", "logs"], optional = true }
-# The OTLP messages and LogsService client transport-otlp sends with, already pulled by opentelemetry-otlp.
-opentelemetry-proto = { version = ">=0.33.1, <0.34", default-features = false, features = ["gen-tonic", "logs"], optional = true }
+# The OTLP messages, the LogsService and MetricsService clients, and the SDK-to-OTLP metric
+# conversion transport-otlp sends with, already pulled by opentelemetry-otlp.
+opentelemetry-proto = { version = ">=0.33.1, <0.34", default-features = false, features = ["gen-tonic", "logs", "metrics"], optional = true }
+# host.name, host.id and host.arch on every OTLP resource.
+opentelemetry-resource-detectors = { version = ">=0.13.1, <0.14", optional = true }
 tracing-opentelemetry = { version = ">=0.34.0, <0.35", optional = true }
 
 metrics = { version = ">=0.24.6, <0.25", optional = true }

@@ -11,9 +11,7 @@ and to `docs/metrics-manifest.json` via the `metrics-manifest` CLI subcommand.
 That manifest is the only source of metric metadata for downstream tools (Grafana
 provisioning, alert validators, the data-plane docs site).
 
-Process and container metrics (RSS, CPU, FDs, cgroup limits) auto-collect on a
-fixed interval via [sysinfo](https://crates.io/crates/sysinfo) when the relevant
-features are on, and container metrics read cgroup v1 and v2 transparently.
+Process and container metrics (RSS, CPU, FDs, cgroup limits) refresh every `update_interval` via [sysinfo](https://crates.io/crates/sysinfo) while the `/metrics` server or OTLP push runs, and container metrics read cgroup v1 and v2 transparently.
 
 ---
 
@@ -249,22 +247,20 @@ flush the batch exporter, or lose the last interval's data. See
 [`OtelMetricsConfig`](../../src/metrics/otel_types.rs) for endpoint / protocol /
 batching config.
 
-On the `http` protocol the endpoint is a base URL and `/v1/metrics` is appended
-to it, because the exporter POSTs to whatever endpoint it is handed, unchanged.
-An endpoint that ends in `/v1/metrics` is used as it is. With no
-endpoint configured the default follows the protocol: `http://localhost:4317`
-for `grpc`, `http://localhost:4318` for `http`, including when
-`OTEL_EXPORTER_OTLP_PROTOCOL` picks it.
+The endpoint (`metrics.otel.endpoint`, or `OTEL_EXPORTER_OTLP_ENDPOINT`) is `http://localhost` by default. Its port follows the rules tracing and the transport use:
+
+- `http://` naming no port takes 4317 under `grpc` and 4318 under `http`, whichever of config or `OTEL_EXPORTER_OTLP_PROTOCOL` picks it
+- `https://` naming no port keeps 443, where hosted collectors behind a TLS gateway listen
+- a named port is used as given, so `http://localhost:4317` under `http` stays on 4317
+- on `http`, `/v1/metrics` is appended unless the endpoint already ends in it
+
+`metrics.otel.via_transport: true` pushes through the OTLP transport `transport.otlp` configures, and `MetricsManager::with_otlp_transport(config, transport)` through the app's own, so logs and metrics share one connection. Its TLS, proxy, `connect_to`, headers and `timeout_ms` replace `endpoint`, `protocol`, `headers` and `export_timeout_secs`. Without the `transport-otlp` feature the key leaves push off ([../transport/otlp.md](../transport/otlp.md#metrics)).
+
+Push needs no `/metrics` server: the manager refreshes the process and container gauges every `update_interval` while either runs. Dropping the manager stops the refresh.
 
 Each metric name exports as one OTel metric, with one stream per label set, however often a macro registers it. scalo keeps one handle per key and gives every instrument of a name the unit and description of its first `describe_*`, because OTel splits instruments that differ in either. A describe after the name's first use is ignored, so describe a metric before it records if it is to carry a unit. A gauge's increments, decrements and sets run one at a time, so the value it exports is its running value.
 
-The OTLP resource names the replica, so each pod of a service writes its own
-series. `service.instance.id` comes from the first of `OTEL_RESOURCE_ATTRIBUTES`,
-`POD_NAME`, `HOSTNAME` (the pod name in Kubernetes) and an id generated once per
-process. `k8s.pod.name` is added from `POD_NAME`, or from `HOSTNAME` when running
-in Kubernetes. A key `OTEL_RESOURCE_ATTRIBUTES` sets is never overwritten, and
-`metrics.otel.resource_attributes` wins over all of them. Spans carry the same
-identity.
+The OTLP resource names the replica, so each pod of a service writes its own series. `service.instance.id` comes from the first of `OTEL_RESOURCE_ATTRIBUTES`, `POD_NAME`, `HOSTNAME` (the pod name in Kubernetes) and an id generated once per process. `k8s.pod.name` is added from `POD_NAME`, or from `HOSTNAME` when running in Kubernetes. `service.version` comes from `SERVICE_VERSION`, and `host.name`, `host.id`, `host.arch` and `os.type` from the host. A key `OTEL_RESOURCE_ATTRIBUTES` sets is never overwritten, and `metrics.otel.resource_attributes` wins over all of them. Spans and the OTLP transport carry the same identity.
 
 ---
 
@@ -274,6 +270,7 @@ identity.
 | --- | --- |
 | `MetricsManager::new(namespace)` | Construct + install recorder |
 | `MetricsManager::with_config(MetricsConfig)` | Custom namespace, intervals, OTel config |
+| `MetricsManager::with_otlp_transport(MetricsConfig, Arc<OtlpTransport>)` | OTLP push through the app's OTLP transport (feature `transport-otlp`) |
 | `MetricsManager::new_for_test(namespace)` *(crate-private, scalo's own tests)* | No global install -- safe for parallel tests |
 | `counter` / `gauge` / `histogram` | Construct + auto-register |
 | `*_with_labels(name, desc, labels, group)` | Same, with manifest label keys + group |
@@ -284,7 +281,7 @@ identity.
 | `registry() -> MetricRegistry` | Cloneable handle for embedding `/metrics/manifest` in custom routers |
 | `render_handle() -> Option<RenderHandle>` | Cloneable Prometheus text renderer for axum routes |
 | `start_server(addr)` / `start_server_with_routes(addr, extra)` | Built-in router / merge service routes |
-| `shutdown_otel()` | Flush OTLP batch exporter |
+| `shutdown_otel()` | Flush OTLP push, and stop the gauge refresh when no server runs |
 | `ServiceMetrics::register(&mgr)` | Canonical data-plane metric set (feature `metrics` or `otel-metrics`) |
 | `latency_buckets()` / `size_buckets()` | Standard histogram bucket presets |
 
