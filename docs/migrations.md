@@ -6,7 +6,15 @@ release and the target before bumping.
 
 ---
 
-## 2.14.35
+## 2.14.37
+
+### gRPC zstd needs the `compression` feature (BEHAVIOUR CHANGE)
+
+`transport-grpc` turns on tonic's gzip only, so a gRPC build links the zstd C library only with `compression`. Without it, `transport.grpc.compression: {codec: zstd}` and `VectorCompatClient::with_compression` with zstd fail validation naming `none, gzip`, and gRPC servers, gRPC clients and the OTLP gRPC client read gzip alone.
+
+**Consumer adjustment** -- a service that sends or receives gRPC zstd enables `compression` beside `transport-grpc`.
+
+## 2.14.36
 
 ### Every compression setting is one `{codec, level}` key, `scalo::compression` (API and BEHAVIOUR CHANGE)
 
@@ -33,6 +41,8 @@ Behaviour that changes with no config:
 - `tiered-sink` no longer pulls `snap`, and `tonic` is built with `zstd` as well as `gzip`.
 
 **Consumer adjustment** -- rewrite each key in the table, in YAML, env (`..._COMPRESSION__CODEC=gzip`) and struct literals (`Compression::new(Codec::Gzip)`, `Compression::NONE`). A tiered sink set to `snappy` enables `compression-snappy`. Drain a tiered sink's spill cache before changing its codec: entries carry no codec tag.
+
+## 2.14.35
 
 ### A refused proxy CONNECT holds the records (BEHAVIOUR CHANGE)
 

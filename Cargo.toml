@@ -173,7 +173,7 @@ transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 # Shaped senders and delivery approaches for tests and benches: src/transport/test_support/mod.rs
 transport-test-support = ["transport", "memory", "tokio", "dep:futures-util"]
-transport-grpc = ["transport", "transport-proxy", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util", "tls", "tonic/gzip", "tonic/zstd"]
+transport-grpc = ["transport", "transport-proxy", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util", "tls", "tonic/gzip"]
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
