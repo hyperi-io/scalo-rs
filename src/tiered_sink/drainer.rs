@@ -8,11 +8,12 @@
 
 //! Background drain task for spooled messages.
 
+use crate::compression::Compressor;
 use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
 use crate::transport::{Record, SendResult, TransportSender};
 use crate::yaque::{self, Receiver};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -134,11 +135,13 @@ enum DrainResult {
     /// This many records the sink would not take were written to the DLQ, or
     /// dropped and counted when there is none, and committed.
     DeadLettered(usize),
-    /// Decompression error
-    DecompressError(String),
-    /// The spooled bytes could not be decoded back into a record (corrupt /
-    /// incompatible frame). Dropped (committed) so it cannot block the queue.
-    DecodeError(String),
+    /// An entry failed its CRC: its stored bytes are damaged. Dropped
+    /// (committed) so it cannot block the queue.
+    Corrupt(String),
+    /// The entry at the head of the spool does not decompress or decode under
+    /// the spill codec, as when it was written under another. Nothing is
+    /// committed, and the drain holds until the codec that wrote it is back.
+    Held(String),
     /// Queue is empty
     Empty,
     /// I/O error
@@ -196,13 +199,15 @@ async fn settle(result: DrainResult, drainer: &mut Drainer, circuit: &CircuitBre
                 "The DLQ did not confirm a drained batch's dead letters; it stays spooled"
             );
         }
-        DrainResult::DecompressError(e) => {
+        DrainResult::Corrupt(e) => {
             #[cfg(feature = "tracing")]
-            tracing::error!(error = %e, "Failed to decompress spooled message, dropping");
+            tracing::error!(error = %e, "Spooled entry failed its CRC, dropping");
+            #[cfg(not(feature = "tracing"))]
+            let _ = e;
         }
-        DrainResult::DecodeError(e) => {
-            #[cfg(feature = "tracing")]
-            tracing::error!(error = %e, "Failed to decode spooled record, dropping");
+        DrainResult::Held(_) => {
+            // The loop logs the hold once, and the entry stays spooled.
+            drainer.record_failure();
         }
         DrainResult::Empty | DrainResult::IoError => {
             // Nothing to do, just continue
@@ -446,28 +451,29 @@ fn fitting(sizes: &[u64], max_bytes: u64) -> usize {
     fit.max(1)
 }
 
-/// One spooled entry, decoded for the sink, or why it could not be.
-enum Entry {
-    Record(Record),
-    Unreadable(DrainResult),
+/// Why a spooled entry did not decode.
+enum Unreadable {
+    /// It failed its CRC, so it is dropped.
+    Corrupt(String),
+    /// It does not decompress or decode under the spill codec, so it is kept.
+    WrongCodec(String),
 }
 
-/// Unframe, decompress and decode one spooled entry.
-fn decode_entry(raw: Vec<u8>, crc: bool, codec: crate::compression::Compression) -> Entry {
-    // Verify+strip the CRC header (when enabled), then decompress. Either
-    // failing means the spilled bytes are unreadable, so the entry is dropped,
-    // never replayed downstream.
-    let data = match crate::spool_codec::unframe(crc, raw)
-        .map_err(|c| c.0)
-        .and_then(|c| codec.decompress(&c, usize::MAX).map_err(|e| e.to_string()))
-    {
-        Ok(data) => data,
-        Err(e) => return Entry::Unreadable(DrainResult::DecompressError(e)),
-    };
-    match Record::decode(&data) {
-        Ok(record) => Entry::Record(record),
-        Err(e) => Entry::Unreadable(DrainResult::DecodeError(e.to_string())),
-    }
+/// Unframe, decompress into `scratch` and decode one spooled entry.
+fn decode_entry(
+    raw: &[u8],
+    crc: bool,
+    decoder: &mut Compressor,
+    scratch: &mut Vec<u8>,
+) -> Result<Record, Unreadable> {
+    let body =
+        crate::spool_codec::unframe(crc, raw.to_vec()).map_err(|c| Unreadable::Corrupt(c.0))?;
+    // The spill keeps no codec per entry, so a failure past the CRC is read as
+    // an entry another codec wrote, never dropped.
+    decoder
+        .decompress_into(&body, scratch, usize::MAX)
+        .map_err(|e| Unreadable::WrongCodec(e.to_string()))?;
+    Record::decode(scratch).map_err(|e| Unreadable::WrongCodec(e.to_string()))
 }
 
 /// Take up to `cap` entries within `batch.max_bytes`, send the readable ones in
@@ -479,7 +485,8 @@ async fn drain_once<S: TransportSender>(
     receiver: &mut Receiver,
     cap: usize,
     batch: DrainBatch,
-    codec: crate::compression::Compression,
+    decoder: &mut Compressor,
+    scratch: &mut Vec<u8>,
     crc: bool,
     send_timeout: Duration,
     spool_count: &AtomicU64,
@@ -498,8 +505,7 @@ async fn drain_once<S: TransportSender>(
         }
     };
     let sizes: Vec<u64> = first.iter().map(|e| e.len() as u64).collect();
-    let take = fitting(&sizes, batch.max_bytes);
-    let stored: u64 = sizes.iter().take(take).sum();
+    let mut take = fitting(&sizes, batch.max_bytes);
     // yaque commits a guard whole, so a batch over the byte cap is rolled
     // back (on drop) and only what fits is taken again.
     let guard = if take == first.len() {
@@ -512,21 +518,46 @@ async fn drain_once<S: TransportSender>(
             Err(yaque::TryRecvError::Io(_)) => return vec![DrainResult::IoError],
         }
     };
-    let taken = guard.len();
-    let mut records = Vec::with_capacity(taken);
+    let mut decoded = Vec::with_capacity(guard.len());
     let mut unreadable = Vec::new();
+    let mut wrong_codec = None;
+    for (index, raw) in guard.iter().enumerate() {
+        match decode_entry(raw, crc, decoder, scratch) {
+            Ok(record) => decoded.push(record),
+            Err(Unreadable::Corrupt(e)) => unreadable.push(DrainResult::Corrupt(e)),
+            Err(Unreadable::WrongCodec(e)) => {
+                wrong_codec = Some((index, e));
+                break;
+            }
+        }
+    }
+    // Only the entries before one the codec cannot read are taken: dropping
+    // the guard rolls the batch back, so the rest stay spooled in order.
+    let guard = match wrong_codec {
+        None => guard,
+        Some((0, error)) => return vec![DrainResult::Held(error)],
+        Some((index, _)) => {
+            drop(guard);
+            take = index;
+            match receiver.try_recv_batch_up_to(take) {
+                Ok(guard) => guard,
+                Err(yaque::TryRecvError::QueueEmpty) => return vec![DrainResult::Empty],
+                Err(yaque::TryRecvError::Io(_)) => return vec![DrainResult::IoError],
+            }
+        }
+    };
+    let taken = guard.len();
+    let stored: u64 = sizes.iter().take(taken).sum();
+    let mut records = Vec::with_capacity(decoded.len());
     let mut dead = Vec::new();
-    for raw in guard.iter() {
-        match decode_entry(raw.clone(), crc, codec) {
-            Entry::Record(record) => match sink.dead_letter_reason(&record) {
-                None => records.push(record),
-                Some(reason) => dead.push(Undeliverable {
-                    label: reason.as_str(),
-                    reason: reason.to_string(),
-                    record,
-                }),
-            },
-            Entry::Unreadable(why) => unreadable.push(why),
+    for record in decoded {
+        match sink.dead_letter_reason(&record) {
+            None => records.push(record),
+            Some(reason) => dead.push(Undeliverable {
+                label: reason.as_str(),
+                reason: reason.to_string(),
+                record,
+            }),
         }
     }
 
@@ -615,7 +646,8 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     spool_count: Arc<AtomicU64>,
     spool_bytes: Arc<AtomicU64>,
     circuit: Arc<CircuitBreaker>,
-    codec: crate::compression::Compression,
+    mut decoder: Compressor,
+    held: Arc<AtomicBool>,
     crc: bool,
     strategy: DrainStrategy,
     interval: Duration,
@@ -628,6 +660,8 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     let mut drainer = Drainer::new(strategy);
     // Entries still to send one at a time after a refused batch.
     let mut isolate = 0_usize;
+    // Decompressed entries land here, reused across passes.
+    let mut scratch = Vec::new();
 
     #[cfg(feature = "shutdown")]
     let global_shutdown = crate::shutdown::token();
@@ -688,7 +722,8 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                 &mut receiver,
                 cap,
                 batch,
-                codec,
+                &mut decoder,
+                &mut scratch,
                 crc,
                 send_timeout,
                 &spool_count,
@@ -700,14 +735,13 @@ pub async fn drain_loop<S: TransportSender + 'static>(
 
         let mut took = 0_usize;
         for result in results {
+            note_hold(&result, &held, decoder.compression());
             match result {
                 DrainResult::Success(records) => {
                     took += records;
                     pause = Duration::ZERO;
                 }
-                DrainResult::DeadLettered(_)
-                | DrainResult::DecompressError(_)
-                | DrainResult::DecodeError(_) => pause = Duration::ZERO,
+                DrainResult::DeadLettered(_) | DrainResult::Corrupt(_) => pause = Duration::ZERO,
                 DrainResult::Isolate(entries) => {
                     isolate = entries;
                     pause = Duration::ZERO;
@@ -722,6 +756,34 @@ pub async fn drain_loop<S: TransportSender + 'static>(
             .delay()
             .saturating_mul(u32::try_from(took.max(1)).unwrap_or(u32::MAX));
     }
+}
+
+/// Set or clear `held` from a pass's result, logging and counting only the
+/// change, so a hold is reported once however many passes it lasts.
+fn note_hold(result: &DrainResult, held: &AtomicBool, codec: crate::compression::Compression) {
+    let holding = match result {
+        DrainResult::Held(_) => true,
+        DrainResult::Empty | DrainResult::IoError | DrainResult::SinkUnavailable => return,
+        _ => false,
+    };
+    if held.swap(holding, AtomicOrdering::Relaxed) == holding {
+        return;
+    }
+    #[cfg(feature = "metrics")]
+    ::metrics::gauge!("tiered_sink_drain_held").set(if holding { 1.0 } else { 0.0 });
+    #[cfg(feature = "tracing")]
+    match result {
+        DrainResult::Held(error) => tracing::error!(
+            codec = %codec,
+            error = %error,
+            "The spill's next entry does not read under its codec, so the drain holds and keeps it. Reopen the sink under the codec that wrote it"
+        ),
+        _ => {
+            tracing::info!(codec = %codec, "The spill reads under its codec again, so the drain resumes")
+        }
+    }
+    #[cfg(not(feature = "tracing"))]
+    let _ = codec;
 }
 
 /// Records one pass takes: `max_records`, held to a second's worth at `rate`

@@ -122,7 +122,7 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Records the sender names in `dead_letter_reason` are taken out first. Every entry is committed only when the sink answers `Ok` and the DLQ holds the dead letters. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal`, and a `FilteredDlq`, names no record, so the batch is kept and its entries are sent one at a time, which dead-letters only the record the sink rejects. An entry that fails its CRC or does not decode is dropped on its own, and the rest of its batch is sent.
+Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Records the sender names in `dead_letter_reason` are taken out first. Every entry is committed only when the sink answers `Ok` and the DLQ holds the dead letters. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal`, and a `FilteredDlq`, names no record, so the batch is kept and its entries are sent one at a time, which dead-letters only the record the sink rejects. An entry that fails its CRC is dropped on its own, and the rest of its batch is sent. One that does not decompress or decode holds the drain ([Changing the codec](#changing-the-codec)).
 
 A pass that takes records starts the next after the strategy's pause for that many records, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
 
@@ -156,6 +156,10 @@ Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailabl
 `TieredSink::new` clears spool locks a killed process left behind and rejects a `spool_path` another live sink holds, so each sink needs a path of its own. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. A receive position torn by a kill is not that case: the sink replays from the first segment instead, so some consumed records come again. A spill is flushed to the operating system, so it survives the process being killed. It survives the host losing power once the cache is synced: `TieredSink::sync().await` syncs every spill so far and the directories of the cache's path (the first call flushes each one up to the root, since opening creates any that are missing, and Windows has no directory sync, so there it flushes the files alone), so a caller that accepts records in batches syncs once per batch, and `sync_on_spill: true` syncs inside every spilling `send`. The default is off because a sync costs a disk sync per spilled record on the path that runs when the sink is down. A sync that fails returns `TieredSinkError::Spool` with the record already spilled, so a retry can deliver it twice. It finds the segments through the cache's path, so a spool directory renamed or replaced while the sink runs is not flushed, and a directory above the cache's parent that the process may not open is skipped. See [spool.md](spool.md#locks-after-a-hard-kill).
 
 ---
+
+## Changing the codec
+
+A spilled entry carries no codec, so the drain reads every entry with the `compression` the sink runs now. An entry that does not decompress or decode under it is never dropped: the drain sends what comes before it, then holds with that entry and everything after it on disk. It logs the codec and the error once, sets `tiered_sink_drain_held` to `1`, fails readiness (the `tiered_sink_drain` health component) and `is_drain_held()` returns `true`. New records still spill behind it. Reopen the sink under the codec that wrote the entries and the drain resumes, in order. An entry that fails its CRC is damaged rather than foreign, and is still dropped. Drain the spill before changing `compression` to avoid the hold.
 
 ## Configuration
 
@@ -205,6 +209,7 @@ Emitted through the `metrics` crate, and only when scalo is built with the `metr
 | `tiered_sink_overflow_total` | counter | `policy` | Records a full spool did not take: `drop_newest` sheds them, `dlq` writes them to the DLQ. `block` returns `SpoolFull` and does not count |
 | `tiered_sink_dead_letters_total` | counter | `reason`, `outcome` | Records the drain or `when_full: dlq` could not deliver. `outcome` is `dlq` when the DLQ confirmed it, `dropped` with no DLQ or one no backend can hold it. `reason` is `too_large`, `outbound_filter`, `rejected` (refused when sent) or `spool_full` |
 | `tiered_sink_dropped_total` | counter | `policy` | Records dropped on overflow. Moves with `tiered_sink_overflow_total` |
+| `tiered_sink_drain_held` | gauge | none | `1` while the drain holds at a spilled entry its codec cannot read, else `0`. See [Changing the codec](#changing-the-codec) |
 | `spool_messages` | gauge | none | Records in the spool after the last spill. The drainer never updates it, so it goes stale once draining starts. `spool_len()` is the live count. `ServiceMetrics::spool_messages` writes the same series |
 | `spool_bytes` | gauge | none | Bytes in the spool as stored (compressed, plus the CRC header when `crc` is on). Stale the same way. `spool_bytes()` is the live figure. `ServiceMetrics::spool_bytes` writes the same series |
 | `spool_disk_available_bytes` | gauge | none | Bytes free to unprivileged users on the spool's filesystem, set every `poll_interval_secs` by the disk poller, so only with `disk_aware` |
@@ -220,8 +225,9 @@ Alert on:
 - `spool_circuit_state` held at `2`. The sink is down and everything is going to the spool.
 - `1 - spool_disk_available_bytes / spool_disk_total_bytes` nearing `max_usage_percent`. Spool writes then return `DiskUnavailable`.
 - `spool_quarantined_total` above 0. A spill cache was set aside and its records are not replayed.
+- `tiered_sink_drain_held` at `1`. The spill holds entries another codec wrote, and nothing drains until the sink runs under that codec again.
 
-No metric counts a `SpoolFull`, `DiskUnavailable` or `DeadLetter` error, which goes back to the caller, or an entry the drainer discards because it fails its CRC, decompression or decode, which is logged at error level.
+No metric counts a `SpoolFull`, `DiskUnavailable` or `DeadLetter` error, which goes back to the caller, or an entry the drainer discards because it fails its CRC, which is logged at error level.
 
 ---
 
@@ -237,6 +243,7 @@ No metric counts a `SpoolFull`, `DiskUnavailable` or `DeadLetter` error, which g
 | `reset_circuit()` | Manual reset (admin / test) |
 | `hot_path_count() / cold_path_count()` | Cumulative path counters |
 | `is_disk_available()` | Disk-aware poller flag |
+| `is_drain_held()` | Whether the drain holds at an entry its codec cannot read |
 | `inner() -> &S` | Borrow the wrapped backend |
 | `shutdown()` | Stop the drain task and the disk poller, and wait for both to exit |
 | `TieredSinkError` | `SpoolOpen` from `new`. From `send`: `DeadLetter` (the sender named it or answered `FilteredDlq`), `Sink` (a `Fatal` answer, with its cause), `SpoolFull`, `DiskUnavailable`, `Spool` (the spool write failed), `Codec` (compression failed, or from `new` a `compression` the spill does not take) |

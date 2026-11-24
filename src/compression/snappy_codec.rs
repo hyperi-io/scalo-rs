@@ -48,6 +48,14 @@ impl Block {
         if size > limit {
             return Err(over_limit(limit));
         }
+        // Snappy expands at most about 22 to 1, so a larger claim is not a
+        // snappy block, and is refused before `dst` is zero-filled to it.
+        if size > src.len().saturating_mul(32).saturating_add(16) {
+            return Err(invalid(format!(
+                "snappy block of {} bytes cannot hold the {size} its header says",
+                src.len()
+            )));
+        }
         dst.try_reserve(size).map_err(io::Error::other)?;
         dst.resize(size, 0);
         let written = self.decoder.decompress(src, dst).map_err(invalid)?;

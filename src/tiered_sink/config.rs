@@ -32,7 +32,8 @@ pub struct TieredSinkConfig {
 
     /// Codec for spilled records: `none`, `zstd`, `lz4`, or `snappy` with the
     /// `compression-snappy` feature. Default zstd at level 3. A cache keeps no
-    /// codec per record, so change it only on an empty spool.
+    /// codec per record, so the drain holds at an entry another codec wrote
+    /// until the sink reopens under that codec. Change it on an empty spool.
     #[serde(default = "default_compression")]
     #[cfg_attr(
         feature = "config-schema",

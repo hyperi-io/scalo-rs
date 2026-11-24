@@ -43,6 +43,14 @@ pub(super) fn decompress_into(src: &[u8], dst: &mut Vec<u8>, limit: usize) -> io
     if size > limit {
         return Err(over_limit(limit));
     }
+    // LZ4 expands at most 255 to 1, so a larger claim is not an LZ4 block,
+    // and is refused before `dst` is zero-filled to it.
+    if size > body.len().saturating_mul(255).saturating_add(16) {
+        return Err(invalid(format!(
+            "lz4 block of {} bytes cannot hold the {size} its header says",
+            body.len()
+        )));
+    }
     dst.try_reserve(size).map_err(io::Error::other)?;
     dst.resize(size, 0);
     let written = block::decompress_into(body, dst).map_err(invalid)?;

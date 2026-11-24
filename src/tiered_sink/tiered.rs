@@ -8,6 +8,7 @@
 
 //! TieredSink implementation.
 
+use crate::compression::{Compressor, CompressorPool};
 use crate::tiered_sink::{
     CircuitBreaker, CircuitState, OrderingMode, Result, TieredSinkConfig, TieredSinkError, drainer,
 };
@@ -39,7 +40,13 @@ pub struct TieredSink<S: TransportSender> {
     spool_count: Arc<AtomicU64>,
     spool_bytes: Arc<AtomicU64>,
     circuit: Arc<CircuitBreaker>,
-    codec: crate::compression::Compression,
+    /// Spill codec contexts, one per `send` compressing at once.
+    compressors: CompressorPool,
+    /// Set while the drain holds at an entry the spill codec cannot read.
+    drain_held: Arc<std::sync::atomic::AtomicBool>,
+    /// Fails readiness while `drain_held` is set. Leaves the registry with the sink.
+    #[cfg(feature = "health")]
+    _drain_health: crate::health::HealthRegistration,
     config: TieredSinkConfig,
     /// Stops the drainer and the disk poller. Every waiter sees the cancel, even one that waits after it.
     shutdown: CancellationToken,
@@ -96,9 +103,12 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         volume_limits: Option<String>,
         kubernetes: bool,
     ) -> Result<Self> {
-        super::config::ACCEPTS
+        let codec_error = |e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e);
+        let compression = super::config::ACCEPTS
             .check(config.compression)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            .map_err(codec_error)?;
+        let compressors = CompressorPool::new(compression).map_err(codec_error)?;
+        let decoder = Compressor::new(compression).map_err(codec_error)?;
         if config.max_spool_bytes.is_none()
             && let Some(cap) = volume_limits
                 .as_deref()
@@ -167,7 +177,18 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             config.circuit_reset_timeout(),
         ));
         let shutdown = CancellationToken::new();
-        let codec = config.compression;
+        let drain_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(feature = "health")]
+        let drain_health = {
+            let held = Arc::clone(&drain_held);
+            crate::health::HealthRegistry::register_scoped("tiered_sink_drain", move || {
+                if held.load(AtomicOrdering::Relaxed) {
+                    crate::health::HealthStatus::Unhealthy
+                } else {
+                    crate::health::HealthStatus::Healthy
+                }
+            })
+        };
         let disk_available = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         // Shared by senders + drainer in StrictFifo to enforce
@@ -199,7 +220,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             Arc::clone(&spool_count),
             Arc::clone(&spool_bytes),
             Arc::clone(&circuit),
-            codec,
+            decoder,
+            Arc::clone(&drain_held),
             config.crc,
             config.drain_strategy,
             config.drain_interval(),
@@ -220,7 +242,10 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             spool_count,
             spool_bytes,
             circuit,
-            codec,
+            compressors,
+            drain_held,
+            #[cfg(feature = "health")]
+            _drain_health: drain_health,
             config,
             shutdown,
             drain_handle: Some(drain_handle),
@@ -484,7 +509,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         // frame with a CRC32C header (when enabled) so a torn write / bit-rot in
         // the spilled bytes is detectable on drain rather than replayed silently.
         let encoded = record.encode();
-        let compressed = self.codec.compress(&encoded)?;
+        let mut compressed = Vec::new();
+        self.compressors.compress_into(&encoded, &mut compressed)?;
         let compressed = crate::spool_codec::frame(self.config.crc, compressed);
         let compressed_len = compressed.len() as u64;
 
@@ -591,6 +617,15 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     #[must_use]
     pub fn spool_bytes(&self) -> u64 {
         self.spool_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Whether the drain is held at a spilled entry the spill codec cannot
+    /// read, such as one written under another codec. Readiness fails while
+    /// it is. The entry and everything after it stay on disk, and the drain
+    /// resumes once the sink reopens under the codec that wrote them.
+    #[must_use]
+    pub fn is_drain_held(&self) -> bool {
+        self.drain_held.load(AtomicOrdering::Relaxed)
     }
 
     /// Check if disk is available for spooling.
@@ -1528,6 +1563,117 @@ mod tests {
             0,
             "a corrupt record must NEVER be delivered"
         );
+        tiered.shutdown().await;
+    }
+
+    /// A spill written under one codec and reopened under another holds the
+    /// drain at its first entry: nothing is committed, nothing delivered, and
+    /// readiness fails. Reopened under the first codec, every record arrives
+    /// in order.
+    #[tokio::test]
+    async fn a_codec_change_holds_the_spill_and_loses_nothing() {
+        use crate::compression::{Codec, Compression};
+
+        for (written, read) in [
+            (Codec::Zstd, Codec::Lz4),
+            (Codec::None, Codec::Zstd),
+            (Codec::Lz4, Codec::None),
+        ] {
+            let case = format!("{written} read as {read}");
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("codec-change");
+            let under = |codec| {
+                let mut config = spilling_config(&path);
+                config.compression = Compression::new(codec);
+                config
+            };
+            let expected: Vec<Vec<u8>> =
+                (0..5).map(|i| format!("codec-{i}").into_bytes()).collect();
+            let sink = TestSink::new();
+            sink.set_available(false);
+            let tiered = TieredSink::new(sink, under(written)).await.unwrap();
+            for p in &expected {
+                tiered.send(&rec(p)).await.unwrap();
+            }
+            tiered.shutdown().await;
+
+            let tiered = TieredSink::new(TestSink::new(), under(read)).await.unwrap();
+            assert!(held_within(&tiered).await, "{case}: the drain holds");
+            assert_eq!(
+                tiered.spool_len().await,
+                expected.len(),
+                "{case}: none committed"
+            );
+            assert_eq!(
+                tiered.inner().received_count().await,
+                0,
+                "{case}: none delivered"
+            );
+            tiered.shutdown().await;
+
+            let tiered = TieredSink::new(TestSink::new(), under(written))
+                .await
+                .unwrap();
+            wait_for_drain(&tiered).await;
+            assert!(!tiered.is_drain_held(), "{case}");
+            assert_eq!(
+                tiered.inner().received_payloads().await,
+                expected,
+                "{case}: every record, in order, under the codec that wrote it"
+            );
+            tiered.shutdown().await;
+        }
+    }
+
+    /// Whether the drain holds within 5 s.
+    async fn held_within(tiered: &TieredSink<TestSink>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !tiered.is_drain_held() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// A spill holding entries of two codecs drains the ones its codec reads
+    /// and holds at the first it does not, so each run comes out in order.
+    #[tokio::test]
+    async fn a_mixed_spill_drains_its_readable_prefix_then_holds() {
+        use crate::compression::{Codec, Compression};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mixed-codec");
+        let under = |codec| {
+            let mut config = spilling_config(&path);
+            config.compression = Compression::new(codec);
+            config
+        };
+        let first: Vec<Vec<u8>> = (0..3).map(|i| format!("zstd-{i}").into_bytes()).collect();
+        let second: Vec<Vec<u8>> = (0..2).map(|i| format!("lz4-{i}").into_bytes()).collect();
+        for (codec, payloads) in [(Codec::Zstd, &first), (Codec::Lz4, &second)] {
+            let sink = TestSink::new();
+            sink.set_available(false);
+            let tiered = TieredSink::new(sink, under(codec)).await.unwrap();
+            for p in payloads {
+                tiered.send(&rec(p)).await.unwrap();
+            }
+            tiered.shutdown().await;
+        }
+
+        let tiered = TieredSink::new(TestSink::new(), under(Codec::Zstd))
+            .await
+            .unwrap();
+        assert!(held_within(&tiered).await, "held at the first lz4 entry");
+        assert_eq!(tiered.inner().received_payloads().await, first);
+        assert_eq!(tiered.spool_len().await, second.len(), "the lz4 run stays");
+        tiered.shutdown().await;
+
+        let tiered = TieredSink::new(TestSink::new(), under(Codec::Lz4))
+            .await
+            .unwrap();
+        wait_for_drain(&tiered).await;
+        assert_eq!(tiered.inner().received_payloads().await, second);
         tiered.shutdown().await;
     }
 

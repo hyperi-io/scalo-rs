@@ -652,6 +652,13 @@ impl ServiceMetrics {
                     &["reason", "outcome"],
                 ),
                 (
+                    "tiered_sink_drain_held",
+                    "1 while a tiered sink's drain holds at a spilled entry its codec cannot read, else 0",
+                    MetricType::Gauge,
+                    "",
+                    &[],
+                ),
+                (
                     "spool_disk_available_bytes",
                     "Bytes free to unprivileged users on the tiered sink spool's filesystem",
                     MetricType::Gauge,
@@ -1140,6 +1147,7 @@ mod tests {
                 MetricType::Counter,
                 vec!["reason", "outcome"],
             ),
+            ("test_app_tiered_sink_drain_held", MetricType::Gauge, vec![]),
             ("test_app_spool_messages", MetricType::Gauge, vec![]),
             ("test_app_spool_bytes", MetricType::Gauge, vec![]),
             (
