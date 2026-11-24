@@ -204,7 +204,6 @@ impl SyslogTransport {
                 if self.protocol == SyslogProtocol::Udp {
                     let cut = utf8_floor(&state.messages[begin..], self.limit);
                     state.messages.truncate(begin + cut);
-                    #[cfg(feature = "metrics")]
                     metrics::counter!("transport_truncated_total", "transport" => "syslog")
                         .increment(1);
                     tracing::debug!(bytes = len, limit = self.limit, "syslog: datagram cut");
@@ -347,7 +346,6 @@ impl SyslogTransport {
                         unanswered,
                         "syslog: RELP session lost mid-batch, resending the unanswered messages"
                     );
-                    #[cfg(feature = "metrics")]
                     metrics::counter!(
                         "transport_redelivered_total",
                         "transport" => "syslog",
@@ -561,6 +559,7 @@ impl TransportBase for SyslogTransport {
 
 impl Meter for SyslogTransport {
     const TRANSPORT: &'static str = "syslog";
+    const CORE_COUNTS: bool = true;
 }
 
 impl TransportSender for SyslogTransport {
@@ -617,7 +616,6 @@ impl TransportSender for SyslogTransport {
                         records = records.len(),
                         "syslog: send deadline elapsed, the batch is sent again"
                     );
-                    #[cfg(feature = "metrics")]
                     metrics::counter!(
                         "transport_redelivered_total",
                         "transport" => "syslog",

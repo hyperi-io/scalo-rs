@@ -508,8 +508,22 @@ async fn udp_sends_one_datagram_per_message_and_cuts_long_ones() {
     );
     // A 51-byte header, so the 2-byte character sits at bytes 479 and 480.
     let long = format!("{}\u{e9}{}", "x".repeat(428), "y".repeat(200));
+    // Counted through metrics-core alone, as syslog always has been.
+    let capture = crate::transport::core::capture::Capture::default();
+    let guard = metrics::set_default_local_recorder(&capture);
     let result = sender.send_batch(&records(&["short", &long])).await;
+    drop(guard);
     assert!(result.is_ok(), "{result:?}");
+    let counted: Vec<String> = capture.series().into_iter().collect();
+    assert_eq!(
+        counted,
+        [
+            "transport_send_duration_seconds{transport=\"syslog\"}",
+            "transport_sent_bytes_total{transport=\"syslog\"}",
+            "transport_sent_total{transport=\"syslog\"}",
+            "transport_truncated_total{transport=\"syslog\"}",
+        ]
+    );
     assert!(
         sender.dead_letter_reason(&record(&long)).is_none(),
         "UDP cuts, never dead-letters"

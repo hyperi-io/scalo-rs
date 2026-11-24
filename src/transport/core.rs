@@ -11,7 +11,8 @@
 //! [`Meter`] counts one transport's `transport_*` series under its `transport`
 //! label. Every key is built at compile time, so a count costs what a
 //! `metrics::counter!` with literal labels costs: no allocation and no hashing.
-//! Without the `metrics` feature every count compiles away.
+//! Without the `metrics` feature a transport's counts compile away, except
+//! syslog's, which reach a recorder the app installs through `metrics-core`.
 //!
 //! [`Lifecycle`] holds a transport's closed flag and readiness, and its
 //! `transport:<name>` entry in the health registry, which answers from the same
@@ -19,7 +20,6 @@
 
 use metrics::{Key, Label};
 
-#[cfg(feature = "metrics")]
 static METADATA: metrics::Metadata<'static> =
     metrics::Metadata::new(module_path!(), metrics::Level::INFO, Some(module_path!()));
 
@@ -36,13 +36,20 @@ pub(crate) trait Meter {
     /// The label every series carries.
     const LABELS: &'static [Label] = &[Label::from_static_parts("transport", Self::TRANSPORT)];
 
+    /// Whether the counts reach a recorder without the `metrics` feature, through
+    /// `metrics-core` alone. Syslog's always have, and the others' never have.
+    const CORE_COUNTS: bool = false;
+
+    /// Whether this build counts the series at all.
+    const COUNTING: bool = Self::CORE_COUNTS || cfg!(feature = "metrics");
+
     /// `records` written to the wire, carrying `bytes` of payload.
     fn count_sent(records: u64, bytes: u64) {
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_sent_total", Self::LABELS) },
             records,
         );
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_sent_bytes_total", Self::LABELS) },
             bytes,
         );
@@ -57,11 +64,11 @@ pub(crate) trait Meter {
         all(feature = "transport-http", feature = "http-server")
     ))]
     fn count_received(records: u64, bytes: u64) {
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_received_bytes_total", Self::LABELS) },
             bytes,
         );
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_received_events_total", Self::LABELS) },
             records,
         );
@@ -77,7 +84,7 @@ pub(crate) trait Meter {
     fn count_received_messages<T: super::traits::CommitToken>(
         messages: &[super::types::Message<T>],
     ) {
-        if cfg!(feature = "metrics") && !messages.is_empty() {
+        if Self::COUNTING && !messages.is_empty() {
             let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
             Self::count_received(messages.len() as u64, bytes as u64);
         }
@@ -92,7 +99,7 @@ pub(crate) trait Meter {
         feature = "transport-otlp"
     ))]
     fn count_backpressured() {
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_backpressured_total", Self::LABELS) },
             1,
         );
@@ -107,7 +114,7 @@ pub(crate) trait Meter {
         feature = "transport-otlp"
     ))]
     fn count_send_error() {
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_send_errors_total", Self::LABELS) },
             1,
         );
@@ -121,7 +128,7 @@ pub(crate) trait Meter {
         feature = "transport-syslog"
     ))]
     fn count_too_large() {
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_message_too_large_total", Self::LABELS) },
             1,
         );
@@ -133,7 +140,7 @@ pub(crate) trait Meter {
         all(feature = "transport-http", feature = "http-server")
     ))]
     fn count_refused() {
-        count(
+        count::<Self>(
             &const { Key::from_static_parts("transport_refused_total", Self::LABELS) },
             1,
         );
@@ -152,15 +159,14 @@ pub(crate) trait Meter {
         Self: Sized,
     {
         SendTimer {
-            #[cfg(feature = "metrics")]
-            started: std::time::Instant::now(),
+            started: Self::COUNTING.then(std::time::Instant::now),
             _meter: std::marker::PhantomData,
         }
     }
 }
 
-/// Times a send into `transport_send_duration_seconds` under `M`'s label.
-/// Empty, and free, without the `metrics` feature.
+/// Times a send into `transport_send_duration_seconds` under `M`'s label. It
+/// reads no clock where `M` does not count.
 #[cfg(any(
     feature = "transport-http",
     feature = "transport-grpc",
@@ -169,8 +175,7 @@ pub(crate) trait Meter {
     feature = "transport-otlp"
 ))]
 pub(crate) struct SendTimer<M> {
-    #[cfg(feature = "metrics")]
-    started: std::time::Instant,
+    started: Option<std::time::Instant>,
     _meter: std::marker::PhantomData<M>,
 }
 
@@ -184,15 +189,12 @@ pub(crate) struct SendTimer<M> {
 impl<M: Meter> SendTimer<M> {
     /// Record the time since the timer started.
     pub(crate) fn record(&self) {
-        #[cfg(feature = "metrics")]
-        {
+        if let Some(started) = self.started {
             let key =
                 const { Key::from_static_parts("transport_send_duration_seconds", M::LABELS) };
             metrics::with_recorder(|recorder| recorder.register_histogram(&key, &METADATA))
-                .record(self.started.elapsed().as_secs_f64());
+                .record(started.elapsed().as_secs_f64());
         }
-        #[cfg(not(feature = "metrics"))]
-        let _ = self;
     }
 }
 
@@ -294,16 +296,62 @@ mod lifecycle {
     }
 }
 
-/// Add `n` to the counter under `key`, as `metrics::counter!` does: nothing
-/// without the `metrics` feature.
-fn count(key: &Key, n: u64) {
-    #[cfg(feature = "metrics")]
-    metrics::with_recorder(|recorder| recorder.register_counter(key, &METADATA)).increment(n);
-    #[cfg(not(feature = "metrics"))]
-    let _ = (key, n);
+/// Add `n` to the counter under `key`, as `metrics::counter!` does, where `M`
+/// counts.
+fn count<M: Meter + ?Sized>(key: &Key, n: u64) {
+    if M::COUNTING {
+        metrics::with_recorder(|recorder| recorder.register_counter(key, &METADATA)).increment(n);
+    }
 }
 
-#[cfg(all(test, feature = "metrics", feature = "transport-grpc"))]
+/// A recorder that keeps each series registered on it, as `name{labels}`.
+#[cfg(all(test, any(feature = "transport-grpc", feature = "transport-syslog")))]
+pub(crate) mod capture {
+    use metrics::{
+        Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit,
+    };
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    pub(crate) struct Capture(Mutex<BTreeSet<String>>);
+
+    impl Capture {
+        /// The series registered so far.
+        pub(crate) fn series(&self) -> BTreeSet<String> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn note(&self, key: &Key) {
+            let labels: Vec<String> = key
+                .labels()
+                .map(|l| format!("{}=\"{}\"", l.key(), l.value()))
+                .collect();
+            let series = format!("{}{{{}}}", key.name(), labels.join(","));
+            self.0.lock().unwrap().insert(series);
+        }
+    }
+
+    impl Recorder for Capture {
+        fn describe_counter(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_gauge(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
+        fn register_counter(&self, key: &Key, _: &Metadata<'_>) -> Counter {
+            self.note(key);
+            Counter::noop()
+        }
+        fn register_gauge(&self, key: &Key, _: &Metadata<'_>) -> Gauge {
+            self.note(key);
+            Gauge::noop()
+        }
+        fn register_histogram(&self, key: &Key, _: &Metadata<'_>) -> Histogram {
+            self.note(key);
+            Histogram::noop()
+        }
+    }
+}
+
+#[cfg(all(test, feature = "transport-grpc"))]
 mod tests {
     use super::Meter;
     use std::collections::{BTreeSet, HashMap};
@@ -316,6 +364,41 @@ mod tests {
 
     impl Meter for Probe {
         const TRANSPORT: &'static str = "probe";
+    }
+
+    struct CoreProbe;
+
+    impl Meter for CoreProbe {
+        const TRANSPORT: &'static str = "core-probe";
+        const CORE_COUNTS: bool = true;
+    }
+
+    /// A transport that counts through `metrics-core` reaches an installed
+    /// recorder in every build. The others reach it only with `metrics`.
+    #[test]
+    fn core_counts_reach_a_recorder_without_the_metrics_feature() {
+        let capture = super::capture::Capture::default();
+        metrics::with_local_recorder(&capture, || {
+            CoreProbe::count_sent(1, 1);
+            CoreProbe::send_timer().record();
+            Probe::count_sent(1, 1);
+            Probe::send_timer().record();
+        });
+        let core = [
+            "transport_send_duration_seconds{transport=\"core-probe\"}",
+            "transport_sent_bytes_total{transport=\"core-probe\"}",
+            "transport_sent_total{transport=\"core-probe\"}",
+        ];
+        let probe = [
+            "transport_send_duration_seconds{transport=\"probe\"}",
+            "transport_sent_bytes_total{transport=\"probe\"}",
+            "transport_sent_total{transport=\"probe\"}",
+        ];
+        let mut want: BTreeSet<String> = core.iter().map(ToString::to_string).collect();
+        if cfg!(feature = "metrics") {
+            want.extend(probe.iter().map(ToString::to_string));
+        }
+        assert_eq!(capture.series(), want);
     }
 
     /// Each count, and the series it adds under its transport's label.
@@ -372,6 +455,7 @@ mod tests {
     ];
 
     /// What the Prometheus exporter renders for `count`, as `kind name labels`.
+    #[cfg(feature = "metrics")]
     fn rendered(count: fn()) -> BTreeSet<String> {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -403,6 +487,7 @@ mod tests {
 
     /// Every count renders exactly the series the census expands it to, with
     /// the names and labels the transports' literal macros gave them.
+    #[cfg(feature = "metrics")]
     #[test]
     fn each_count_renders_its_series() {
         for (name, count, series) in COUNTS {
