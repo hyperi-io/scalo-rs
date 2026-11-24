@@ -19,9 +19,13 @@ use crate::compression::Codec;
 /// has none.
 pub(crate) const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
 
-/// Every encoding a tonic server or client here reads.
-pub(crate) const ACCEPTED_ENCODINGS: [CompressionEncoding; 2] =
-    [CompressionEncoding::Gzip, CompressionEncoding::Zstd];
+/// Every encoding a tonic client here reads in answers. `transport-grpc`
+/// turns on tonic's zstd, and `transport-otlp` alone turns on gzip only.
+#[cfg(feature = "transport-grpc")]
+pub(crate) const ACCEPTED_ENCODINGS: &[CompressionEncoding] =
+    &[CompressionEncoding::Gzip, CompressionEncoding::Zstd];
+#[cfg(not(feature = "transport-grpc"))]
+pub(crate) const ACCEPTED_ENCODINGS: &[CompressionEncoding] = &[CompressionEncoding::Gzip];
 
 /// tonic's encoding for `codec`, which fixes the level. `None` for
 /// [`Codec::None`] and for a codec tonic lacks, which an `Accepts` check
@@ -29,6 +33,7 @@ pub(crate) const ACCEPTED_ENCODINGS: [CompressionEncoding; 2] =
 pub(crate) fn encoding(codec: Codec) -> Option<CompressionEncoding> {
     match codec {
         Codec::Gzip => Some(CompressionEncoding::Gzip),
+        #[cfg(feature = "transport-grpc")]
         Codec::Zstd => Some(CompressionEncoding::Zstd),
         _ => None,
     }

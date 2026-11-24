@@ -159,7 +159,7 @@ config-schema = ["dep:schemars", "serde_json", "deployment"]
 version-check = ["reqwest", "tokio", "serde_json", "tracing", "dep:jiff", "dirs", "dep:uuid"]
 
 # `reqwest/query` sits here, not on `http`, so only this feature pays for `serde_urlencoded`.
-geoip-download = ["http", "reqwest/query", "compression", "dep:tar", "tokio", "dep:jiff", "tracing"]
+geoip-download = ["http", "reqwest/query", "dep:flate2", "dep:tar", "tokio", "dep:jiff", "tracing"]
 
 config-reload = ["config", "parking_lot", "tokio", "tracing"]
 
@@ -173,7 +173,7 @@ transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 # Shaped senders and delivery approaches for tests and benches: src/transport/test_support/mod.rs
 transport-test-support = ["transport", "memory", "tokio", "dep:futures-util"]
-transport-grpc = ["transport", "transport-proxy", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util", "tls", "compression"]
+transport-grpc = ["transport", "transport-proxy", "dep:tonic", "dep:tonic-prost", "dep:prost", "dep:prost-types", "dep:tonic-prost-build", "dep:prost-build", "dep:tokio-stream", "dep:hyper-util", "tls", "tonic/gzip", "tonic/zstd"]
 transport-grpc-vector-compat = ["transport-grpc"]
 transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
@@ -181,7 +181,7 @@ transport-http = ["transport", "transport-proxy", "http", "tls", "compression"]
 # RFC 5424 and 3164 over TCP, TLS, UDP and RELP: docs/transport/syslog.md
 transport-syslog = ["transport", "transport-proxy", "tls", "dep:jiff", "sysinfo"]
 # OTLP log records over gRPC or HTTP/protobuf, with no protoc to build: docs/transport/otlp.md
-transport-otlp = ["transport", "transport-proxy", "tls", "reqwest", "bytes", "tokio", "dep:tonic", "dep:hyper-util", "dep:prost", "dep:tonic-types", "dep:opentelemetry-proto", "dep:opentelemetry", "opentelemetry_sdk", "compression"]
+transport-otlp = ["transport", "transport-proxy", "tls", "reqwest", "bytes", "tokio", "dep:tonic", "dep:hyper-util", "dep:prost", "dep:tonic-types", "dep:opentelemetry-proto", "dep:opentelemetry", "opentelemetry_sdk", "dep:flate2", "tonic/gzip"]
 # One egress proxy setting for the stream transports: src/transport/proxy.rs
 transport-proxy = ["transport", "tokio", "dep:http", "dep:hyper-util", "hyper-util/client-proxy", "dep:system-configuration", "dep:windows", "windows/Win32_Networking_WinHttp"]
 # A real Squid for proxy tests. Needs a Docker daemon at test time.

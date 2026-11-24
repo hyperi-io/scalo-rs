@@ -21,12 +21,14 @@ use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::grpc::GrpcConfig;
 use crate::transport::tonic_channel::{self, lazy_channel};
 
-/// The codecs a push to a Vector source takes. tonic fixes the level.
+/// The codecs a push to a Vector source takes. tonic applies them and fixes
+/// the level.
 pub const VECTOR_ACCEPTS: Accepts = Accepts::new(
     "vector_compat.compression",
     &[Codec::None, Codec::Gzip, Codec::Zstd],
 )
-.without_level();
+.without_level()
+.external();
 
 /// Client that sends events to a Vector source via gRPC.
 ///
@@ -129,7 +131,7 @@ impl VectorCompatClient {
 
         let mut client = vector::vector_client::VectorClient::new(channel)
             .max_decoding_message_size(MAX_DECODE_BYTES);
-        for accepted in tonic_channel::ACCEPTED_ENCODINGS {
+        for &accepted in tonic_channel::ACCEPTED_ENCODINGS {
             client = client.accept_compressed(accepted);
         }
 

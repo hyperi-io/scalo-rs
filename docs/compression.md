@@ -31,14 +31,15 @@ Each surface lists its codecs in an `Accepts`, and refuses anything else when it
 - gRPC and OTLP over gRPC map the codec onto tonic's `CompressionEncoding`, which fixes the level, so a level is refused. A gRPC server reads gzip and zstd on every connection, whatever its own `compression` says.
 - Kafka maps onto librdkafka's `compression.type` and `compression.level`, so snappy needs no scalo feature there. The raw `producer_librdkafka` and `librdkafka_overrides` maps stay strings and win: a codec named there takes that codec's default level, unless a raw map names a level too. See [kafka-path.md](kafka-path.md#wire-compression).
 - Rotated files past the six newest get the codec's suffix, `.gz` or `.zst`. Retention reads every suffix, so changing the codec keeps old files in the count.
-- GeoIP downloads are gzip because the provider packages them that way. The codec is fixed in code, never read from config.
-- The tiered sink keeps no codec per record, so change its codec only on an empty spill cache.
+- GeoIP downloads are gzip because the provider packages them that way, read through flate2 directly and never from config.
+- The tiered sink keeps no codec per record. Its drain holds, committing nothing, at an entry the current codec cannot read, and resumes when the sink reopens under the codec that wrote it ([pipeline/tiered-sink.md](pipeline/tiered-sink.md#changing-the-codec)).
 
-The engines need features. The `compression` feature compiles the zstd, LZ4 and gzip engines, and tonic's gzip and zstd. `compression-snappy` adds snappy. `tiered-sink`, `io`, `transport-http`, `transport-otlp`, `transport-grpc` and `geoip-download` each pull `compression`.
+The engines need features. The `compression` feature compiles the zstd, LZ4 and gzip engines, and tonic's gzip and zstd. `compression-snappy` adds snappy. `tiered-sink`, `io` and `transport-http` each pull `compression`. Where a dependency applies a fixed codec, the feature pulls only that codec: `transport-grpc` turns on tonic's gzip and zstd, `transport-otlp` tonic's gzip and `flate2`, and `geoip-download` `flate2`.
 
 | API | For |
 | --- | --- |
 | `Compressor::new(compression)` | Blocks in a loop. `compress_into(src, dst)` and `decompress_into(src, dst, limit)` reuse the codec context and `dst`, so a loop allocates only what `dst` grows by |
+| `CompressorPool::new(compression)` | Callers compressing at once, such as concurrent sends. Each call takes an idle `Compressor` or makes one, and returns it, so the pool holds as many as were ever busy together |
 | `Compression::compress(src)`, `decompress(src, limit)` | One block, with a context made for it |
 | `Compression::encoder(writer)`, `decoder(reader)` | Streams. `Encoder::finish` writes the trailer. Wrap a decoder in `Read::take` for untrusted input |
 | `Codec::tag()`, `Codec::from_tag(byte)` | One stable byte per codec, for a store scalo owns |

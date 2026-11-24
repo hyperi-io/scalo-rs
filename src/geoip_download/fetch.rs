@@ -21,11 +21,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use flate2::read::GzDecoder;
 use reqwest::header::AUTHORIZATION;
 use tracing::info;
 
 use super::{DOWNLOAD_TIMEOUT_SECS, GeoIpDownloadError};
-use crate::compression::{Codec, Compression};
 use crate::http_client::signer::basic_auth_value;
 use crate::http_client::{HttpClient, HttpClientConfig, HttpError, RequestSigner, SignError};
 use crate::sensitive::SensitiveString;
@@ -47,10 +47,6 @@ pub(super) enum Archive {
     /// The body is a gzip-compressed tar carrying `member` somewhere inside.
     TarGz { member: &'static str },
 }
-
-/// The provider fixes the packaging, so the codec is mapped here, never read
-/// from config.
-const PROVIDER_GZIP: Compression = Compression::new(Codec::Gzip);
 
 /// Credential attached to the request.
 ///
@@ -225,7 +221,7 @@ fn materialise(
             fs::rename(part, staged)?;
         }
         Archive::Gzip => {
-            let decoder = PROVIDER_GZIP.decoder(io::BufReader::new(source))?;
+            let decoder = GzDecoder::new(io::BufReader::new(source));
             write_capped(decoder, staged, max_bytes)?;
         }
         Archive::TarGz { member } => {
@@ -275,7 +271,7 @@ fn extract_member(
     member: &'static str,
     max_bytes: u64,
 ) -> Result<(), GeoIpDownloadError> {
-    let decoder = PROVIDER_GZIP.decoder(io::BufReader::new(source))?;
+    let decoder = GzDecoder::new(io::BufReader::new(source));
     let mut archive = tar::Archive::new(decoder);
 
     for entry in archive.entries()? {

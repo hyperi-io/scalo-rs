@@ -230,7 +230,7 @@ impl OtlpTransport {
                 let body = if compression.is_none() {
                     body
                 } else {
-                    match compression.compress(&body) {
+                    match gzip_body(&body) {
                         Ok(compressed) => compressed,
                         Err(e) => {
                             return SendResult::Fatal(TransportError::Internal(format!(
@@ -487,7 +487,7 @@ fn grpc_wire(
     let channel =
         super::tonic_channel::lazy_channel(endpoint, config.timeout_ms, config.proxy.dialer()?);
     let mut client = LogsServiceClient::new(channel);
-    for accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
+    for &accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
         client = client.accept_compressed(accepted);
     }
     if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
@@ -681,6 +681,18 @@ fn error_text(body: &[u8], protobuf: bool) -> String {
 /// At most [`MAX_DETAIL_CHARS`] of `text`, trimmed.
 fn truncated(text: &str) -> String {
     text.trim().chars().take(MAX_DETAIL_CHARS).collect()
+}
+
+/// `body` gzipped, the one codec [`OTLP_ACCEPTS`] takes. flate2 directly,
+/// so OTLP compiles no other codec.
+fn gzip_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(body.len() / 4),
+        flate2::Compression::default(),
+    );
+    encoder.write_all(body)?;
+    encoder.finish()
 }
 
 /// `url` with any user name and password left out.

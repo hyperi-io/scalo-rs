@@ -46,9 +46,11 @@ impl OtlpProtocol {
 
 /// The codecs an export request takes: `grpc-encoding` on gRPC,
 /// `Content-Encoding` on HTTP. tonic fixes the gRPC level, so no level is
-/// taken on either.
+/// taken on either. tonic and flate2 apply it, not scalo's engine.
 pub const OTLP_ACCEPTS: Accepts =
-    Accepts::new("transport.otlp.compression", &[Codec::None, Codec::Gzip]).without_level();
+    Accepts::new("transport.otlp.compression", &[Codec::None, Codec::Gzip])
+        .without_level()
+        .external();
 
 /// OTLP logs transport configuration, read from `transport.otlp` or from the
 /// `otlp` section of a [`TransportConfig`](crate::transport::TransportConfig).

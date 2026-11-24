@@ -11,13 +11,14 @@ use serde::{Deserialize, Serialize};
 use crate::compression::{Accepts, Codec, Compression};
 use crate::transport::tonic_channel::DEFAULT_SEND_TIMEOUT_MS;
 
-/// The codecs a gRPC or Vector-compat client sends with. tonic fixes the
-/// level, so none is taken.
+/// The codecs a gRPC or Vector-compat client sends with. tonic applies them
+/// and fixes the level, so none is taken and scalo's engine is not needed.
 pub const GRPC_ACCEPTS: Accepts = Accepts::new(
     "transport.grpc.compression",
     &[Codec::None, Codec::Gzip, Codec::Zstd],
 )
-.without_level();
+.without_level()
+.external();
 
 #[cfg(feature = "config-schema")]
 fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {

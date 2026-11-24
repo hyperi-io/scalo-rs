@@ -626,7 +626,7 @@ fn build_client(
     let mut client = proto::transport_client::TransportClient::new(channel)
         .max_decoding_message_size(config.max_message_size);
 
-    for accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
+    for &accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
         client = client.accept_compressed(accepted);
     }
     if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
