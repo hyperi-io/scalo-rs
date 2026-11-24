@@ -156,7 +156,6 @@ fn test_kafka_config_defaults() {
     assert_eq!(config.client_id, "scalo");
     assert!(!config.enable_auto_commit);
     assert_eq!(config.auto_offset_reset, "earliest");
-    assert_eq!(config.fetch_max_bytes, 52_428_800); // 50MB
     assert_eq!(config.session_timeout_ms, 45000);
     assert_eq!(config.heartbeat_interval_ms, 3000);
     assert_eq!(config.max_poll_interval_ms, 300_000);

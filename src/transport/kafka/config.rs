@@ -1316,18 +1316,6 @@ pub struct KafkaConfig {
     #[serde(default = "default_max_poll_interval")]
     pub max_poll_interval_ms: u32,
 
-    /// Fetch minimum bytes.
-    #[serde(default = "default_fetch_min_bytes")]
-    pub fetch_min_bytes: i32,
-
-    /// Fetch maximum bytes.
-    #[serde(default = "default_fetch_max_bytes")]
-    pub fetch_max_bytes: i32,
-
-    /// Maximum messages per partition per poll.
-    #[serde(default = "default_max_partition_fetch_bytes")]
-    pub max_partition_fetch_bytes: i32,
-
     /// Auto offset reset (earliest, latest, none).
     #[serde(default = "default_auto_offset_reset")]
     pub auto_offset_reset: String,
@@ -1469,9 +1457,6 @@ impl fmt::Debug for KafkaConfig {
             .field("session_timeout_ms", &self.session_timeout_ms)
             .field("heartbeat_interval_ms", &self.heartbeat_interval_ms)
             .field("max_poll_interval_ms", &self.max_poll_interval_ms)
-            .field("fetch_min_bytes", &self.fetch_min_bytes)
-            .field("fetch_max_bytes", &self.fetch_max_bytes)
-            .field("max_partition_fetch_bytes", &self.max_partition_fetch_bytes)
             .field("auto_offset_reset", &self.auto_offset_reset)
             .field("enable_partition_eof", &self.enable_partition_eof)
             .field("sizing", &self.sizing)
@@ -1549,18 +1534,6 @@ fn default_max_poll_interval() -> u32 {
     300_000
 }
 
-fn default_fetch_min_bytes() -> i32 {
-    1
-}
-
-fn default_fetch_max_bytes() -> i32 {
-    52_428_800 // 50 MB
-}
-
-fn default_max_partition_fetch_bytes() -> i32 {
-    1_048_576 // 1 MB
-}
-
 fn default_auto_offset_reset() -> String {
     "earliest".to_string()
 }
@@ -1608,9 +1581,6 @@ impl Default for KafkaConfig {
             session_timeout_ms: default_session_timeout(),
             heartbeat_interval_ms: default_heartbeat_interval(),
             max_poll_interval_ms: default_max_poll_interval(),
-            fetch_min_bytes: default_fetch_min_bytes(),
-            fetch_max_bytes: default_fetch_max_bytes(),
-            max_partition_fetch_bytes: default_max_partition_fetch_bytes(),
             auto_offset_reset: default_auto_offset_reset(),
             enable_partition_eof: false,
             sizing: KafkaSizingConfig::default(),
@@ -1680,7 +1650,7 @@ impl KafkaConfig {
     ///
     /// Order of precedence (lowest to highest):
     /// 1. Profile defaults
-    /// 2. Explicit config fields (fetch_min_bytes, etc.)
+    /// 2. Explicit config fields (`session_timeout_ms`, etc.)
     /// 3. `extra_config` (legacy, deprecated)
     /// 4. `librdkafka_overrides` (highest priority)
     #[must_use]
@@ -1735,12 +1705,6 @@ impl KafkaConfig {
             (
                 "max.poll.interval.ms",
                 self.max_poll_interval_ms.to_string(),
-            ),
-            ("fetch.min.bytes", self.fetch_min_bytes.to_string()),
-            ("fetch.max.bytes", self.fetch_max_bytes.to_string()),
-            (
-                "max.partition.fetch.bytes",
-                self.max_partition_fetch_bytes.to_string(),
             ),
             ("auto.offset.reset", self.auto_offset_reset.clone()),
             (
@@ -3684,10 +3648,7 @@ mod tests {
         ("auto.offset.reset", "earliest"),
         ("enable.auto.commit", "false"),
         ("enable.partition.eof", "false"),
-        ("fetch.max.bytes", "52428800"),
-        ("fetch.min.bytes", "1"),
         ("heartbeat.interval.ms", "3000"),
-        ("max.partition.fetch.bytes", "1048576"),
         ("max.poll.interval.ms", "300000"),
         ("session.timeout.ms", "45000"),
     ];

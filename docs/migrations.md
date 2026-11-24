@@ -30,9 +30,15 @@ A scalo producer never ran these: every producer path lays the sizing surface ov
 
 ### A Kafka consumer's explicit fields win over its profile (BEHAVIOUR CHANGE)
 
-The consumer laid the `KafkaProfile` keys over `KafkaConfig`'s explicit consumer fields, so `enable_auto_commit: true` lost to both profiles' `enable.auto.commit=false` and never took effect. The profile now goes first and the fields over it, as `build_librdkafka_config` documents. The defaults are unchanged: both profiles and the field say `false`. `fetch.min.bytes`, the one other key both set, is set again by the sizing map after both.
+The consumer laid the `KafkaProfile` keys over `KafkaConfig`'s explicit consumer fields, so `enable_auto_commit: true` lost to both profiles' `enable.auto.commit=false` and never took effect. The profile now goes first and the fields over it, as `build_librdkafka_config` documents. The defaults are unchanged: both profiles and the field say `false`.
 
 **Consumer adjustment** -- a consumer with `enable_auto_commit: true` now auto-commits. Drop the field where the code commits by hand.
+
+### `KafkaConfig` loses its three fetch-size fields (API CHANGE)
+
+`KafkaConfig.fetch_min_bytes`, `fetch_max_bytes` and `max_partition_fetch_bytes` are gone. The consumer sizing map set all three after them, so none ever reached librdkafka. The config loader logs a YAML key that still names one and skips it.
+
+**Consumer adjustment** -- set `kafka.sizing.consumer.fetch_min_bytes`, `kafka.sizing.consumer.fetch_max_bytes` or `kafka.sizing.consumer.max_partition_fetch_bytes`, and drop the old field from struct literals.
 
 ## 2.14.36
 

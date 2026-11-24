@@ -4953,9 +4953,8 @@ mod tests {
         );
     }
 
-    /// The explicit field and the sizing surface both set
-    /// `max.partition.fetch.bytes`, so an override by the other name wins only
-    /// once both are gone.
+    /// The sizing surface sets `max.partition.fetch.bytes`, so an override by
+    /// the other name wins only once that name is gone.
     #[test]
     fn consumer_takes_a_fetch_override_by_the_alias_name() {
         let mut config = KafkaConfig::default();
@@ -5736,7 +5735,6 @@ mod tests {
     #[test]
     fn test_kafka_config_defaults() {
         let config = KafkaConfig::default();
-        assert_eq!(config.fetch_max_bytes, 52_428_800); // 50MB
         assert!(!config.enable_auto_commit); // Manual commit
     }
 
