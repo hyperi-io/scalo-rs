@@ -445,7 +445,7 @@ pub struct ProducerKnobs {
 /// The raw maps are logged (one line per key) when they override a property
 /// that the sizing surface depends on (the fetch byte sizes and
 /// `enable.auto.commit`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct KafkaSizingConfig {
     /// Sizing profile (throughput / balanced / low_latency).
@@ -482,6 +482,24 @@ pub struct KafkaSizingConfig {
     /// `request.required.acks` for `acks`).
     #[serde(default)]
     pub producer_librdkafka: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for KafkaSizingConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KafkaSizingConfig")
+            .field("profile", &self.profile)
+            .field("consumer", &self.consumer)
+            .field("producer", &self.producer)
+            .field(
+                "consumer_librdkafka",
+                &RedactedRawMap(raw_layer(&self.consumer_librdkafka)),
+            )
+            .field(
+                "producer_librdkafka",
+                &RedactedRawMap(raw_layer(&self.producer_librdkafka)),
+            )
+            .finish()
+    }
 }
 
 // ============================================================================
@@ -1526,9 +1544,25 @@ pub struct KafkaConfig {
     pub filters_out: Vec<crate::transport::filter::FilterRule>,
 }
 
-/// A raw librdkafka map for `Debug`, with the value of any key naming a
-/// password or secret redacted.
-struct RedactedRawMap<'a>(&'a HashMap<String, String>);
+/// librdkafka credential properties whose names contain neither `password`
+/// nor `secret`.
+const RAW_CREDENTIAL_KEYS: &[&str] = &[
+    "ssl.key.pem",
+    "sasl.oauthbearer.config",
+    "sasl.oauthbearer.assertion.private.key.pem",
+    "sasl.oauthbearer.assertion.private.key.passphrase",
+];
+
+/// Whether a raw librdkafka key holds a credential, in any letter case.
+fn is_raw_credential_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("password")
+        || lower.contains("secret")
+        || RAW_CREDENTIAL_KEYS.contains(&lower.as_str())
+}
+
+/// A raw librdkafka map for `Debug`, with every credential value redacted.
+struct RedactedRawMap<'a>(RawLayer<'a>);
 
 impl fmt::Debug for RedactedRawMap<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1540,13 +1574,11 @@ impl fmt::Debug for RedactedRawMap<'_> {
         }
         f.debug_map()
             .entries(self.0.iter().map(|(key, value)| {
-                let lower = key.to_ascii_lowercase();
-                let shown: &dyn fmt::Debug =
-                    if lower.contains("password") || lower.contains("secret") {
-                        &Redacted
-                    } else {
-                        value
-                    };
+                let shown: &dyn fmt::Debug = if is_raw_credential_key(key) {
+                    &Redacted
+                } else {
+                    value
+                };
                 (key, shown)
             }))
             .finish()
@@ -1599,9 +1631,12 @@ impl fmt::Debug for KafkaConfig {
             .field("sizing", &self.sizing)
             .field(
                 "librdkafka_overrides",
-                &RedactedRawMap(&self.librdkafka_overrides),
+                &RedactedRawMap(raw_layer(&self.librdkafka_overrides)),
             )
-            .field("extra_config", &RedactedRawMap(&self.extra_config))
+            .field(
+                "extra_config",
+                &RedactedRawMap(raw_layer(&self.extra_config)),
+            )
             .field("filters_in", &self.filters_in)
             .field("filters_out", &self.filters_out)
             .finish()
@@ -2709,8 +2744,8 @@ mod tests {
         }
     }
 
-    /// Secure overrides pass, and `Debug` hides the value of every raw key
-    /// naming a password or secret.
+    /// Secure overrides pass, and `Debug` hides every credential value in
+    /// every raw map `raw_librdkafka_maps` returns.
     #[test]
     fn validate_passes_overrides_that_keep_the_client_secure() {
         let mut config = KafkaConfig {
@@ -2721,19 +2756,68 @@ mod tests {
         .with_override("security.protocol", "SASL_SSL")
         .with_override("sasl.mechanism", "SCRAM-SHA-512")
         .with_override("enable.ssl.certificate.verification", "true")
-        .with_override("statistics.interval.ms", "0")
-        .with_override("sasl.password", "override-pw")
-        .with_override("SSL.Keystore.Password", "keystore-pw")
-        .with_override("sasl.oauthbearer.client.secret", "oauth-secret");
-        #[allow(deprecated)]
-        config
-            .extra_config
-            .insert("ssl.key.password".to_string(), "legacy-pw".to_string());
+        .with_override("statistics.interval.ms", "0");
+        // (map, credential key, value)
+        let credentials = [
+            ("librdkafka_overrides", "sasl.password", "override-pw"),
+            (
+                "librdkafka_overrides",
+                "SSL.Keystore.Password",
+                "keystore-pw",
+            ),
+            (
+                "librdkafka_overrides",
+                "sasl.oauthbearer.client.secret",
+                "oauth-secret",
+            ),
+            ("extra_config", "ssl.key.password", "legacy-pw"),
+            ("sizing.producer_librdkafka", "ssl.key.pem", "producer-pem"),
+            (
+                "sizing.consumer_librdkafka",
+                "sasl.oauthbearer.config",
+                "consumer-oauth",
+            ),
+            (
+                "librdkafka_overrides",
+                "sasl.oauthbearer.assertion.private.key.pem",
+                "assertion-pem",
+            ),
+            (
+                "extra_config",
+                "Sasl.OAuthBearer.Assertion.Private.Key.Passphrase",
+                "assertion-phrase",
+            ),
+        ];
+        for (map, key, value) in credentials {
+            let (key, value) = (key.to_string(), value.to_string());
+            #[allow(deprecated)]
+            match map {
+                "librdkafka_overrides" => {
+                    config.librdkafka_overrides.insert(key, value);
+                }
+                "extra_config" => {
+                    config.extra_config.insert(key, value);
+                }
+                "sizing.producer_librdkafka" => {
+                    config.sizing.producer_librdkafka.insert(key, value);
+                }
+                "sizing.consumer_librdkafka" => {
+                    config.sizing.consumer_librdkafka.insert(key, value);
+                }
+                other => panic!("no raw map {other}"),
+            }
+        }
+        for (map, layer) in config.raw_librdkafka_maps() {
+            assert!(
+                layer.iter().any(|(key, _)| is_raw_credential_key(key)),
+                "{map} is a raw map this test does not fill"
+            );
+        }
         assert!(config.validate(false).is_ok());
         assert!(config.validate(true).is_ok());
         let debug = format!("{config:?}");
-        for secret in ["override-pw", "keystore-pw", "oauth-secret", "legacy-pw"] {
-            assert!(!debug.contains(secret), "Debug shows {secret}: {debug}");
+        for (_, _, value) in credentials {
+            assert!(!debug.contains(value), "Debug shows {value}: {debug}");
         }
         assert!(debug.contains("\"sasl.password\""), "Debug keeps key names");
         assert!(debug.contains("SCRAM-SHA-512"), "Debug keeps other values");
