@@ -1529,7 +1529,7 @@ mod tests {
             headers: Vec::new(),
             metadata: crate::transport::RecordMeta {
                 timestamp_ms: None,
-                format: PayloadFormat::Json,
+                format: crate::transport::PayloadFormat::Json,
             },
         };
         tiered.send(&record).await.expect("spooled on the 500");
