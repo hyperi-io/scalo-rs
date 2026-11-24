@@ -20,10 +20,12 @@
 //!
 //! ## Available Profiles
 //!
-//! - **`production`**: High-throughput, PB/day workloads. Large queues, cooperative
-//!   rebalancing, disabled CRC checks, optimized fetch parameters.
-//! - **`devtest`**: Development and testing. Relaxed SSL validation, smaller queues,
-//!   faster reconnection, debug-friendly settings.
+//! - **`production`** ([`PRODUCTION_PROFILE`]): cooperative rebalancing, 1 MiB
+//!   fetches, offsets committed by the service.
+//! - **`devtest`** ([`DEVTEST_PROFILE`]): smaller queues, fast reconnects,
+//!   connection-close logging, and certificate verification off.
+//!
+//! Both are defined in [`crate::kafka_config`], with the producer profiles.
 //!
 //! ## Example YAML Config
 //!
@@ -1069,209 +1071,22 @@ impl std::fmt::Display for KafkaProfile {
 }
 
 // ============================================================================
-// Merge Helper
-// ============================================================================
-
-/// Merge profile defaults with user overrides.
-///
-/// Starts with `profile` defaults, then applies `overrides` on top.
-/// User overrides always win. Returns the final merged map.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use std::collections::HashMap;
-/// use scalo::transport::kafka::config::{merge_with_overrides, PRODUCTION_PROFILE};
-///
-/// let mut overrides = HashMap::new();
-/// overrides.insert("fetch.min.bytes".to_string(), "2097152".to_string());
-///
-/// let merged = merge_with_overrides(PRODUCTION_PROFILE, &overrides);
-/// assert_eq!(merged.get("fetch.min.bytes").unwrap(), "2097152");
-/// assert_eq!(merged.get("partition.assignment.strategy").unwrap(), "cooperative-sticky");
-/// ```
-#[must_use]
-pub fn merge_with_overrides<S: std::hash::BuildHasher>(
-    profile: &[(&str, &str)],
-    overrides: &HashMap<String, String, S>,
-) -> HashMap<String, String> {
-    let mut config = HashMap::with_capacity(profile.len() + overrides.len());
-
-    for (key, value) in profile {
-        config.insert((*key).to_string(), (*value).to_string());
-    }
-    for (key, value) in overrides {
-        config.insert(key.clone(), value.clone());
-    }
-
-    config
-}
-
-// ============================================================================
 // Profile Defaults
 // ============================================================================
 
-/// Production consumer profile -- lean baseline.
-///
-/// Only settings that differ from librdkafka defaults with clear justification.
-/// Services override on an exception basis via `librdkafka_overrides`.
-///
-/// | Setting | Value | librdkafka default | Why |
-/// |---|---|---|---|
-/// | `partition.assignment.strategy` | `cooperative-sticky` | `range,roundrobin` | KIP-429: avoids stop-the-world rebalances |
-/// | `fetch.min.bytes` | 1 MiB | 1 byte | Batch fetches for throughput |
-/// | `fetch.wait.max.ms` | 100 ms | 500 ms | Bound latency when fetch.min.bytes not met |
-/// | `queued.min.messages` | 20000 | 100000 | 10-20K batches are most efficient |
-/// | `enable.auto.commit` | false | true | data-plane services manage offset commits |
-/// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
-pub const PRODUCTION_PROFILE: &[(&str, &str)] = &[
-    ("partition.assignment.strategy", "cooperative-sticky"),
-    ("fetch.min.bytes", "1048576"),
-    ("fetch.wait.max.ms", "100"),
-    ("queued.min.messages", "20000"),
-    ("enable.auto.commit", "false"),
-    ("statistics.interval.ms", "1000"),
-];
-
-/// Development/test consumer profile -- minimal latency, low memory.
-///
-/// Inherits the same "only non-defaults" philosophy. Optimised for fast
-/// iteration on developer machines: no fetch batching, smaller queues,
-/// fast reconnects, debug logging.
-///
-/// | Setting | Value | librdkafka default | Why |
-/// |---|---|---|---|
-/// | `partition.assignment.strategy` | `cooperative-sticky` | `range,roundrobin` | Consistent across all environments |
-/// | `queued.min.messages` | 1000 | 100000 | Lower memory for dev machines |
-/// | `enable.auto.commit` | false | true | data-plane services manage commits |
-/// | `reconnect.backoff.ms` | 10 ms | 100 ms | Fast reconnect for quick iteration |
-/// | `reconnect.backoff.max.ms` | 100 ms | 10000 ms | Cap quickly |
-/// | `log.connection.close` | true | false | Debug-friendly |
-/// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable metrics even in dev |
-pub const DEVTEST_PROFILE: &[(&str, &str)] = &[
-    ("partition.assignment.strategy", "cooperative-sticky"),
-    ("queued.min.messages", "1000"),
-    ("enable.auto.commit", "false"),
-    ("reconnect.backoff.ms", "10"),
-    ("reconnect.backoff.max.ms", "100"),
-    ("log.connection.close", "true"),
-    ("statistics.interval.ms", "1000"),
-];
-
-// ============================================================================
-// Producer Profile Defaults
-// ============================================================================
-
-/// High-throughput producer -- lean baseline.
-///
-/// Only settings that differ from librdkafka defaults and that the sizing
-/// surface leaves alone. Batching, codec, queue size and delivery settings
-/// come from [`KafkaSizingConfig`], which every producer path applies after
-/// this constant. Services override via `librdkafka_overrides`.
-///
-/// | Setting | Value | librdkafka default | Why |
-/// |---|---|---|---|
-/// | `socket.nagle.disable` | true | false | Kafka batches at app level |
-/// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
-pub const PRODUCER_HIGH_THROUGHPUT: &[(&str, &str)] = &[
-    ("socket.nagle.disable", "true"),
-    ("statistics.interval.ms", "1000"),
-];
-
-/// Exactly-once producer -- idempotence + ordering.
-///
-/// The delivery invariants are explicit here. The sizing surface, applied
-/// after this constant, also sets `enable.idempotence` and
-/// `max.in.flight.requests.per.connection` on every path, and `acks` while
-/// idempotence is on. The table holds while `sizing.producer.idempotence` is
-/// unset or `true`, the default. With it `false` the producer is not
-/// idempotent whatever this profile says. Batching and codec come from the
-/// sizing surface.
-///
-/// | Setting | Value | librdkafka default | Why |
-/// |---|---|---|---|
-/// | `enable.idempotence` | true | false | Exactly-once within partition |
-/// | `acks` | all | all (-1) | Invariant for EOS (explicit) |
-/// | `max.in.flight.requests.per.connection` | 5 | 1000000 | Max for idempotent producer |
-/// | `socket.nagle.disable` | true | false | Kafka batches at app level |
-/// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
-pub const PRODUCER_EXACTLY_ONCE: &[(&str, &str)] = &[
-    ("enable.idempotence", "true"),
-    ("acks", "all"),
-    ("max.in.flight.requests.per.connection", "5"),
-    ("socket.nagle.disable", "true"),
-    ("statistics.interval.ms", "1000"),
-];
-
-/// Low-latency producer -- leader-ack only.
-///
-/// `acks=1` takes effect only with `sizing.producer.idempotence: false`: the
-/// idempotent producer, on by default, requires `acks=all`, and the sizing
-/// surface sets it after this constant. The batching delay comes from the
-/// sizing profile, and `low_latency` lingers 0 ms.
-///
-/// | Setting | Value | librdkafka default | Why |
-/// |---|---|---|---|
-/// | `acks` | 1 | all (-1) | Leader ack only for speed |
-/// | `socket.nagle.disable` | true | false | No TCP coalescing |
-/// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
-pub const PRODUCER_LOW_LATENCY: &[(&str, &str)] = &[
-    ("acks", "1"),
-    ("socket.nagle.disable", "true"),
-    ("statistics.interval.ms", "1000"),
-];
-
-/// DevTest producer -- fast acks.
-///
-/// `acks=1` takes effect only with `sizing.producer.idempotence: false`, as
-/// for [`PRODUCER_LOW_LATENCY`]. Batching and codec come from the sizing
-/// surface.
-///
-/// | Setting | Value | librdkafka default | Why |
-/// |---|---|---|---|
-/// | `acks` | 1 | all (-1) | Faster for dev |
-/// | `socket.nagle.disable` | true | false | No TCP coalescing |
-/// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics in dev |
-pub const PRODUCER_DEVTEST: &[(&str, &str)] = &[
-    ("acks", "1"),
-    ("socket.nagle.disable", "true"),
-    ("statistics.interval.ms", "1000"),
-];
+pub use crate::kafka_config::{
+    CONSUMER_DEVTEST as DEVTEST_PROFILE, CONSUMER_LOW_LATENCY as LOW_LATENCY_CONSUMER_DEFAULTS,
+    CONSUMER_PRODUCTION as PRODUCTION_PROFILE, PRODUCER_DEVTEST, PRODUCER_EXACTLY_ONCE,
+    PRODUCER_LOW_LATENCY, PRODUCER_PRODUCTION as PRODUCER_HIGH_THROUGHPUT, merge_with_overrides,
+};
 
 /// Legacy producer defaults -- now aliases `PRODUCER_HIGH_THROUGHPUT`.
 #[deprecated(since = "2.0.0", note = "Use PRODUCER_HIGH_THROUGHPUT instead")]
 pub const PRODUCER_DEFAULTS: &[(&str, &str)] = PRODUCER_HIGH_THROUGHPUT;
 
-// ============================================================================
-// Legacy Constants (for backward compatibility)
-// ============================================================================
-
 /// Alias for `PRODUCTION_PROFILE` (backward compatibility).
 #[deprecated(since = "2.0.0", note = "Use PRODUCTION_PROFILE instead")]
 pub const HIGH_THROUGHPUT_CONSUMER_DEFAULTS: &[(&str, &str)] = PRODUCTION_PROFILE;
-
-/// Low-latency consumer -- minimal fetch delay.
-///
-/// Only settings that differ from librdkafka defaults.
-///
-/// | Setting | Value | librdkafka default | Why |
-/// |---|---|---|---|
-/// | `partition.assignment.strategy` | `cooperative-sticky` | `range,roundrobin` | Consistent across envs |
-/// | `fetch.wait.max.ms` | 10 ms | 500 ms | Return quickly |
-/// | `queued.min.messages` | 1000 | 100000 | Smaller pre-fetch queue |
-/// | `enable.auto.commit` | false | true | the data plane manages commits |
-/// | `reconnect.backoff.ms` | 10 ms | 100 ms | Fast reconnect |
-/// | `reconnect.backoff.max.ms` | 100 ms | 10000 ms | Cap quickly |
-/// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
-pub const LOW_LATENCY_CONSUMER_DEFAULTS: &[(&str, &str)] = &[
-    ("partition.assignment.strategy", "cooperative-sticky"),
-    ("fetch.wait.max.ms", "10"),
-    ("queued.min.messages", "1000"),
-    ("enable.auto.commit", "false"),
-    ("reconnect.backoff.ms", "10"),
-    ("reconnect.backoff.max.ms", "100"),
-    ("statistics.interval.ms", "1000"),
-];
 
 // ============================================================================
 // Configuration Struct
@@ -1501,18 +1316,6 @@ pub struct KafkaConfig {
     #[serde(default = "default_max_poll_interval")]
     pub max_poll_interval_ms: u32,
 
-    /// Fetch minimum bytes.
-    #[serde(default = "default_fetch_min_bytes")]
-    pub fetch_min_bytes: i32,
-
-    /// Fetch maximum bytes.
-    #[serde(default = "default_fetch_max_bytes")]
-    pub fetch_max_bytes: i32,
-
-    /// Maximum messages per partition per poll.
-    #[serde(default = "default_max_partition_fetch_bytes")]
-    pub max_partition_fetch_bytes: i32,
-
     /// Auto offset reset (earliest, latest, none).
     #[serde(default = "default_auto_offset_reset")]
     pub auto_offset_reset: String,
@@ -1654,9 +1457,6 @@ impl fmt::Debug for KafkaConfig {
             .field("session_timeout_ms", &self.session_timeout_ms)
             .field("heartbeat_interval_ms", &self.heartbeat_interval_ms)
             .field("max_poll_interval_ms", &self.max_poll_interval_ms)
-            .field("fetch_min_bytes", &self.fetch_min_bytes)
-            .field("fetch_max_bytes", &self.fetch_max_bytes)
-            .field("max_partition_fetch_bytes", &self.max_partition_fetch_bytes)
             .field("auto_offset_reset", &self.auto_offset_reset)
             .field("enable_partition_eof", &self.enable_partition_eof)
             .field("sizing", &self.sizing)
@@ -1734,18 +1534,6 @@ fn default_max_poll_interval() -> u32 {
     300_000
 }
 
-fn default_fetch_min_bytes() -> i32 {
-    1
-}
-
-fn default_fetch_max_bytes() -> i32 {
-    52_428_800 // 50 MB
-}
-
-fn default_max_partition_fetch_bytes() -> i32 {
-    1_048_576 // 1 MB
-}
-
 fn default_auto_offset_reset() -> String {
     "earliest".to_string()
 }
@@ -1793,9 +1581,6 @@ impl Default for KafkaConfig {
             session_timeout_ms: default_session_timeout(),
             heartbeat_interval_ms: default_heartbeat_interval(),
             max_poll_interval_ms: default_max_poll_interval(),
-            fetch_min_bytes: default_fetch_min_bytes(),
-            fetch_max_bytes: default_fetch_max_bytes(),
-            max_partition_fetch_bytes: default_max_partition_fetch_bytes(),
             auto_offset_reset: default_auto_offset_reset(),
             enable_partition_eof: false,
             sizing: KafkaSizingConfig::default(),
@@ -1865,7 +1650,7 @@ impl KafkaConfig {
     ///
     /// Order of precedence (lowest to highest):
     /// 1. Profile defaults
-    /// 2. Explicit config fields (fetch_min_bytes, etc.)
+    /// 2. Explicit config fields (`session_timeout_ms`, etc.)
     /// 3. `extra_config` (legacy, deprecated)
     /// 4. `librdkafka_overrides` (highest priority)
     #[must_use]
@@ -1898,6 +1683,49 @@ impl KafkaConfig {
     pub(crate) fn resolved_producer_settings(&self) -> BTreeMap<String, String> {
         self.sizing
             .producer_map_under(raw_layer(&self.librdkafka_overrides))
+    }
+
+    /// The consumer settings every consumer path applies after its connection
+    /// and group: profile defaults, the explicit consumer fields,
+    /// `extra_config`, the sizing surface, then `librdkafka_overrides`, which
+    /// wins. A key replaces its other librdkafka name from the layers below it.
+    #[allow(deprecated)]
+    pub(crate) fn resolved_consumer_settings(&self) -> BTreeMap<String, String> {
+        let fields = [
+            ("enable.auto.commit", self.enable_auto_commit.to_string()),
+            (
+                "auto.commit.interval.ms",
+                self.auto_commit_interval_ms.to_string(),
+            ),
+            ("session.timeout.ms", self.session_timeout_ms.to_string()),
+            (
+                "heartbeat.interval.ms",
+                self.heartbeat_interval_ms.to_string(),
+            ),
+            (
+                "max.poll.interval.ms",
+                self.max_poll_interval_ms.to_string(),
+            ),
+            ("auto.offset.reset", self.auto_offset_reset.clone()),
+            (
+                "enable.partition.eof",
+                self.enable_partition_eof.to_string(),
+            ),
+        ];
+        let fields: RawLayer<'_> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let sizing = self.sizing.resolved_consumer_map();
+        let mut map = BTreeMap::new();
+        overlay_raw_layers(
+            &mut map,
+            &[
+                self.profile_defaults().to_vec(),
+                fields,
+                raw_layer(&self.extra_config),
+                raw_layer(&sizing),
+                raw_layer(&self.librdkafka_overrides),
+            ],
+        );
+        map
     }
 
     /// Add a librdkafka override.
@@ -3791,34 +3619,193 @@ mod tests {
         );
     }
 
-    /// The producer profile constants are laid under the sizing surface, so a
-    /// batching or codec key in one would read as a setting and never take
-    /// effect.
+    type Pairs = &'static [(&'static str, &'static str)];
+
+    /// `PRODUCTION_PROFILE`'s keys.
+    const PRODUCTION: Pairs = &[
+        ("partition.assignment.strategy", "cooperative-sticky"),
+        ("fetch.min.bytes", "1048576"),
+        ("fetch.wait.max.ms", "100"),
+        ("queued.min.messages", "20000"),
+        ("enable.auto.commit", "false"),
+        ("statistics.interval.ms", "1000"),
+    ];
+
+    /// `DEVTEST_PROFILE`'s keys.
+    const DEVTEST: Pairs = &[
+        ("partition.assignment.strategy", "cooperative-sticky"),
+        ("queued.min.messages", "1000"),
+        ("enable.auto.commit", "false"),
+        ("reconnect.backoff.ms", "10"),
+        ("reconnect.backoff.max.ms", "100"),
+        ("log.connection.close", "true"),
+        ("statistics.interval.ms", "1000"),
+    ];
+
+    /// The explicit consumer fields' defaults.
+    const CONSUMER_FIELDS: Pairs = &[
+        ("auto.commit.interval.ms", "5000"),
+        ("auto.offset.reset", "earliest"),
+        ("enable.auto.commit", "false"),
+        ("enable.partition.eof", "false"),
+        ("heartbeat.interval.ms", "3000"),
+        ("max.poll.interval.ms", "300000"),
+        ("session.timeout.ms", "45000"),
+    ];
+
+    const AUTO_COMMIT: Pairs = &[("enable.auto.commit", "true")];
+
+    /// The default sizing surface's producer map.
+    const PRODUCER_SIZING: Pairs = &[
+        ("acks", "all"),
+        ("batch.size", "131072"),
+        ("compression.level", "3"),
+        ("compression.type", "zstd"),
+        ("enable.idempotence", "true"),
+        ("linger.ms", "20"),
+        ("max.in.flight.requests.per.connection", "5"),
+        ("message.max.bytes", "16777216"),
+        ("queue.buffering.max.kbytes", "65536"),
+        ("sticky.partitioning.linger.ms", "20"),
+    ];
+
+    /// The default sizing surface's consumer map.
+    const CONSUMER_SIZING: Pairs = &[
+        ("fetch.max.bytes", "52428800"),
+        ("fetch.min.bytes", "1048576"),
+        ("fetch.wait.max.ms", "50"),
+        ("max.partition.fetch.bytes", "1048576"),
+    ];
+
+    /// Each profile's own keys, and the map it resolves to as every scalo
+    /// client lays it: a consumer profile under the explicit consumer fields
+    /// and the sizing surface, a producer profile under the sizing surface. A
+    /// producer profile names no batching or codec key, since the sizing
+    /// surface sets them all.
     #[test]
-    fn producer_profiles_leave_batching_and_codec_to_the_sizing_surface() {
-        const SIZING_OWNED: &[&str] = &[
-            "batch.size",
-            "linger.ms",
-            "queue.buffering.max.ms",
-            "compression.type",
-            "compression.codec",
-            "compression.level",
-            "queue.buffering.max.kbytes",
-            "message.max.bytes",
-            "sticky.partitioning.linger.ms",
-        ];
-        for (name, profile) in [
-            ("PRODUCER_HIGH_THROUGHPUT", PRODUCER_HIGH_THROUGHPUT),
-            ("PRODUCER_EXACTLY_ONCE", PRODUCER_EXACTLY_ONCE),
-            ("PRODUCER_LOW_LATENCY", PRODUCER_LOW_LATENCY),
-            ("PRODUCER_DEVTEST", PRODUCER_DEVTEST),
-        ] {
-            for (key, _) in profile {
-                assert!(
-                    !SIZING_OWNED.contains(key),
-                    "{name} names {key}, which the sizing surface always sets"
-                );
+    fn every_profile_resolves_under_the_sizing_surface() {
+        let map = |pairs: Pairs| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|&(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let consumer = |profile: KafkaProfile, enable_auto_commit: bool| {
+            KafkaConfig {
+                profile,
+                enable_auto_commit,
+                ..Default::default()
             }
+            .resolved_consumer_settings()
+        };
+        let producer = |profile: Pairs| {
+            let mut resolved = map(profile);
+            resolved.extend(KafkaConfig::default().resolved_producer_settings());
+            resolved
+        };
+        let mut low_latency = map(LOW_LATENCY_CONSUMER_DEFAULTS);
+        low_latency.extend(KafkaSizingConfig::default().resolved_consumer_map());
+
+        let cases: [(&str, Pairs, Pairs, BTreeMap<String, String>, &[Pairs]); 9] = [
+            (
+                "PRODUCTION_PROFILE",
+                PRODUCTION_PROFILE,
+                PRODUCTION,
+                consumer(KafkaProfile::Production, false),
+                &[CONSUMER_FIELDS, CONSUMER_SIZING],
+            ),
+            (
+                "PRODUCTION_PROFILE under enable_auto_commit",
+                PRODUCTION_PROFILE,
+                PRODUCTION,
+                consumer(KafkaProfile::Production, true),
+                &[CONSUMER_FIELDS, AUTO_COMMIT, CONSUMER_SIZING],
+            ),
+            (
+                "DEVTEST_PROFILE",
+                DEVTEST_PROFILE,
+                DEVTEST,
+                consumer(KafkaProfile::DevTest, false),
+                &[CONSUMER_FIELDS, CONSUMER_SIZING],
+            ),
+            (
+                "DEVTEST_PROFILE under enable_auto_commit",
+                DEVTEST_PROFILE,
+                DEVTEST,
+                consumer(KafkaProfile::DevTest, true),
+                &[CONSUMER_FIELDS, AUTO_COMMIT, CONSUMER_SIZING],
+            ),
+            (
+                "LOW_LATENCY_CONSUMER_DEFAULTS",
+                LOW_LATENCY_CONSUMER_DEFAULTS,
+                &[
+                    ("partition.assignment.strategy", "cooperative-sticky"),
+                    ("fetch.wait.max.ms", "10"),
+                    ("queued.min.messages", "1000"),
+                    ("enable.auto.commit", "false"),
+                    ("reconnect.backoff.ms", "10"),
+                    ("reconnect.backoff.max.ms", "100"),
+                    ("statistics.interval.ms", "1000"),
+                ],
+                low_latency,
+                &[CONSUMER_SIZING],
+            ),
+            (
+                "PRODUCER_HIGH_THROUGHPUT",
+                PRODUCER_HIGH_THROUGHPUT,
+                &[
+                    ("socket.nagle.disable", "true"),
+                    ("statistics.interval.ms", "1000"),
+                ],
+                producer(PRODUCER_HIGH_THROUGHPUT),
+                &[PRODUCER_SIZING],
+            ),
+            (
+                "PRODUCER_EXACTLY_ONCE",
+                PRODUCER_EXACTLY_ONCE,
+                &[
+                    ("enable.idempotence", "true"),
+                    ("acks", "all"),
+                    ("max.in.flight.requests.per.connection", "5"),
+                    ("socket.nagle.disable", "true"),
+                    ("statistics.interval.ms", "1000"),
+                ],
+                producer(PRODUCER_EXACTLY_ONCE),
+                &[PRODUCER_SIZING],
+            ),
+            (
+                "PRODUCER_LOW_LATENCY",
+                PRODUCER_LOW_LATENCY,
+                &[
+                    ("acks", "1"),
+                    ("socket.nagle.disable", "true"),
+                    ("statistics.interval.ms", "1000"),
+                ],
+                producer(PRODUCER_LOW_LATENCY),
+                &[PRODUCER_SIZING],
+            ),
+            (
+                "PRODUCER_DEVTEST",
+                PRODUCER_DEVTEST,
+                &[
+                    ("acks", "1"),
+                    ("socket.nagle.disable", "true"),
+                    ("statistics.interval.ms", "1000"),
+                ],
+                producer(PRODUCER_DEVTEST),
+                &[PRODUCER_SIZING],
+            ),
+        ];
+
+        for (name, profile, own, resolved, layers) in cases {
+            assert_eq!(profile.len(), own.len(), "{name} names a key twice");
+            assert_eq!(map(profile), map(own), "{name}");
+
+            let mut expected = map(own);
+            for &layer in layers {
+                expected.extend(map(layer));
+            }
+            assert_eq!(resolved, expected, "{name} resolved");
         }
     }
 

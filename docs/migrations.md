@@ -14,6 +14,32 @@ release and the target before bumping.
 
 **Consumer adjustment** -- a service that sends or receives gRPC zstd enables `compression` beside `transport-grpc`.
 
+### `kafka_config`'s producer profiles name no batching or codec key (BEHAVIOUR CHANGE)
+
+The Kafka profile constants are defined once, in `kafka_config`, and `transport::kafka` re-exports them under its names: `PRODUCTION_PROFILE` is `CONSUMER_PRODUCTION`, `DEVTEST_PROFILE` is `CONSUMER_DEVTEST`, `LOW_LATENCY_CONSUMER_DEFAULTS` is `CONSUMER_LOW_LATENCY` and `PRODUCER_HIGH_THROUGHPUT` is `PRODUCER_PRODUCTION`. Nothing under `transport::kafka` changes value. Three `kafka_config` producer profiles drop the keys the sizing surface owns:
+
+| Profile | Dropped |
+| --- | --- |
+| `PRODUCER_PRODUCTION` | `linger.ms=100`, `compression.type=zstd` |
+| `PRODUCER_EXACTLY_ONCE` | `linger.ms=20`, `compression.type=zstd` |
+| `PRODUCER_LOW_LATENCY` | `linger.ms=0`, `compression.type=lz4` |
+
+A scalo producer never ran these: every producer path lays the sizing surface over the profile, and the `throughput` default lingers 20 ms with zstd at level 3.
+
+**Consumer adjustment** -- code that hands one of these maps to a client scalo doesn't build, such as a generated Vector config, now gets librdkafka's own `linger.ms` and codec, or its own. To produce as a scalo producer does, lay `KafkaSizingConfig::default().resolved_producer_map()` (`transport-kafka-config`) over the profile, or set the two keys itself.
+
+### A Kafka consumer's explicit fields win over its profile (BEHAVIOUR CHANGE)
+
+The consumer laid the `KafkaProfile` keys over `KafkaConfig`'s explicit consumer fields, so `enable_auto_commit: true` lost to both profiles' `enable.auto.commit=false` and never took effect. The profile now goes first and the fields over it, as `build_librdkafka_config` documents. The defaults are unchanged: both profiles and the field say `false`.
+
+**Consumer adjustment** -- a consumer with `enable_auto_commit: true` now auto-commits. Drop the field where the code commits by hand.
+
+### `KafkaConfig` loses its three fetch-size fields (API CHANGE)
+
+`KafkaConfig.fetch_min_bytes`, `fetch_max_bytes` and `max_partition_fetch_bytes` are gone. The consumer sizing map set all three after them, so none ever reached librdkafka. The config loader logs a YAML key that still names one and skips it.
+
+**Consumer adjustment** -- set `kafka.sizing.consumer.fetch_min_bytes`, `kafka.sizing.consumer.fetch_max_bytes` or `kafka.sizing.consumer.max_partition_fetch_bytes`, and drop the old field from struct literals.
+
 ## 2.14.36
 
 ### Every compression setting is one `{codec, level}` key, `scalo::compression` (API and BEHAVIOUR CHANGE)

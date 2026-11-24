@@ -569,6 +569,14 @@ mod tests {
         const KAFKA: Accepts = Accepts::new("kafka.compression", &Codec::ALL).external();
         let snappy_missing = (!cfg!(feature = "compression-snappy"))
             .then_some("test.compression: codec snappy needs scalo's `compression-snappy` feature");
+        // An engine this build lacks is refused before the level is read.
+        let engine = |compiled: &'static str, missing: &'static str| {
+            Some(if cfg!(feature = "compression") {
+                compiled
+            } else {
+                missing
+            })
+        };
         let rows: [(Accepts, Compression, Option<&str>); 9] = [
             (GRPC, Compression::new(Codec::None), None),
             (
@@ -581,22 +589,34 @@ mod tests {
             (
                 GRPC,
                 Compression::new(Codec::Gzip).with_level(6),
-                Some("grpc.compression: gzip takes no level here"),
+                engine(
+                    "grpc.compression: gzip takes no level here",
+                    "grpc.compression: codec gzip needs scalo's `compression` feature",
+                ),
             ),
             (
                 ALL_LEVELS,
                 Compression::new(Codec::Zstd).with_level(23),
-                Some("test.compression: zstd level 23 is outside 1-22"),
+                engine(
+                    "test.compression: zstd level 23 is outside 1-22",
+                    "test.compression: codec zstd needs scalo's `compression` feature",
+                ),
             ),
             (
                 ALL_LEVELS,
                 Compression::new(Codec::Gzip).with_level(0),
-                Some("test.compression: gzip level 0 is outside 1-9"),
+                engine(
+                    "test.compression: gzip level 0 is outside 1-9",
+                    "test.compression: codec gzip needs scalo's `compression` feature",
+                ),
             ),
             (
                 ALL_LEVELS,
                 Compression::new(Codec::Lz4).with_level(1),
-                Some("test.compression: lz4 takes no level here"),
+                engine(
+                    "test.compression: lz4 takes no level here",
+                    "test.compression: codec lz4 needs scalo's `compression` feature",
+                ),
             ),
             (
                 ALL_LEVELS,

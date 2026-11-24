@@ -855,11 +855,19 @@ mod tests {
             return;
         }
         let exe = std::env::current_exe().expect("test binary path");
-        let output = std::process::Command::new(exe)
-            .args([name, "--exact"])
-            .env(CHILD, "1")
-            .output()
-            .expect("run the test in a process of its own");
+        // Spawned under temp-env's lock, so the child never inherits another test's scoped `APP_ENV`.
+        let child = temp_env::with_vars([] as [(&str, Option<&str>); 0], || {
+            std::process::Command::new(exe)
+                .args([name, "--exact"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("run the test in a process of its own")
+        });
+        let output = child
+            .wait_with_output()
+            .expect("the test's own process ran");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && stdout.contains("test result: ok. 1 passed"),

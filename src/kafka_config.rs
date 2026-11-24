@@ -14,6 +14,11 @@
 //! with `config`, `directory-config` or `deployment`) and JSON the `config`
 //! feature.
 //!
+//! The profiles are defined here only. `transport::kafka` re-exports them,
+//! with `CONSUMER_PRODUCTION`, `CONSUMER_DEVTEST`, `CONSUMER_LOW_LATENCY` and
+//! `PRODUCER_PRODUCTION` named `PRODUCTION_PROFILE`, `DEVTEST_PROFILE`,
+//! `LOW_LATENCY_CONSUMER_DEFAULTS` and `PRODUCER_HIGH_THROUGHPUT` there.
+//!
 //! ## Loading from Config Git Directory
 //!
 //! Services store librdkafka settings in their config git directory and load
@@ -268,60 +273,65 @@ pub const CONSUMER_LOW_LATENCY: &[(&str, &str)] = &[
 // Producer Profiles
 // ============================================================================
 
-/// Production producer baseline -- high throughput, zstd compression.
+/// Production producer baseline, `PRODUCER_HIGH_THROUGHPUT` in
+/// `transport::kafka`.
+///
+/// No producer profile names a batching or codec key: the sizing surface
+/// (`transport::kafka::KafkaSizingConfig`) sets those on every scalo producer
+/// path, after the profile. A client scalo doesn't build gets librdkafka's
+/// own `linger.ms` and codec unless it lays
+/// `KafkaSizingConfig::default().resolved_producer_map()` over this, which
+/// gives `throughput`'s 20 ms and zstd at level 3.
 ///
 /// | Setting | Value | librdkafka Default | Why |
 /// |---|---|---|---|
-/// | `linger.ms` | 100 ms | 5 ms | Accumulate larger batches |
-/// | `compression.type` | zstd | none | Best ratio with good CPU |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 (disabled) | Enable Prometheus metrics |
 pub const PRODUCER_PRODUCTION: &[(&str, &str)] = &[
-    ("linger.ms", "100"),
-    ("compression.type", "zstd"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
 
 /// Exactly-once producer -- idempotence + ordering.
 ///
+/// The sizing surface, applied after this, also sets `enable.idempotence`,
+/// `max.in.flight.requests.per.connection` and, while idempotence is on,
+/// `acks`. With `sizing.producer.idempotence: false` the producer is not
+/// idempotent whatever this profile says.
+///
 /// | Setting | Value | librdkafka Default | Why |
 /// |---|---|---|---|
 /// | `enable.idempotence` | true | false | Exactly-once within partition |
 /// | `acks` | all | all (-1) | Invariant for EOS (explicit) |
 /// | `max.in.flight.requests.per.connection` | 5 | 1000000 | Max for idempotent producer |
-/// | `linger.ms` | 20 ms | 5 ms | Moderate batching |
-/// | `compression.type` | zstd | none | Best ratio |
 /// | `socket.nagle.disable` | true | false | Kafka batches at app level |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
 pub const PRODUCER_EXACTLY_ONCE: &[(&str, &str)] = &[
     ("enable.idempotence", "true"),
     ("acks", "all"),
     ("max.in.flight.requests.per.connection", "5"),
-    ("linger.ms", "20"),
-    ("compression.type", "zstd"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
 
-/// Low-latency producer -- minimal delay, leader-ack only.
+/// Low-latency producer -- leader-ack only.
+///
+/// `acks=1` takes effect only with `sizing.producer.idempotence: false`: the
+/// idempotent producer, on by default, requires `acks=all`, and the sizing
+/// surface sets it after this. The `low_latency` sizing profile lingers 0 ms.
 ///
 /// | Setting | Value | librdkafka Default | Why |
 /// |---|---|---|---|
 /// | `acks` | 1 | all (-1) | Leader ack only for speed |
-/// | `linger.ms` | 0 ms | 5 ms | Send immediately |
-/// | `compression.type` | lz4 | none | LZ4 is fastest codec |
 /// | `socket.nagle.disable` | true | false | No TCP coalescing |
 /// | `statistics.interval.ms` | 1000 ms | 0 | Enable metrics |
 pub const PRODUCER_LOW_LATENCY: &[(&str, &str)] = &[
     ("acks", "1"),
-    ("linger.ms", "0"),
-    ("compression.type", "lz4"),
     ("socket.nagle.disable", "true"),
     ("statistics.interval.ms", "1000"),
 ];
 
-/// DevTest producer -- fast acks, no compression.
+/// DevTest producer -- fast acks, as [`PRODUCER_LOW_LATENCY`].
 ///
 /// | Setting | Value | librdkafka Default | Why |
 /// |---|---|---|---|
@@ -566,28 +576,6 @@ impl KafkaSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn consumer_production_only_non_defaults() {
-        assert_eq!(CONSUMER_PRODUCTION.len(), 6);
-        let map: HashMap<&str, &str> = CONSUMER_PRODUCTION.iter().copied().collect();
-        assert_eq!(map["partition.assignment.strategy"], "cooperative-sticky");
-        assert_eq!(map["fetch.min.bytes"], "1048576");
-        assert_eq!(map["fetch.wait.max.ms"], "100");
-        assert_eq!(map["queued.min.messages"], "20000");
-        assert_eq!(map["enable.auto.commit"], "false");
-        assert_eq!(map["statistics.interval.ms"], "1000");
-    }
-
-    #[test]
-    fn producer_production_only_non_defaults() {
-        assert_eq!(PRODUCER_PRODUCTION.len(), 4);
-        let map: HashMap<&str, &str> = PRODUCER_PRODUCTION.iter().copied().collect();
-        assert_eq!(map["linger.ms"], "100");
-        assert_eq!(map["compression.type"], "zstd");
-        assert_eq!(map["socket.nagle.disable"], "true");
-        assert_eq!(map["statistics.interval.ms"], "1000");
-    }
 
     #[test]
     fn merge_user_overrides_win() {
