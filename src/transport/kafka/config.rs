@@ -1715,6 +1715,55 @@ impl KafkaConfig {
             .producer_map_under(raw_layer(&self.librdkafka_overrides))
     }
 
+    /// The consumer settings every consumer path applies after its connection
+    /// and group: profile defaults, the explicit consumer fields,
+    /// `extra_config`, the sizing surface, then `librdkafka_overrides`, which
+    /// wins. A key replaces its other librdkafka name from the layers below it.
+    #[allow(deprecated)]
+    pub(crate) fn resolved_consumer_settings(&self) -> BTreeMap<String, String> {
+        let fields = [
+            ("enable.auto.commit", self.enable_auto_commit.to_string()),
+            (
+                "auto.commit.interval.ms",
+                self.auto_commit_interval_ms.to_string(),
+            ),
+            ("session.timeout.ms", self.session_timeout_ms.to_string()),
+            (
+                "heartbeat.interval.ms",
+                self.heartbeat_interval_ms.to_string(),
+            ),
+            (
+                "max.poll.interval.ms",
+                self.max_poll_interval_ms.to_string(),
+            ),
+            ("fetch.min.bytes", self.fetch_min_bytes.to_string()),
+            ("fetch.max.bytes", self.fetch_max_bytes.to_string()),
+            (
+                "max.partition.fetch.bytes",
+                self.max_partition_fetch_bytes.to_string(),
+            ),
+            ("auto.offset.reset", self.auto_offset_reset.clone()),
+            (
+                "enable.partition.eof",
+                self.enable_partition_eof.to_string(),
+            ),
+        ];
+        let fields: RawLayer<'_> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let sizing = self.sizing.resolved_consumer_map();
+        let mut map = BTreeMap::new();
+        overlay_raw_layers(
+            &mut map,
+            &[
+                self.profile_defaults().to_vec(),
+                fields,
+                raw_layer(&self.extra_config),
+                raw_layer(&sizing),
+                raw_layer(&self.librdkafka_overrides),
+            ],
+        );
+        map
+    }
+
     /// Add a librdkafka override.
     ///
     /// This has the highest priority and will override profile defaults.
@@ -3606,70 +3655,124 @@ mod tests {
         );
     }
 
-    /// Each profile's own keys, and the map it resolves to with the default
-    /// sizing surface laid over it, as every scalo client lays it. A producer
-    /// profile names no batching or codec key, since the sizing surface sets
-    /// them all.
+    type Pairs = &'static [(&'static str, &'static str)];
+
+    /// `PRODUCTION_PROFILE`'s keys.
+    const PRODUCTION: Pairs = &[
+        ("partition.assignment.strategy", "cooperative-sticky"),
+        ("fetch.min.bytes", "1048576"),
+        ("fetch.wait.max.ms", "100"),
+        ("queued.min.messages", "20000"),
+        ("enable.auto.commit", "false"),
+        ("statistics.interval.ms", "1000"),
+    ];
+
+    /// `DEVTEST_PROFILE`'s keys.
+    const DEVTEST: Pairs = &[
+        ("partition.assignment.strategy", "cooperative-sticky"),
+        ("queued.min.messages", "1000"),
+        ("enable.auto.commit", "false"),
+        ("reconnect.backoff.ms", "10"),
+        ("reconnect.backoff.max.ms", "100"),
+        ("log.connection.close", "true"),
+        ("statistics.interval.ms", "1000"),
+    ];
+
+    /// The explicit consumer fields' defaults.
+    const CONSUMER_FIELDS: Pairs = &[
+        ("auto.commit.interval.ms", "5000"),
+        ("auto.offset.reset", "earliest"),
+        ("enable.auto.commit", "false"),
+        ("enable.partition.eof", "false"),
+        ("fetch.max.bytes", "52428800"),
+        ("fetch.min.bytes", "1"),
+        ("heartbeat.interval.ms", "3000"),
+        ("max.partition.fetch.bytes", "1048576"),
+        ("max.poll.interval.ms", "300000"),
+        ("session.timeout.ms", "45000"),
+    ];
+
+    const AUTO_COMMIT: Pairs = &[("enable.auto.commit", "true")];
+
+    /// The default sizing surface's producer map.
+    const PRODUCER_SIZING: Pairs = &[
+        ("acks", "all"),
+        ("batch.size", "131072"),
+        ("compression.level", "3"),
+        ("compression.type", "zstd"),
+        ("enable.idempotence", "true"),
+        ("linger.ms", "20"),
+        ("max.in.flight.requests.per.connection", "5"),
+        ("message.max.bytes", "16777216"),
+        ("queue.buffering.max.kbytes", "65536"),
+        ("sticky.partitioning.linger.ms", "20"),
+    ];
+
+    /// The default sizing surface's consumer map.
+    const CONSUMER_SIZING: Pairs = &[
+        ("fetch.max.bytes", "52428800"),
+        ("fetch.min.bytes", "1048576"),
+        ("fetch.wait.max.ms", "50"),
+        ("max.partition.fetch.bytes", "1048576"),
+    ];
+
+    /// Each profile's own keys, and the map it resolves to as every scalo
+    /// client lays it: a consumer profile under the explicit consumer fields
+    /// and the sizing surface, a producer profile under the sizing surface. A
+    /// producer profile names no batching or codec key, since the sizing
+    /// surface sets them all.
     #[test]
     fn every_profile_resolves_under_the_sizing_surface() {
-        type Pairs = &'static [(&'static str, &'static str)];
-        const PRODUCER_SIZING: Pairs = &[
-            ("acks", "all"),
-            ("batch.size", "131072"),
-            ("compression.level", "3"),
-            ("compression.type", "zstd"),
-            ("enable.idempotence", "true"),
-            ("linger.ms", "20"),
-            ("max.in.flight.requests.per.connection", "5"),
-            ("message.max.bytes", "16777216"),
-            ("queue.buffering.max.kbytes", "65536"),
-            ("sticky.partitioning.linger.ms", "20"),
-        ];
-        const CONSUMER_SIZING: Pairs = &[
-            ("fetch.max.bytes", "52428800"),
-            ("fetch.min.bytes", "1048576"),
-            ("fetch.wait.max.ms", "50"),
-            ("max.partition.fetch.bytes", "1048576"),
-        ];
         let map = |pairs: Pairs| -> BTreeMap<String, String> {
             pairs
                 .iter()
                 .map(|&(k, v)| (k.to_string(), v.to_string()))
                 .collect()
         };
-        let config = KafkaConfig::default();
-        let producer = config.resolved_producer_settings();
-        let consumer = config.sizing.resolved_consumer_map();
+        let consumer = |profile: KafkaProfile, enable_auto_commit: bool| {
+            KafkaConfig {
+                profile,
+                enable_auto_commit,
+                ..Default::default()
+            }
+            .resolved_consumer_settings()
+        };
+        let producer = |profile: Pairs| {
+            let mut resolved = map(profile);
+            resolved.extend(KafkaConfig::default().resolved_producer_settings());
+            resolved
+        };
+        let mut low_latency = map(LOW_LATENCY_CONSUMER_DEFAULTS);
+        low_latency.extend(KafkaSizingConfig::default().resolved_consumer_map());
 
-        let cases: [(&str, Pairs, Pairs, &BTreeMap<String, String>, Pairs); 7] = [
+        let cases: [(&str, Pairs, Pairs, BTreeMap<String, String>, &[Pairs]); 9] = [
             (
                 "PRODUCTION_PROFILE",
                 PRODUCTION_PROFILE,
-                &[
-                    ("partition.assignment.strategy", "cooperative-sticky"),
-                    ("fetch.min.bytes", "1048576"),
-                    ("fetch.wait.max.ms", "100"),
-                    ("queued.min.messages", "20000"),
-                    ("enable.auto.commit", "false"),
-                    ("statistics.interval.ms", "1000"),
-                ],
-                &consumer,
-                CONSUMER_SIZING,
+                PRODUCTION,
+                consumer(KafkaProfile::Production, false),
+                &[CONSUMER_FIELDS, CONSUMER_SIZING],
+            ),
+            (
+                "PRODUCTION_PROFILE under enable_auto_commit",
+                PRODUCTION_PROFILE,
+                PRODUCTION,
+                consumer(KafkaProfile::Production, true),
+                &[CONSUMER_FIELDS, AUTO_COMMIT, CONSUMER_SIZING],
             ),
             (
                 "DEVTEST_PROFILE",
                 DEVTEST_PROFILE,
-                &[
-                    ("partition.assignment.strategy", "cooperative-sticky"),
-                    ("queued.min.messages", "1000"),
-                    ("enable.auto.commit", "false"),
-                    ("reconnect.backoff.ms", "10"),
-                    ("reconnect.backoff.max.ms", "100"),
-                    ("log.connection.close", "true"),
-                    ("statistics.interval.ms", "1000"),
-                ],
-                &consumer,
-                CONSUMER_SIZING,
+                DEVTEST,
+                consumer(KafkaProfile::DevTest, false),
+                &[CONSUMER_FIELDS, CONSUMER_SIZING],
+            ),
+            (
+                "DEVTEST_PROFILE under enable_auto_commit",
+                DEVTEST_PROFILE,
+                DEVTEST,
+                consumer(KafkaProfile::DevTest, true),
+                &[CONSUMER_FIELDS, AUTO_COMMIT, CONSUMER_SIZING],
             ),
             (
                 "LOW_LATENCY_CONSUMER_DEFAULTS",
@@ -3683,8 +3786,8 @@ mod tests {
                     ("reconnect.backoff.max.ms", "100"),
                     ("statistics.interval.ms", "1000"),
                 ],
-                &consumer,
-                CONSUMER_SIZING,
+                low_latency,
+                &[CONSUMER_SIZING],
             ),
             (
                 "PRODUCER_HIGH_THROUGHPUT",
@@ -3693,8 +3796,8 @@ mod tests {
                     ("socket.nagle.disable", "true"),
                     ("statistics.interval.ms", "1000"),
                 ],
-                &producer,
-                PRODUCER_SIZING,
+                producer(PRODUCER_HIGH_THROUGHPUT),
+                &[PRODUCER_SIZING],
             ),
             (
                 "PRODUCER_EXACTLY_ONCE",
@@ -3706,8 +3809,8 @@ mod tests {
                     ("socket.nagle.disable", "true"),
                     ("statistics.interval.ms", "1000"),
                 ],
-                &producer,
-                PRODUCER_SIZING,
+                producer(PRODUCER_EXACTLY_ONCE),
+                &[PRODUCER_SIZING],
             ),
             (
                 "PRODUCER_LOW_LATENCY",
@@ -3717,8 +3820,8 @@ mod tests {
                     ("socket.nagle.disable", "true"),
                     ("statistics.interval.ms", "1000"),
                 ],
-                &producer,
-                PRODUCER_SIZING,
+                producer(PRODUCER_LOW_LATENCY),
+                &[PRODUCER_SIZING],
             ),
             (
                 "PRODUCER_DEVTEST",
@@ -3728,19 +3831,19 @@ mod tests {
                     ("socket.nagle.disable", "true"),
                     ("statistics.interval.ms", "1000"),
                 ],
-                &producer,
-                PRODUCER_SIZING,
+                producer(PRODUCER_DEVTEST),
+                &[PRODUCER_SIZING],
             ),
         ];
 
-        for (name, profile, own, sizing, sizing_expected) in cases {
+        for (name, profile, own, resolved, layers) in cases {
             assert_eq!(profile.len(), own.len(), "{name} names a key twice");
             assert_eq!(map(profile), map(own), "{name}");
 
-            let mut resolved = map(profile);
-            resolved.extend(sizing.clone());
             let mut expected = map(own);
-            expected.extend(map(sizing_expected));
+            for &layer in layers {
+                expected.extend(map(layer));
+            }
             assert_eq!(resolved, expected, "{name} resolved");
         }
     }

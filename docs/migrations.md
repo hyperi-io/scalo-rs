@@ -28,6 +28,12 @@ A scalo producer never ran these: every producer path lays the sizing surface ov
 
 **Consumer adjustment** -- code that hands one of these maps to a client scalo doesn't build, such as a generated Vector config, now gets librdkafka's own `linger.ms` and codec, or its own. To produce as a scalo producer does, lay `KafkaSizingConfig::default().resolved_producer_map()` (`transport-kafka-config`) over the profile, or set the two keys itself.
 
+### A Kafka consumer's explicit fields win over its profile (BEHAVIOUR CHANGE)
+
+The consumer laid the `KafkaProfile` keys over `KafkaConfig`'s explicit consumer fields, so `enable_auto_commit: true` lost to both profiles' `enable.auto.commit=false` and never took effect. The profile now goes first and the fields over it, as `build_librdkafka_config` documents. The defaults are unchanged: both profiles and the field say `false`. `fetch.min.bytes`, the one other key both set, is set again by the sizing map after both.
+
+**Consumer adjustment** -- a consumer with `enable_auto_commit: true` now auto-commits. Drop the field where the code commits by hand.
+
 ## 2.14.36
 
 ### Every compression setting is one `{codec, level}` key, `scalo::compression` (API and BEHAVIOUR CHANGE)

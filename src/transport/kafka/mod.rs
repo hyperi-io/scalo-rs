@@ -615,8 +615,8 @@ fn settle_stale_poll(polled: Polled) -> Polled {
 
 /// Build the consumer's librdkafka config for one group protocol.
 ///
-/// Every documented layer runs first -- explicit fields, profile defaults, the
-/// sizing surface, then `librdkafka_overrides` -- and the protocol is applied
+/// Every documented layer runs first -- see
+/// [`KafkaConfig::resolved_consumer_settings`] -- and the protocol is applied
 /// LAST, because under `consumer` librdkafka refuses the client outright if a
 /// classic-only property was set by any of them.
 ///
@@ -630,47 +630,8 @@ fn consumer_client_config(config: &KafkaConfig, protocol: ConsumerProtocol) -> C
     if let Some(ref id) = config.group_instance_id {
         client_config.set("group.instance.id", id);
     }
-    client_config.set("enable.auto.commit", config.enable_auto_commit.to_string());
-    client_config.set(
-        "auto.commit.interval.ms",
-        config.auto_commit_interval_ms.to_string(),
-    );
-    client_config.set("session.timeout.ms", config.session_timeout_ms.to_string());
-    client_config.set(
-        "heartbeat.interval.ms",
-        config.heartbeat_interval_ms.to_string(),
-    );
-    client_config.set(
-        "max.poll.interval.ms",
-        config.max_poll_interval_ms.to_string(),
-    );
-    client_config.set("fetch.min.bytes", config.fetch_min_bytes.to_string());
-    client_config.set("fetch.max.bytes", config.fetch_max_bytes.to_string());
-    client_config.set(
-        "max.partition.fetch.bytes",
-        config.max_partition_fetch_bytes.to_string(),
-    );
-    client_config.set("auto.offset.reset", &config.auto_offset_reset);
-    client_config.set(
-        "enable.partition.eof",
-        config.enable_partition_eof.to_string(),
-    );
-
-    // Profile defaults (overridable by librdkafka_overrides).
-    let rdkafka_config = config.build_librdkafka_config();
-    apply_layer(&mut client_config, &raw_layer(&rdkafka_config));
-
-    // Sizing surface:
-    //   profile defaults < named consumer knobs < sizing.consumer_librdkafka
-    let sizing = config.sizing.resolved_consumer_map();
-    apply_layer(&mut client_config, &raw_layer(&sizing));
-
-    // Re-apply librdkafka_overrides LAST so they remain the highest-priority
-    // layer the docs promise (config.rs precedence list). build_librdkafka_config
-    // above also applied them, but the sizing surface in between would
-    // otherwise clobber any fetch.* key an operator set via an override --
-    // silently reverting a deployment's tuning on upgrade.
-    apply_layer(&mut client_config, &raw_layer(&config.librdkafka_overrides));
+    let settings = config.resolved_consumer_settings();
+    apply_layer(&mut client_config, &raw_layer(&settings));
 
     // Security.
     client_config.set("security.protocol", &config.security_protocol);
