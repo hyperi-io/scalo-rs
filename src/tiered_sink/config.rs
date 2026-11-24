@@ -8,8 +8,8 @@
 
 //! TieredSink configuration.
 
+use crate::compression::{Accepts, Codec, Compression};
 use crate::spool_codec::CorruptionPolicy;
-use crate::tiered_sink::CompressionCodec;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,9 +30,15 @@ pub struct TieredSinkConfig {
     #[serde(default = "default_send_timeout_ms")]
     pub send_timeout_ms: u64,
 
-    /// Compression codec for spooled messages.
-    #[serde(default)]
-    pub compression: CompressionCodec,
+    /// Codec for spilled records: `none`, `zstd`, `lz4`, or `snappy` with the
+    /// `compression-snappy` feature. Default zstd at level 3. A cache keeps no
+    /// codec per record, so change it only on an empty spool.
+    #[serde(default = "default_compression")]
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(schema_with = "compression_schema")
+    )]
+    pub compression: Compression,
 
     /// Strategy for draining spooled messages back to primary.
     #[serde(default)]
@@ -115,6 +121,21 @@ pub struct TieredSinkConfig {
     pub sync_on_spill: bool,
 }
 
+/// The codecs a spill takes.
+pub(crate) const ACCEPTS: Accepts = Accepts::new(
+    "tiered_sink.compression",
+    &[Codec::None, Codec::Zstd, Codec::Lz4, Codec::Snappy],
+);
+
+fn default_compression() -> Compression {
+    Compression::new(Codec::Zstd)
+}
+
+#[cfg(feature = "config-schema")]
+fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    ACCEPTS.schema()
+}
+
 fn default_send_timeout_ms() -> u64 {
     1000 // 1 second
 }
@@ -146,7 +167,7 @@ impl TieredSinkConfig {
         Self {
             spool_path: spool_path.into(),
             send_timeout_ms: default_send_timeout_ms(),
-            compression: CompressionCodec::default(),
+            compression: default_compression(),
             drain_strategy: DrainStrategy::default(),
             ordering: OrderingMode::default(),
             max_spool_bytes: None,
@@ -192,10 +213,10 @@ impl TieredSinkConfig {
         self
     }
 
-    /// Set compression codec.
+    /// Set the spill codec.
     #[must_use]
-    pub fn compression(mut self, codec: CompressionCodec) -> Self {
-        self.compression = codec;
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
         self
     }
 
@@ -496,15 +517,33 @@ mod tests {
         }
     }
 
+    /// `compression` reads the shared shape, and the sink refuses gzip.
+    #[test]
+    fn compression_reads_the_shared_shape() {
+        let read = |compression: serde_json::Value| {
+            let mut doc = serde_json::json!({"spool_path": "/var/spool/test"});
+            if !compression.is_null() {
+                doc["compression"] = compression;
+            }
+            serde_json::from_value::<TieredSinkConfig>(doc).map(|c| c.compression)
+        };
+        assert_eq!(
+            read(serde_json::Value::Null).unwrap(),
+            Compression::new(Codec::Zstd)
+        );
+        let lz4 = read(serde_json::json!({"codec": "lz4"})).unwrap();
+        assert_eq!(ACCEPTS.check(lz4), Ok(Compression::new(Codec::Lz4)));
+        let gzip = read(serde_json::json!({"codec": "gzip"})).unwrap();
+        assert!(ACCEPTS.check(gzip).is_err());
+        assert!(read(serde_json::json!({"zstd": {"level": 1}})).is_err());
+    }
+
     #[test]
     fn test_default_config() {
         let config = TieredSinkConfig::new("/tmp/test.queue");
         assert_eq!(config.send_timeout_ms, 1000);
-        assert_eq!(config.compression, CompressionCodec::default());
-        assert!(matches!(
-            config.compression,
-            CompressionCodec::Zstd { level: 1 }
-        ));
+        assert_eq!(config.compression, Compression::new(Codec::Zstd));
+        assert_eq!(config.compression.effective_level(), Some(3));
         assert!(matches!(
             config.drain_strategy,
             DrainStrategy::Adaptive { .. }
@@ -518,13 +557,13 @@ mod tests {
     fn test_builder_pattern() {
         let config = TieredSinkConfig::new("/tmp/test.queue")
             .send_timeout(Duration::from_secs(5))
-            .compression(CompressionCodec::Snappy)
+            .compression(Compression::new(Codec::Lz4))
             .drain_strategy(DrainStrategy::Greedy)
             .ordering(OrderingMode::StrictFifo)
             .max_spool_bytes(1024 * 1024 * 100);
 
         assert_eq!(config.send_timeout_ms, 5000);
-        assert_eq!(config.compression, CompressionCodec::Snappy);
+        assert_eq!(config.compression, Compression::new(Codec::Lz4));
         assert!(matches!(config.drain_strategy, DrainStrategy::Greedy));
         assert_eq!(config.ordering, OrderingMode::StrictFifo);
         assert_eq!(config.max_spool_bytes, Some(100 * 1024 * 1024));

@@ -16,9 +16,17 @@ use std::time::Duration;
 use super::convert::json_to_event_wrapper;
 use super::proto::vector;
 use super::tls::VectorCompatTls;
+use crate::compression::{Accepts, Codec, Compression};
 use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::grpc::GrpcConfig;
-use crate::transport::tonic_channel::lazy_channel;
+use crate::transport::tonic_channel::{self, lazy_channel};
+
+/// The codecs a push to a Vector source takes. tonic fixes the level.
+pub const VECTOR_ACCEPTS: Accepts = Accepts::new(
+    "vector_compat.compression",
+    &[Codec::None, Codec::Gzip, Codec::Zstd],
+)
+.without_level();
 
 /// Client that sends events to a Vector source via gRPC.
 ///
@@ -38,9 +46,14 @@ use crate::transport::tonic_channel::lazy_channel;
 /// dials afresh.
 ///
 /// Plaintext by default. [`connect_lazy_tls`](Self::connect_lazy_tls) connects
-/// over TLS with the trust and client identity the caller gives it.
+/// over TLS with the trust and client identity the caller gives it. Pushes are
+/// gzipped, which Vector's source reads, unless
+/// [`with_compression`](Self::with_compression) says otherwise.
 pub struct VectorCompatClient {
     client: vector::vector_client::VectorClient<tonic::transport::Channel>,
+
+    /// Codec each push is sent with.
+    compression: Compression,
 
     /// Dial and health-check limit (milliseconds, 0 = none).
     send_timeout_ms: u64,
@@ -114,15 +127,30 @@ impl VectorCompatClient {
         }
         let channel = lazy_channel(ep, send_timeout_ms, crate::transport::ProxyDialer::direct());
 
-        let client = vector::vector_client::VectorClient::new(channel)
-            .max_decoding_message_size(MAX_DECODE_BYTES)
-            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-            .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let mut client = vector::vector_client::VectorClient::new(channel)
+            .max_decoding_message_size(MAX_DECODE_BYTES);
+        for accepted in tonic_channel::ACCEPTED_ENCODINGS {
+            client = client.accept_compressed(accepted);
+        }
 
         Ok(Self {
             client,
+            compression: Compression::new(Codec::Gzip),
             send_timeout_ms,
         })
+    }
+
+    /// Send each push with `compression`: `none`, `gzip` (the default) or
+    /// `zstd`, with no level. The source must read the codec.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` for a codec or level [`VECTOR_ACCEPTS`] refuses.
+    pub fn with_compression(mut self, compression: Compression) -> TransportResult<Self> {
+        self.compression = VECTOR_ACCEPTS
+            .check(compression)
+            .map_err(|e| TransportError::Config(e.to_string()))?;
+        Ok(self)
     }
 
     /// Send JSON values as Vector log events.
@@ -157,8 +185,11 @@ impl VectorCompatClient {
         values: &[serde_json::Value],
     ) -> Result<(), tonic::Status> {
         let events: Vec<_> = values.iter().map(json_to_event_wrapper).collect();
-        self.client
-            .clone()
+        let mut client = self.client.clone();
+        if let Some(encoding) = tonic_channel::encoding(self.compression.codec) {
+            client = client.send_compressed(encoding);
+        }
+        client
             .push_events(vector::PushEventsRequest { events })
             .await?;
         Ok(())
@@ -233,6 +264,22 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The client takes none, gzip or zstd with no level, and refuses the rest.
+    #[tokio::test]
+    async fn with_compression_takes_only_what_tonic_sends() {
+        let client = || VectorCompatClient::connect_lazy("http://127.0.0.1:1").unwrap();
+        assert_eq!(client().compression, Compression::new(Codec::Gzip));
+        for (compression, ok) in [
+            (Compression::NONE, true),
+            (Compression::new(Codec::Zstd), true),
+            (Compression::new(Codec::Lz4), false),
+            (Compression::new(Codec::Gzip).with_level(6), false),
+        ] {
+            let built = client().with_compression(compression);
+            assert_eq!(built.is_ok(), ok, "{compression}");
+        }
+    }
 
     /// A listener that completes TCP but never speaks, holding every connection,
     /// and the number of connections it has accepted.

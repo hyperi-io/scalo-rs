@@ -45,7 +45,7 @@ flowchart LR
 
 *Figure 1. L4 Detail -- Tiered sink delivery. Green ends return `Ok`, orange ends `Err`, and the plain end `Ok` for a record it dropped.* Up: [Pipeline](README.md).
 
-The hot send is one `send_batch`, bounded by `send_timeout_ms`, made when the breaker admits it and, under `StrictFifo`, the spool is empty. Not delivered covers a breaker refusal, `Backpressured` and a timeout. Spool writes encode and compress (Zstd, LZ4 or Snappy) and append to the yaque spool, and a background drain sends the spool on once the breaker admits.
+The hot send is one `send_batch`, bounded by `send_timeout_ms`, made when the breaker admits it and, under `StrictFifo`, the spool is empty. Not delivered covers a breaker refusal, `Backpressured` and a timeout. Spool writes encode and compress (zstd, LZ4 or snappy) and append to the yaque spool, and a background drain sends the spool on once the breaker admits.
 
 A `disk_capacity_poller` watches the spool filesystem when
 `disk_aware` is configured -- if usage crosses the threshold the
@@ -163,7 +163,7 @@ Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailabl
 tiered_sink:
   spool_path: /var/spool/myapp/clickhouse
   send_timeout_ms: 1000
-  compression: { zstd: { level: 1 } }   # or none, lz4, snappy
+  compression: {codec: zstd, level: 3}  # the default. Or none, lz4, snappy (compression-snappy)
   drain_strategy:
     type: adaptive
     initial_rate: 100
@@ -239,8 +239,8 @@ No metric counts a `SpoolFull`, `DiskUnavailable` or `DeadLetter` error, which g
 | `is_disk_available()` | Disk-aware poller flag |
 | `inner() -> &S` | Borrow the wrapped backend |
 | `shutdown()` | Stop the drain task and the disk poller, and wait for both to exit |
-| `TieredSinkError` | `SpoolOpen` from `new`. From `send`: `DeadLetter` (the sender named it or answered `FilteredDlq`), `Sink` (a `Fatal` answer, with its cause), `SpoolFull`, `DiskUnavailable`, `Spool` (the spool write failed), `Codec` (compression failed) |
-| `TieredSinkConfig` / `WhenFull` / `OrderingMode` / `DrainStrategy` / `DiskAwareConfig` / `CompressionCodec` / `CorruptionPolicy` | Configuration, see [Configuration](#configuration) |
+| `TieredSinkError` | `SpoolOpen` from `new`. From `send`: `DeadLetter` (the sender named it or answered `FilteredDlq`), `Sink` (a `Fatal` answer, with its cause), `SpoolFull`, `DiskUnavailable`, `Spool` (the spool write failed), `Codec` (compression failed, or from `new` a `compression` the spill does not take) |
+| `TieredSinkConfig` / `WhenFull` / `OrderingMode` / `DrainStrategy` / `DiskAwareConfig` / `CorruptionPolicy` | Configuration, see [Configuration](#configuration) |
 | `CircuitBreaker` / `CircuitState` | Exposed for tests and custom integrations |
 
 `shutdown()` lets a drain in flight finish its send and commit, then returns. A drain send to a downstream that never answers is cut off at `send_timeout_ms`, so `shutdown()` waits at most that long. It does not drain the spill cache to the sink: records still spooled stay on disk and replay on the next open, so shutdown loses nothing `send` accepted.
@@ -263,5 +263,5 @@ Drop cancels the same token, so both background tasks exit even if the consumer 
 - [`../../src/tiered_sink/circuit.rs`](../../src/tiered_sink/circuit.rs)
 - [`../../src/tiered_sink/error.rs`](../../src/tiered_sink/error.rs)
 - [`../../src/tiered_sink/drainer.rs`](../../src/tiered_sink/drainer.rs)
-- [`../../src/tiered_sink/codec.rs`](../../src/tiered_sink/codec.rs) -- compression
+- [../compression.md](../compression.md) -- the `compression` key and its codecs
 - [`../../src/tiered_sink/config.rs`](../../src/tiered_sink/config.rs)

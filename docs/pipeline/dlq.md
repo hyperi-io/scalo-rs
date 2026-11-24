@@ -18,7 +18,7 @@ backends. Callers never block on disk, Kafka, or HTTP I/O.
 
 | Backend | Feature | Storage |
 | --------- | --------- | --------- |
-| File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, rotated by time (`Hourly` default) or size, gzipped after rotation, with the modes the process umask gives unless `file_mode` and `dir_mode` set them |
+| File | `dlq` (always available) | NDJSON to disk via the shared `io::NdjsonWriter`, rotated by time (`Hourly` default) or size, compressed after rotation (`compress_rotated`, gzip by default), with the modes the process umask gives unless `file_mode` and `dir_mode` set them |
 | Kafka | `dlq-kafka` (needs `transport-kafka`) | Publish to a dedicated DLQ topic -- per-table (`acme.auth` -> `acme.auth.dlq`) or single common topic (`<service>.dlq` unless `common_topic` names one) |
 | HTTP | `dlq-http` (needs `reqwest`) | POST batched entries as NDJSON |
 
@@ -233,7 +233,7 @@ dlq:
     path: /var/spool/scalo/dlq   # the service name is appended as a subdirectory
     rotation: hourly             # hourly | daily | never, by local time
     max_age_days: 30
-    compress_rotated: true       # gzip all but the six newest rotated files
+    compress_rotated: {codec: gzip}  # none, gzip or zstd for all but the six newest rotated files
     max_bytes: null              # rotate before a batch that would pass this many bytes
     max_files: null              # rotated files kept; null: no count limit
     durable: false               # sync each batch and the folder after a rotation

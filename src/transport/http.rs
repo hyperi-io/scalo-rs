@@ -13,7 +13,7 @@
 //! ## Send
 //!
 //! POSTs each run of records with the same key to `{endpoint}/{key}` as one
-//! body, framed by `framing` and gzipped when `gzip` is set. `failover`
+//! body, framed by `framing` and compressed by `compression`. `failover`
 //! endpoints are tried in order after `endpoint`. Redirects are refused unless
 //! `follow_redirects` is set, and no proxy is used unless `proxy` names one.
 //! The guide is `docs/transport/http.md`.
@@ -51,6 +51,12 @@ mod send_tests;
 
 pub use send::{HttpAuth, HttpEndpoint};
 
+/// The codecs an HTTP request body takes.
+pub const HTTP_ACCEPTS: Accepts = Accepts::new(
+    "transport.http.compression",
+    &[Codec::None, Codec::Gzip, Codec::Zstd],
+);
+
 use super::error::{TransportError, TransportResult};
 #[cfg(feature = "http-server")]
 use super::traits::RecvBatch;
@@ -61,6 +67,7 @@ use super::types::Message;
 use super::types::PayloadFormat;
 use super::types::SendResult;
 use super::work_batch::WorkBatch;
+use crate::compression::{Accepts, Codec, Compression};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 #[cfg(feature = "http-server")]
@@ -185,9 +192,10 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_framing")]
     pub framing: crate::framing::FramingConfig,
 
-    /// Gzip request bodies, with `Content-Encoding: gzip`. Default off.
+    /// Request body codec, sent as `Content-Encoding`: `none` (default),
+    /// `gzip` or `zstd`. The receiver must decode it.
     #[serde(default)]
-    pub gzip: bool,
+    pub compression: Compression,
 
     /// Statuses that mean the body is stored. Empty, the default, is any 2xx.
     #[serde(default)]
@@ -291,7 +299,7 @@ impl Default for HttpTransportConfig {
             headers: std::collections::BTreeMap::new(),
             user_agent: None,
             framing: default_framing(),
-            gzip: false,
+            compression: Compression::NONE,
             success_status: Vec::new(),
             proxy: crate::transport::ProxyConfig::None,
             follow_redirects: false,
@@ -325,7 +333,7 @@ impl std::fmt::Debug for HttpTransportConfig {
             .field("headers", &self.headers)
             .field("user_agent", &self.user_agent)
             .field("framing", &self.framing)
-            .field("gzip", &self.gzip)
+            .field("compression", &self.compression)
             .field("success_status", &self.success_status)
             .field("proxy", &self.proxy)
             .field("follow_redirects", &self.follow_redirects)

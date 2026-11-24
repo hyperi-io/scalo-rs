@@ -70,7 +70,7 @@ pub mod proto;
 pub mod token;
 
 pub use super::hold::{HoldLadder, HoldLadderError, Rung, hold_budget};
-pub use config::{CoalesceConfig, GrpcConfig};
+pub use config::{CoalesceConfig, GRPC_ACCEPTS, GrpcConfig};
 pub use token::GrpcToken;
 
 use super::ack::{
@@ -623,10 +623,11 @@ fn build_client(
     let mut client = proto::transport_client::TransportClient::new(channel)
         .max_decoding_message_size(config.max_message_size);
 
-    if config.compression {
-        client = client
-            .send_compressed(tonic::codec::CompressionEncoding::Gzip)
-            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    for accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
+        client = client.accept_compressed(accepted);
+    }
+    if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
+        client = client.send_compressed(encoding);
     }
     Ok(client)
 }
@@ -692,6 +693,7 @@ impl GrpcTransport {
 
     async fn new_inner(options: GrpcTransportBuilder<'_>) -> TransportResult<Self> {
         let config = options.config;
+        config.check_compression()?;
         let pending = options.hold_registry();
         #[cfg(feature = "governor")]
         let pressure = options.pressure;
@@ -748,7 +750,9 @@ impl GrpcTransport {
                 .max_decoding_message_size(config.max_message_size)
                 .max_encoding_message_size(config.max_message_size)
                 .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-                .send_compressed(tonic::codec::CompressionEncoding::Gzip);
+                .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+                .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+                .send_compressed(tonic::codec::CompressionEncoding::Zstd);
 
             // Build server with optional Vector compat
             let mut builder = tonic::transport::Server::builder();
@@ -766,6 +770,7 @@ impl GrpcTransport {
                     )
                     .max_decoding_message_size(config.max_message_size)
                     .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
                     .send_compressed(tonic::codec::CompressionEncoding::Gzip);
 
                 // Hand the governor to the Vector-compat pushes, which shed on it
@@ -2090,6 +2095,7 @@ pub(crate) mod test_peers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::{Codec, Compression};
 
     #[tokio::test]
     async fn the_receive_server_sets_tcp_nodelay_on_an_accepted_connection() {
@@ -2132,7 +2138,7 @@ mod tests {
         assert_eq!(config.recv_timeout_ms, 100);
         assert_eq!(config.send_timeout_ms, 30_000);
         assert_eq!(config.max_message_size, 16 * 1024 * 1024);
-        assert!(!config.compression);
+        assert!(config.compression.is_none());
         assert!(!config.tls_enabled);
         assert!(config.tls_ca_path.is_none());
         assert_eq!(
@@ -2277,10 +2283,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grpc_config_with_compression() {
-        let config = GrpcConfig::server("0.0.0.0:6000").with_compression();
-        assert!(config.compression);
+    /// A server with no codec set reads a gzip or zstd client, and a codec
+    /// or a level gRPC does not take fails the build.
+    #[tokio::test]
+    async fn each_codec_reaches_a_plain_server_and_others_are_refused() {
+        let (server, endpoint) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
+        for codec in [Codec::Gzip, Codec::Zstd] {
+            let client = GrpcTransport::new(
+                &GrpcConfig::client(&endpoint).with_compression(Compression::new(codec)),
+            )
+            .await
+            .unwrap();
+            let sent = client.send("events", filled(4096)).await;
+            assert!(sent.is_ok(), "{codec}: {sent:?}");
+            let got = server.recv(10).await.unwrap().records;
+            assert_eq!(got.len(), 1, "{codec}");
+            assert_eq!(got[0].payload.len(), 4096, "{codec}");
+            client.close().await.unwrap();
+        }
+        server.close().await.unwrap();
+
+        for refused in [
+            Compression::new(Codec::Lz4),
+            Compression::new(Codec::Zstd).with_level(3),
+        ] {
+            let built = GrpcTransport::new(
+                &GrpcConfig::client("http://127.0.0.1:1").with_compression(refused),
+            )
+            .await;
+            assert!(
+                matches!(built, Err(TransportError::Config(_))),
+                "{refused}: {:?}",
+                built.err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -2813,13 +2849,13 @@ mod tests {
         let (server, endpoint) = receiver(
             GrpcConfig::server("127.0.0.1:0")
                 .with_max_message_size(LIMIT)
-                .with_compression(),
+                .with_compression(Compression::new(Codec::Gzip)),
         )
         .await;
         let client = GrpcTransport::new(
             &GrpcConfig::client(&endpoint)
                 .with_max_message_size(LIMIT)
-                .with_compression(),
+                .with_compression(Compression::new(Codec::Gzip)),
         )
         .await
         .unwrap();
@@ -2870,13 +2906,13 @@ mod tests {
         let (server, endpoint) = receiver(
             GrpcConfig::server("127.0.0.1:0")
                 .with_max_message_size(LIMIT)
-                .with_compression(),
+                .with_compression(Compression::new(Codec::Gzip)),
         )
         .await;
         let client = GrpcTransport::new(
             &GrpcConfig::client(&endpoint)
                 .with_max_message_size(LIMIT)
-                .with_compression(),
+                .with_compression(Compression::new(Codec::Gzip)),
         )
         .await
         .unwrap();
@@ -2905,13 +2941,13 @@ mod tests {
         let (server, endpoint) = receiver(
             GrpcConfig::server("127.0.0.1:0")
                 .with_max_message_size(LIMIT)
-                .with_compression(),
+                .with_compression(Compression::new(Codec::Gzip)),
         )
         .await;
         let client = GrpcTransport::new(
             &GrpcConfig::client(&endpoint)
                 .with_max_message_size(LIMIT)
-                .with_compression(),
+                .with_compression(Compression::new(Codec::Gzip)),
         )
         .await
         .unwrap();

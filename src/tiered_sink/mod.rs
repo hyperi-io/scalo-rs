@@ -42,7 +42,7 @@
 //! - **Circuit breaker**: Avoids hammering a dead sink
 //! - **Background drain**: Recovers spooled messages when sink is healthy
 //! - **Configurable ordering**: Interleaved (default) or strict FIFO
-//! - **Multiple compression codecs**: Zstd (default, level 1), LZ4, Snappy, None
+//! - **Compressed spill**: zstd level 3 by default, or LZ4, snappy (with `compression-snappy`) or none
 //!
 //! ## Example
 //!
@@ -64,14 +64,12 @@
 //! ```
 
 mod circuit;
-mod codec;
 mod config;
 mod drainer;
 mod error;
 mod tiered;
 
 pub use circuit::{CircuitBreaker, CircuitState};
-pub use codec::CompressionCodec;
 pub use config::{
     DiskAwareConfig, DrainStrategy, OrderingMode, TieredSinkConfig, WRITABLE_PATH_LIMITS_ENV,
     WhenFull,

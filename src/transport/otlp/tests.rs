@@ -22,7 +22,8 @@ use prost::Message as _;
 use tonic::Code;
 use tonic_types::{ErrorDetails, StatusExt as _};
 
-use super::{OtlpCompression, OtlpConfig, OtlpProtocol};
+use super::{OtlpConfig, OtlpProtocol};
+use crate::compression::{Codec, Compression};
 use crate::tls::test_pki::{Leaf, TestCa};
 use crate::tls::{ClientTlsConfig, TrustChoice};
 use crate::transport::filter::{FilterAction, FilterRule};
@@ -264,7 +265,7 @@ type Tweak = fn(&mut OtlpConfig);
 fn as_is(_: &mut OtlpConfig) {}
 
 fn gzip(config: &mut OtlpConfig) {
-    config.compression = OtlpCompression::Gzip;
+    config.compression = Compression::new(Codec::Gzip);
 }
 
 fn ten_second_cap(config: &mut OtlpConfig) {
@@ -665,7 +666,7 @@ async fn each_collector_answer_maps_onto_a_send_result() {
             });
         }
         (case.tweak)(&mut config);
-        let gzip = config.compression == OtlpCompression::Gzip;
+        let gzip = config.compression.codec == Codec::Gzip;
         let transport_config = TransportConfig {
             transport_type: TransportType::Otlp,
             otlp: Some(config),

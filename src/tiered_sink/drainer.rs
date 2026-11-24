@@ -453,13 +453,13 @@ enum Entry {
 }
 
 /// Unframe, decompress and decode one spooled entry.
-fn decode_entry(raw: Vec<u8>, crc: bool, codec: crate::tiered_sink::CompressionCodec) -> Entry {
+fn decode_entry(raw: Vec<u8>, crc: bool, codec: crate::compression::Compression) -> Entry {
     // Verify+strip the CRC header (when enabled), then decompress. Either
     // failing means the spilled bytes are unreadable, so the entry is dropped,
     // never replayed downstream.
     let data = match crate::spool_codec::unframe(crc, raw)
         .map_err(|c| c.0)
-        .and_then(|c| codec.decompress(&c).map_err(|e| e.to_string()))
+        .and_then(|c| codec.decompress(&c, usize::MAX).map_err(|e| e.to_string()))
     {
         Ok(data) => data,
         Err(e) => return Entry::Unreadable(DrainResult::DecompressError(e)),
@@ -479,7 +479,7 @@ async fn drain_once<S: TransportSender>(
     receiver: &mut Receiver,
     cap: usize,
     batch: DrainBatch,
-    codec: crate::tiered_sink::CompressionCodec,
+    codec: crate::compression::Compression,
     crc: bool,
     send_timeout: Duration,
     spool_count: &AtomicU64,
@@ -615,7 +615,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     spool_count: Arc<AtomicU64>,
     spool_bytes: Arc<AtomicU64>,
     circuit: Arc<CircuitBreaker>,
-    codec: crate::tiered_sink::CompressionCodec,
+    codec: crate::compression::Compression,
     crc: bool,
     strategy: DrainStrategy,
     interval: Duration,

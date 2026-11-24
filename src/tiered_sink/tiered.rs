@@ -9,8 +9,7 @@
 //! TieredSink implementation.
 
 use crate::tiered_sink::{
-    CircuitBreaker, CircuitState, CompressionCodec, OrderingMode, Result, TieredSinkConfig,
-    TieredSinkError, drainer,
+    CircuitBreaker, CircuitState, OrderingMode, Result, TieredSinkConfig, TieredSinkError, drainer,
 };
 use crate::transport::{Record, SendResult, TransportSender};
 use crate::yaque::{Receiver, Sender};
@@ -40,7 +39,7 @@ pub struct TieredSink<S: TransportSender> {
     spool_count: Arc<AtomicU64>,
     spool_bytes: Arc<AtomicU64>,
     circuit: Arc<CircuitBreaker>,
-    codec: CompressionCodec,
+    codec: crate::compression::Compression,
     config: TieredSinkConfig,
     /// Stops the drainer and the disk poller. Every waiter sees the cancel, even one that waits after it.
     shutdown: CancellationToken,
@@ -77,7 +76,8 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     ///
     /// Returns [`TieredSinkError::SpoolOpen`] if the spill cache is locked by a
     /// live owner, or cannot be opened and was not quarantined (see
-    /// `TieredSinkConfig::on_corruption`).
+    /// `TieredSinkConfig::on_corruption`), and [`TieredSinkError::Codec`] for a
+    /// `compression` the spill does not take.
     pub async fn new(sink: S, config: TieredSinkConfig) -> Result<Self> {
         Self::with_volume_limits(
             sink,
@@ -96,6 +96,9 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         volume_limits: Option<String>,
         kubernetes: bool,
     ) -> Result<Self> {
+        super::config::ACCEPTS
+            .check(config.compression)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         if config.max_spool_bytes.is_none()
             && let Some(cap) = volume_limits
                 .as_deref()
@@ -1252,7 +1255,7 @@ mod tests {
         sink.set_available(false);
         let mut config = spilling_config(&dir.path().join("q"));
         config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
-        config.compression = CompressionCodec::None;
+        config.compression = crate::compression::Compression::NONE;
         let payloads: Vec<Vec<u8>> = (0..10).map(|i| vec![b'0' + i; 1000]).collect();
         let stored = crate::spool_codec::frame(config.crc, rec(&payloads[0]).encode()).len() as u64;
         config.drain_batch_max_bytes = stored * 3 + stored / 2;
@@ -1493,7 +1496,7 @@ mod tests {
             let sink = TestSink::new();
             sink.set_available(false);
             let mut config = TieredSinkConfig::new(&spool_path).crc(true);
-            config.compression = CompressionCodec::None;
+            config.compression = crate::compression::Compression::NONE;
             config.circuit_failure_threshold = 1;
             let tiered = TieredSink::new(sink, config).await.unwrap();
             tiered.send(&rec(b"poison record bytes")).await.unwrap();
@@ -1512,7 +1515,7 @@ mod tests {
         // delivered, and the spool must end up empty.
         let sink = TestSink::new();
         let mut config = TieredSinkConfig::new(&spool_path).crc(true);
-        config.compression = CompressionCodec::None;
+        config.compression = crate::compression::Compression::NONE;
         config.drain_interval_ms = 5;
         let tiered = TieredSink::new(sink, config).await.unwrap();
         wait_for_drain(&tiered).await;
@@ -1849,7 +1852,7 @@ mod tests {
                 path: dir.to_path_buf(),
                 rotation: crate::dlq::RotationPeriod::Daily,
                 max_age_days: 1,
-                compress_rotated: false,
+                compress_rotated: crate::compression::Compression::NONE,
                 ..crate::dlq::FileDlqConfig::default()
             },
             mode: crate::dlq::DlqMode::FileOnly,

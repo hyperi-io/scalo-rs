@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
+use scalo::compression::{Codec, Compression};
 use scalo::transport::grpc::{GrpcConfig, GrpcToken, GrpcTransport};
 use scalo::transport::{
     AcknowledgementsConfig, DeliveryStatus, PayloadFormat, Record, RecordMeta, SendResult,
@@ -243,12 +244,13 @@ async fn test_compression() {
     let port = find_available_port().await;
     let addr = format!("127.0.0.1:{port}");
 
-    let server_config = GrpcConfig::server(&addr).with_compression();
+    let server_config = GrpcConfig::server(&addr).with_compression(Compression::new(Codec::Gzip));
     let server = GrpcTransport::new(&server_config)
         .await
         .expect("failed to create compressed server");
 
-    let client_config = GrpcConfig::client(&format!("http://{addr}")).with_compression();
+    let client_config = GrpcConfig::client(&format!("http://{addr}"))
+        .with_compression(Compression::new(Codec::Zstd));
     let client = GrpcTransport::new(&client_config)
         .await
         .expect("failed to create compressed client");

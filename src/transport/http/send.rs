@@ -15,8 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, TryLockError};
 use std::time::{Duration, Instant};
 
 use reqwest::StatusCode;
@@ -25,7 +24,8 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::HttpTransportConfig;
+use super::{HTTP_ACCEPTS, HttpTransportConfig};
+use crate::compression::{Compression, Compressor};
 use crate::framing::Framing;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::{TransportError, TransportResult};
@@ -200,15 +200,6 @@ fn describe(error: reqwest::Error) -> String {
     text
 }
 
-fn gzip(body: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::with_capacity(body.len() / 4),
-        flate2::Compression::fast(),
-    );
-    encoder.write_all(body)?;
-    encoder.finish()
-}
-
 /// What a response status says about the body that drew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Answer {
@@ -299,7 +290,12 @@ pub(super) struct Sender {
     dialer: ProxyDialer,
     targets: Vec<Target>,
     framing: Arc<dyn Framing>,
-    gzip: bool,
+    /// The body codec and its context, kept between bodies. `None` sends as framed.
+    compressor: Option<std::sync::Mutex<Compressor>>,
+    /// The body codec, checked against `HTTP_ACCEPTS`.
+    compression: Compression,
+    /// The `Content-Encoding` a compressed body goes with.
+    encoding: Option<&'static str>,
     success: Vec<StatusCode>,
     max_retry_after: Duration,
     send_timeout: Duration,
@@ -326,6 +322,16 @@ impl Sender {
             .framing
             .build()
             .map_err(|e| TransportError::Config(format!("HTTP body framing: {e}")))?;
+        let compression = HTTP_ACCEPTS
+            .check(config.compression)
+            .map_err(|e| TransportError::Config(e.to_string()))?;
+        let compressor = if compression.is_none() {
+            None
+        } else {
+            let compressor =
+                Compressor::new(compression).map_err(|e| TransportError::Config(e.to_string()))?;
+            Some(std::sync::Mutex::new(compressor))
+        };
         let success = config
             .success_status
             .iter()
@@ -353,7 +359,7 @@ impl Sender {
             auth = config.auth.kind(),
             headers = ?config.headers.keys().collect::<Vec<&String>>(),
             framing = %config.framing.framing_type,
-            gzip = config.gzip,
+            compression = %compression,
             proxy = config.proxy.kind(),
             follow_redirects = config.follow_redirects,
             success_status = ?config.success_status,
@@ -364,7 +370,9 @@ impl Sender {
             dialer,
             targets,
             framing,
-            gzip: config.gzip,
+            compressor,
+            encoding: (!compression.is_none()).then_some(compression.codec.name()),
+            compression,
             success,
             max_retry_after: Duration::from_millis(config.max_retry_after_ms),
             send_timeout: Duration::from_millis(config.send_timeout_ms),
@@ -408,17 +416,41 @@ impl Sender {
         SendResult::Ok
     }
 
-    /// The body as sent, gzipped when `gzip` is set.
+    /// The body as sent, compressed when `compression` names a codec.
     fn body(&self, framed: Vec<u8>) -> Result<bytes::Bytes, SendResult> {
-        if !self.gzip {
+        let Some(shared) = &self.compressor else {
             return Ok(bytes::Bytes::from(framed));
-        }
-        gzip(&framed).map(bytes::Bytes::from).map_err(|e| {
-            SendResult::Fatal(TransportError::Internal(format!(
-                "HTTP gzip of a {}-byte body: {e}",
-                framed.len()
-            )))
-        })
+        };
+        // A concurrent send holding the kept context gets one of its own, so
+        // callers never queue behind each other's compression.
+        let mut own;
+        let mut held;
+        let compressor: &mut Compressor = match shared.try_lock() {
+            Ok(guard) => {
+                held = guard;
+                &mut held
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                held = poisoned.into_inner();
+                &mut held
+            }
+            Err(TryLockError::WouldBlock) => {
+                own = Compressor::new(self.compression)
+                    .map_err(|e| SendResult::Fatal(TransportError::Internal(e.to_string())))?;
+                &mut own
+            }
+        };
+        let mut body = Vec::new();
+        compressor
+            .compress_into(&framed, &mut body)
+            .map(|()| bytes::Bytes::from(body))
+            .map_err(|e| {
+                SendResult::Fatal(TransportError::Internal(format!(
+                    "HTTP {} of a {}-byte body: {e}",
+                    compressor.compression().codec,
+                    framed.len()
+                )))
+            })
     }
 
     /// Post one body to each endpoint in turn until one stores or rejects it.
@@ -452,8 +484,8 @@ impl Sender {
                 .timeout(budget)
                 .header(CONTENT_TYPE, self.framing.content_type())
                 .body(body.clone());
-            if self.gzip {
-                request = request.header(CONTENT_ENCODING, "gzip");
+            if let Some(encoding) = self.encoding {
+                request = request.header(CONTENT_ENCODING, encoding);
             }
             if let Some((name, value)) = &target.auth {
                 request = request.header(name.clone(), value.clone());

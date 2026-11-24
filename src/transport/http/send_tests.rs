@@ -417,16 +417,16 @@ impl crate::framing::Framing for Piped {
 }
 
 /// Each framing shapes the body and its `Content-Type`, one body per run of
-/// records with the same key, and gzip compresses it.
+/// records with the same key, and `compression` compresses it.
 #[tokio::test]
-async fn each_framing_shapes_the_body_and_gzip_compresses_it() {
-    use std::io::Read as _;
+async fn each_framing_shapes_the_body_and_compression_compresses_it() {
+    use crate::compression::{Codec, Compression};
 
-    // (framing, key, gzip, records, (path, content type, body) per request)
+    // (framing, key, codec, records, (path, content type, body) per request)
     type Row = (
         &'static str,
         &'static str,
-        bool,
+        Codec,
         Vec<Record>,
         Vec<(&'static str, &'static str, &'static str)>,
     );
@@ -436,35 +436,35 @@ async fn each_framing_shapes_the_body_and_gzip_compresses_it() {
         (
             "ndjson",
             "",
-            false,
+            Codec::None,
             two(),
             vec![("/", "application/x-ndjson", "{\"a\":1}\n{\"b\":2}\n")],
         ),
         (
             "json_array",
             "",
-            false,
+            Codec::None,
             two(),
             vec![("/", "application/json", r#"[{"a":1},{"b":2}]"#)],
         ),
         (
             "json_wrapped",
             "events",
-            false,
+            Codec::None,
             two(),
             vec![("/", "application/json", r#"{"events":[{"a":1},{"b":2}]}"#)],
         ),
         (
             "json_concat",
             "",
-            false,
+            Codec::None,
             two(),
             vec![("/", "application/json", r#"{"a":1}{"b":2}"#)],
         ),
         (
             "single",
             "",
-            false,
+            Codec::None,
             two(),
             vec![
                 ("/", "application/octet-stream", r#"{"a":1}"#),
@@ -474,21 +474,28 @@ async fn each_framing_shapes_the_body_and_gzip_compresses_it() {
         (
             "piped_http_test",
             "",
-            false,
+            Codec::None,
             two(),
             vec![("/", "text/plain", r#"{"a":1}|{"b":2}|"#)],
         ),
         (
             "ndjson",
             "",
-            true,
+            Codec::Gzip,
+            two(),
+            vec![("/", "application/x-ndjson", "{\"a\":1}\n{\"b\":2}\n")],
+        ),
+        (
+            "ndjson",
+            "",
+            Codec::Zstd,
             two(),
             vec![("/", "application/x-ndjson", "{\"a\":1}\n{\"b\":2}\n")],
         ),
         (
             "json_array",
             "",
-            false,
+            Codec::None,
             vec![
                 record(Some("x"), "1"),
                 record(Some("x"), "2"),
@@ -502,8 +509,8 @@ async fn each_framing_shapes_the_body_and_gzip_compresses_it() {
             ],
         ),
     ];
-    for (framing, key, gzip, records, want) in rows {
-        let name = format!("{framing} gzip={gzip}");
+    for (framing, key, codec, records, want) in rows {
+        let name = format!("{framing} {codec}");
         let server = Server::status(200).await;
         let config = HttpTransportConfig {
             framing: FramingConfig {
@@ -514,7 +521,7 @@ async fn each_framing_shapes_the_body_and_gzip_compresses_it() {
                     key.into()
                 },
             },
-            gzip,
+            compression: Compression::new(codec),
             ..HttpTransportConfig::sender(&server.url())
         };
         let result = sender(&config).await.send_batch(&records).await;
@@ -524,16 +531,18 @@ async fn each_framing_shapes_the_body_and_gzip_compresses_it() {
         for (request, (path, content_type, body)) in seen.iter().zip(want) {
             assert_eq!(request.path(), path, "{name}");
             assert_eq!(request.header("content-type"), Some(content_type), "{name}");
-            let sent = if gzip {
-                assert_eq!(request.header("content-encoding"), Some("gzip"), "{name}");
-                let mut inflated = Vec::new();
-                flate2::read::GzDecoder::new(request.body.as_slice())
-                    .read_to_end(&mut inflated)
-                    .unwrap();
-                inflated
-            } else {
+            let sent = if codec == Codec::None {
                 assert_eq!(request.header("content-encoding"), None, "{name}");
                 request.body.clone()
+            } else {
+                assert_eq!(
+                    request.header("content-encoding"),
+                    Some(codec.name()),
+                    "{name}"
+                );
+                Compression::new(codec)
+                    .decompress(&request.body, 1 << 20)
+                    .unwrap()
             };
             assert_eq!(String::from_utf8_lossy(&sent), body, "{name}");
         }
@@ -1086,7 +1095,7 @@ fn send_keys_reach_the_config_through_the_cascade() {
     headers: { X-Api-Key: key-yaml }
     user_agent: yaml/1
     framing: { type: json_wrapped, key: events }
-    gzip: false
+    compression: { codec: gzip, level: 9 }
     success_status: [200, 201, 204]
     proxy: http://proxy.example:3128
     follow_redirects: false
@@ -1096,7 +1105,10 @@ fn send_keys_reach_the_config_through_the_cascade() {
     .unwrap();
     temp_env::with_vars(
         [
-            ("HTTPSEND__TRANSPORT__HTTP__GZIP", Some("true")),
+            (
+                "HTTPSEND__TRANSPORT__HTTP__COMPRESSION__CODEC",
+                Some("zstd"),
+            ),
             ("HTTPSEND__TRANSPORT__HTTP__USER_AGENT", Some("env/2")),
             ("HTTPSEND__TRANSPORT__HTTP__PROXY", Some("system")),
             ("HTTPSEND__TRANSPORT__HTTP__FOLLOW_REDIRECTS", Some("true")),
@@ -1154,7 +1166,11 @@ fn send_keys_reach_the_config_through_the_cascade() {
             key: "events".into(),
         }
     );
-    assert!(config.gzip);
+    assert_eq!(
+        config.compression,
+        crate::compression::Compression::new(crate::compression::Codec::Zstd).with_level(9),
+        "codec from env, level from YAML"
+    );
     assert_eq!(config.success_status, [200, 201, 204]);
     assert_eq!(config.proxy, ProxyConfig::System);
     assert!(config.follow_redirects);
@@ -1162,7 +1178,8 @@ fn send_keys_reach_the_config_through_the_cascade() {
 }
 
 /// Unset send keys take their defaults: one record per request, any 2xx,
-/// no proxy, no redirects, no gzip.
+/// no proxy, no redirects, no compression. A codec HTTP does not take fails
+/// the build.
 #[test]
 fn send_keys_default_to_the_conservative_choice() {
     let config: HttpTransportConfig = serde_json::from_str("{}").unwrap();
@@ -1170,8 +1187,11 @@ fn send_keys_default_to_the_conservative_choice() {
     assert_eq!(config.success_status, [] as [u16; 0]);
     assert_eq!(config.proxy, ProxyConfig::None);
     assert!(!config.follow_redirects);
-    assert!(!config.gzip);
+    assert!(config.compression.is_none());
     assert_eq!(config.auth, HttpAuth::None);
+    let lz4: HttpTransportConfig =
+        serde_json::from_str(r#"{"compression": {"codec": "lz4"}}"#).unwrap();
+    assert!(super::HTTP_ACCEPTS.check(lz4.compression).is_err());
     assert_eq!(config.max_retry_after_ms, 60_000);
 
     let proxy: ProxyConfig = serde_json::from_str("null").unwrap();

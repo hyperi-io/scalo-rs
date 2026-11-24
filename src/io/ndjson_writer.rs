@@ -173,7 +173,8 @@ impl NdjsonWriter {
     /// # Errors
     ///
     /// Returns `std::io::Error` if the output directory cannot be created
-    /// or listed, or `filename` names no file (`..`, say).
+    /// or listed, `filename` names no file (`..`, say), or `compress_rotated`
+    /// names a codec rotated files do not take.
     pub fn new(
         config: &FileWriterConfig,
         subdir: &str,
@@ -204,6 +205,9 @@ impl NdjsonWriter {
         label: &str,
         mode: OpenMode,
     ) -> Result<Self, std::io::Error> {
+        super::ROTATED_ACCEPTS
+            .check(config.compress_rotated)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let dir = if subdir.is_empty() {
             config.path.clone()
         } else {

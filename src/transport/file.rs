@@ -43,8 +43,11 @@ use super::error::{TransportError, TransportResult};
 use super::traits::{CommitToken, RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::WorkBatch;
+use crate::compression::Compression;
 use crate::framing::{DecodeLimits, Frame, Framing, Lf, StreamDecoder};
-use crate::io::{FileWriteOptions, FileWriterConfig, NdjsonWriter, RotationPeriod};
+use crate::io::{
+    FileWriteOptions, FileWriterConfig, NdjsonWriter, ROTATED_ACCEPTS, RotationPeriod,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -89,9 +92,10 @@ pub struct FileTransportConfig {
     #[serde(default)]
     pub max_age_days: Option<u32>,
 
-    /// Gzip rotated files, keeping the six newest uncompressed. Default off.
+    /// Codec for rotated files past the six newest: `none` (default), `gzip`
+    /// or `zstd`.
     #[serde(default)]
-    pub compress_rotated: bool,
+    pub compress_rotated: Compression,
 
     /// Size rotation, retention by count, `durable` and file modes. An unset
     /// mode is private here: files `0600`, folders `0700`.
@@ -132,7 +136,7 @@ impl Default for FileTransportConfig {
             append: true,
             rotation: default_rotation(),
             max_age_days: None,
-            compress_rotated: false,
+            compress_rotated: Compression::NONE,
             write: FileWriteOptions::default(),
             filters_in: Vec::new(),
             filters_out: Vec::new(),
@@ -152,11 +156,14 @@ impl FileTransportConfig {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        let compress_rotated = ROTATED_ACCEPTS
+            .check(self.compress_rotated)
+            .map_err(|e| TransportError::Config(e.to_string()))?;
         let config = FileWriterConfig {
             path: dir.to_path_buf(),
             rotation: self.rotation,
             max_age_days: self.max_age_days.unwrap_or(u32::MAX),
-            compress_rotated: self.compress_rotated,
+            compress_rotated,
             write: self.write.private_by_default(),
         };
         Ok((config, name.to_owned()))
@@ -683,6 +690,7 @@ impl super::traits::FromCascade for FileTransportConfig {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compression::Codec;
     use tempfile::TempDir;
 
     async fn make_transport(dir: &TempDir, filename: &str) -> FileTransport {
@@ -1225,7 +1233,7 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.yaml"),
             "transport:\n  file:\n    path: /var/log/app/out.ndjson\n    rotation: daily\n    \
-             max_age_days: 3\n    compress_rotated: true\n    max_bytes: 1048576\n    \
+             max_age_days: 3\n    compress_rotated: {codec: zstd}\n    max_bytes: 1048576\n    \
              max_files: 4\n    file_mode: \"0640\"\n",
         )
         .unwrap();
@@ -1249,7 +1257,7 @@ mod tests {
         let config = FileTransportConfig::from_cascade().unwrap();
         assert_eq!(config.rotation, RotationPeriod::Daily);
         assert_eq!(config.max_age_days, Some(3));
-        assert!(config.compress_rotated);
+        assert_eq!(config.compress_rotated, Compression::new(Codec::Zstd));
         assert_eq!(config.write.max_bytes, Some(1_048_576));
         assert_eq!(config.write.max_files, Some(9), "env wins");
         assert!(config.write.durable, "from env");
@@ -1269,7 +1277,16 @@ mod tests {
         let config = FileTransportConfig::default();
         assert_eq!(config.rotation, RotationPeriod::Never);
         assert_eq!(config.max_age_days, None);
-        assert!(!config.compress_rotated);
+        assert_eq!(config.compress_rotated, Compression::NONE);
+        let lz4 = FileTransportConfig {
+            path: "/tmp/out.ndjson".into(),
+            compress_rotated: Compression::new(Codec::Lz4),
+            ..FileTransportConfig::default()
+        };
+        assert!(matches!(
+            lz4.writer_config(),
+            Err(TransportError::Config(_))
+        ));
         assert_eq!(config.write, FileWriteOptions::default());
     }
 

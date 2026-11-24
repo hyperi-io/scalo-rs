@@ -31,7 +31,7 @@ mod record;
 #[cfg(test)]
 mod tests;
 
-pub use config::{OtlpCompression, OtlpConfig, OtlpProtocol};
+pub use config::{OTLP_ACCEPTS, OtlpConfig, OtlpProtocol};
 pub use record::SEVERITY_HEADER;
 
 use std::sync::Arc;
@@ -53,6 +53,7 @@ use super::proxy::Scheme;
 use super::traits::{TransportBase, TransportSender};
 use super::types::{PayloadFormat, SendResult};
 use super::work_batch::{Record, RecordMeta};
+use crate::compression::Compression;
 use record::LogResource;
 
 /// The most characters of a collector's error text a result carries.
@@ -86,7 +87,7 @@ enum Wire {
         client: reqwest::Client,
         url: String,
         headers: reqwest::header::HeaderMap,
-        gzip: bool,
+        compression: Compression,
         dialer: crate::transport::ProxyDialer,
         /// The https collector's host and port, for reading a refused CONNECT.
         tunnel: Option<(String, u16)>,
@@ -135,7 +136,7 @@ impl OtlpTransport {
         tracing::info!(
             endpoint = %endpoint,
             protocol = config.protocol.as_str(),
-            compression = ?config.compression,
+            compression = %config.compression,
             timeout_ms = config.timeout_ms,
             max_retry_delay_ms = config.max_retry_delay_ms,
             tls = tls.as_ref().map_or("none", |t| t.trust.as_str()),
@@ -207,23 +208,23 @@ impl OtlpTransport {
                 client,
                 url,
                 headers,
-                gzip,
+                compression,
                 dialer,
                 tunnel,
             } => {
                 let body = request.encode_to_vec();
                 let encoded_len = body.len();
-                let body = if *gzip {
-                    match gzip_body(&body) {
+                let body = if compression.is_none() {
+                    body
+                } else {
+                    match compression.compress(&body) {
                         Ok(compressed) => compressed,
                         Err(e) => {
                             return SendResult::Fatal(TransportError::Internal(format!(
-                                "OTLP gzip: {e}"
+                                "OTLP {compression}: {e}"
                             )));
                         }
                     }
-                } else {
-                    body
                 };
                 let response = client
                     .post(url)
@@ -448,7 +449,6 @@ fn grpc_wire(
     url: &str,
     tls: Option<&crate::tls::ClientTls>,
 ) -> TransportResult<Wire> {
-    use tonic::codec::CompressionEncoding;
     use tonic::metadata::{AsciiMetadataKey, AsciiMetadataValue, MetadataMap};
 
     // The lazy channel spawns its connection task on the current runtime.
@@ -467,9 +467,12 @@ fn grpc_wire(
     }
     let channel =
         super::tonic_channel::lazy_channel(endpoint, config.timeout_ms, config.proxy.dialer()?);
-    let mut client = LogsServiceClient::new(channel).accept_compressed(CompressionEncoding::Gzip);
-    if config.compression == OtlpCompression::Gzip {
-        client = client.send_compressed(CompressionEncoding::Gzip);
+    let mut client = LogsServiceClient::new(channel);
+    for accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
+        client = client.accept_compressed(accepted);
+    }
+    if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
+        client = client.send_compressed(encoding);
     }
 
     let mut metadata = MetadataMap::new();
@@ -527,17 +530,19 @@ fn http_wire(
         CONTENT_TYPE,
         HeaderValue::from_static("application/x-protobuf"),
     );
-    let gzip = config.compression == OtlpCompression::Gzip;
-    if gzip {
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-    } else {
+    if config.compression.is_none() {
         headers.remove(CONTENT_ENCODING);
+    } else {
+        headers.insert(
+            CONTENT_ENCODING,
+            HeaderValue::from_static(config.compression.codec.name()),
+        );
     }
     Ok(Wire::Http {
         client,
         url,
         headers,
-        gzip,
+        compression: config.compression,
         dialer,
         tunnel,
     })
@@ -660,17 +665,6 @@ fn error_text(body: &[u8], protobuf: bool) -> String {
 /// At most [`MAX_DETAIL_CHARS`] of `text`, trimmed.
 fn truncated(text: &str) -> String {
     text.trim().chars().take(MAX_DETAIL_CHARS).collect()
-}
-
-/// `body` gzip-compressed.
-fn gzip_body(body: &[u8]) -> std::io::Result<Vec<u8>> {
-    use std::io::Write as _;
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::with_capacity(body.len() / 4),
-        flate2::Compression::default(),
-    );
-    encoder.write_all(body)?;
-    encoder.finish()
 }
 
 /// `url` with any user name and password left out.
