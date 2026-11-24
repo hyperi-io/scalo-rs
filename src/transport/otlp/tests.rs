@@ -454,6 +454,17 @@ const CASES: &[Case] = &[
             "Backpressured",
         )
     },
+    Case {
+        tls: Tls::Untrusted,
+        records: 0,
+        detail: "UnknownIssuer",
+        ..case(
+            "grpc collector from a CA the client does not trust",
+            GRPC,
+            Answer::Accept,
+            "Fatal(Config",
+        )
+    },
     case("http accepted", HTTP, Answer::Accept, "Ok"),
     Case {
         detail: "rejected 2 of 3 log records: two were bad",
