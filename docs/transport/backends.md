@@ -169,10 +169,10 @@ transport:
     grpc:
       endpoint: "http://my-app:6000"
       max_message_size: 16777216
-      compression: {codec: none}   # or gzip, zstd. No level: tonic fixes it
+      compression: {codec: none}   # or gzip, or zstd with the compression feature. No level: tonic fixes it
 ```
 
-`compression` is the codec the client sends with ([../compression.md](../compression.md)). A server reads gzip and zstd from any client, whatever its own setting.
+`compression` is the codec the client sends with ([../compression.md](../compression.md)). A server reads gzip from any client, and zstd as well when the build has `compression`, whatever its own setting.
 
 ### Sending over gRPC
 

@@ -23,18 +23,18 @@ Each surface lists its codecs in an `Accepts`, and refuses anything else when it
 | Rotated files: file transport | `compress_rotated` | none, gzip, zstd | yes | none |
 | HTTP send | `transport.http.compression` | none, gzip, zstd | yes | none |
 | OTLP | `transport.otlp.compression` | none, gzip | no | none |
-| gRPC client | `transport.grpc.compression` | none, gzip, zstd | no | none |
-| Vector-compat client | `VectorCompatClient::with_compression` | none, gzip, zstd | no | gzip |
+| gRPC client | `transport.grpc.compression` | none, gzip, zstd (with `compression`) | no | none |
+| Vector-compat client | `VectorCompatClient::with_compression` | none, gzip, zstd (with `compression`) | no | gzip |
 | Kafka producer | `kafka.sizing.producer.compression` | all five | yes | zstd 3 |
 
 - HTTP, OTLP and gRPC default to none because the peer must decode the codec. HTTP and OTLP over HTTP send it as `Content-Encoding`. scalo's HTTP receive side decodes gzip and zstd bodies, to at most `max_body_bytes`, and answers any other coding 415.
-- gRPC and OTLP over gRPC map the codec onto tonic's `CompressionEncoding`, which fixes the level, so a level is refused. A gRPC server reads gzip and zstd on every connection, whatever its own `compression` says.
+- gRPC and OTLP over gRPC map the codec onto tonic's `CompressionEncoding`, which fixes the level, so a level is refused. A gRPC server reads gzip on every connection, and zstd as well with the `compression` feature, whatever its own `compression` says.
 - Kafka maps onto librdkafka's `compression.type` and `compression.level`, so snappy needs no scalo feature there. The raw `producer_librdkafka` and `librdkafka_overrides` maps stay strings and win: a codec named there takes that codec's default level, unless a raw map names a level too. See [kafka-path.md](kafka-path.md#wire-compression).
 - Rotated files past the six newest get the codec's suffix, `.gz` or `.zst`. Retention reads every suffix, so changing the codec keeps old files in the count.
 - GeoIP downloads are gzip because the provider packages them that way, read through flate2 directly and never from config.
 - The tiered sink keeps no codec per record. Its drain holds, committing nothing, at an entry the current codec cannot read, and resumes when the sink reopens under the codec that wrote it ([pipeline/tiered-sink.md](pipeline/tiered-sink.md#changing-the-codec)).
 
-The engines need features. The `compression` feature compiles the zstd, LZ4 and gzip engines, and tonic's gzip and zstd. `compression-snappy` adds snappy. `tiered-sink`, `io` and `transport-http` each pull `compression`. Where a dependency applies a fixed codec, the feature pulls only that codec: `transport-grpc` turns on tonic's gzip and zstd, `transport-otlp` tonic's gzip and `flate2`, and `geoip-download` `flate2`.
+The engines need features. The `compression` feature compiles the zstd, LZ4 and gzip engines, and tonic's gzip and zstd. `compression-snappy` adds snappy. tonic's zstd, and the zstd C library under it, comes only with `compression`, so gRPC zstd needs it. `tiered-sink`, `io` and `transport-http` each pull `compression`. Where a dependency applies a fixed codec, the feature pulls only that codec: `transport-grpc` turns on tonic's gzip, `transport-otlp` tonic's gzip and `flate2`, and `geoip-download` `flate2`.
 
 | API | For |
 | --- | --- |
