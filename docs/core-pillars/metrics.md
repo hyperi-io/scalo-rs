@@ -247,20 +247,17 @@ flush the batch exporter, or lose the last interval's data. See
 [`OtelMetricsConfig`](../../src/metrics/otel_types.rs) for endpoint / protocol /
 batching config.
 
-The endpoint (`metrics.otel.endpoint`, or `OTEL_EXPORTER_OTLP_ENDPOINT`) is `http://localhost` by default. Its port follows the rules tracing and the transport use:
+The endpoint (`metrics.otel.endpoint`, or `OTEL_EXPORTER_OTLP_ENDPOINT`) is `http://localhost` by default. `http://` naming no port takes 4317 under `grpc` and 4318 under `http`, `https://` naming none keeps 443, and a named port is used as given. On `http`, `/v1/metrics` is appended unless the endpoint ends in it.
 
-- `http://` naming no port takes 4317 under `grpc` and 4318 under `http`, whichever of config or `OTEL_EXPORTER_OTLP_PROTOCOL` picks it
-- `https://` naming no port keeps 443, where hosted collectors behind a TLS gateway listen
-- a named port is used as given, so `http://localhost:4317` under `http` stays on 4317
-- on `http`, `/v1/metrics` is appended unless the endpoint already ends in it
-
-`metrics.otel.via_transport: true` pushes through the OTLP transport `transport.otlp` configures, and `MetricsManager::with_otlp_transport(config, transport)` through the app's own, so logs and metrics share one connection. Its TLS, proxy, `connect_to`, headers and `timeout_ms` replace `endpoint`, `protocol`, `headers` and `export_timeout_secs`. Without the `transport-otlp` feature the key leaves push off ([../transport/otlp.md](../transport/otlp.md#metrics)).
+`metrics.otel.via_transport: true` pushes through the OTLP transport `transport.otlp` configures, and `MetricsManager::with_otlp_transport(config, transport)` through the app's own. Its TLS, proxy, `connect_to`, headers and `timeout_ms` replace `endpoint`, `protocol`, `headers` and `export_timeout_secs`. Without the `transport-otlp` feature the key leaves push off ([../transport/otlp.md](../transport/otlp.md#metrics)).
 
 Push needs no `/metrics` server: the manager refreshes the process and container gauges every `update_interval` while either runs. Dropping the manager stops the refresh.
 
-Each metric name exports as one OTel metric, with one stream per label set, however often a macro registers it. scalo keeps one handle per key and gives every instrument of a name the unit and description of its first `describe_*`, because OTel splits instruments that differ in either. A describe after the name's first use is ignored, so describe a metric before it records if it is to carry a unit. A gauge's increments, decrements and sets run one at a time, so the value it exports is its running value.
+Each metric name exports as one OTel metric, with one stream per label set, however often a macro registers it. scalo keeps one handle per key and gives every instrument of a name the unit and description of its first `describe_*`, because OTel splits instruments that differ in either. A describe after the name's first use is ignored. A gauge's increments, decrements and sets run one at a time, so the value it exports is its running value.
 
-The OTLP resource names the replica, so each pod of a service writes its own series. `service.instance.id` comes from the first of `OTEL_RESOURCE_ATTRIBUTES`, `POD_NAME`, `HOSTNAME` (the pod name in Kubernetes) and an id generated once per process. `k8s.pod.name` is added from `POD_NAME`, or from `HOSTNAME` when running in Kubernetes. `service.version` comes from `SERVICE_VERSION`, and `host.name`, `host.id`, `host.arch` and `os.type` from the host. A key `OTEL_RESOURCE_ATTRIBUTES` sets is never overwritten, and `metrics.otel.resource_attributes` wins over all of them. Spans and the OTLP transport carry the same identity.
+Units export as the UCUM codes the semantic conventions use: `Bytes` as `By`, `Seconds` as `s`, `Microseconds` as `us`, and `Count` or no unit as `1`. With no facade unit, a description opening with an annotation such as `{packet}` exports that as the unit. A gauge exports as a gauge, so an up-down counter such as `system.memory.usage` does too. `Counter::absolute` exports the value set.
+
+The OTLP resource names the replica, so each pod of a service writes its own series. `service.instance.id` comes from the first of `OTEL_RESOURCE_ATTRIBUTES`, `POD_NAME`, `HOSTNAME` (the pod name in Kubernetes) and an id generated once per process. `k8s.pod.name` is added from `POD_NAME`, or from `HOSTNAME` when running in Kubernetes. `service.version` (from `SERVICE_VERSION`) and `host.*` and `os.type` are added. A key `OTEL_RESOURCE_ATTRIBUTES` sets is never overwritten, and `metrics.otel.resource_attributes` wins over all of them. Spans and the OTLP transport carry the same identity.
 
 ---
 

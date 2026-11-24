@@ -9,7 +9,8 @@
 //! `MetricsManager::with_otlp_transport` pushes through the OTLP transport to
 //! an in-process gRPC collector, the SDK's reader exporting from its own
 //! thread, with no `/metrics` server started. The process gauges it pushes are
-//! set by the manager's own refresh: with no server, nothing else sets them.
+//! set by the manager's own refresh: with no server, nothing else sets them. A
+//! counter set with `absolute` exports the value set, not a running sum of them.
 //!
 //! The global metrics recorder installs once per process, so this file owns
 //! one `MetricsManager`.
@@ -47,8 +48,8 @@ impl MetricsService for Collector {
     }
 }
 
-/// The last value `name` was exported with, as a float.
-fn last_value(received: &[ExportMetricsServiceRequest], name: &str) -> Option<f64> {
+/// Every value `name` was exported with, in order, as floats.
+fn values(received: &[ExportMetricsServiceRequest], name: &str) -> Vec<f64> {
     received
         .iter()
         .flat_map(|request| &request.resource_metrics)
@@ -66,7 +67,25 @@ fn last_value(received: &[ExportMetricsServiceRequest], name: &str) -> Option<f6
             #[allow(clippy::cast_precision_loss, reason = "test values are small")]
             Number::AsInt(v) => v as f64,
         })
-        .next_back()
+        .collect()
+}
+
+/// The last value `name` was exported with.
+fn last_value(received: &[ExportMetricsServiceRequest], name: &str) -> Option<f64> {
+    values(received, name).last().copied()
+}
+
+/// Wait for the collector to have `name` at `want`, or the deadline: a bound
+/// on a hang, not a timing assertion, since exports land every second.
+async fn wait_for(received: &Received, name: &str, want: impl Fn(f64) -> bool) -> Option<f64> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let last = last_value(&received.lock().unwrap(), name);
+        if last.is_some_and(&want) || Instant::now() > deadline {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// The resource attribute `key` on the first export, as text.
@@ -114,30 +133,40 @@ async fn metrics_push_through_the_transport_with_no_server() {
         },
         Arc::clone(&transport),
     );
-    metrics::counter!("transport_push_probe_total").increment(1);
+    let absolute = metrics::counter!("transport_push_absolute_total");
+    absolute.absolute(10);
 
-    // A bound on a hang, not a timing assertion: exports land every second.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let (rss, probe) = loop {
-        let (rss, probe) = {
-            let received = received.lock().unwrap();
-            (
-                last_value(&received, "process_resident_memory_bytes"),
-                last_value(&received, "transport_push_probe_total"),
-            )
-        };
-        if (rss.is_some() && probe.is_some()) || Instant::now() > deadline {
-            break (rss, probe);
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    assert_eq!(probe, Some(1.0), "the counter reached the collector");
+    let rss = wait_for(&received, "process_resident_memory_bytes", |bytes| {
+        bytes > 0.0
+    })
+    .await;
     assert!(
         rss.is_some_and(|bytes| bytes > 0.0),
         "the process gauge was refreshed with no server: {rss:?}"
     );
+    let first = wait_for(&received, "transport_push_absolute_total", |v| {
+        (v - 10.0).abs() < f64::EPSILON
+    })
+    .await;
+    assert_eq!(
+        first,
+        Some(10.0),
+        "the absolute counter reached the collector"
+    );
+    absolute.absolute(25);
+    let second = wait_for(&received, "transport_push_absolute_total", |v| {
+        (v - 25.0).abs() < f64::EPSILON
+    })
+    .await;
+    assert_eq!(second, Some(25.0), "the second absolute value, not 10 + 25");
 
     let received = received.lock().unwrap();
+    assert!(
+        values(&received, "transport_push_absolute_total")
+            .iter()
+            .all(|v| [10.0, 25.0].contains(v)),
+        "no export summed the absolute values"
+    );
     assert_eq!(
         attribute(&received, "service.name").as_deref(),
         Some("scalo-transport-push"),

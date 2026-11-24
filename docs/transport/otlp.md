@@ -91,6 +91,7 @@ let provider = SdkMeterProvider::builder()
 ```
 
 - Resource: the meter provider's, not the transport's, so a `MetricsManager` keeps its own `service.name` and `metrics.otel.resource_attributes`. Both carry the same replica and host identity.
+- Units: the meter provider's. `MetricsManager` exports the facade's as UCUM codes, `By` for bytes ([../core-pillars/metrics.md](../core-pillars/metrics.md#otel-mode)).
 - Temporality: cumulative. A failed export is not retried: the next one that lands carries the totals.
 - Results: a collector answer maps as for logs, and anything but `Ok` is an export error the SDK reports, `rejected_data_points` included. A metric export moves no `transport_*` counter, runs no filter and is logged at debug.
 - Shutdown: the exporter's stops it exporting and leaves the transport open for its logs. A closed transport fails every metric export.
