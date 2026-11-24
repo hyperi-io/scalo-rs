@@ -3,6 +3,15 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.35](https://github.com/hyperi-io/scalo-rs/compare/v2.14.34...v2.14.35) (2026-11-24)
+
+### Bug Fixes
+
+* **otlp:** redact OTLP header values in Debug ([#559](https://github.com/hyperi-io/scalo-rs/issues/559)) ([ca196b9](https://github.com/hyperi-io/scalo-rs/commit/ca196b9f1a9d44b523600a3618fd9af21f733f42))
+* **spool:** use a copy of yaque 0.6.6 for spool and tiered-sink ([#560](https://github.com/hyperi-io/scalo-rs/issues/560)) ([cd91f4d](https://github.com/hyperi-io/scalo-rs/commit/cd91f4d1e97ee6b412e11123f84d4efc630e57e0))
+* **transport:** fail gRPC on server cert or name rejection ([902bf05](https://github.com/hyperi-io/scalo-rs/commit/902bf05a84fc4a3c99cbcae387ff28849d81affe))
+* **transport:** hold records on proxy refusal ([#558](https://github.com/hyperi-io/scalo-rs/issues/558)) ([2333b86](https://github.com/hyperi-io/scalo-rs/commit/2333b866b65cfc084856a67251c2304e53fa74c5))
+
 ## [2.14.34](https://github.com/hyperi-io/scalo-rs/compare/v2.14.33...v2.14.34) (2026-11-23)
 
 ### Bug Fixes
