@@ -13,7 +13,7 @@ use super::test_front::echo;
 use super::{ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Refusals, Scheme, refusal};
 #[cfg(all(feature = "transport-proxy-test-support", unix))]
 use super::{
-    squid::{PASSWORD, Squid, TARGET_HOST, USER},
+    squid::{Squid, TARGET_HOST, USER},
     test_front::plain_front,
 };
 use crate::sensitive::SensitiveString;
@@ -239,17 +239,18 @@ async fn connect_through_the_proxy() {
         return;
     };
     let target = plain_front(echo().await).await;
+    let wrong = format!("{}-wrong", squid.password());
     // (name, proxy URL, wanted: Ok or the refusal status)
     let rows: [(&str, String, Result<(), u16>); 5] = [
         ("open", squid.open(), Ok(())),
         ("port 443 only", squid.port_only(), Err(403)),
         ("credentials wanted, none sent", squid.auth(), Err(407)),
-        ("credentials sent", squid.auth_with(USER, PASSWORD), Ok(())),
         (
-            "wrong password",
-            squid.auth_with(USER, "wrong-password"),
-            Err(407),
+            "credentials sent",
+            squid.auth_with(USER, squid.password()),
+            Ok(()),
         ),
+        ("wrong password", squid.auth_with(USER, &wrong), Err(407)),
     ];
     for (name, proxy, wanted) in rows {
         let dialer = url(&proxy).dialer().unwrap();
@@ -270,7 +271,7 @@ async fn connect_through_the_proxy() {
                 let text = refused.to_string();
                 assert!(text.contains(&status.to_string()), "{name}: {text}");
                 assert!(
-                    !text.contains(PASSWORD) && !text.contains("wrong-password"),
+                    !text.contains(squid.password()) && !text.contains(&wrong),
                     "{name}: {text}"
                 );
             }

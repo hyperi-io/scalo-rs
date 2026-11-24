@@ -19,7 +19,7 @@
 //! | [`open`](Squid::open) | any target |
 //! | [`port_only`](Squid::port_only) | port 443 only, 403 for the rest |
 //! | [`auth`](Squid::auth) | 407 without credentials |
-//! | [`auth_with`](Squid::auth_with) | any target for [`USER`] and [`PASSWORD`], 407 for others |
+//! | [`auth_with`](Squid::auth_with) | any target for [`USER`] and [`password`](Squid::password), 407 for others |
 //!
 //! [`TARGET_HOST`] resolves only inside Squid, to the machine running the
 //! tests, so a connection to it that arrives went through the proxy. Put a
@@ -46,11 +46,8 @@ pub const TARGET_HOST: &str = "target.test";
 /// The proxy user [`Squid::auth_with`] takes.
 pub const USER: &str = "scalo";
 
-/// Its password.
-pub const PASSWORD: &str = "scalo-proxy-test-pw";
-
-/// [`PASSWORD`] as SHA-512 crypt, which `basic_ncsa_auth` reads.
-const PASSWORD_HASH: &str = "$6$scalotest$e5.khkgogFEx6TPOPAL5XsnjQ7M/bgs0NB8qow1pRkJnUGvu0eW6bYuvujyKmMGkln0E32QcGLTE2lT/G6qJa1";
+/// Where the run's random proxy password sits in the container.
+const PASSWORD_FILE: &str = "/etc/squid/proxy-password";
 
 const OPEN_PORT: u16 = 3128;
 const PORT_ONLY_PORT: u16 = 3129;
@@ -66,6 +63,7 @@ const SUITE: Suite = Suite {
 #[derive(Debug)]
 pub struct Squid {
     container: SharedContainer,
+    password: String,
 }
 
 impl Squid {
@@ -92,7 +90,13 @@ impl Squid {
                         tokio::task::spawn_blocking(|| shared_service::acquire(&SUITE, &spec()))
                             .await
                             .unwrap_or_else(|e| panic!("start Squid: {e}"));
-                    Self { container }
+                    let password = String::from_utf8_lossy(&container.read_file(PASSWORD_FILE))
+                        .trim()
+                        .to_string();
+                    Self {
+                        container,
+                        password,
+                    }
                 })
                 .await,
         )
@@ -116,8 +120,16 @@ impl Squid {
         self.url(AUTH_PORT, None)
     }
 
+    /// The password of [`USER`] for this run: random, written into the
+    /// container when it starts.
+    #[must_use]
+    pub fn password(&self) -> &str {
+        &self.password
+    }
+
     /// The same proxy with `user:password@` in its URL. [`USER`] and
-    /// [`PASSWORD`] open a tunnel to any target, and any other pair is 407.
+    /// [`password`](Self::password) open a tunnel to any target, and any other
+    /// pair is 407.
     #[must_use]
     pub fn auth_with(&self, user: &str, password: &str) -> String {
         self.url(AUTH_PORT, Some((user, password)))
@@ -144,13 +156,23 @@ fn spec() -> ServiceSpec {
     ServiceSpec {
         ports: vec![OPEN_PORT, PORT_ONLY_PORT, AUTH_PORT],
         files,
+        after_start: hash_password,
         // The image's supervisor logs this once Squid has stayed up for a second.
         ready: Ready::Log("Started default services"),
         ..ServiceSpec::new("squid", SQUID_IMAGE, Duration::from_secs(120))
     }
 }
 
-/// The config, password file and hosts file copied in before Squid starts.
+/// Hashes the random password into the file `basic_ncsa_auth` reads, with the
+/// image's own `openssl`, in `/tmp` because the exec user can't write `/etc`.
+fn hash_password(container: &SharedContainer) {
+    let script = format!(
+        "printf '{USER}:' > /tmp/squid-passwd && openssl passwd -6 -in {PASSWORD_FILE} >> /tmp/squid-passwd"
+    );
+    let _ = container.exec(&["sh", "-c", &script]);
+}
+
+/// The config, password and hosts file copied in before Squid starts.
 fn files(_host: &str) -> Vec<(String, Vec<u8>)> {
     let out = shared_service::docker(&[
         "network",
@@ -171,7 +193,7 @@ http_port {OPEN_PORT} name=open
 http_port {PORT_ONLY_PORT} name=port_only
 http_port {AUTH_PORT} name=auth
 hosts_file /etc/squid/hosts
-auth_param basic program /usr/lib/squid/basic_ncsa_auth /etc/squid/passwd
+auth_param basic program /usr/lib/squid/basic_ncsa_auth /tmp/squid-passwd
 auth_param basic realm scalo-test
 acl via_open myportname open
 acl via_port_only myportname port_only
@@ -188,8 +210,8 @@ http_access deny all
     vec![
         ("/etc/squid/squid.conf".into(), conf.into_bytes()),
         (
-            "/etc/squid/passwd".into(),
-            format!("{USER}:{PASSWORD_HASH}\n").into_bytes(),
+            PASSWORD_FILE.into(),
+            uuid::Uuid::new_v4().simple().to_string().into_bytes(),
         ),
         (
             "/etc/squid/hosts".into(),

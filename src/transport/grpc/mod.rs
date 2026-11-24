@@ -2677,7 +2677,7 @@ mod tests {
     async fn sends_go_through_a_connect_proxy() {
         use crate::sensitive::SensitiveString;
         use crate::transport::ProxyConfig;
-        use crate::transport::proxy::squid::{PASSWORD, Squid, TARGET_HOST, USER};
+        use crate::transport::proxy::squid::{Squid, TARGET_HOST, USER};
         use crate::transport::proxy::test_front::{plain_front, tls_front};
 
         let Some(squid) = Squid::shared().await else {
@@ -2697,7 +2697,7 @@ mod tests {
         let rows = [
             (squid.open(), false),
             (squid.open(), true),
-            (squid.auth_with(USER, PASSWORD), true),
+            (squid.auth_with(USER, squid.password()), true),
         ];
         for (proxy, over_tls) in &rows {
             let mut config = GrpcConfig::client(if *over_tls { &tls } else { &plain });

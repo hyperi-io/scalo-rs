@@ -20,7 +20,7 @@ use crate::sensitive::SensitiveString;
 use crate::transport::error::TransportError;
 use crate::transport::proxy::ProxyConfig;
 #[cfg(all(feature = "transport-proxy-test-support", unix))]
-use crate::transport::proxy::squid::{PASSWORD, Squid, TARGET_HOST, USER};
+use crate::transport::proxy::squid::{Squid, TARGET_HOST, USER};
 use crate::transport::proxy::test_front::tls_front;
 use crate::transport::traits::TransportSender;
 use crate::transport::types::{PayloadFormat, SendResult};
@@ -849,7 +849,7 @@ async fn https_goes_through_a_connect_proxy() {
     let endpoint = format!("https://{TARGET_HOST}:{}", front.port());
     let rows = [
         ("open", squid.open()),
-        ("credentials sent", squid.auth_with(USER, PASSWORD)),
+        ("credentials sent", squid.auth_with(USER, squid.password())),
     ];
     for (name, proxy) in rows {
         let config = HttpTransportConfig {

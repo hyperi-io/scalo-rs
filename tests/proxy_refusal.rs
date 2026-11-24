@@ -41,7 +41,7 @@ use scalo::transport::grpc::{GrpcConfig, GrpcTransport};
 use scalo::transport::http::{HttpTransport, HttpTransportConfig};
 use scalo::transport::otlp::{OtlpConfig, OtlpProtocol, OtlpTransport};
 use scalo::transport::proxy::Scheme;
-use scalo::transport::proxy::squid::{PASSWORD, Squid, TARGET_HOST, USER};
+use scalo::transport::proxy::squid::{Squid, TARGET_HOST, USER};
 use scalo::transport::syslog::{SyslogConfig, SyslogProtocol, SyslogTransport};
 use scalo::transport::{
     PayloadFormat, ProxyConfig, ProxyError, Record, RecordMeta, SendResult, TransportSender,
@@ -75,7 +75,7 @@ impl Refusal {
         match self {
             Self::PortOnly => squid.port_only(),
             Self::AuthRequired => squid.auth(),
-            Self::WrongPassword => squid.auth_with(USER, &format!("{PASSWORD}-wrong")),
+            Self::WrongPassword => squid.auth_with(USER, &format!("{}-wrong", squid.password())),
         }
     }
 }
