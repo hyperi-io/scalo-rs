@@ -39,6 +39,8 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::yaque;
+
 use serde::{Deserialize, Serialize};
 
 /// What to do when a corrupt cache is detected (queue won't open, or a CRC check

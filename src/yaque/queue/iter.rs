@@ -1,18 +1,22 @@
+// Copied from yaque 0.6.6, src/queue/iter.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 use std::fs::*;
 use std::io::{self};
 use std::path::{Path, PathBuf};
 
-use crate::header::Header;
-use crate::state::{QueueState, QueueStatePersistence};
-use crate::sync::{FileGuard, SyncFollower};
-use crate::version::check_queue_version;
+use crate::yaque::header::Header;
+use crate::yaque::state::{QueueState, QueueStatePersistence};
+use crate::yaque::sync::{FileGuard, SyncFollower};
+use crate::yaque::version::check_queue_version;
 
 use super::try_acquire_recv_lock;
-use super::{segment_filename, HEADER_EOF};
+use super::{HEADER_EOF, segment_filename};
 
 /// An [`Iterator`] that iterates over the elements of the queue, until it hts
 /// the end for the first time. Use this structure instead of
-/// [`crate::Receiver`] if you just need to read the data stored in a queue.
+/// [`crate::yaque::Receiver`] if you just need to read the data stored in a queue.
 ///
 /// Three good reasons for this are:
 ///
@@ -20,7 +24,7 @@ use super::{segment_filename, HEADER_EOF};
 /// 2. There is no transactional mechanism involved, since there is no need for
 /// one and, because of this,
 /// 3. Elements are not buffered in memory, as opposed to what
-/// [`crate::Receiver::recv_batch`] does.
+/// [`crate::yaque::Receiver::recv_batch`] does.
 ///
 /// And you also get some extra percents of performance from a simpler
 /// implementation. Don't pay for what you don't use!

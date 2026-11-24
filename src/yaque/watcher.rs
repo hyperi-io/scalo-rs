@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/watcher.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! Watcher implementations for specific events on the queue directory. This is the interface with
 //! the `inotify` API.
 

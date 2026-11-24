@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/lib.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! # Yaque: Yet Another QUEue
 //!
 //! Yaque is yet another disk-backed persistent queue (and mutex) for Rust. It
@@ -21,7 +25,7 @@
 //! To create a new queue, just use the [`channel`] function, passing a
 //! directory path on which to mount the queue. If the directory does not exist
 //! on creation, it (and possibly all its parent directories) will be created.
-//! ```rust
+//! ```ignore
 //! use yaque::channel;
 //!
 //! futures::executor::block_on(async {
@@ -36,7 +40,7 @@
 //! that the sending and receiving methods, [`Sender::send`] and [`Receiver::recv`]
 //!  are asynchronous. Writing to the queue with the sender is mostly lock-free,
 //! but might lock if you limit queue size.
-//! ```rust
+//! ```ignore
 //! use yaque::{channel, queue::try_clear};
 //!
 //! futures::executor::block_on(async {
@@ -93,7 +97,7 @@
 //! [`Receiver::recv_batch_timeout`] to receive data, awaiting up to a
 //! completion of a provided future, such as a delay or a channel. Here is an
 //! example:
-//! ```rust
+//! ```ignore
 //! use yaque::channel;
 //! use std::time::Duration;
 //! use futures_timer::Delay;
@@ -193,6 +197,14 @@
 //! Pull requests and contributions are also greatly appreciated.
 //!
 
+#![allow(
+    dead_code,
+    unused_imports,
+    clippy::all,
+    clippy::pedantic,
+    reason = "yaque 0.6.6 as published, and scalo calls part of its API"
+)]
+
 mod error;
 mod header;
 mod state;
@@ -202,8 +214,37 @@ mod watcher;
 
 pub mod mutex;
 pub mod queue;
-#[cfg(feature = "recovery")]
 pub mod recovery;
 
 pub use error::{TryRecvError, TrySendError};
-pub use queue::{channel, QueueIter, Receiver, ReceiverBuilder, Sender, SenderBuilder};
+pub use queue::{QueueIter, Receiver, ReceiverBuilder, Sender, SenderBuilder, channel};
+
+/// A fresh scratch directory for a test queue, removed when the guard drops.
+#[cfg(test)]
+pub(crate) fn test_queue_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue");
+    (dir, path)
+}
+
+/// A seeded xorshift64 stream, so a failing test replays the same data.
+#[cfg(test)]
+pub(crate) fn test_rng() -> impl FnMut() -> u64 {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+}
+
+/// Run a future to completion on a runtime of its own.
+#[cfg(test)]
+pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}

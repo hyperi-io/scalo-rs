@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/header.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! Hamming-encoded headers for the preppers. Reading a corrupted header can
 //! have devastating consequences. It is better to panic. And yes, this _has_
 //! happened in a real world scenario (SIGKILL).
@@ -136,8 +140,9 @@ mod test {
     use super::*;
 
     fn lots_of_lengths() -> impl Iterator<Item = Header> {
+        let mut rng = crate::yaque::test_rng();
         (0..)
-            .map(|_| Header::new(rand::random::<u32>() & 0x03_FF_FF_FFu32))
+            .map(move |_| Header::new(rng() as u32 & 0x03_FF_FF_FFu32))
             .take(1_000_000)
     }
 

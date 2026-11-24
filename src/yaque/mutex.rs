@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/mutex.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! A persistent mutex implementation using the atomicity of [`OpenOptions::create_new`]
 //!
 //! Please note that this `Mutex` just really works if other processes in your system
@@ -8,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-pub use crate::sync::FileGuard;
+pub use super::sync::FileGuard;
 
 /// A persistent mutex implementation using the atomicity of [`OpenOptions::create_new`].
 /// This structure, as opposed to [`FileGuard`], holds some content in a separate file.
@@ -103,8 +107,9 @@ mod test {
 
     #[test]
     fn test_mutex() {
-        futures::executor::block_on(async move {
-            let mutex = Mutex::open("data/mutex").unwrap();
+        let (_dir, path) = crate::yaque::test_queue_dir();
+        crate::yaque::block_on(async move {
+            let mutex = Mutex::open(&path).unwrap();
             let guard = mutex.lock().await.unwrap();
 
             guard.write(b"some data").unwrap();
@@ -122,8 +127,9 @@ mod test {
 
     #[test]
     fn test_mutex_longer_data_first() {
-        futures::executor::block_on(async move {
-            let mutex = Mutex::open("data/mutex-longer-data-first").unwrap();
+        let (_dir, path) = crate::yaque::test_queue_dir();
+        crate::yaque::block_on(async move {
+            let mutex = Mutex::open(&path).unwrap();
             let guard = mutex.lock().await.unwrap();
 
             guard.write(b"some long data").unwrap();

@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/sync.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! Synchronization structures based on the filesystem.
 
 use lazy_static::lazy_static;
@@ -11,12 +15,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-use crate::watcher::{file_removal_watcher, file_watcher, removal_watcher};
+use super::watcher::{file_removal_watcher, file_watcher, removal_watcher};
 
 lazy_static! {
     /// A unique token to differentiate between processes which might have the
     /// same PID, but are otherwise different instances.
-    pub(crate) static ref UNIQUE_PROCESS_TOKEN: u64 = rand::thread_rng().gen();
+    pub(crate) static ref UNIQUE_PROCESS_TOKEN: u64 = rand::thread_rng().r#gen();
 }
 
 pub fn render_lock() -> String {
@@ -314,7 +318,7 @@ impl DeletionEvent {
 }
 
 /// A simpler, sync alternative to [`TailFollower`] used in the implementation
-/// of [`crate::QueueIter`].
+/// of [`crate::yaque::QueueIter`].
 pub struct SyncFollower {
     file: io::BufReader<File>,
 }

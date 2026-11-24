@@ -221,6 +221,10 @@ pub mod http_server;
 #[cfg(any(feature = "spool", feature = "tiered-sink"))]
 pub(crate) mod spool_codec;
 
+// The disk queue under both, copied in from yaque 0.6.6 (Apache-2.0, see NOTICE).
+#[cfg(any(feature = "spool", feature = "tiered-sink"))]
+mod yaque;
+
 #[cfg(feature = "spool")]
 #[cfg_attr(docsrs, doc(cfg(feature = "spool")))]
 pub mod spool;

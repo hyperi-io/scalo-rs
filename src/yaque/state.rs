@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/state.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! Structures for managing the state of a queue.
 
 use std::cmp::{Ordering, PartialOrd};

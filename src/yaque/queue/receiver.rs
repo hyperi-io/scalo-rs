@@ -1,5 +1,9 @@
-use futures::future;
+// Copied from yaque 0.6.6, src/queue/receiver.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 use futures::FutureExt;
+use futures::future;
 use std::collections::VecDeque;
 use std::fs::*;
 use std::future::Future;
@@ -8,14 +12,14 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::error::TryRecvError;
-use crate::header::Header;
-use crate::state::QueueState;
-use crate::state::QueueStatePersistence;
-use crate::sync::{FileGuard, TailFollower};
-use crate::version::check_queue_version;
+use crate::yaque::error::TryRecvError;
+use crate::yaque::header::Header;
+use crate::yaque::state::QueueState;
+use crate::yaque::state::QueueStatePersistence;
+use crate::yaque::sync::{FileGuard, TailFollower};
+use crate::yaque::version::check_queue_version;
 
-use super::{segment_filename, HEADER_EOF};
+use super::{HEADER_EOF, segment_filename};
 
 /// The name of the receiver lock in the queue folder.
 pub(crate) fn recv_lock_filename<P: AsRef<Path>>(base: P) -> PathBuf {

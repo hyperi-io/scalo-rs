@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/recovery.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! Recovery utilities for queues left in as inconsistent state, based on "best
 //! effort" strategies. Use these functions if you need to automatically recover
 //! from a failure.
@@ -26,7 +30,7 @@
 use std::fs::*;
 use std::io;
 use std::path::Path;
-use sysinfo::*;
+use yaque_sysinfo::*;
 
 use super::queue::{recv_lock_filename, send_lock_filename};
 use super::state::{QueueState, QueueStatePersistence};
@@ -54,7 +58,7 @@ pub fn unlock<P: AsRef<Path>>(lock_filename: P) -> io::Result<()> {
                 .chars()
                 .take_while(|ch| ch.is_digit(10))
                 .collect::<String>()
-                .parse::<sysinfo::Pid>()
+                .parse::<yaque_sysinfo::Pid>()
         })
         .expect("failed to parse recv lock file: no pid")
         .expect("failed to parse recv lock file: bad pid");
@@ -165,7 +169,7 @@ pub fn guess_recv_metadata<P: AsRef<Path>>(base: P) -> io::Result<()> {
     let lock = FileGuard::try_lock(recv_lock_filename(base.as_ref()))?;
 
     // Find smallest segment:
-    let mut min_segment = std::u64::MAX;
+    let mut min_segment = u64::MAX;
     for maybe_entry in read_dir(base.as_ref())? {
         let path = maybe_entry?.path();
         if path.extension().map(|ext| ext == "q").unwrap_or(false) {
@@ -223,7 +227,7 @@ pub fn guess_recv_metadata_with_loss<P: AsRef<Path>>(base: P) -> io::Result<()> 
     let lock = FileGuard::try_lock(recv_lock_filename(base.as_ref()))?;
 
     // Find smallest segment:
-    let mut min_segment = std::u64::MAX;
+    let mut min_segment = u64::MAX;
     for maybe_entry in read_dir(base.as_ref())? {
         let path = maybe_entry?.path();
         if path.extension().map(|ext| ext == "q").unwrap_or(false) {
@@ -319,25 +323,26 @@ mod tests {
 
     #[test]
     fn test_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("test-unlock.lock");
+
         // Create a guard:
-        let guard = FileGuard::try_lock("data/test-unlock.lock").unwrap();
+        let guard = FileGuard::try_lock(&lock).unwrap();
 
         // "Forget" to drop it:
         std::mem::forget(guard);
 
         // Now, try to unlock:
-        assert_eq!(
-            io::ErrorKind::Other,
-            unlock("data/test-unlock.lock").unwrap_err().kind()
-        );
+        assert_eq!(io::ErrorKind::Other, unlock(&lock).unwrap_err().kind());
 
         // Clean up:
-        remove_file("data/test-unlock.lock").unwrap();
+        remove_file(&lock).unwrap();
     }
 
     #[test]
     fn test_unlock_inexistent() {
-        unlock("data/inexistent-lock.lock").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        unlock(dir.path().join("inexistent-lock.lock")).unwrap();
     }
 
     // TODO missing test for `guess_send_metadata` and `recover`.
@@ -350,10 +355,12 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_recover_while_open() {
-        // Create a channel:
-        let channel = crate::channel("data/recover-while-open").unwrap();
+        let (_dir, path) = crate::yaque::test_queue_dir();
 
-        recover("data/recover-while-open").unwrap();
+        // Create a channel:
+        let channel = crate::yaque::channel(&path).unwrap();
+
+        recover(&path).unwrap();
 
         drop(channel);
     }
@@ -361,6 +368,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_recover_inexistent() {
-        recover("data/recover-inexistent").unwrap();
+        let (_dir, path) = crate::yaque::test_queue_dir();
+        recover(&path).unwrap();
     }
 }

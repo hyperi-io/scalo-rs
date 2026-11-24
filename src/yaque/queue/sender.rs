@@ -1,15 +1,19 @@
+// Copied from yaque 0.6.6, src/queue/sender.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 use std::fs::*;
 use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use crate::error::TrySendError;
-use crate::header::Header;
-use crate::state::QueueState;
-use crate::sync::{DeletionEvent, FileGuard};
-use crate::version::check_queue_version;
+use crate::yaque::error::TrySendError;
+use crate::yaque::header::Header;
+use crate::yaque::state::QueueState;
+use crate::yaque::sync::{DeletionEvent, FileGuard};
+use crate::yaque::version::check_queue_version;
 
-use super::{segment_filename, HEADER_EOF};
+use super::{HEADER_EOF, segment_filename};
 
 /// The name of the sender lock in the queue folder.
 pub(crate) fn send_lock_filename<P: AsRef<Path>>(base: P) -> PathBuf {
@@ -225,7 +229,7 @@ impl Sender {
     fn write(&mut self, data: &[u8]) -> io::Result<u64> {
         // Get length of the data and write the header:
         let len = data.as_ref().len();
-        assert!(len < std::u64::MAX as usize);
+        assert!(len < u64::MAX as usize);
         let header = Header::new(len as u32).encode();
 
         // Write stuff to the file:

@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/version.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! Versioning to pester the user not to write to incompatible queues.
 //!
 
@@ -5,7 +9,14 @@ use semver::{Version, VersionReq};
 use std::io;
 use std::path::Path;
 
-use crate::mutex::Mutex;
+use super::mutex::Mutex;
+
+/// The version stamped in `version/contents`. It names the on-disk format, so it
+/// stays yaque's release and never follows scalo's.
+const QUEUE_FORMAT_VERSION: &str = "0.6.6";
+
+/// The stamped versions a queue may carry and still open.
+const QUEUE_FORMAT_ACCEPTS: &str = "0.6.*";
 
 // fn get_version_for_queue<P: AsRef<Path>>(base: P) -> io::Result<Version> {
 //     let version_file_contents = read_to_string(base.as_ref().join("yaque-version"))?;
@@ -81,7 +92,7 @@ pub fn check_queue_version<P: AsRef<Path>>(base: P) -> io::Result<()> {
     let str_contents = String::from_utf8_lossy(&contents);
 
     if str_contents.is_empty() {
-        lock.write(format!("{}\n", env!("CARGO_PKG_VERSION")).as_bytes())?;
+        lock.write(format!("{}\n", QUEUE_FORMAT_VERSION).as_bytes())?;
     } else {
         let version = match str_contents.trim().parse::<Version>() {
             Ok(version) => version,
@@ -93,19 +104,14 @@ pub fn check_queue_version<P: AsRef<Path>>(base: P) -> io::Result<()> {
             ),
         };
 
-        let requirement = VersionReq::parse(&format!(
-            "{}.{}.*",
-            env!("CARGO_PKG_VERSION_MAJOR"),
-            env!("CARGO_PKG_VERSION_MINOR")
-        ))
-        .expect("requirement is valid");
+        let requirement = VersionReq::parse(QUEUE_FORMAT_ACCEPTS).expect("requirement is valid");
 
         if !requirement.matches(&version) {
             panic!(
                 "queue `{:?}` is of version {}, but you have yaque version {}, which is compatible with {}",
                 base.as_ref(),
                 version,
-                env!("CARGO_PKG_VERSION"),
+                QUEUE_FORMAT_VERSION,
                 requirement
             );
         }

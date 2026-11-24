@@ -10,12 +10,12 @@
 
 use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
 use crate::transport::{Record, SendResult, TransportSender};
+use crate::yaque::{self, Receiver};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use yaque::Receiver;
 
 /// Drainer state and rate tracking.
 pub struct Drainer {

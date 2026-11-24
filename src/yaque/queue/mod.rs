@@ -1,3 +1,7 @@
+// Copied from yaque 0.6.6, src/queue/mod.rs: https://github.com/tokahuke/yaque
+// Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
+// Modified for scalo.
+
 //! Queue implementation and utility functions.
 
 mod iter;
@@ -8,9 +12,7 @@ pub use iter::QueueIter;
 pub use receiver::{Receiver, ReceiverBuilder, RecvGuard};
 pub use sender::{Sender, SenderBuilder};
 
-#[cfg(feature = "recovery")]
 pub(crate) use receiver::recv_lock_filename;
-#[cfg(feature = "recovery")]
 pub(crate) use sender::send_lock_filename;
 
 use std::fs::*;
@@ -63,78 +65,61 @@ pub async fn clear<P: AsRef<Path>>(base: P) -> io::Result<()> {
     Ok(())
 }
 
-/// Global initialization for tests
-#[cfg(test)]
-#[ctor::ctor]
-fn init_log() {
-    // Init logger:
-    #[cfg(feature = "log-trace")]
-    simple_logger::SimpleLogger::new()
-        .with_level(log::LevelFilter::Trace)
-        .init()
-        .ok();
-
-    #[cfg(feature = "log-debug")]
-    simple_logger::SimpleLogger::new()
-        .with_level(log::LevelFilter::Debug)
-        .init()
-        .ok();
-
-    // Remove an old test:
-    std::fs::remove_dir_all("data").ok();
-
-    // Create new structure:
-    std::fs::create_dir_all("data").unwrap();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // use futures::StreamExt;
-    use futures_timer::Delay;
-    use rand::{Rng, SeedableRng};
-    use rand_xorshift::XorShiftRng;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::error::{TryRecvError, TrySendError};
+    use crate::yaque::error::{TryRecvError, TrySendError};
+    use crate::yaque::{block_on, test_queue_dir, test_rng};
 
     use self::sender::get_queue_size;
 
     fn data_lots_of_data() -> impl Iterator<Item = Vec<u8>> {
-        let mut rng = XorShiftRng::from_rng(rand::thread_rng()).expect("can init");
+        let mut rng = test_rng();
         (0..).map(move |_| {
-            (0..rng.gen::<usize>() % 128)
-                .map(|_| rng.gen())
+            (0..rng() as usize % 128)
+                .map(|_| rng() as u8)
                 .collect::<Vec<_>>()
         })
     }
 
+    fn delay(duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+
     #[test]
     fn create_and_clear() {
-        let _ = Sender::open("data/create-and-clear").unwrap();
-        try_clear("data/create-and-clear").unwrap();
+        let (_dir, path) = test_queue_dir();
+        let _ = Sender::open(&path).unwrap();
+        try_clear(&path).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn create_and_clear_fails() {
-        let sender = Sender::open("data/create-and-clear-fails").unwrap();
-        try_clear("data/create-and-clear-fails").unwrap();
+        let (_dir, path) = test_queue_dir();
+        let sender = Sender::open(&path).unwrap();
+        try_clear(&path).unwrap();
         drop(sender);
     }
 
     #[test]
     fn create_and_clear_async() {
-        let _ = Sender::open("data/create-and-clear-async").unwrap();
+        let (_dir, path) = test_queue_dir();
+        let _ = Sender::open(&path).unwrap();
 
-        futures::executor::block_on(async { clear("data/create-and-clear-async").await.unwrap() });
+        block_on(async { clear(&path).await.unwrap() });
     }
 
     #[test]
     fn test_enqueue() {
-        let mut sender = Sender::open("data/enqueue").unwrap();
+        let (_dir, path) = test_queue_dir();
+        let mut sender = Sender::open(&path).unwrap();
         for data in data_lots_of_data().take(100_000) {
             sender.try_send(&data).unwrap();
         }
@@ -143,9 +128,11 @@ mod tests {
     /// Test enqueuing everything and then dequeueing everything, with no persistence.
     #[test]
     fn test_enqueue_then_dequeue() {
+        let (_dir, path) = test_queue_dir();
+
         // Enqueue:
         let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
-        let mut sender = Sender::open("data/enqueue-then-dequeue").unwrap();
+        let mut sender = Sender::open(&path).unwrap();
         for data in &dataset {
             sender.try_send(data).unwrap();
         }
@@ -153,8 +140,8 @@ mod tests {
         log::trace!("enqueued");
 
         // Dequeue:
-        futures::executor::block_on(async {
-            let mut receiver = Receiver::open("data/enqueue-then-dequeue").unwrap();
+        block_on(async {
+            let mut receiver = Receiver::open(&path).unwrap();
             let dataset_iter = dataset.iter();
             let mut i = 0u64;
 
@@ -170,12 +157,14 @@ mod tests {
     /// Test enqueuing and dequeueing, round robin, with no persistence.
     #[test]
     fn test_enqueue_and_dequeue() {
+        let (_dir, path) = test_queue_dir();
+
         // Enqueue:
         let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
-        let mut sender = Sender::open("data/enqueue-and-dequeue").unwrap();
+        let mut sender = Sender::open(&path).unwrap();
 
-        futures::executor::block_on(async {
-            let mut receiver = Receiver::open("data/enqueue-and-dequeue").unwrap();
+        block_on(async {
+            let mut receiver = Receiver::open(&path).unwrap();
             let mut i = 0;
 
             for data in &dataset {
@@ -192,6 +181,9 @@ mod tests {
     /// Test enqueuing and dequeueing in parallel.
     #[test]
     fn test_enqueue_dequeue_parallel() {
+        let (_dir, path) = test_queue_dir();
+        let send_path = path.clone();
+
         // Generate data:
         let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
         let arc_sender = Arc::new(dataset);
@@ -199,8 +191,8 @@ mod tests {
 
         // Enqueue (let's test async send!):
         let enqueue = std::thread::spawn(move || {
-            futures::executor::block_on(async {
-                let mut sender = Sender::open("data/enqueue-dequeue-parallel").unwrap();
+            block_on(async {
+                let mut sender = Sender::open(&send_path).unwrap();
                 for data in &*arc_sender {
                     sender.send(data).await.unwrap();
                 }
@@ -209,8 +201,8 @@ mod tests {
 
         // Dequeue:
         let dequeue = std::thread::spawn(move || {
-            futures::executor::block_on(async {
-                let mut receiver = Receiver::open("data/enqueue-dequeue-parallel").unwrap();
+            block_on(async {
+                let mut receiver = Receiver::open(&path).unwrap();
                 let dataset_iter = arc_receiver.iter();
                 let mut i = 0u64;
 
@@ -230,6 +222,9 @@ mod tests {
     /// Test enqueuing and dequeueing in parallel, using batches.
     #[test]
     fn test_enqueue_dequeue_parallel_with_batches() {
+        let (_dir, path) = test_queue_dir();
+        let send_path = path.clone();
+
         // Generate data:
         let mut dataset = vec![];
         let mut batch = vec![];
@@ -248,7 +243,7 @@ mod tests {
 
         // Enqueue:
         let enqueue = std::thread::spawn(move || {
-            let mut sender = Sender::open("data/enqueue-dequeue-parallel-with-batches").unwrap();
+            let mut sender = Sender::open(&send_path).unwrap();
             for batch in &*arc_sender {
                 sender.try_send_batch(batch).unwrap();
             }
@@ -256,9 +251,8 @@ mod tests {
 
         // Dequeue:
         let dequeue = std::thread::spawn(move || {
-            futures::executor::block_on(async {
-                let mut receiver =
-                    Receiver::open("data/enqueue-dequeue-parallel-with-batches").unwrap();
+            block_on(async {
+                let mut receiver = Receiver::open(&path).unwrap();
                 let dataset_iter = arc_receiver.iter();
                 let mut i = 0u64;
 
@@ -277,19 +271,18 @@ mod tests {
 
     #[test]
     fn test_dequeue_is_atomic() {
-        let mut sender = Sender::open("data/dequeue-is-atomic").unwrap();
+        let (_dir, path) = test_queue_dir();
+        let mut sender = Sender::open(&path).unwrap();
         let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
 
-        futures::executor::block_on(async move {
-            let mut receiver = Receiver::open("data/dequeue-is-atomic").unwrap();
+        block_on(async move {
+            let mut receiver = Receiver::open(&path).unwrap();
             let dataset_iter = dataset.iter();
             let mut i = 0u64;
 
             for data in dataset_iter {
                 sender.try_send(data).unwrap();
                 // Try not to poll the future to the end.
-                // TODO maybe you need something a bit more convincing than
-                // `async {}`...
                 let incomplete =
                     futures::future::select(Box::pin(receiver.recv()), Box::pin(async {})).await;
                 drop(incomplete); // need to force this explicitly.
@@ -305,8 +298,9 @@ mod tests {
 
     #[test]
     fn test_rollback() {
-        futures::executor::block_on(async move {
-            let (mut sender, mut receiver) = channel("data/rollback").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (mut sender, mut receiver) = channel(&path).unwrap();
             sender.try_send(b"123").unwrap();
             sender.try_send(b"456").unwrap();
 
@@ -322,28 +316,31 @@ mod tests {
 
     #[test]
     fn test_recv_timeout_nothing() {
-        futures::executor::block_on(async move {
-            let (_, mut receiver) = channel("data/recv-timeout-nothing").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (_, mut receiver) = channel(&path).unwrap();
 
-            assert!(receiver
-                .recv_timeout(Delay::new(Duration::from_secs(1)))
-                .await
-                .unwrap()
-                .is_none(),);
+            assert!(
+                receiver
+                    .recv_timeout(delay(Duration::from_secs(1)))
+                    .await
+                    .unwrap()
+                    .is_none(),
+            );
         });
     }
 
     #[test]
     fn test_recv_timeout_immediate() {
-        futures::executor::block_on(async move {
-            let (mut sender, mut receiver) = channel("data/recv-timeout-immediate").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (mut sender, mut receiver) = channel(&path).unwrap();
 
             sender.try_send(b"123").unwrap();
-            // sender.send(b"456").unwrap();
 
             assert_eq!(
                 &*receiver
-                    .recv_timeout(Delay::new(Duration::from_secs(1)))
+                    .recv_timeout(delay(Duration::from_secs(1)))
                     .await
                     .unwrap()
                     .unwrap(),
@@ -354,19 +351,18 @@ mod tests {
 
     #[test]
     fn test_recv_timeout_delayed() {
-        futures::executor::block_on(async move {
-            let (mut sender, mut receiver) = channel("data/recv-timeout-delayed").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (mut sender, mut receiver) = channel(&path).unwrap();
 
             std::thread::spawn(move || {
-                futures::executor::block_on(async move {
-                    Delay::new(Duration::from_secs(1)).await;
-                    sender.try_send(b"123").unwrap();
-                });
+                std::thread::sleep(Duration::from_secs(1));
+                sender.try_send(b"123").unwrap();
             });
 
             assert_eq!(
                 &*receiver
-                    .recv_timeout(Delay::new(Duration::from_secs(2)))
+                    .recv_timeout(delay(Duration::from_secs(2)))
                     .await
                     .unwrap()
                     .unwrap(),
@@ -377,28 +373,32 @@ mod tests {
 
     #[test]
     fn test_recv_batch_timeout_nothing() {
-        futures::executor::block_on(async move {
-            let (_, mut receiver) = channel("data/recv-batch-timeout-nothing").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (_, mut receiver) = channel(&path).unwrap();
 
-            assert!(receiver
-                .recv_batch_timeout(2, Delay::new(Duration::from_secs(1)))
-                .await
-                .unwrap()
-                .is_empty(),);
+            assert!(
+                receiver
+                    .recv_batch_timeout(2, delay(Duration::from_secs(1)))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+            );
         });
     }
 
     #[test]
     fn test_recv_batch_timeout_immediate() {
-        futures::executor::block_on(async move {
-            let (mut sender, mut receiver) = channel("data/recv-batch-timeout-immediate").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (mut sender, mut receiver) = channel(&path).unwrap();
 
             sender.try_send(b"123").unwrap();
             sender.try_send(b"456").unwrap();
 
             assert_eq!(
                 &*receiver
-                    .recv_batch_timeout(2, Delay::new(Duration::from_secs(1)))
+                    .recv_batch_timeout(2, delay(Duration::from_secs(1)))
                     .await
                     .unwrap(),
                 &[b"123", b"456"],
@@ -408,21 +408,20 @@ mod tests {
 
     #[test]
     fn test_recv_batch_timeout_delayed_1() {
-        futures::executor::block_on(async move {
-            let (mut sender, mut receiver) = channel("data/recv-batch-timeout-delayed-1").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (mut sender, mut receiver) = channel(&path).unwrap();
 
             std::thread::spawn(move || {
-                futures::executor::block_on(async move {
-                    for i in 0..5usize {
-                        Delay::new(Duration::from_secs_f64(0.5)).await;
-                        sender.try_send(i.to_string().as_bytes()).unwrap();
-                    }
-                });
+                for i in 0..5usize {
+                    std::thread::sleep(Duration::from_secs_f64(0.5));
+                    sender.try_send(i.to_string().as_bytes()).unwrap();
+                }
             });
 
             assert_eq!(
                 &*receiver
-                    .recv_batch_timeout(3, Delay::new(Duration::from_secs(2)))
+                    .recv_batch_timeout(3, delay(Duration::from_secs(2)))
                     .await
                     .unwrap(),
                 &[b"0", b"1", b"2"]
@@ -432,21 +431,20 @@ mod tests {
 
     #[test]
     fn test_recv_batch_timeout_delayed_2() {
-        futures::executor::block_on(async move {
-            let (mut sender, mut receiver) = channel("data/recv-batch-timeout-delayed-2").unwrap();
+        let (_dir, path) = test_queue_dir();
+        block_on(async move {
+            let (mut sender, mut receiver) = channel(&path).unwrap();
 
             std::thread::spawn(move || {
-                futures::executor::block_on(async move {
-                    for i in 0..5usize {
-                        Delay::new(Duration::from_secs_f64(0.6)).await;
-                        sender.try_send(i.to_string().as_bytes()).unwrap();
-                    }
-                });
+                for i in 0..5usize {
+                    std::thread::sleep(Duration::from_secs_f64(0.6));
+                    sender.try_send(i.to_string().as_bytes()).unwrap();
+                }
             });
 
             assert_eq!(
                 &*receiver
-                    .recv_batch_timeout(5, Delay::new(Duration::from_secs(2)))
+                    .recv_batch_timeout(5, delay(Duration::from_secs(2)))
                     .await
                     .unwrap(),
                 &[b"0", b"1", b"2"]
@@ -456,10 +454,11 @@ mod tests {
 
     #[test]
     fn test_max_queue_size() {
+        let (_dir, path) = test_queue_dir();
         let mut sender = SenderBuilder::new()
             .max_queue_size(Some(2048))
             .segment_size(512)
-            .open("data/max-queue-size")
+            .open(&path)
             .unwrap();
         let mut data = data_lots_of_data();
 
@@ -472,7 +471,7 @@ mod tests {
             }
         }
 
-        let size = get_queue_size("data/max-queue-size").unwrap().in_bytes;
+        let size = get_queue_size(&path).unwrap().in_bytes;
         assert!(
             size >= 2048,
             "size was {}; should be at least {}",
@@ -483,12 +482,13 @@ mod tests {
 
     #[test]
     fn test_max_queue_size_with_drain() {
+        let (_dir, path) = test_queue_dir();
         let mut sender = SenderBuilder::new()
             .max_queue_size(Some(2048))
             .segment_size(512)
-            .open("data/max-queue-size-with-drain")
+            .open(&path)
             .unwrap();
-        let mut receiver = Receiver::open("data/max-queue-size-with-drain").unwrap();
+        let mut receiver = Receiver::open(&path).unwrap();
         let mut data = data_lots_of_data();
 
         loop {
@@ -500,9 +500,7 @@ mod tests {
             }
         }
 
-        let size = get_queue_size("data/max-queue-size-with-drain")
-            .unwrap()
-            .in_bytes;
+        let size = get_queue_size(&path).unwrap().in_bytes;
         assert!(
             size >= 2048,
             "size was {}; should be at least {}",
@@ -528,6 +526,10 @@ mod tests {
     #[test]
     fn test_enqueue_dequeue_parallel_with_max_queue_size() {
         fn test(queue_size: u64) {
+            let (_dir, path) = test_queue_dir();
+            let send_path = path.clone();
+            let clear_path = path.clone();
+
             // Generate data:
             let dataset = data_lots_of_data().take(100_000).collect::<Vec<_>>();
             let arc_sender = Arc::new(dataset);
@@ -535,10 +537,10 @@ mod tests {
 
             // Enqueue (let's test async send!):
             let enqueue = std::thread::spawn(move || {
-                futures::executor::block_on(async {
+                block_on(async {
                     let mut sender = SenderBuilder::new()
                         .max_queue_size(Some(queue_size))
-                        .open("data/enqueue-dequeue-parallel-with-max-queue-size")
+                        .open(&send_path)
                         .unwrap();
                     for data in &*arc_sender {
                         sender.send(data).await.unwrap();
@@ -548,10 +550,8 @@ mod tests {
 
             // Dequeue:
             let dequeue = std::thread::spawn(move || {
-                futures::executor::block_on(async {
-                    let mut receiver =
-                        Receiver::open("data/enqueue-dequeue-parallel-with-max-queue-size")
-                            .unwrap();
+                block_on(async {
+                    let mut receiver = Receiver::open(&path).unwrap();
                     let dataset_iter = arc_receiver.iter();
                     let mut i = 0u64;
 
@@ -567,7 +567,7 @@ mod tests {
             enqueue.join().expect("enqueue thread panicked");
             dequeue.join().expect("dequeue thread panicked");
 
-            try_clear("data/enqueue-dequeue-parallel-with-max-queue-size").unwrap();
+            try_clear(&clear_path).unwrap();
         }
 
         test(2 * 1024 * 1024); // smaller than segment
@@ -590,18 +590,16 @@ mod tests {
     // test small segment size + big batch transaction: commit and rollback.
     #[test]
     fn test_trans_segment_transactions() {
+        let (_dir, path) = test_queue_dir();
         let data = data_lots_of_data().take(100).collect::<Vec<_>>();
 
         // Populate a queue:
-        let mut sender = SenderBuilder::new()
-            .segment_size(512)
-            .open("data/trans-segment-transactions")
-            .unwrap();
+        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
 
         sender.try_send_batch(&data).unwrap();
 
-        futures::executor::block_on(async move {
-            let mut receiver = Receiver::open("data/trans-segment-transactions").unwrap();
+        block_on(async move {
+            let mut receiver = Receiver::open(&path).unwrap();
 
             // Do some rollbacks:
             for _ in 0..7 {
@@ -639,17 +637,15 @@ mod tests {
     // test simple try_recv uses.
     #[test]
     fn test_try_recv() {
+        let (_dir, path) = test_queue_dir();
         let data = data_lots_of_data().take(100).collect::<Vec<_>>();
 
         // Populate a queue:
-        let mut sender = SenderBuilder::new()
-            .segment_size(512)
-            .open("data/try-recv")
-            .unwrap();
+        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
 
         sender.try_send_batch(&data[..25]).unwrap();
 
-        let mut receiver = Receiver::open("data/try-recv").unwrap();
+        let mut receiver = Receiver::open(&path).unwrap();
 
         let mut count = 0;
         loop {
@@ -670,15 +666,13 @@ mod tests {
     // test simple try_recv_batch uses.
     #[test]
     fn test_try_recv_batch() {
+        let (_dir, path) = test_queue_dir();
         let data = data_lots_of_data().take(100).collect::<Vec<_>>();
 
         // Populate a queue:
-        let mut sender = SenderBuilder::new()
-            .segment_size(512)
-            .open("data/try-recv-batch")
-            .unwrap();
+        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
 
-        let mut receiver = Receiver::open("data/try-recv-batch").unwrap();
+        let mut receiver = Receiver::open(&path).unwrap();
 
         // only works for multiples of 25, up to 25
         for recv_size in [1, 5, 25] {
@@ -706,20 +700,16 @@ mod tests {
     // test simple try_recv_batch_up_to uses.
     #[test]
     fn test_try_recv_batch_up_to() {
+        let (_dir, path) = test_queue_dir();
         let data = data_lots_of_data().take(100).collect::<Vec<_>>();
 
         // Populate a queue:
-        let mut sender = SenderBuilder::new()
-            .segment_size(512)
-            .open("data/try-recv-batch-up-to")
-            .unwrap();
+        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
 
-        let mut receiver = Receiver::open("data/try-recv-batch-up-to").unwrap();
+        let mut receiver = Receiver::open(&path).unwrap();
 
         for send_size in [1, 10, 25, 100] {
             for recv_size in [1, 7, 25, 30, 100] {
-                println!("send_size: {send_size}, recv_size: {recv_size}");
-
                 sender.try_send_batch(&data[..send_size]).unwrap();
 
                 let mut count = 0;
@@ -737,20 +727,22 @@ mod tests {
                     }
                 }
 
-                assert_eq!(count, send_size);
+                assert_eq!(
+                    count, send_size,
+                    "send_size: {send_size}, recv_size: {recv_size}"
+                );
             }
         }
     }
 
     #[test]
     fn test_try_recv_batch_up_to_zero() {
-        // Populate a queue:
-        let mut sender = SenderBuilder::new()
-            .segment_size(512)
-            .open("data/try-recv-batch-up-to-zero")
-            .unwrap();
+        let (_dir, path) = test_queue_dir();
 
-        let mut receiver = Receiver::open("data/try-recv-batch-up-to-zero").unwrap();
+        // Populate a queue:
+        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
+
+        let mut receiver = Receiver::open(&path).unwrap();
         sender.try_send_batch([[1]]).unwrap();
 
         let no_items = receiver
@@ -762,46 +754,18 @@ mod tests {
     }
 
     #[test]
-    fn test_receive_with_timeout_and_end_transaction() {
-        // let data = data_lots_of_data().take(100).collect::<Vec<_>>();
-
-        // let (mut sender, mut receiver) = channel("data/receive_with_timeout_and_end_transaction").unwrap();
-
-        // futures::executor::block_on(async move {
-        //     // Put 7 items:
-        //     sender.try_send("these").unwrap();
-        //     sender.try_send("are").unwrap();
-        //     sender.try_send("seven").unwrap();
-        //     sender.try_send("items").unwrap();
-        //     sender.try_send("in").unwrap();
-        //     sender.try_send("the").unwrap();
-        //     sender.try_send("queue").unwrap();
-
-        //     // Ask for 10:
-        //     let guard = receiver.recv_batch_timeout(10, Delay::new(Duration::from_millis(10))).await.unwrap();
-        //     assert!(guard.is_none());
-        // });
-    }
-
-    #[test]
     fn test_iterate() {
+        let (_dir, path) = test_queue_dir();
         let data = data_lots_of_data().take(10_000).collect::<Vec<_>>();
 
         // Populate a queue:
-        let mut sender = SenderBuilder::new()
-            .segment_size(512)
-            .open("data/iterate")
-            .unwrap();
+        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
 
         sender.try_send_batch(&data).unwrap();
 
-        let iterated = QueueIter::open("data/iterate")
+        let iterated = QueueIter::open(&path)
             .unwrap()
-            .enumerate()
-            .map(|(i, item)| {
-                println!("{}", i);
-                item.unwrap()
-            })
+            .map(|item| item.unwrap())
             .collect::<Vec<_>>();
 
         assert_eq!(data, iterated);
@@ -809,18 +773,17 @@ mod tests {
 
     #[test]
     fn test_try_recv_empty_msg() {
+        let (_dir, path) = test_queue_dir();
+
         // Populate a queue:
-        let mut sender = SenderBuilder::new()
-            .segment_size(512)
-            .open("data/try-recv-empty-msg")
-            .unwrap();
+        let mut sender = SenderBuilder::new().segment_size(512).open(&path).unwrap();
 
         sender.try_send(&[]).unwrap();
 
-        let mut receiver = Receiver::open("data/try-recv-empty-msg").unwrap();
+        let mut receiver = Receiver::open(&path).unwrap();
 
         let item = receiver.try_recv().unwrap();
-        assert_eq!(&*item, &[]);
+        assert!(item.is_empty());
         item.commit().unwrap();
     }
 }

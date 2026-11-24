@@ -9,13 +9,13 @@
 //! Disk-backed async FIFO queue implementation.
 
 use crate::spool::{CorruptionPolicy, Result, SpoolConfig, SpoolError};
+use crate::yaque::{self, Receiver, Sender};
 use std::path::Path;
-use yaque::{Receiver, Sender};
 
 /// Disk-backed async FIFO queue with optional compression.
 ///
-/// Crash-safe writes, survives restarts. Built on
-/// [yaque](https://crates.io/crates/yaque) (transactional persistent queue).
+/// Crash-safe writes, survives restarts. Built on scalo's copy of yaque 0.6.6,
+/// a transactional persistent queue.
 pub struct Spool {
     /// `None` only after a failed recovery, which leaves the spool closed.
     queue: Option<Queue>,
