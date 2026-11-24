@@ -78,6 +78,7 @@ use super::ack::{
 };
 use super::error::{TransportError, TransportResult};
 use super::finalizer::DeliveryStatus;
+use super::proxy::Refusals;
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
@@ -393,6 +394,8 @@ pub struct GrpcTransport {
 struct Wire {
     client: proto::transport_client::TransportClient<tonic::transport::Channel>,
     send_timeout_ms: u64,
+    /// Whether the proxy is refusing CONNECT, shared with the transport's readiness.
+    refusals: Refusals,
     /// In-flight send count (for metrics), shared with the transport's `send`.
     #[cfg(feature = "metrics")]
     inflight: Arc<AtomicU64>,
@@ -840,8 +843,9 @@ impl GrpcTransport {
         #[cfg(feature = "health")]
         let health_registration = {
             let h = Arc::clone(&healthy);
+            let refusals = wire.as_ref().map(|w| w.refusals.clone());
             crate::health::HealthRegistry::register_scoped("transport:grpc", move || {
-                if h.load(Ordering::Relaxed) {
+                if h.load(Ordering::Relaxed) && !refusals.as_ref().is_some_and(|r| r.is_refused()) {
                     crate::health::HealthStatus::Healthy
                 } else {
                     crate::health::HealthStatus::Unhealthy
@@ -1023,13 +1027,10 @@ fn redelivery_reason(status: &tonic::Status) -> Option<&'static str> {
 }
 
 /// The send result for a failed RPC: backpressure while the server is down or
-/// busy, so the caller retries rather than drops, and `Reject` when the proxy
-/// refused the tunnel.
-fn failed_rpc_result(status: &tonic::Status) -> SendResult {
+/// busy or the proxy refused the tunnel, so the caller retries rather than drops.
+fn failed_rpc_result(status: &tonic::Status, refusals: &Refusals) -> SendResult {
     if let Some(refused) = crate::transport::proxy::refusal(status) {
-        #[cfg(feature = "metrics")]
-        metrics::counter!("transport_send_errors_total", "transport" => "grpc").increment(1);
-        return crate::transport::proxy::rejected(refused, "grpc");
+        return refusals.hold(refused, "grpc");
     }
     if downstream_unavailable(status) {
         #[cfg(feature = "metrics")]
@@ -1067,7 +1068,10 @@ impl TransportSender for GrpcTransport {
             }
         }
 
-        let Some(Wire { client, .. }) = &self.wire else {
+        let Some(Wire {
+            client, refusals, ..
+        }) = &self.wire
+        else {
             return SendResult::Fatal(TransportError::Config(
                 "no endpoint configured for sending".into(),
             ));
@@ -1107,6 +1111,7 @@ impl TransportSender for GrpcTransport {
         let mut client = client.clone();
         let result = match within_send_timeout(self.send_timeout_ms, client.push(request)).await {
             Ok(_) => {
+                refusals.clear("grpc");
                 #[cfg(feature = "metrics")]
                 {
                     metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
@@ -1123,7 +1128,7 @@ impl TransportSender for GrpcTransport {
                 self.max_message_size,
                 status.message(),
             ),
-            Err(status) => failed_rpc_result(&status),
+            Err(status) => failed_rpc_result(&status, refusals),
         };
 
         #[cfg(feature = "metrics")]
@@ -1457,6 +1462,7 @@ impl Wire {
         Self {
             client,
             send_timeout_ms,
+            refusals: Refusals::default(),
             #[cfg(feature = "metrics")]
             inflight: Arc::default(),
         }
@@ -1534,6 +1540,7 @@ impl Wire {
                     );
                     SendResult::Backpressured
                 } else {
+                    self.refusals.clear("grpc");
                     #[cfg(feature = "metrics")]
                     {
                         metrics::counter!(
@@ -1550,7 +1557,7 @@ impl Wire {
             }
             Err(status) => {
                 code = Some(status.code());
-                failed_rpc_result(&status)
+                failed_rpc_result(&status, &self.refusals)
             }
         };
 
@@ -1613,7 +1620,8 @@ impl TransportBase for GrpcTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        let healthy = self.healthy.load(Ordering::Relaxed);
+        let refused = self.wire.as_ref().is_some_and(|w| w.refusals.is_refused());
+        let healthy = self.healthy.load(Ordering::Relaxed) && !refused;
         #[cfg(feature = "metrics")]
         metrics::gauge!("transport_healthy", "transport" => "grpc").set(if healthy {
             1.0
@@ -2461,6 +2469,7 @@ mod tests {
     /// status tonic raised for the client's own connection is an outage.
     #[test]
     fn only_transient_codes_and_connection_failures_are_backpressure() {
+        let refusals = Refusals::default();
         for status in [
             tonic::Status::unavailable("down"),
             tonic::Status::resource_exhausted("full"),
@@ -2472,7 +2481,7 @@ mod tests {
             ))),
         ] {
             assert!(
-                failed_rpc_result(&status).is_backpressured(),
+                failed_rpc_result(&status, &refusals).is_backpressured(),
                 "{status:?} should be retried"
             );
         }
@@ -2483,7 +2492,7 @@ mod tests {
             tonic::Status::internal("server bug"),
         ] {
             assert!(
-                failed_rpc_result(&status).is_fatal(),
+                failed_rpc_result(&status, &refusals).is_fatal(),
                 "{status:?} is the server's answer and should stay fatal"
             );
         }
@@ -2695,73 +2704,50 @@ mod tests {
         (server, format!("http://{addr}"))
     }
 
-    /// A send goes through the proxy's CONNECT tunnel, plain or with TLS
-    /// inside it, and a refused CONNECT is `Reject` with the proxy's status
-    /// and the endpoint's port.
+    /// A send goes through a real Squid's CONNECT tunnel, plain or with TLS
+    /// inside it, with the proxy's credentials where it asks for them. The
+    /// target name resolves only inside Squid, so a record that arrives went
+    /// through it.
+    #[cfg(all(feature = "transport-proxy-test-support", unix))]
     #[tokio::test]
     async fn sends_go_through_a_connect_proxy() {
         use crate::sensitive::SensitiveString;
         use crate::transport::ProxyConfig;
-        use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, credentials, tls_front};
+        use crate::transport::proxy::squid::{Squid, TARGET_HOST, USER};
+        use crate::transport::proxy::test_front::{plain_front, tls_front};
 
-        let (server, plain) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
+        let Some(squid) = Squid::shared().await else {
+            return;
+        };
+        let (server, _) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
         let listening = server.local_addr().unwrap();
+        let plain = format!(
+            "http://{TARGET_HOST}:{}",
+            plain_front(listening).await.port()
+        );
         let (front, ca) = tls_front(listening, &[b"h2"]).await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
         tokio::fs::write(ca_file.path(), &ca).await.unwrap();
-        let tls = format!("https://localhost:{}", front.port());
-        let good = credentials();
-        let auth = good.header.clone();
-        // (policy, credentials, TLS inside the tunnel, refusal status)
+        let tls = format!("https://{TARGET_HOST}:{}", front.port());
+        // (proxy URL, TLS inside the tunnel)
         let rows = [
-            (Policy::Allow, None, false, None),
-            (Policy::Allow, None, true, None),
-            (Policy::Refuse(403), None, false, Some(403)),
-            (Policy::Auth(auth.clone()), None, true, Some(407)),
-            (Policy::Auth(auth), Some(&good), true, None),
-            (Policy::OnlyPort(443), None, true, Some(403)),
+            (squid.open(), false),
+            (squid.open(), true),
+            (squid.auth_with(USER, squid.password()), true),
         ];
-        let mut delivered = 0;
-        for (policy, credentials, over_tls, status) in rows {
-            let name = format!(
-                "{policy:?} credentials={} tls={over_tls}",
-                credentials.is_some()
-            );
-            let proxy = ConnectProxy::start(policy).await;
-            let url = credentials.map_or_else(|| proxy.url(), |c| proxy.url_with(c));
-            let mut config = GrpcConfig::client(if over_tls { &tls } else { &plain });
-            config.proxy = ProxyConfig::Url(SensitiveString::new(url));
-            config.send_timeout_ms = 5_000;
-            if over_tls {
+        for (proxy, over_tls) in &rows {
+            let mut config = GrpcConfig::client(if *over_tls { &tls } else { &plain });
+            config.proxy = ProxyConfig::Url(SensitiveString::new(proxy.as_str()));
+            config.send_timeout_ms = 10_000;
+            if *over_tls {
                 config.tls_enabled = true;
                 config.tls_ca_path = Some(ca_file.path().to_string_lossy().into_owned());
             }
             let client = GrpcTransport::new(&config).await.unwrap();
             let result = client.send("events", filled(8)).await;
-
-            let tunnel = if over_tls {
-                format!("localhost:{}", front.port())
-            } else {
-                listening.to_string()
-            };
-            let seen = proxy.seen();
-            assert!(
-                !seen.is_empty() && seen.iter().all(|c| c.target == tunnel),
-                "{name}: {seen:?}"
-            );
-            match (status, &result) {
-                (None, SendResult::Ok) => delivered += 1,
-                (Some(status), SendResult::Reject(error)) => {
-                    let text = error.to_string();
-                    assert!(
-                        text.contains(&format!("HTTP {status}")) && text.contains(&tunnel),
-                        "{name}: {text}"
-                    );
-                }
-                _ => panic!("{name}: got {result:?}"),
-            }
+            assert!(result.is_ok(), "tls={over_tls}: got {result:?}");
         }
-        assert_eq!(server.recv(10).await.unwrap().records.len(), delivered);
+        assert_eq!(server.recv(10).await.unwrap().records.len(), rows.len());
     }
 
     /// Record headers, the dedup key among them, reach `recv` from a

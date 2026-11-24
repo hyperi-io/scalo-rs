@@ -74,6 +74,8 @@ pub struct OtlpTransport {
     /// The endpoint with any user name and password left out, for logs.
     endpoint: String,
     closed: Arc<AtomicBool>,
+    /// Whether the proxy is refusing CONNECT, which fails readiness until an export goes through.
+    refusals: crate::transport::proxy::Refusals,
     filter_engine: TransportFilterEngine,
 }
 
@@ -119,12 +121,14 @@ impl OtlpTransport {
             &TransportFilterTierConfig::from_cascade()?,
         )?;
         let closed = Arc::new(AtomicBool::new(false));
+        let refusals = crate::transport::proxy::Refusals::default();
 
         #[cfg(feature = "health")]
         let health_registration = {
             let closed = Arc::clone(&closed);
+            let refusals = refusals.clone();
             crate::health::HealthRegistry::register_scoped("transport:otlp", move || {
-                if closed.load(Ordering::Relaxed) {
+                if closed.load(Ordering::Relaxed) || refusals.is_refused() {
                     crate::health::HealthStatus::Unhealthy
                 } else {
                     crate::health::HealthStatus::Healthy
@@ -154,6 +158,7 @@ impl OtlpTransport {
             max_retry_delay: Duration::from_millis(config.max_retry_delay_ms),
             endpoint,
             closed,
+            refusals,
             filter_engine,
         })
     }
@@ -184,7 +189,12 @@ impl OtlpTransport {
             .await
             .unwrap_or(SendResult::Backpressured);
         self.observe(&result, sent, bytes, started, budget);
-        if result.is_ok() { handled } else { result }
+        if result.is_ok() {
+            self.refusals.clear("otlp");
+            handled
+        } else {
+            result
+        }
     }
 
     async fn export_on_wire(
@@ -201,7 +211,10 @@ impl OtlpTransport {
                 call.set_timeout(budget);
                 match client.clone().export(call).await {
                     Ok(response) => accepted(response.into_inner().partial_success, sent),
-                    Err(status) => grpc_failure(&status, self.max_retry_delay),
+                    Err(status) => match crate::transport::proxy::refusal(&status) {
+                        Some(refused) => self.refusals.hold(refused, "otlp"),
+                        None => grpc_failure(&status, self.max_retry_delay),
+                    },
                 }
             }
             Wire::Http {
@@ -252,7 +265,7 @@ impl OtlpTransport {
                             && let Some(refused) =
                                 dialer.refusal_of(Scheme::Tls, host, *port, budget).await
                         {
-                            return crate::transport::proxy::rejected(&refused, "otlp");
+                            return self.refusals.hold(&refused, "otlp");
                         }
                         tracing::debug!(endpoint = %self.endpoint, error = %e, "OTLP HTTP request failed");
                         SendResult::Backpressured
@@ -345,14 +358,19 @@ impl OtlpTransport {
                 }
             }
             SendResult::Backpressured | SendResult::RetryAfter(_) => {
-                tracing::warn!(
-                    endpoint = %self.endpoint,
-                    records,
-                    elapsed_ms,
-                    budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
-                    retry_after_ms = result.retry_after().map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
-                    "OTLP export not taken; the records may have arrived and are sent again"
-                );
+                // A refused tunnel is logged once per run, so each retry stays at debug.
+                if self.refusals.is_refused() {
+                    tracing::debug!(endpoint = %self.endpoint, records, "OTLP export held behind a refused proxy");
+                } else {
+                    tracing::warn!(
+                        endpoint = %self.endpoint,
+                        records,
+                        elapsed_ms,
+                        budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        retry_after_ms = result.retry_after().map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
+                        "OTLP export not taken; the records may have arrived and are sent again"
+                    );
+                }
                 #[cfg(feature = "metrics")]
                 metrics::counter!("transport_backpressured_total", "transport" => "otlp")
                     .increment(1);
@@ -384,9 +402,10 @@ impl TransportBase for OtlpTransport {
         Ok(())
     }
 
-    /// `false` after `close()`. Does not probe the collector.
+    /// `false` after `close()`, and while the proxy refuses CONNECT. Does not
+    /// probe the collector.
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed)
+        !self.closed.load(Ordering::Relaxed) && !self.refusals.is_refused()
     }
 
     fn name(&self) -> &'static str {
@@ -577,9 +596,6 @@ fn accepted(partial: Option<ExportLogsPartialSuccess>, sent: usize) -> SendResul
 fn grpc_failure(status: &tonic::Status, max_retry_delay: Duration) -> SendResult {
     use tonic::Code;
 
-    if let Some(refused) = crate::transport::proxy::refusal(status) {
-        return crate::transport::proxy::rejected(refused, "otlp");
-    }
     // tonic attaches a source error only when the client's own connection
     // failed or its stream was reset: the collector never answered.
     if std::error::Error::source(status).is_some() {

@@ -32,6 +32,12 @@ Behaviour that changes with no config:
 
 **Consumer adjustment** -- rewrite each key in the table, in YAML, env (`..._COMPRESSION__CODEC=gzip`) and struct literals (`Compression::new(Codec::Gzip)`, `Compression::NONE`). A tiered sink set to `snappy` enables `compression-snappy`. Drain a tiered sink's spill cache before changing its codec: entries carry no codec tag.
 
+### A refused proxy CONNECT holds the records (BEHAVIOUR CHANGE)
+
+A proxy that refused the CONNECT, as a 403 for a port it doesn't allow or a 407 for credentials it wants, was `Reject` on the gRPC, HTTP, OTLP and syslog transports, so a caller dead-lettered every record. It is `Backpressured` and the caller keeps the records and retries them, as for a Kafka client the broker refuses. The first refusal of a run is logged with the proxy's status and the target port, and each one adds to `transport_proxy_refused_total{transport}`. `is_healthy()` and the `transport:grpc`, `transport:http` and `transport:otlp` health checks report not-ready until a send goes through. `transport::proxy::rejected` is gone, and `transport::proxy::Refusals` replaces it. See [transport/http.md](transport/http.md#proxy-redirects-and-logs).
+
+**Consumer adjustment** -- code that matched `Reject` to spot a proxy refusal matches `Backpressured` and alerts on `transport_proxy_refused_total`. A caller of `proxy::rejected` calls `Refusals::hold`. A pod behind a proxy that refuses its target fails readiness until the proxy policy or the `proxy` setting is fixed.
+
 ### `OtlpConfig.headers` and `OtelMetricsConfig.headers` hold `SensitiveString` values (API CHANGE)
 
 `OtlpConfig.headers` is a `BTreeMap<String, SensitiveString>`, where it was `BTreeMap<String, String>`, and `OtelMetricsConfig.headers` is a `HashMap<String, SensitiveString>`, where it was `HashMap<String, String>`. `Debug` and logs show each value redacted. The YAML and env shape is unchanged. `KafkaConfig` and `KafkaSizingConfig` redact credential values in every raw librdkafka map (`librdkafka_overrides`, `extra_config`, `sizing.producer_librdkafka`, `sizing.consumer_librdkafka`) in `Debug`. A credential key contains `password` or `secret`, or is `ssl.key.pem`, `sasl.oauthbearer.config` or a `sasl.oauthbearer.assertion.private.key` `pem` or `passphrase`.

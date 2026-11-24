@@ -29,7 +29,7 @@ use crate::compression::{Compression, Compressor};
 use crate::framing::Framing;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::{TransportError, TransportResult};
-use crate::transport::proxy::{self, ProxyDialer, ProxyRefused, Scheme};
+use crate::transport::proxy::{self, ProxyDialer, ProxyRefused, Refusals, Scheme};
 use crate::transport::types::SendResult;
 
 /// Longest same-origin redirect chain `follow_redirects` follows.
@@ -288,6 +288,8 @@ impl Target {
 pub(super) struct Sender {
     client: reqwest::Client,
     dialer: ProxyDialer,
+    /// Whether the proxy is refusing CONNECT, shared with the transport's readiness.
+    refusals: Refusals,
     targets: Vec<Target>,
     framing: Arc<dyn Framing>,
     /// The body codec and its context, kept between bodies. `None` sends as framed.
@@ -368,6 +370,7 @@ impl Sender {
         Ok(Self {
             client,
             dialer,
+            refusals: Refusals::default(),
             targets,
             framing,
             compressor,
@@ -377,6 +380,11 @@ impl Sender {
             max_retry_after: Duration::from_millis(config.max_retry_after_ms),
             send_timeout: Duration::from_millis(config.send_timeout_ms),
         })
+    }
+
+    /// Whether the proxy is refusing CONNECT, for the transport's readiness.
+    pub(super) fn refusals(&self) -> Refusals {
+        self.refusals.clone()
     }
 
     /// Send `(destination, payload)` pairs, one body per run of the same
@@ -469,7 +477,6 @@ impl Sender {
         };
 
         let mut retry = false;
-        let mut refusal: Option<ProxyRefused> = None;
         let mut wait: Option<Duration> = None;
         let mut reasons = Vec::new();
         let total = self.targets.len();
@@ -528,8 +535,11 @@ impl Sender {
                         && !timed_out
                         && let Some(refused) = self.refused(target, deadline).await
                     {
+                        // A refused tunnel holds the batch: the proxy's policy is the
+                        // operator's to fix, and the records are fine.
+                        self.refusals.note(&refused, "http");
                         reasons.push(format!("{shown}: {refused}"));
-                        refusal = Some(refused);
+                        retry = true;
                         continue;
                     }
                     retry |= !held;
@@ -540,6 +550,7 @@ impl Sender {
             let status = response.status();
             match classify(status, &self.success) {
                 Answer::Delivered => {
+                    self.refusals.clear("http");
                     tracing::debug!(
                         endpoint = %shown,
                         records,
@@ -597,9 +608,6 @@ impl Sender {
         if retry {
             tracing::debug!(records, reason = %reason, "HTTP batch to be sent again");
             return wait.map_or(SendResult::Backpressured, SendResult::RetryAfter);
-        }
-        if let Some(refused) = refusal {
-            return proxy::rejected(&refused, "http");
         }
         tracing::error!(
             records,
