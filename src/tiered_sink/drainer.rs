@@ -518,12 +518,12 @@ async fn drain_once<S: TransportSender>(
             Err(yaque::TryRecvError::Io(_)) => return vec![DrainResult::IoError],
         }
     };
-    let mut decoded = Vec::with_capacity(guard.len());
+    let mut read_back = Vec::with_capacity(guard.len());
     let mut unreadable = Vec::new();
     let mut wrong_codec = None;
     for (index, raw) in guard.iter().enumerate() {
         match decode_entry(raw, crc, decoder, scratch) {
-            Ok(record) => decoded.push(record),
+            Ok(record) => read_back.push(record),
             Err(Unreadable::Corrupt(e)) => unreadable.push(DrainResult::Corrupt(e)),
             Err(Unreadable::WrongCodec(e)) => {
                 wrong_codec = Some((index, e));
@@ -548,9 +548,9 @@ async fn drain_once<S: TransportSender>(
     };
     let taken = guard.len();
     let stored: u64 = sizes.iter().take(taken).sum();
-    let mut records = Vec::with_capacity(decoded.len());
+    let mut records = Vec::with_capacity(read_back.len());
     let mut dead = Vec::new();
-    for record in decoded {
+    for record in read_back {
         match sink.dead_letter_reason(&record) {
             None => records.push(record),
             Some(reason) => dead.push(Undeliverable {
@@ -772,15 +772,14 @@ fn note_hold(result: &DrainResult, held: &AtomicBool, codec: crate::compression:
     #[cfg(feature = "metrics")]
     ::metrics::gauge!("tiered_sink_drain_held").set(if holding { 1.0 } else { 0.0 });
     #[cfg(feature = "tracing")]
-    match result {
-        DrainResult::Held(error) => tracing::error!(
+    if let DrainResult::Held(error) = result {
+        tracing::error!(
             codec = %codec,
             error = %error,
             "The spill's next entry does not read under its codec, so the drain holds and keeps it. Reopen the sink under the codec that wrote it"
-        ),
-        _ => {
-            tracing::info!(codec = %codec, "The spill reads under its codec again, so the drain resumes")
-        }
+        );
+    } else {
+        tracing::info!(codec = %codec, "The spill reads under its codec again, so the drain resumes");
     }
     #[cfg(not(feature = "tracing"))]
     let _ = codec;
