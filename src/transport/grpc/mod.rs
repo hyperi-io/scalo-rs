@@ -1230,11 +1230,9 @@ impl TransportSender for GrpcTransport {
                 limit: self.max_message_size,
             });
         }
-        matches!(
-            self.filter_engine.outbound_one(&record.payload),
-            Some(SendResult::FilteredDlq)
-        )
-        .then_some(DeadLetterReason::OutboundFilter)
+        self.filter_engine
+            .outbound_dead_letter(&record.payload)
+            .then_some(DeadLetterReason::OutboundFilter)
     }
 }
 

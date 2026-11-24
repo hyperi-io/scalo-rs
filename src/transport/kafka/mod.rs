@@ -2378,11 +2378,9 @@ impl TransportSender for KafkaTransport {
                 limit,
             });
         }
-        matches!(
-            self.filter_engine.outbound_one(&record.payload),
-            Some(SendResult::FilteredDlq)
-        )
-        .then_some(DeadLetterReason::OutboundFilter)
+        self.filter_engine
+            .outbound_dead_letter(&record.payload)
+            .then_some(DeadLetterReason::OutboundFilter)
     }
 }
 

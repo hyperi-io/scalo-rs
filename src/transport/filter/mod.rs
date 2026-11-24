@@ -318,9 +318,20 @@ impl TransportFilterEngine {
 
     /// Whether an outbound `dlq` filter takes `payload`: the answer a sender's
     /// `dead_letter_reason` gives for a filter match.
+    ///
+    /// Counted in `transport_filtered_total` only when it answers `true`, as
+    /// the record is then taken out before the send. Any other outcome is the
+    /// send's to count when it filters the record.
     #[must_use]
     pub fn outbound_dead_letter(&self, payload: &[u8]) -> bool {
-        self.has_dlq_filters_out() && matches!(self.apply_outbound(payload), FilterDisposition::Dlq)
+        if !self.has_dlq_filters_out() || is_likely_msgpack(payload) {
+            return false;
+        }
+        let dead_lettered = first_match(payload, &self.filters_out) == Some(FilterAction::Dlq);
+        if dead_lettered {
+            self.metrics.record(FilterDirection::Out, FilterAction::Dlq);
+        }
+        dead_lettered
     }
 
     /// Evaluate outbound filters against a raw payload. First-match-wins.
@@ -397,17 +408,16 @@ impl TransportFilterEngine {
             return FilterDisposition::Pass;
         }
 
-        for filter in filters {
-            if let Some(action) = filter.evaluate(payload) {
+        match first_match(payload, filters) {
+            None => FilterDisposition::Pass,
+            Some(action) => {
                 self.metrics.record(direction, action);
-                return match action {
+                match action {
                     FilterAction::Drop => FilterDisposition::Drop,
                     FilterAction::Dlq => FilterDisposition::Dlq,
-                };
+                }
             }
         }
-
-        FilterDisposition::Pass
     }
 
     fn compile_rules(
@@ -454,6 +464,11 @@ impl TransportFilterEngine {
             }
         }
     }
+}
+
+/// The action of the first of `filters` that `payload` matches, uncounted.
+fn first_match(payload: &[u8], filters: &[CompiledFilter]) -> Option<FilterAction> {
+    filters.iter().find_map(|filter| filter.evaluate(payload))
 }
 
 /// Log a one-shot warning per direction when filters skip MsgPack.
