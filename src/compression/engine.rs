@@ -97,8 +97,8 @@ impl Compressor {
     ///
     /// # Errors
     ///
-    /// `InvalidData` for bytes that are not this codec's block or that
-    /// decompress past `limit`.
+    /// `InvalidData` for bytes that are not this codec's block, and
+    /// `FileTooLarge` for bytes that decompress past `limit`.
     pub fn decompress_into(
         &mut self,
         src: &[u8],
@@ -376,10 +376,11 @@ impl<R: Read> Read for Decoder<R> {
     }
 }
 
-/// The error for output past a decompression limit.
+/// The error for output past a decompression limit, `FileTooLarge` so a
+/// caller can tell it from bytes that are not the codec's.
 pub(super) fn over_limit(limit: usize) -> io::Error {
     io::Error::new(
-        io::ErrorKind::InvalidData,
+        io::ErrorKind::FileTooLarge,
         format!("decompressed past the {limit}-byte limit"),
     )
 }
@@ -514,7 +515,7 @@ mod tests {
             let err = compressor
                 .decompress_into(&packed, &mut unpacked, data.len() - 1)
                 .unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{codec}: {err}");
+            assert_eq!(err.kind(), io::ErrorKind::FileTooLarge, "{codec}: {err}");
             if codec != Codec::None {
                 assert!(
                     compressor

@@ -68,7 +68,7 @@ register_framing("counted", Arc::new(Counted))?;
 // transport.output.http.framing: { type: counted }
 ```
 
-`compression` compresses each body and sends the codec as `Content-Encoding`: `gzip` (level 6 unless `level` is set) or `zstd` (level 3). The receiver must decode it. LZ4 and snappy have no HTTP content coding, so they are refused at build. See [../compression.md](../compression.md).
+`compression` compresses each body and sends the codec as `Content-Encoding`: `gzip` (level 6 unless `level` is set) or `zstd` (level 3). The receiver must decode it, as scalo's own HTTP receive side does ([backends.md](backends.md#http)). LZ4 and snappy have no HTTP content coding, so they are refused at build. See [../compression.md](../compression.md).
 
 ## Answers, failover and the deadline
 

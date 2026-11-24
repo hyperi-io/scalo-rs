@@ -27,7 +27,7 @@ Each surface lists its codecs in an `Accepts`, and refuses anything else when it
 | Vector-compat client | `VectorCompatClient::with_compression` | none, gzip, zstd | no | gzip |
 | Kafka producer | `kafka.sizing.producer.compression` | all five | yes | zstd 3 |
 
-- HTTP, OTLP and gRPC default to none because the peer must decode the codec. HTTP and OTLP over HTTP send it as `Content-Encoding`.
+- HTTP, OTLP and gRPC default to none because the peer must decode the codec. HTTP and OTLP over HTTP send it as `Content-Encoding`. scalo's HTTP receive side decodes gzip and zstd bodies, to at most `max_body_bytes`, and answers any other coding 415.
 - gRPC and OTLP over gRPC map the codec onto tonic's `CompressionEncoding`, which fixes the level, so a level is refused. A gRPC server reads gzip and zstd on every connection, whatever its own `compression` says.
 - Kafka maps onto librdkafka's `compression.type` and `compression.level`, so snappy needs no scalo feature there. The raw `producer_librdkafka` and `librdkafka_overrides` maps stay strings and win: a codec named there takes that codec's default level, unless a raw map names a level too. See [kafka-path.md](kafka-path.md#wire-compression).
 - Rotated files past the six newest get the codec's suffix, `.gz` or `.zst`. Retention reads every suffix, so changing the codec keeps old files in the count.
@@ -45,7 +45,7 @@ The engines need features. The `compression` feature compiles the zstd, LZ4 and 
 | `Codec::tag()`, `Codec::from_tag(byte)` | One stable byte per codec, for a store scalo owns |
 | `Codec::extension()` | The file suffix of what an `Encoder` writes |
 
-zstd and gzip blocks and streams are one format. For LZ4 and snappy the block is the raw block (LZ4 with a 4-byte little-endian length in front, as `lz4_flex::compress_prepend_size` writes it) and the stream is the framed format, so each is read by the form that wrote it. `decompress_into` refuses output past `limit` with `InvalidData`.
+zstd and gzip blocks and streams are one format. For LZ4 and snappy the block is the raw block (LZ4 with a 4-byte little-endian length in front, as `lz4_flex::compress_prepend_size` writes it) and the stream is the framed format, so each is read by the form that wrote it. `decompress_into` answers bytes that are not the codec's with `InvalidData`, and output past `limit` with `FileTooLarge`.
 
 ```rust
 use scalo::compression::{Codec, Compression, Compressor};

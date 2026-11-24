@@ -418,6 +418,7 @@ transport:
 ```
 
 - Admission: a POST is checked before its body is read. A held governor answers 503, then the request reserves its declared `Content-Length` (or `max_body_bytes` without one) from `max_in_flight_bytes`, and answers 503 with `Retry-After: 1` when that does not fit. The bytes stay reserved while the record is queued and come back as `recv` hands it over, so bodies read and queued never exceed `max_in_flight_bytes`. A declared length over `max_body_bytes` is 413 at once. `max_in_flight_bytes` below `max_body_bytes` is refused at construction.
+- Content-Encoding: none or `identity` queues the body as it came. `gzip` and `zstd` are decoded through [`scalo::compression`](../compression.md) before the record is queued, to at most `max_body_bytes`: past that is 413, and bytes that do not decode are 400. Decoding reserves `max_body_bytes` more from `max_in_flight_bytes` for its output, answering 503 when that does not fit, and the record then holds its decoded size. Any other coding, or a list of codings, is 415 before the body is read. Nothing refused is queued.
 
 - Client TLS: the `tls_*` keys ([../api/tls.md](../api/tls.md#client-trust)), with `tls_pin_sha256` for key pins. None set keeps `reqwest`'s OS verifier, and `tls_trust` unset means `native`.
 - Cancellation safety: send is `reqwest`'s async path -- drop

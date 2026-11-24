@@ -26,6 +26,8 @@ Behaviour that changes with no config:
 
 - A tiered sink spills at zstd level 3, where it was 1. Records spilled at level 1 still drain.
 - A gRPC server reads zstd as well as gzip, and every gRPC and OTLP client accepts both in answers.
+- The HTTP receive side decodes a gzip or zstd `Content-Encoding` before queueing, to at most `max_body_bytes` (413 past it, 400 for bytes that do not decode), reserving `max_body_bytes` more in-flight bytes while it decodes. Any other coding is 415, where the body was queued undecoded.
+- A tiered sink's drain no longer drops an entry that does not decompress or decode under its codec. It holds with that entry on disk, sets `tiered_sink_drain_held`, fails readiness and resumes when the sink reopens under the codec that wrote it. A CRC failure is still dropped.
 - `VectorCompatClient` still pushes gzip, and `with_compression` sets another codec.
 - A file writer refuses `compress_rotated` set to `lz4` or `snappy` at open, and retention counts `.zst` files as rotated.
 - `tiered-sink` no longer pulls `snap`, and `tonic` is built with `zstd` as well as `gzip`.
