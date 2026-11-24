@@ -1648,14 +1648,22 @@ mod tests {
     }
 
     /// A Prometheus handle without installing a global recorder.
-    #[cfg(all(feature = "metrics", feature = "http-server"))]
+    #[cfg(all(
+        feature = "metrics",
+        feature = "http-server",
+        any(feature = "scaling", feature = "memory")
+    ))]
     fn test_prometheus_handle() -> PrometheusHandle {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle()
     }
 
-    #[cfg(all(feature = "metrics", feature = "http-server"))]
+    #[cfg(all(
+        feature = "metrics",
+        feature = "http-server",
+        any(feature = "scaling", feature = "memory")
+    ))]
     async fn probe(app: &axum::Router, path: &str) -> axum::http::StatusCode {
         use tower::ServiceExt;
 
