@@ -78,7 +78,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 
 | Module | Feature | Purpose |
 | -------- | --------- | --------- |
-| `spool` | `spool` | Disk-backed async FIFO queue (`src/yaque`, derived from yaque 0.6.6, + `compression`), with an opt-in per-record CRC32C check (`crc`, off by default) |
+| `spool` | `spool` | Disk-backed async FIFO queue (`src/yaque`, derived from yaque 0.6.6, + `compression`), with a per-record codec tag, write time and CRC32C check (`crc`, on by default) |
 | `tiered_sink` | `tiered-sink` | Transport + spool + circuit breaker + background drain |
 | `sink_stack` | `sink-stack` | Outbound control stack - composes timeout, load-shed, concurrency-limit, retry/backoff and rate-limit around a transport sender (tower `ServiceBuilder`), and preserves at-least-once |
 | `worker::pool` | `worker-pool` | `AdaptiveWorkerPool` (rayon + tokio), pressure-based scaling |

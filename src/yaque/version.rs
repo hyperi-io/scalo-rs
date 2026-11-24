@@ -11,19 +11,20 @@ use std::path::Path;
 use semver::{Version, VersionReq};
 
 /// The version stamped in `version/contents`. It names the on-disk format, so
-/// it never follows scalo's release.
-pub(crate) const QUEUE_FORMAT_VERSION: &str = "0.6.6";
+/// it never follows scalo's release. 0.7 puts a codec tag, a CRC32C and the
+/// write time in front of every entry.
+pub(crate) const QUEUE_FORMAT_VERSION: &str = "0.7.0";
 
 /// The stamped versions a queue may carry and still open.
-pub(crate) const QUEUE_FORMAT_ACCEPTS: &str = "0.6.*";
+pub(crate) const QUEUE_FORMAT_ACCEPTS: &str = "0.7.*";
 
 /// Stamps the format into a queue that has none, or checks the one it has.
 /// The caller holds the queue's locks, so no other open races the stamp.
 ///
 /// # Errors
 ///
-/// `InvalidData` naming the file when it holds no version or one outside
-/// [`QUEUE_FORMAT_ACCEPTS`], or the read's or write's error.
+/// `InvalidData` naming the file when it holds no version, `Unsupported` for
+/// one outside [`QUEUE_FORMAT_ACCEPTS`], or the read's or write's error.
 pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
     let dir = base.join("version");
     std::fs::create_dir_all(&dir)?;
@@ -49,9 +50,14 @@ pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
     let accepted = VersionReq::parse(QUEUE_FORMAT_ACCEPTS)
         .map_err(|e| invalid(format!("cannot be checked: {e}")))?;
     if !accepted.matches(&named) {
-        return Err(invalid(format!(
-            "names format {named}, and this build reads {QUEUE_FORMAT_ACCEPTS}"
-        )));
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{} names spool format {named}, and this build reads {QUEUE_FORMAT_ACCEPTS}. \
+                 Drain it with the release that wrote it, or remove it",
+                file.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -60,28 +66,30 @@ pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A fresh queue is stamped with a version it accepts, and every other
-    /// stamp is an error naming the file, never a panic.
+    /// A fresh queue is stamped with a version it accepts. Another format is
+    /// `Unsupported` and a stamp that is no version `InvalidData`, each naming
+    /// the file, never a panic.
     #[test]
     fn a_stamp_is_written_once_and_checked_after() {
-        let rows: [(&str, Option<&[u8]>, bool); 5] = [
-            ("fresh", None, true),
-            ("this format", Some(b"0.6.6\n"), true),
-            ("another format", Some(b"0.5.2\n"), false),
-            ("not a version", Some(b"not a version"), false),
-            ("only whitespace", Some(b"\n"), false),
+        use io::ErrorKind::{InvalidData, Unsupported};
+        let rows: [(&str, Option<&[u8]>, Option<io::ErrorKind>); 6] = [
+            ("fresh", None, None),
+            ("this format", Some(b"0.7.0\n"), None),
+            ("the format before", Some(b"0.6.6\n"), Some(Unsupported)),
+            ("an older format", Some(b"0.5.2\n"), Some(Unsupported)),
+            ("not a version", Some(b"not a version"), Some(InvalidData)),
+            ("only whitespace", Some(b"\n"), Some(InvalidData)),
         ];
-        for (name, stamp, opens) in rows {
+        for (name, stamp, refused) in rows {
             let dir = tempfile::tempdir().unwrap();
             if let Some(stamp) = stamp {
                 std::fs::create_dir_all(dir.path().join("version")).unwrap();
                 std::fs::write(dir.path().join("version").join("contents"), stamp).unwrap();
             }
             match check_queue_version(dir.path()) {
-                Ok(()) => assert!(opens, "{name}: opened"),
+                Ok(()) => assert_eq!(refused, None, "{name}: opened"),
                 Err(e) => {
-                    assert!(!opens, "{name}: {e}");
-                    assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{name}");
+                    assert_eq!(Some(e.kind()), refused, "{name}: {e}");
                     assert!(e.to_string().contains("contents"), "{name}: {e}");
                 }
             }

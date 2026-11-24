@@ -2,7 +2,7 @@
 
 Disk-backed async FIFO queue. Crash-safe, persistent, with optional zstd compression and bounded size, for any pipeline that needs durable store-and-forward. `TieredSink` does not use `Spool`: it runs its own queue for disk spillover and shares the locks, quarantine, sync and full-disk handling below.
 
-The queue started as yaque 0.6.6 (<https://github.com/tokahuke/yaque>, Apache-2.0), copied into scalo as the private module `src/yaque` because upstream looked abandoned: no release and no commit to its default branch since 2023-11. scalo has since replaced its locks, its wake-up and its read path. The entry format is still yaque's, so a spool an earlier scalo wrote opens as before.
+The queue started as yaque 0.6.6 (<https://github.com/tokahuke/yaque>, Apache-2.0), copied into scalo as the private module `src/yaque` because upstream looked abandoned: no release and no commit to its default branch since 2023-11. scalo has since replaced its locks, its wake-up and its read path, and put a codec tag, a CRC32C and the write time in front of every record (spool format 0.7). A spool written in an earlier format is refused at open: drain it with the release that wrote it, or remove it.
 
 For most workloads you want `TieredSink` (transport + spool + circuit
 breaker + drain). Reach for `Spool` directly only when you're building
@@ -19,7 +19,8 @@ buffer, a checkpoint store, or a custom drainer.
 | Persistent | Survives restarts, segment files in the queue directory |
 | Crash-safe | A record is committed only once read whole. The committed position is saved in `recv-metadata` every 250 records or 350 ms, and by each timed sync |
 | Async-native | `recv()` awaits when empty, and the push in the same process wakes it. No file watcher, no thread |
-| Optional compression | zstd at construction-time level (1-22, clamped) |
+| Optional compression | zstd at construction-time level (1-22, clamped). Each record names its codec |
+| Integrity | A CRC32C per record, on by default. A damaged record is dropped and counted, never returned |
 | Bounded | `max_items` (count) and `max_size_bytes` (bytes queued) |
 
 ---
@@ -30,14 +31,22 @@ Directly in the configured `path`:
 
 ```text
 <path>/
-|-- 0.q                # segment file -- [4-byte header][record] ... [end marker]
+|-- 0.q                # segment file -- [4-byte header][13-byte prefix][record] ... [end marker]
 |-- 1.q
 |-- ...
 |-- recv-metadata      # 16 bytes: (segment u64 BE, position u64 BE)
 |-- send.lock          # OS-locked by the open spool
 |-- recv.lock
-`-- version/contents   # the format version
+`-- version/contents   # the spool format, 0.7.0
 ```
+
+Each record's 13-byte prefix:
+
+| Bytes | Holds |
+| --- | --- |
+| 0 | The codec's tag in the low 4 bits, and bit 7 set when the CRC is written |
+| 1-4 | CRC32C over byte 0, bytes 5-12 and the record, little endian. Zeros with `crc: false` |
+| 5-12 | When the record was written, milliseconds since the Unix epoch, little endian |
 
 A segment takes records until it passes `segment_bytes` (16 MiB), then an end marker closes it and the next record starts a new file. A record bigger than a segment gets one to itself. The receiver position is two big-endian u64s pointing at the next record. A read is a transaction: `pop_front` and `recv` commit it, and `peek` hands the record back. A segment file is deleted once every record in it is committed.
 
@@ -62,12 +71,18 @@ Two sinks or spools on one path in one process, or two processes sharing one vol
 
 ### Quarantine
 
-When a queue will not open, or a CRC check fails on read, `on_corruption` decides (default `quarantine`). A queue will not open when its `version/contents` does not hold a version or names a format this build does not read, or the directory holds a `.q` file that is not a segment number. Each is an open failure naming the file, never a panic:
+When a queue will not open, `on_corruption` decides (default `quarantine`). A queue will not open when its `version/contents` does not hold a version, or the directory holds a `.q` file that is not a segment number. Each is an open failure naming the file, never a panic:
 
-- `quarantine` moves the queue's files into a new `corrupt-YYYYMMDD-HHMMSS-<nanos>-<n>/` subdirectory of the spool path and opens a fresh queue in place. The path itself is never renamed, so this works when the path is a mount point (an `emptyDir` or PVC mounted exactly at `spool_path`). Counted in `spool_quarantined_total{trigger="open_failed|crc_mismatch|damaged_header"}`, one warn with the path.
+- `quarantine` moves the queue's files into a new `corrupt-YYYYMMDD-HHMMSS-<nanos>-<n>/` subdirectory of the spool path and opens a fresh queue in place. The path itself is never renamed, so this works when the path is a mount point (an `emptyDir` or PVC mounted exactly at `spool_path`). Counted in `spool_quarantined_total{trigger="open_failed|damaged_header"}`, one warn with the path.
 - `fail` returns the error.
 
 A record's 4-byte header carries parity bits. One that fails them is damaged, and no record after it can be found, so a read that meets it quarantines the queue under either policy, counted as `trigger="damaged_header"`.
+
+A `version/contents` naming another spool format is refused with `Open` under either policy, and nothing moves: its records wait for the release that reads them.
+
+### Damaged records
+
+A record that fails its CRC is dropped, counted in `spool_damaged_entries_total{store}` with one warn, and the read goes on. Under `on_corruption: fail` that pop also returns `SpoolError::Corrupted` once. At open, a newest segment's last record that fails is a torn write, cut off and counted in `spool_torn_entries_cut_total`.
 
 Permission, full-disk, read-only and quota errors are returned under either policy, because moving the queue aside would orphan records that are still readable. Quarantined subdirectories are kept for forensics and are not counted against `max_size_bytes`. Remove them by hand once inspected.
 
@@ -87,14 +102,38 @@ A push copies nothing: the record goes to the disk from the caller's bytes, or f
 
 ## Compression
 
-When `compress = true`, every payload is zstd-compressed before it is
-written and decompressed inside `recv`, `pop_front` and `peek`, through
-scalo's compression layer with its context reused. Compression level is
-config-controlled (default 3 -- fast). Use higher levels (10+) for
-archival queues, and the default for a hot-path spool.
+Each record is compressed on its own before it is written, and decompressed inside `recv`, `pop_front` and `peek` through scalo's compression layer, its contexts reused. `compress: true` turns on zstd at `compression_level` (default 3). The tiered sink's spill compresses with zstd level 3 by default, under any codec its `compression` names.
 
-The choice is a one-shot at construction -- there's no per-message
-override.
+Each record's prefix names the codec it was written with, so a change applies to new records and the ones already queued still read.
+
+## Why zstd level 3
+
+A spool is a supporting job. It catches records when the next stage can't keep up, and the app it lives in has real work to do. So the default codec has to save disk without taking the CPU the app needs.
+
+zstd level 3 is that middle ground for records of a kilobyte or more. The spool compresses each record on its own, so the saving depends on record size. Measured on a quiet bare-metal host with a fast local SSD, one record per send, 1.1 GB written:
+
+| Record size | Codec | Written to disk | CPU per GB in |
+| --- | --- | --- | --- |
+| 200 B | none | 1,203 MB | 4.0 s |
+| 200 B | zstd 3 | 1,068 MB | 24.8 s |
+| 1 KiB | none | 1,099 MB | 1.2 s |
+| 1 KiB | lz4 | 746 MB | 3.2 s |
+| 1 KiB | zstd 3 | 560 MB | 9.0 s |
+| 16 KiB | none | 1,075 MB | 0.4 s |
+| 16 KiB | zstd 3 | 276 MB | 3.9 s |
+
+At 1 KiB zstd 3 halves what reaches the disk, and at 16 KiB it writes a quarter. At 200 B it saves about a tenth for six times the CPU, which isn't worth it. On that host the disk was never the limit. Once compression was on, the spool was bound by CPU.
+
+## Choosing a codec
+
+Think about which resource is short first. On the tiered sink, set `compression: {codec: ..., level: ...}`. A `Spool` takes `compress` and `compression_level`, zstd only.
+
+- **Your disk is the bottleneck.** That's any of three caps: capacity (the volume fills), throughput (MB/s) or IOPS (a cloud volume's provisioned limits). Each one is a trade of CPU for disk. A higher zstd level stores fewer bytes, so the same volume holds a longer outage, the same MB/s carries more records, and fewer blocks are written. Each step up costs noticeably more CPU for a few percent saving, so check the spool metrics below before and after.
+- **Your CPU is the bottleneck** (the receiver at full ingest is the usual case). Drop to lz4 on the tiered sink, or zstd level 1. You write more bytes, and the app keeps its CPU.
+- **Your records are small** (a few hundred bytes). Compression saves little per record. lz4 or `none` costs far less CPU for nearly the same disk.
+- **`none`** suits a fast local disk with plenty of room.
+
+`spool_bytes_in_total{store,codec}` counts the bytes taken in, `spool_bytes_written_total{store,codec}` the bytes written to disk, and `spool_codec_microseconds_total{store,codec,op="compress"}` the time spent compressing. If compression time climbs while the app's own work slows, the codec is too expensive for that host. If written bytes climb while the disk sits at its cap, it's too cheap.
 
 ---
 
@@ -145,6 +184,7 @@ spool:
   path: /var/spool/myapp/replay
   compress: true
   compression_level: 3
+  crc: true                     # the default. false writes the CRC as zeros
   max_items: 1000000
   max_size_bytes: 10737418240   # 10 GiB
   sync_on_push: false           # true syncs to disk before every push returns
@@ -155,7 +195,7 @@ spool:
 
 Builder methods on `SpoolConfig` cover the common shapes --
 `SpoolConfig::new(path)`, `SpoolConfig::with_compression(path)`,
-`.compress(bool)`, `.compression_level(i)`, `.max_items(n)`,
+`.compress(bool)`, `.compression_level(i)`, `.crc(bool)`, `.max_items(n)`,
 `.max_size_bytes(b)`, `.sync_on_push(bool)`, `.sync_interval_ms(ms)`,
 `.segment_bytes(b)`, `.read_buffer_bytes(b)`.
 
@@ -214,7 +254,7 @@ arrives). `pop_front` is the try-style alternative that returns
 
 ## Metrics
 
-With the `metrics` feature, a spool reports `spool_queue_depth`, and with `store="spool"` the series the tiered sink's spill reports under `store="tiered_sink"`: `spool_bytes_in_total`, `spool_bytes_written_total`, `spool_codec_microseconds_total`, `spool_disk_bytes`, `spool_disk_full_refused_bytes_total`, `spool_disk_full_wait_milliseconds_total`, `spool_sync_seconds`, `spool_memory_reserved_bytes`, `spool_position_save_failures_total`, `spool_segment_delete_failures_total`, `spool_torn_entries_cut_total` and `spool_quarantined_total`. [tiered-sink.md](tiered-sink.md#metrics) describes each.
+With the `metrics` feature, a spool reports `spool_queue_depth`, and with `store="spool"` the series the tiered sink's spill reports under `store="tiered_sink"`: `spool_bytes_in_total`, `spool_bytes_written_total`, `spool_codec_microseconds_total`, `spool_disk_bytes`, `spool_disk_full_refused_bytes_total`, `spool_disk_full_wait_milliseconds_total`, `spool_sync_seconds`, `spool_memory_reserved_bytes`, `spool_position_save_failures_total`, `spool_segment_delete_failures_total`, `spool_torn_entries_cut_total`, `spool_damaged_entries_total` and `spool_quarantined_total`. [tiered-sink.md](tiered-sink.md#metrics) describes each.
 
 ---
 

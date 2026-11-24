@@ -10,10 +10,10 @@
 //! and the `TieredSink` cold path so the integrity + recovery behaviour is
 //! defined once.
 //!
-//! - **CRC framing** ([`crc_prefix`] / [`unframe`]): an optional CRC32C in
-//!   front of each record's on-disk bytes. The queue parity-checks only the
-//!   LENGTH header, so a torn write or bit-rot in the payload would otherwise
-//!   be returned silently. The checksum turns that into a [`CorruptionError`].
+//! - **Framing** ([`prefix`] / [`unframe`]): each entry's codec, write time
+//!   and CRC32C in front of its body. The queue parity-checks only the length
+//!   header, so the checksum is what turns a torn write or bit-rot in the body
+//!   into a [`CorruptionError`].
 //! - **Open** ([`open_queue`]): refuses a queue another open holds, replays a
 //!   receive position a crash left unusable, and quarantines a queue that will
 //!   not open under [`CorruptionPolicy::Quarantine`].
@@ -68,8 +68,7 @@ pub enum CorruptionPolicy {
     Fail,
 }
 
-/// A record's on-disk bytes failed their CRC32C check (torn write / bit-rot), or
-/// the framing was too short to hold the header.
+/// An entry's stored bytes failed their CRC32C check, or are too short to hold its prefix.
 #[derive(Debug, Clone)]
 pub struct CorruptionError(pub String);
 
@@ -79,40 +78,132 @@ impl std::fmt::Display for CorruptionError {
     }
 }
 
-/// The bytes written in front of `body` when `crc` is on: its CRC32C, little
-/// endian. Empty when off, so the entry is `body` alone.
-#[must_use]
-pub(crate) fn crc_prefix(crc: bool, body: &[u8]) -> ([u8; 4], usize) {
-    if crc {
-        (crc32c::crc32c(body).to_le_bytes(), 4)
-    } else {
-        ([0; 4], 0)
-    }
+/// Bytes in front of each entry's body: a tag, a CRC32C and the write time.
+pub(crate) const PREFIX_LEN: usize = 13;
+
+/// The tag bit set on an entry that carries its CRC.
+const CHECKED: u8 = 0x80;
+
+/// Milliseconds since the Unix epoch, 0 for a clock set before it.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
-/// Verifies and strips the CRC32C [`crc_prefix`] wrote, borrowing the body.
+/// The prefix of an entry whose `body` was compressed with `codec` at
+/// `written_ms`: the codec's tag, then with `crc` a CRC32C over the tag, the
+/// time and the body, then the time, both little endian.
+#[must_use]
+pub(crate) fn prefix(codec: Codec, crc: bool, written_ms: u64, body: &[u8]) -> [u8; PREFIX_LEN] {
+    tagged(codec.tag(), crc, written_ms, body)
+}
+
+/// [`prefix`] for any codec tag, known to this build or not.
+#[must_use]
+pub(crate) fn tagged(tag: u8, crc: bool, written_ms: u64, body: &[u8]) -> [u8; PREFIX_LEN] {
+    let mut prefix = [0; PREFIX_LEN];
+    prefix[0] = tag | if crc { CHECKED } else { 0 };
+    prefix[5..].copy_from_slice(&written_ms.to_le_bytes());
+    if crc {
+        let sum = checksum(prefix[0], &prefix[5..], body);
+        prefix[1..5].copy_from_slice(&sum.to_le_bytes());
+    }
+    prefix
+}
+
+fn checksum(tag: u8, time: &[u8], body: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc32c::crc32c_append(crc32c::crc32c(&[tag]), time), body)
+}
+
+/// A stored entry, its prefix read and its CRC checked.
+#[derive(Debug)]
+pub(crate) struct Entry<'a> {
+    /// The codec its body was compressed with, or the tag of one this build does not know.
+    pub(crate) codec: Result<Codec, u8>,
+    pub(crate) body: &'a [u8],
+}
+
+/// When an entry was written, in milliseconds since the Unix epoch, read from
+/// its prefix without checking the CRC. 0 for one too short to hold it.
+#[cfg(feature = "tiered-sink")]
+pub(crate) fn written_ms(raw: &[u8]) -> u64 {
+    raw.get(5..PREFIX_LEN)
+        .and_then(|time| time.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
+}
+
+/// Reads an entry's prefix and checks its CRC, borrowing the body.
 ///
 /// # Errors
-/// [`CorruptionError`] if the entry is shorter than the 4-byte CRC or the
-/// checksum does not match -- corruption surfaces as an error, never as
-/// silently-wrong bytes handed downstream.
-pub(crate) fn unframe(crc: bool, raw: &[u8]) -> Result<&[u8], CorruptionError> {
-    if !crc {
-        return Ok(raw);
-    }
-    let Some((header, body)) = raw.split_first_chunk::<4>() else {
-        return Err(CorruptionError(
-            "record shorter than the 4-byte CRC header".to_string(),
-        ));
-    };
-    let expected = u32::from_le_bytes(*header);
-    let actual = crc32c::crc32c(body);
-    if expected != actual {
+/// [`CorruptionError`] when the entry is shorter than its prefix or fails its
+/// CRC, so damaged bytes are never handed on.
+pub(crate) fn unframe(raw: &[u8]) -> Result<Entry<'_>, CorruptionError> {
+    let Some((&[tag, c0, c1, c2, c3, ref time @ ..], body)) = raw.split_first_chunk::<PREFIX_LEN>()
+    else {
         return Err(CorruptionError(format!(
-            "CRC32C mismatch (expected {expected:08x}, computed {actual:08x}) -- torn write or bit-rot"
+            "entry of {} bytes is shorter than its {PREFIX_LEN}-byte prefix",
+            raw.len()
         )));
+    };
+    if tag & CHECKED != 0 {
+        let expected = u32::from_le_bytes([c0, c1, c2, c3]);
+        let actual = checksum(tag, time, body);
+        if expected != actual {
+            return Err(CorruptionError(format!(
+                "CRC32C mismatch (stored {expected:08x}, computed {actual:08x})"
+            )));
+        }
     }
-    Ok(body)
+    let codec_tag = tag & !CHECKED;
+    Ok(Entry {
+        codec: Codec::from_tag(codec_tag).ok_or(codec_tag),
+        body,
+    })
+}
+
+/// Whether the last entry of a queue's newest segment is whole: one that fails
+/// its CRC there is a torn write, and the open cuts it off.
+pub(crate) fn whole(raw: &[u8]) -> bool {
+    unframe(raw).is_ok()
+}
+
+/// One decompressor per codec the entries name, each made on first use.
+#[derive(Default)]
+pub(crate) struct Decoders {
+    engines: [Option<crate::compression::Compressor>; Codec::ALL.len()],
+}
+
+impl Decoders {
+    /// Replaces `out` with `entry`'s body decompressed under its own codec.
+    ///
+    /// # Errors
+    /// A codec this build does not know or lacks, or a body that does not
+    /// decompress under it.
+    pub(crate) fn decode_into(
+        &mut self,
+        entry: &Entry<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let codec = entry.codec.map_err(|tag| {
+            format!("the entry names codec tag {tag}, which this build does not know")
+        })?;
+        let slot = &mut self.engines[usize::from(codec.tag())];
+        if slot.is_none() {
+            *slot = Some(
+                crate::compression::Compressor::new(crate::compression::Compression::new(codec))
+                    .map_err(|e| format!("the entry's codec {codec} cannot run here: {e}"))?,
+            );
+        }
+        let Some(engine) = slot.as_mut() else {
+            return Err(format!("no {codec} decoder"));
+        };
+        engine
+            .decompress_into(entry.body, out, usize::MAX)
+            .map_err(|e| format!("the entry does not decompress under its codec {codec}: {e}"))
+    }
 }
 
 /// Name prefix of the subdirectories [`quarantine`] creates inside a spool path.
@@ -123,9 +214,6 @@ const QUARANTINE_PREFIX: &str = "corrupt-";
 pub(crate) enum QuarantineTrigger {
     /// The queue would not open.
     OpenFailed,
-    /// A record failed its CRC check on read. Only the standalone spool recovers on read.
-    #[cfg(feature = "spool")]
-    CrcMismatch,
     /// A header failed its parity check, so no later entry can be found.
     DamagedHeader,
 }
@@ -134,8 +222,6 @@ impl QuarantineTrigger {
     fn label(self) -> &'static str {
         match self {
             Self::OpenFailed => "open_failed",
-            #[cfg(feature = "spool")]
-            Self::CrcMismatch => "crc_mismatch",
             Self::DamagedHeader => "damaged_header",
         }
     }
@@ -201,7 +287,11 @@ pub(crate) fn open_queue(
     if open_err.kind() == io::ErrorKind::WouldBlock {
         return Err(OpenError::Locked(open_err.to_string()));
     }
-    if is_environmental(open_err.kind()) || policy == CorruptionPolicy::Fail {
+    // A queue in another format is not damage: its records wait for the release that wrote them.
+    if is_environmental(open_err.kind())
+        || open_err.kind() == io::ErrorKind::Unsupported
+        || policy == CorruptionPolicy::Fail
+    {
         return Err(OpenError::Failed(open_err.to_string()));
     }
     quarantine(path, QuarantineTrigger::OpenFailed, &open_err.to_string())
@@ -525,6 +615,11 @@ pub(crate) struct StoreMetrics {
     reserved_bytes: ::metrics::Gauge,
     #[cfg(feature = "metrics")]
     cut_short: ::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    damaged: ::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    oldest_age: ::metrics::Gauge,
+    store: &'static str,
 }
 
 impl StoreMetrics {
@@ -545,7 +640,29 @@ impl StoreMetrics {
             reserved_bytes: ::metrics::gauge!("spool_memory_reserved_bytes", "store" => store),
             #[cfg(feature = "metrics")]
             cut_short: ::metrics::counter!("spool_drain_cut_short_total", "store" => store),
+            #[cfg(feature = "metrics")]
+            damaged: ::metrics::counter!("spool_damaged_entries_total", "store" => store),
+            #[cfg(feature = "metrics")]
+            oldest_age: ::metrics::gauge!("spool_oldest_age_seconds", "store" => store),
+            store,
         }
+    }
+
+    /// An entry that failed its CRC and was dropped: counted, and logged once.
+    pub(crate) fn damaged(&self, error: &CorruptionError) {
+        #[cfg(feature = "metrics")]
+        self.damaged.increment(1);
+        tracing::warn!(store = self.store, error = %error, "dropped a spooled entry that failed its CRC");
+    }
+
+    /// The age of the oldest entry held, from its write time, 0 for none.
+    #[cfg(feature = "tiered-sink")]
+    pub(crate) fn oldest(&self, written_ms: u64) {
+        #[cfg(feature = "metrics")]
+        self.oldest_age
+            .set(age(written_ms).map_or(0.0, |age| age.as_secs_f64()));
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, written_ms);
     }
 
     /// A record of `bytes_in` taken in and `written` bytes appended, after
@@ -738,24 +855,70 @@ pub(crate) fn is_damaged_header(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::InvalidData
 }
 
+/// How long ago `written_ms` was, `None` for 0, which stands for no entry.
+#[cfg(feature = "tiered-sink")]
+pub(crate) fn age(written_ms: u64) -> Option<Duration> {
+    (written_ms > 0).then(|| Duration::from_millis(now_ms().saturating_sub(written_ms)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// An entry reads back with its codec and time, and a flip of any byte
+    /// its CRC covers is caught. Without the CRC only the length is checked.
     #[test]
-    fn crc_framing_round_trips_and_catches_damage() {
+    fn framing_round_trips_and_catches_damage() {
         let body = b"the payload bytes";
-        let (prefix, len) = crc_prefix(true, body);
-        let framed = [&prefix[..len], &body[..]].concat();
-        assert_eq!(framed.len(), body.len() + 4, "4-byte CRC header prepended");
-        assert_eq!(unframe(true, &framed).unwrap(), body);
-        assert_eq!(crc_prefix(false, body).1, 0, "no CRC, no prefix");
-        assert_eq!(unframe(false, body).unwrap(), body);
-        let mut damaged = framed;
-        let last = damaged.len() - 1;
-        damaged[last] ^= 0xFF;
-        assert!(unframe(true, &damaged).is_err());
-        assert!(unframe(true, &[1, 2]).is_err(), "too short for the header");
+        for (codec, crc) in [
+            (Codec::Zstd, true),
+            (Codec::Lz4, true),
+            (Codec::None, false),
+        ] {
+            let framed = [&prefix(codec, crc, 1_700_000_000_123, body)[..], body].concat();
+            let entry = unframe(&framed).unwrap();
+            assert_eq!(entry.codec, Ok(codec), "{codec}");
+            #[cfg(feature = "tiered-sink")]
+            assert_eq!(written_ms(&framed), 1_700_000_000_123, "{codec}");
+            assert_eq!(entry.body, body, "{codec}");
+            for at in [0, 1, 6, PREFIX_LEN, framed.len() - 1] {
+                let mut damaged = framed.clone();
+                damaged[at] ^= 0x01;
+                // Bit 0 of the tag turns zstd into none and lz4 into gzip, the CRC catches it.
+                assert_eq!(
+                    unframe(&damaged).is_err(),
+                    crc,
+                    "{codec}: byte {at} flipped"
+                );
+            }
+        }
+        assert!(unframe(&[1, 2]).is_err(), "too short for the prefix");
+        let unknown = [&tagged(0x0F, true, 1, body)[..], body].concat();
+        assert_eq!(
+            unframe(&unknown).unwrap().codec,
+            Err(0x0F),
+            "a codec this build does not know"
+        );
+    }
+
+    /// Each entry decodes under the codec it names, whatever the one before it used.
+    #[test]
+    fn each_entry_decodes_under_its_own_codec() {
+        let record = b"a record that compresses a record that compresses".repeat(4);
+        let mut decoders = Decoders::default();
+        for codec in [Codec::Zstd, Codec::None, Codec::Lz4, Codec::Zstd] {
+            let mut packed = Vec::new();
+            crate::compression::Compressor::new(crate::compression::Compression::new(codec))
+                .unwrap()
+                .compress_into(&record, &mut packed)
+                .unwrap();
+            let framed = [&prefix(codec, true, 1, &packed)[..], &packed].concat();
+            let mut out = Vec::new();
+            decoders
+                .decode_into(&unframe(&framed).unwrap(), &mut out)
+                .unwrap();
+            assert_eq!(out, record, "{codec}");
+        }
     }
 
     #[test]

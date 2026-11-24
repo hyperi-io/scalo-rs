@@ -8,8 +8,7 @@
 
 //! Background drain task for spooled messages.
 
-use crate::compression::Compressor;
-use crate::spool_codec::{QueueCell, StoreMetrics};
+use crate::spool_codec::{Decoders, QueueCell, StoreMetrics, written_ms};
 use crate::tiered_sink::tiered::Spill;
 use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
 use crate::transport::{Record, SendResult, TransportSender};
@@ -138,12 +137,12 @@ enum DrainResult {
     /// This many records the sink would not take were written to the DLQ, or
     /// dropped and counted when there is none, and committed.
     DeadLettered(usize),
-    /// An entry failed its CRC: its stored bytes are damaged. Dropped
-    /// (committed) so it cannot block the queue.
-    Corrupt(String),
-    /// The entry at the head of the spool does not decompress or decode under
-    /// the spill codec, as when it was written under another. Nothing is
-    /// committed, and the drain holds until the codec that wrote it is back.
+    /// An entry failed its CRC: its stored bytes are damaged. Counted and
+    /// dropped (committed) so it cannot block the queue.
+    Corrupt,
+    /// The entry at the head of the spool names a codec this build lacks, or
+    /// does not decompress or decode under its own. Nothing is committed, and
+    /// the drain holds until a build that reads it opens the spill.
     Held(String),
     /// A header failed its parity check, so no later entry can be found. The
     /// spill is quarantined and a fresh one opened.
@@ -200,12 +199,6 @@ async fn settle(result: DrainResult, drainer: &mut Drainer, circuit: &CircuitBre
                 "The DLQ did not confirm a drained batch's dead letters; it stays spooled"
             );
         }
-        DrainResult::Corrupt(e) => {
-            #[cfg(feature = "tracing")]
-            tracing::error!(error = %e, "Spooled entry failed its CRC, dropping");
-            #[cfg(not(feature = "tracing"))]
-            let _ = e;
-        }
         DrainResult::Held(_) => {
             // The loop logs the hold once, and the entry stays spooled.
             drainer.record_failure();
@@ -216,9 +209,7 @@ async fn settle(result: DrainResult, drainer: &mut Drainer, circuit: &CircuitBre
             #[cfg(not(feature = "tracing"))]
             let _ = e;
         }
-        DrainResult::Empty | DrainResult::IoError(_) => {
-            // Nothing to do, just continue
-        }
+        DrainResult::Corrupt | DrainResult::Empty | DrainResult::IoError(_) => {}
     }
 }
 
@@ -453,24 +444,21 @@ pub(crate) struct DrainBatch {
 /// Why a spooled entry did not decode.
 enum Unreadable {
     /// It failed its CRC, so it is dropped.
-    Corrupt(String),
-    /// It does not decompress or decode under the spill codec, so it is kept.
+    Corrupt(crate::spool_codec::CorruptionError),
+    /// It does not decompress or decode under its own codec, so it is kept.
     WrongCodec(String),
 }
 
-/// Unframe, decompress into `scratch` and decode one spooled entry.
+/// Unframe, decompress into `scratch` under the entry's own codec, and decode one spooled entry.
 fn decode_entry(
     raw: &[u8],
-    crc: bool,
-    decoder: &mut Compressor,
+    decoders: &mut Decoders,
     scratch: &mut Vec<u8>,
 ) -> Result<Record, Unreadable> {
-    let body = crate::spool_codec::unframe(crc, raw).map_err(|c| Unreadable::Corrupt(c.0))?;
-    // The spill keeps no codec per entry, so a failure past the CRC is read as
-    // an entry another codec wrote, never dropped.
-    decoder
-        .decompress_into(body, scratch, usize::MAX)
-        .map_err(|e| Unreadable::WrongCodec(e.to_string()))?;
+    let entry = crate::spool_codec::unframe(raw).map_err(Unreadable::Corrupt)?;
+    decoders
+        .decode_into(&entry, scratch)
+        .map_err(Unreadable::WrongCodec)?;
     Record::decode(scratch).map_err(|e| Unreadable::WrongCodec(e.to_string()))
 }
 
@@ -493,6 +481,24 @@ pub(crate) struct Counters {
     pub(crate) bytes: Arc<AtomicU64>,
     /// Wakes the sends a full spool blocks once a pass frees room.
     pub(crate) progress: Arc<tokio::sync::Notify>,
+    /// When the entry at the spool's front was written, 0 for none.
+    pub(crate) oldest_ms: Arc<AtomicU64>,
+}
+
+impl Counters {
+    /// Sets the front's write time after a pass, 0 when the pass left none.
+    /// A spill that lands while the pass looked counts from now.
+    fn front(&self, written_ms: u64) {
+        self.oldest_ms.store(written_ms, AtomicOrdering::Release);
+        if written_ms == 0 && self.count.load(AtomicOrdering::Acquire) > 0 {
+            let _ = self.oldest_ms.compare_exchange(
+                0,
+                crate::spool_codec::now_ms(),
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
 }
 
 /// The drain's health, shared with the sink's health check.
@@ -533,20 +539,27 @@ impl DrainQueue {
     }
 
     /// Commits the first `entries` read and returns the rest, on the blocking
-    /// pool: a commit can delete segments and save the position.
-    async fn commit(&self, entries: usize) {
+    /// pool: a commit can delete segments and save the position. Returns when
+    /// the entry left at the front was written, 0 for none.
+    async fn commit(&self, entries: usize) -> u64 {
         let receiver = Arc::clone(&self.receiver);
         let guard = self.guard();
-        let disk = tokio::task::spawn_blocking(move || {
+        let committed = tokio::task::spawn_blocking(move || {
             receiver.lock().as_mut().map(|receiver| {
+                let kept = receiver.taken().get(entries).map(|raw| written_ms(raw));
                 receiver.commit(entries, guard.as_deref());
-                receiver.disk_bytes()
+                let front = kept.unwrap_or_else(|| front_written_ms(receiver));
+                (receiver.disk_bytes(), front)
             })
         })
         .await;
         self.metrics.reserved(0, false);
-        if let Ok(Some(disk)) = disk {
-            self.metrics.disk(disk);
+        match committed {
+            Ok(Some((disk, front))) => {
+                self.metrics.disk(disk);
+                front
+            }
+            _ => 0,
         }
     }
 
@@ -611,6 +624,7 @@ impl DrainQueue {
         .and_then(|reopened| reopened);
         counters.count.store(0, AtomicOrdering::Relaxed);
         counters.bytes.store(0, AtomicOrdering::Relaxed);
+        counters.oldest_ms.store(0, AtomicOrdering::Release);
         refresh_gauges(&counters.count, &counters.bytes);
         if let Err(e) = reopened {
             #[cfg(feature = "tracing")]
@@ -629,9 +643,8 @@ async fn drain_once<S: TransportSender>(
     queue: &DrainQueue,
     cap: usize,
     batch: DrainBatch,
-    decoder: &mut Compressor,
+    decoders: &mut Decoders,
     scratch: &mut Vec<u8>,
-    crc: bool,
     send_timeout: Duration,
     counters: &Counters,
     dead_letters: &DeadLetters,
@@ -648,15 +661,14 @@ async fn drain_once<S: TransportSender>(
         sink,
         queue,
         taken,
-        decoder,
+        decoders,
         scratch,
-        crc,
         send_timeout,
         counters,
         dead_letters,
     )
     .await;
-    queue.commit(commit).await;
+    counters.front(queue.commit(commit).await);
     outcome
 }
 
@@ -667,9 +679,8 @@ async fn deliver<S: TransportSender>(
     sink: &S,
     queue: &DrainQueue,
     taken: usize,
-    decoder: &mut Compressor,
+    decoders: &mut Decoders,
     scratch: &mut Vec<u8>,
-    crc: bool,
     send_timeout: Duration,
     counters: &Counters,
     dead_letters: &DeadLetters,
@@ -684,9 +695,12 @@ async fn deliver<S: TransportSender>(
             return (vec![DrainResult::Empty], 0);
         };
         for (index, raw) in receiver.taken().iter().enumerate() {
-            match decode_entry(raw, crc, decoder, scratch) {
+            match decode_entry(raw, decoders, scratch) {
                 Ok(record) => read_back.push(record),
-                Err(Unreadable::Corrupt(e)) => unreadable.push(DrainResult::Corrupt(e)),
+                Err(Unreadable::Corrupt(e)) => {
+                    queue.metrics.damaged(&e);
+                    unreadable.push(DrainResult::Corrupt);
+                }
                 Err(Unreadable::WrongCodec(e)) => {
                     wrong_codec = Some((index, e));
                     break;
@@ -800,9 +814,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     sink: Arc<S>,
     counters: Counters,
     circuit: Arc<CircuitBreaker>,
-    mut decoder: Compressor,
     flags: Flags,
-    crc: bool,
     strategy: DrainStrategy,
     interval: Duration,
     send_timeout: Duration,
@@ -812,6 +824,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     dead_letters: DeadLetters,
 ) {
     let mut drainer = Drainer::new(strategy);
+    let mut decoders = Decoders::default();
     // Entries still to send one at a time after a refused batch.
     let mut isolate = 0_usize;
     // Decompressed entries land here, reused across passes.
@@ -849,6 +862,9 @@ pub async fn drain_loop<S: TransportSender + 'static>(
             () = tokio::time::sleep(pause) => {}
         }
         pause = interval;
+        queue
+            .metrics
+            .oldest(counters.oldest_ms.load(AtomicOrdering::Acquire));
 
         // Gate the drain through the breaker. When half-open this claims the
         // single recovery-probe permit, so the drainer alone probes the
@@ -875,9 +891,8 @@ pub async fn drain_loop<S: TransportSender + 'static>(
             &queue,
             cap,
             batch,
-            &mut decoder,
+            &mut decoders,
             &mut scratch,
-            crc,
             send_timeout,
             &counters,
             &dead_letters,
@@ -887,7 +902,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
         let mut took = 0_usize;
         let mut progressed = false;
         for result in results {
-            note_hold(&result, &flags.held, decoder.compression());
+            note_hold(&result, &flags.held);
             note_read_error(&result, &mut read_failing);
             match &result {
                 DrainResult::Success(records) => {
@@ -895,7 +910,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                     pause = Duration::ZERO;
                     progressed = true;
                 }
-                DrainResult::DeadLettered(_) | DrainResult::Corrupt(_) => {
+                DrainResult::DeadLettered(_) | DrainResult::Corrupt => {
                     pause = Duration::ZERO;
                     progressed = true;
                 }
@@ -974,7 +989,7 @@ fn note_stall(stalled: bool, flag: &AtomicBool) {
 
 /// Set or clear `held` from a pass's result, logging and counting only the
 /// change, so a hold is reported once however many passes it lasts.
-fn note_hold(result: &DrainResult, held: &AtomicBool, codec: crate::compression::Compression) {
+fn note_hold(result: &DrainResult, held: &AtomicBool) {
     let holding = match result {
         DrainResult::Held(_) => true,
         DrainResult::Empty | DrainResult::IoError(_) | DrainResult::SinkUnavailable => return,
@@ -988,15 +1003,23 @@ fn note_hold(result: &DrainResult, held: &AtomicBool, codec: crate::compression:
     #[cfg(feature = "tracing")]
     if let DrainResult::Held(error) = result {
         tracing::error!(
-            codec = %codec,
             error = %error,
-            "The spill's next entry does not read under its codec, so the drain holds and keeps it. Reopen the sink under the codec that wrote it"
+            "The spill's next entry does not read, so the drain holds and keeps it. Open the spill with a build that reads its codec"
         );
     } else {
-        tracing::info!(codec = %codec, "The spill reads under its codec again, so the drain resumes");
+        tracing::info!("The spill's next entry reads again, so the drain resumes");
     }
-    #[cfg(not(feature = "tracing"))]
-    let _ = codec;
+}
+
+/// When the next entry in `receiver` was written, read and returned to the
+/// queue, 0 for none.
+pub(crate) fn front_written_ms(receiver: &mut Receiver) -> u64 {
+    let front = match receiver.read(1, u64::MAX, None) {
+        Ok(taken) if taken.entries > 0 => receiver.taken().first().map_or(0, |raw| written_ms(raw)),
+        _ => 0,
+    };
+    receiver.commit(0, None);
+    front
 }
 
 /// Records one pass takes: `max_records`, held to a second's worth at `rate`

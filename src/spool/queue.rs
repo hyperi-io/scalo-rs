@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use crate::compression::{Codec, Compression, Compressor};
 use crate::concurrency::PeriodicWorker;
 use crate::spool::{CorruptionPolicy, Result, SpoolConfig, SpoolError};
-use crate::spool_codec::{self, FullDisk, QueueCell, StoreMetrics, SyncTicker};
+use crate::spool_codec::{
+    self, CorruptionError, Decoders, FullDisk, QueueCell, StoreMetrics, SyncTicker,
+};
 use crate::yaque::{self, MemoryGuard, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 
@@ -40,8 +42,8 @@ pub struct Spool {
     /// Compresses pushes, and its output buffer, both reused.
     compressor: Compressor,
     packed: Vec<u8>,
-    /// Decompresses pops, its context reused.
-    decoder: Compressor,
+    /// Decompresses each pop under the codec its entry names.
+    decoders: Decoders,
     full: FullDisk,
     metrics: StoreMetrics,
     /// The open queue's shared half, for the timed sync.
@@ -71,7 +73,7 @@ fn live(queue: &mut Option<Queue>) -> Result<&mut Queue> {
 /// Why a stored record did not decode.
 enum Unreadable {
     /// Its CRC did not match.
-    Corrupt(String),
+    Damaged(CorruptionError),
     /// It did not decompress.
     Codec(String),
 }
@@ -97,7 +99,6 @@ impl Spool {
         };
         let compressor =
             Compressor::new(codec).map_err(|e| SpoolError::Compression(e.to_string()))?;
-        let decoder = Compressor::new(codec).map_err(|e| SpoolError::Compression(e.to_string()))?;
         // Walks segment files and may cut a torn tail, so it runs off the runtime.
         let path = config.path.clone();
         let policy = config.on_corruption;
@@ -145,7 +146,7 @@ impl Spool {
             bytes,
             compressor,
             packed: Vec::new(),
-            decoder,
+            decoders: Decoders::default(),
             full,
             metrics,
             cell,
@@ -171,9 +172,7 @@ impl Spool {
     ///
     /// Moves the queue's files into a timestamped `corrupt-*` subdirectory of
     /// the spool path (forensics preserved) and opens a fresh queue in place.
-    /// Used by the read paths when a CRC check fails under the Quarantine
-    /// policy, and when a header is damaged under either. Returns the
-    /// quarantine subdirectory, if anything was moved.
+    /// Used by the read paths when a header is damaged, under either policy.
     fn recover(&mut self, trigger: spool_codec::QuarantineTrigger, reason: &str) -> Result<()> {
         // The halves hold the queue's locks, so they close before the fresh queue opens.
         self.queue = None;
@@ -239,8 +238,13 @@ impl Spool {
             data
         };
         let compressing = started.elapsed();
-        let (prefix, prefix_len) = spool_codec::crc_prefix(self.config.crc, body);
-        let written = prefix_len + body.len();
+        let prefix = spool_codec::prefix(
+            self.compressor.compression().codec,
+            self.config.crc,
+            spool_codec::now_ms(),
+            body,
+        );
+        let written = prefix.len() + body.len();
 
         if let Some(max_bytes) = self.config.max_size_bytes
             && self.bytes.saturating_add(written as u64) > max_bytes
@@ -254,7 +258,7 @@ impl Spool {
             return Err(SpoolError::DiskFull(spool_codec::full_error().to_string()));
         }
         let queue = live(&mut self.queue)?;
-        match queue.sender.send(&prefix[..prefix_len], body) {
+        match queue.sender.send(&prefix, body) {
             Ok(()) => self.full.wrote(now),
             Err(e) if spool_codec::is_full(&e) => {
                 self.full.failed(now, 4 + written, &e);
@@ -368,55 +372,56 @@ impl Spool {
         }
     }
 
-    /// Decodes the record the open transaction holds into `out`.
+    /// Decodes the record the open transaction holds into `out`, under the
+    /// codec its entry names.
     fn decode_front(&mut self, out: &mut Vec<u8>) -> std::result::Result<(), Unreadable> {
         let Some(queue) = self.queue.as_ref() else {
             return Err(Unreadable::Codec("spool is closed".into()));
         };
-        let raw = &queue.receiver.taken()[0];
-        let body =
-            spool_codec::unframe(self.config.crc, raw).map_err(|e| Unreadable::Corrupt(e.0))?;
-        self.decoder
-            .decompress_into(body, out, usize::MAX)
-            .map_err(|e| Unreadable::Codec(e.to_string()))
+        let entry =
+            spool_codec::unframe(&queue.receiver.taken()[0]).map_err(Unreadable::Damaged)?;
+        self.decoders
+            .decode_into(&entry, out)
+            .map_err(Unreadable::Codec)
     }
 
-    /// Apply the configured [`CorruptionPolicy`] to a record that failed its CRC.
-    ///
-    /// Under `Quarantine` the corrupt cache is moved aside, a fresh queue takes
-    /// its place, and the caller reports an empty queue. Under `Fail` the
-    /// record stays and the error is returned.
-    fn on_corrupt(&mut self, reason: String) -> Result<()> {
-        if self.config.on_corruption == CorruptionPolicy::Quarantine {
-            self.recover(spool_codec::QuarantineTrigger::CrcMismatch, &reason)?;
-            Ok(())
-        } else {
-            self.finish(false);
-            Err(SpoolError::Corrupted(reason))
+    /// Drops the record that failed its CRC, counting it. Under `Fail` the
+    /// caller then returns [`SpoolError::Corrupted`] naming it.
+    fn drop_damaged(&mut self, written: usize, error: &CorruptionError) -> Result<()> {
+        self.finish(true);
+        self.taken(written);
+        self.release_drained();
+        self.metrics.damaged(error);
+        if self.config.on_corruption == CorruptionPolicy::Fail {
+            return Err(SpoolError::Corrupted(error.to_string()));
         }
+        Ok(())
     }
 
     /// Peek at the first item without removing it.
     ///
     /// # Errors
     ///
-    /// Returns an error if decompression fails or an I/O error occurs. A CRC
-    /// failure under `Fail` policy returns [`SpoolError::Corrupted`]. Under
-    /// `Quarantine` the cache is recovered and `Ok(None)` is returned.
+    /// Returns an error if decompression fails or an I/O error occurs. A record
+    /// that fails its CRC is dropped and counted, and under the `Fail` policy
+    /// returns [`SpoolError::Corrupted`]. Under `Quarantine` the peek goes on
+    /// to the next record.
     pub async fn peek(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.read_front()?.is_none() {
-            return Ok(None);
-        }
         let mut out = Vec::new();
-        match self.decode_front(&mut out) {
-            Ok(()) => {
-                self.finish(false);
-                Ok(Some(out))
-            }
-            Err(Unreadable::Corrupt(reason)) => self.on_corrupt(reason).map(|()| None),
-            Err(Unreadable::Codec(reason)) => {
-                self.finish(false);
-                Err(SpoolError::Decompression(reason))
+        loop {
+            let Some(written) = self.read_front()? else {
+                return Ok(None);
+            };
+            match self.decode_front(&mut out) {
+                Ok(()) => {
+                    self.finish(false);
+                    return Ok(Some(out));
+                }
+                Err(Unreadable::Damaged(error)) => self.drop_damaged(written, &error)?,
+                Err(Unreadable::Codec(reason)) => {
+                    self.finish(false);
+                    return Err(SpoolError::Decompression(reason));
+                }
             }
         }
     }
@@ -450,24 +455,27 @@ impl Spool {
     ///
     /// # Errors
     ///
-    /// Returns an error if decompression fails or an I/O error occurs. A CRC
-    /// failure under `Fail` policy returns [`SpoolError::Corrupted`]. Under
-    /// `Quarantine` the cache is recovered and `Ok(false)` is returned.
+    /// Returns an error if decompression fails or an I/O error occurs. A record
+    /// that fails its CRC is dropped and counted, and under the `Fail` policy
+    /// returns [`SpoolError::Corrupted`]. Under `Quarantine` the pop goes on to
+    /// the next record.
     pub async fn pop_front_into(&mut self, out: &mut Vec<u8>) -> Result<bool> {
-        let Some(written) = self.read_front()? else {
-            return Ok(false);
-        };
-        match self.decode_front(out) {
-            Ok(()) => {
-                self.finish(true);
-                self.taken(written);
-                self.release_drained();
-                Ok(true)
-            }
-            Err(Unreadable::Corrupt(reason)) => self.on_corrupt(reason).map(|()| false),
-            Err(Unreadable::Codec(reason)) => {
-                self.finish(false);
-                Err(SpoolError::Decompression(reason))
+        loop {
+            let Some(written) = self.read_front()? else {
+                return Ok(false);
+            };
+            match self.decode_front(out) {
+                Ok(()) => {
+                    self.finish(true);
+                    self.taken(written);
+                    self.release_drained();
+                    return Ok(true);
+                }
+                Err(Unreadable::Damaged(error)) => self.drop_damaged(written, &error)?,
+                Err(Unreadable::Codec(reason)) => {
+                    self.finish(false);
+                    return Err(SpoolError::Decompression(reason));
+                }
             }
         }
     }
@@ -476,9 +484,9 @@ impl Spool {
     ///
     /// # Errors
     ///
-    /// Returns an error if decompression fails or an I/O error occurs. Under
-    /// `Quarantine`, a corrupt record recovers the cache and returns
-    /// [`SpoolError::Corrupted`] once, naming the record lost.
+    /// Returns an error if decompression fails or an I/O error occurs. A record
+    /// that fails its CRC is dropped and counted, and under the `Fail` policy
+    /// returns [`SpoolError::Corrupted`] once, naming it.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
         loop {
             let mut out = Vec::new();
@@ -591,7 +599,7 @@ fn options(config: &SpoolConfig) -> yaque::Options {
         segment_bytes: config.segment_bytes,
         read_buffer_bytes: config.read_buffer_bytes,
         recycle_bytes: config.read_buffer_bytes,
-        whole: None,
+        whole: Some(spool_codec::whole),
         store: STORE,
     }
 }
@@ -890,124 +898,94 @@ mod tests {
         assert_eq!(spool.pop_front().await.unwrap(), Some(payload));
     }
 
-    /// Corrupt one payload byte in a CRC-enabled spool's segment file.
-    fn flip_payload_byte(path: &std::path::Path) {
-        let seg = path.join("0.q");
-        let mut bytes = std::fs::read(&seg).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xFF;
-        std::fs::write(&seg, &bytes).unwrap();
-    }
-
+    /// A record damaged on disk is dropped and counted, and the records on
+    /// either side of it still come back in order. `Fail` also returns
+    /// `Corrupted` once for it. Nothing is quarantined.
     #[tokio::test]
-    async fn test_crc_detects_payload_corruption_under_fail_policy() {
-        // The crux: with CRC on (Fail policy), a flipped payload byte on disk
-        // must surface as SpoolError::Corrupted, never as silently-wrong bytes.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("corrupt-queue");
-        {
-            let cfg = SpoolConfig::new(&path)
-                .crc(true)
-                .on_corruption(CorruptionPolicy::Fail);
-            let mut spool = Spool::open(cfg).await.unwrap();
-            spool
-                .push(b"the original bytes that must not silently change")
-                .await
-                .unwrap();
-        }
-        flip_payload_byte(&path);
+    async fn a_damaged_record_is_dropped_counted_and_the_rest_read() {
+        for policy in [CorruptionPolicy::Quarantine, CorruptionPolicy::Fail] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("damaged");
+            let records: [&[u8]; 3] = [b"record-0", b"record-1", b"record-2"];
+            let config = SpoolConfig::new(&path).on_corruption(policy);
+            let mut spool = Spool::open(config.clone()).await.unwrap();
+            for record in records {
+                spool.push(record).await.unwrap();
+            }
+            drop(spool);
+            // One body byte of the middle record, past its 4-byte header and its prefix.
+            let entry = 4 + spool_codec::PREFIX_LEN + records[0].len();
+            let segment = path.join("0.q");
+            let mut bytes = std::fs::read(&segment).unwrap();
+            bytes[entry + 4 + spool_codec::PREFIX_LEN + 1] ^= 0xFF;
+            std::fs::write(&segment, &bytes).unwrap();
 
-        let cfg = SpoolConfig::new(&path)
-            .crc(true)
-            .on_corruption(CorruptionPolicy::Fail);
-        let mut spool = Spool::open(cfg).await.unwrap();
-        let result = spool.pop_front().await;
-        assert!(
-            matches!(result, Err(SpoolError::Corrupted(_))),
-            "Fail policy must surface corruption, got {result:?}"
-        );
+            #[cfg(feature = "metrics")]
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            #[cfg(feature = "metrics")]
+            let _metrics = ::metrics::set_default_local_recorder(&recorder);
+            let mut spool = Spool::open(config).await.unwrap();
+            assert_eq!(spool.pop_front().await.unwrap(), Some(records[0].to_vec()));
+            if policy == CorruptionPolicy::Fail {
+                assert!(
+                    matches!(spool.pop_front().await, Err(SpoolError::Corrupted(_))),
+                    "Fail returns the damage once"
+                );
+            }
+            assert_eq!(
+                spool.pop_front().await.unwrap(),
+                Some(records[2].to_vec()),
+                "{policy:?}: the read goes on past it"
+            );
+            assert_eq!(spool.pop_front().await.unwrap(), None, "{policy:?}");
+            #[cfg(feature = "metrics")]
+            assert!(
+                recorder
+                    .handle()
+                    .render()
+                    .contains("spool_damaged_entries_total{store=\"spool\"} 1"),
+                "{policy:?}: counted once"
+            );
+            let quarantined = std::fs::read_dir(&path)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("corrupt-"));
+            assert!(!quarantined, "{policy:?}: nothing quarantined");
+        }
     }
 
-    #[tokio::test]
-    async fn test_corruption_quarantines_and_starts_fresh() {
-        // Default policy: a corrupt cache is renamed aside (timestamped, for
-        // forensics) and a FRESH queue takes its place -- the service continues
-        // rather than stopping or serving bad data.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("spill-cache");
-        {
-            // Default on_corruption == Quarantine.
-            let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-                .await
-                .unwrap();
-            spool.push(b"poisoned record").await.unwrap();
-        }
-        flip_payload_byte(&path);
-
-        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-            .await
-            .unwrap();
-        // The corrupt record reads back as "empty" after the cache is recovered.
-        assert_eq!(
-            spool.pop_front().await.unwrap(),
-            None,
-            "Quarantine recovers to a fresh empty queue"
-        );
-
-        // The corrupt queue was preserved in a timestamped subdirectory of the path.
-        let quarantined: Vec<_> = std::fs::read_dir(&path)
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().starts_with("corrupt-"))
-            .collect();
-        assert_eq!(
-            quarantined.len(),
-            1,
-            "corrupt cache must be moved aside, not deleted"
-        );
-        assert!(quarantined[0].path().join("0.q").exists());
-
-        // The fresh queue is fully usable.
-        spool.push(b"after recovery").await.unwrap();
-        assert_eq!(
-            spool.pop_front().await.unwrap(),
-            Some(b"after recovery".to_vec())
-        );
-    }
-
+    /// A header damaged on disk quarantines the queue on read. The old
+    /// handles close before the fresh queue opens, so their drop can neither
+    /// release the fresh locks nor overwrite its saved position.
     #[tokio::test]
     async fn test_recovered_queue_keeps_its_locks_and_position() {
-        // The corrupt queue's handles close before the fresh queue opens, so their
-        // drop can neither delete the fresh locks nor overwrite its saved position.
         let dir = tempdir().unwrap();
         let path = dir.path().join("spill-cache");
+        // A segment per record, so the damaged one is not the newest, which the open would cut.
+        let mut config = SpoolConfig::new(&path);
+        config.segment_bytes = 16;
         {
-            let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-                .await
-                .unwrap();
-            spool.push(b"consumed first").await.unwrap();
-            spool.push(b"poisoned record").await.unwrap();
+            let mut spool = Spool::open(config.clone()).await.unwrap();
+            for record in [&b"consumed first"[..], b"poisoned record", b"third"] {
+                spool.push(record).await.unwrap();
+            }
             assert_eq!(
                 spool.pop_front().await.unwrap(),
                 Some(b"consumed first".to_vec())
             );
         }
-        // Flip the last byte, which belongs to the second record.
-        let seg = path.join("0.q");
-        let mut bytes = std::fs::read(&seg).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        std::fs::write(&seg, &bytes).unwrap();
+        let segment = path.join("1.q");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes[0] ^= 0x04;
+        std::fs::write(&segment, &bytes).unwrap();
 
-        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-            .await
-            .unwrap();
+        let mut spool = Spool::open(config.clone()).await.unwrap();
         assert_eq!(spool.pop_front().await.unwrap(), None, "recovered to empty");
         assert!(path.join("send.lock").exists(), "fresh sender lock held");
         assert!(path.join("recv.lock").exists(), "fresh receiver lock held");
         assert!(
             matches!(
-                Spool::open(SpoolConfig::new(&path).crc(true)).await,
+                Spool::open(config.clone()).await,
                 Err(SpoolError::Open { .. })
             ),
             "a second open of the recovered queue is refused"
@@ -1015,9 +993,7 @@ mod tests {
 
         spool.push(b"after recovery").await.unwrap();
         drop(spool);
-        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-            .await
-            .unwrap();
+        let mut spool = Spool::open(config).await.unwrap();
         assert_eq!(
             spool.pop_front().await.unwrap(),
             Some(b"after recovery".to_vec()),
@@ -1106,15 +1082,17 @@ mod tests {
     /// release, and on a `.q` file that is not a segment number, which ends a
     /// service built with `panic = "abort"`. Each is an open failure instead:
     /// `fail` returns an error naming the file, and `quarantine` sets the queue
-    /// aside, opens a fresh one and keeps the corrupt files.
+    /// aside, opens a fresh one and keeps the corrupt files. A queue in another
+    /// spool format is refused under both.
     #[tokio::test]
     async fn a_queue_yaque_would_panic_on_is_an_open_failure() {
         let version = std::path::Path::new("version").join("contents");
         let version_named = version.display().to_string();
         // (case, text for the version file or None for a stray `.q` file, what the error names)
-        let cases: [(&str, Option<&str>, &str); 5] = [
+        let cases: [(&str, Option<&str>, &str); 6] = [
             ("not a version", Some("not a version"), &version_named),
-            ("another release", Some("0.5.2"), &version_named),
+            ("the format before", Some("0.6.6"), &version_named),
+            ("an older format", Some("0.5.2"), &version_named),
             ("only whitespace", Some("\n"), &version_named),
             ("not a segment", None, "foo.q"),
             (
@@ -1142,9 +1120,17 @@ mod tests {
                 "{name}: {failed}"
             );
 
-            let mut fresh = Spool::open(SpoolConfig::new(&path))
-                .await
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let opened = Spool::open(SpoolConfig::new(&path)).await;
+            if version_text.is_some_and(|text| text.starts_with("0.")) {
+                // Another spool format is refused under quarantine too, and nothing moves.
+                assert!(
+                    matches!(&opened, Err(SpoolError::Open { message, .. }) if message.contains("spool format")),
+                    "{name}: {opened:?}"
+                );
+                assert!(path.join("0.q").exists(), "{name}: records left in place");
+                continue;
+            }
+            let mut fresh = opened.unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(fresh.is_empty(), "{name}: a fresh queue");
             fresh.push(b"new").await.unwrap();
             assert_eq!(fresh.pop_front().await.unwrap(), Some(b"new".to_vec()));

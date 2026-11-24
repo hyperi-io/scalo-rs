@@ -77,7 +77,7 @@ pub use config::{
 // The config's public field and builder take it, and `spool` may be off.
 pub use crate::spool_codec::CorruptionPolicy;
 pub use error::TieredSinkError;
-pub use tiered::TieredSink;
+pub use tiered::{SpoolState, TieredSink};
 
 /// Result type for tiered sink operations.
 pub type Result<T> = std::result::Result<T, TieredSinkError>;

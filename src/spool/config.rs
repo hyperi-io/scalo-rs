@@ -38,20 +38,20 @@ pub struct SpoolConfig {
     #[serde(default)]
     pub max_size_bytes: Option<u64>,
 
-    /// Prepend a CRC32C checksum to each record and verify it on read. Detects
-    /// torn writes / bit-rot that the queue's length-only header cannot (a flipped
-    /// payload byte would otherwise be returned silently). Default false (the
-    /// on-disk format is unchanged unless enabled). Trades 4 bytes/record + a
-    /// hardware-accelerated checksum for integrity.
-    #[serde(default)]
+    /// Write a CRC32C over each record's codec tag, write time and body, and
+    /// check it on read. A record that fails it is dropped and counted in
+    /// `spool_damaged_entries_total`, never returned. Default true. Off, the
+    /// field is still written, as zeros, and only the length is checked.
+    #[serde(default = "default_true")]
     pub crc: bool,
 
-    /// What to do when a corrupt cache is detected (queue won't open, or a CRC
-    /// check fails on read). Default [`CorruptionPolicy::Quarantine`]: move the
-    /// corrupt queue's files into a timestamped `corrupt-*` subdirectory of
-    /// `path` and start fresh, so a poisoned spill cache can never stop the
-    /// service or silently serve bad data. A cache another live process holds
-    /// is refused, never quarantined.
+    /// What to do when a queue won't open, and whether a record that fails its
+    /// CRC is also returned as [`SpoolError::Corrupted`](crate::spool::SpoolError::Corrupted).
+    /// Default [`CorruptionPolicy::Quarantine`]: move the queue's files into a
+    /// timestamped `corrupt-*` subdirectory of `path` and start fresh, so a
+    /// poisoned cache can never stop the service. A cache another live process
+    /// holds, or one written in another spool format, is refused, never
+    /// quarantined.
     #[serde(default)]
     pub on_corruption: CorruptionPolicy,
 
@@ -84,6 +84,10 @@ fn default_compression_level() -> i32 {
     3
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_sync_interval_ms() -> u64 {
     DEFAULT_SYNC_INTERVAL_MS
 }
@@ -104,7 +108,7 @@ impl Default for SpoolConfig {
             compression_level: default_compression_level(),
             max_items: None,
             max_size_bytes: None,
-            crc: false,
+            crc: true,
             on_corruption: CorruptionPolicy::Quarantine,
             sync_on_push: false,
             sync_interval_ms: default_sync_interval_ms(),

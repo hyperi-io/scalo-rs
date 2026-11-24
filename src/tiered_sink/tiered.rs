@@ -8,7 +8,7 @@
 
 //! TieredSink implementation.
 
-use crate::compression::{Compressor, CompressorPool};
+use crate::compression::CompressorPool;
 use crate::concurrency::{PeriodicTask, PeriodicWorker, TickError};
 use crate::spool_codec::{self, FullDisk, QueueCell, StoreMetrics, SyncTicker};
 use crate::tiered_sink::{
@@ -93,6 +93,8 @@ pub struct TieredSink<S: TransportSender> {
     spool_bytes: Arc<AtomicU64>,
     /// Notified each time the drain frees room.
     progress: Arc<tokio::sync::Notify>,
+    /// When the entry at the spool's front was written, 0 for none.
+    oldest_ms: Arc<AtomicU64>,
     circuit: Arc<CircuitBreaker>,
     /// Spill codec contexts, one per `send` compressing at once.
     compressors: CompressorPool,
@@ -161,7 +163,6 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             .check(config.compression)
             .map_err(codec_error)?;
         let compressors = CompressorPool::new(compression).map_err(codec_error)?;
-        let decoder = Compressor::new(compression).map_err(codec_error)?;
         if config.max_spool_bytes.is_none()
             && let Some(cap) = volume_limits
                 .as_deref()
@@ -189,7 +190,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             ));
         }
 
-        let (sender, receiver, initial_count, initial_bytes, options, segment_reserve) =
+        let (sender, receiver, initial_count, initial_bytes, options, segment_reserve, front_ms) =
             open_spill(&config).await.map_err(spool_open_err)?;
 
         let sink = Arc::new(sink);
@@ -208,6 +209,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         let spool_count = Arc::new(AtomicU64::new(initial_count));
         let spool_bytes = Arc::new(AtomicU64::new(initial_bytes));
         let progress = Arc::new(tokio::sync::Notify::new());
+        let oldest_ms = Arc::new(AtomicU64::new(front_ms));
 
         warn_on_short_reset(&config);
         let circuit = Arc::new(CircuitBreaker::new(
@@ -266,14 +268,13 @@ impl<S: TransportSender + 'static> TieredSink<S> {
                 count: Arc::clone(&spool_count),
                 bytes: Arc::clone(&spool_bytes),
                 progress: Arc::clone(&progress),
+                oldest_ms: Arc::clone(&oldest_ms),
             },
             Arc::clone(&circuit),
-            decoder,
             drainer::Flags {
                 held: Arc::clone(&drain_held),
                 stalled: drain_stalled,
             },
-            config.crc,
             config.drain_strategy,
             config.drain_interval(),
             config.send_timeout_duration(),
@@ -297,6 +298,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             spool_count,
             spool_bytes,
             progress,
+            oldest_ms,
             circuit,
             compressors,
             drain_held,
@@ -597,9 +599,15 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         let started = Instant::now();
         self.compressors.compress_into(&encoded, &mut compressed)?;
         let compressing = started.elapsed();
-        let (prefix, prefix_len) = spool_codec::crc_prefix(self.config.crc, &compressed);
+        let written_ms = spool_codec::now_ms();
+        let prefix = spool_codec::prefix(
+            self.compressors.compression().codec,
+            self.config.crc,
+            written_ms,
+            &compressed,
+        );
         // What the entry takes on disk, its 4-byte header included.
-        let compressed_len = (4 + prefix_len + compressed.len()) as u64;
+        let compressed_len = (4 + prefix.len() + compressed.len()) as u64;
 
         // Reserve item slot.
         if let Some(max_items) = self.config.max_spool_items {
@@ -665,15 +673,11 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             // Starting a segment, or a large copy: on the blocking pool.
             drop(spill);
             let spill = Arc::clone(&self.spill);
-            tokio::task::spawn_blocking(move || {
-                spill
-                    .blocking_lock()
-                    .write(&prefix[..prefix_len], &compressed)
-            })
-            .await
-            .map_err(|e| TieredSinkError::Spool(format!("spill task failed: {e}")))?
+            tokio::task::spawn_blocking(move || spill.blocking_lock().write(&prefix, &compressed))
+                .await
+                .map_err(|e| TieredSinkError::Spool(format!("spill task failed: {e}")))?
         } else {
-            let written = spill.write(&prefix[..prefix_len], &compressed);
+            let written = spill.write(&prefix, &compressed);
             drop(spill);
             written
         };
@@ -690,6 +694,13 @@ impl<S: TransportSender + 'static> TieredSink<S> {
             Err(e) => return Err(TieredSinkError::Spool(e.to_string())),
         }
         reservation.kept = true;
+        // The first record into an empty spool is its oldest.
+        let _ = self.oldest_ms.compare_exchange(
+            0,
+            written_ms,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Relaxed,
+        );
         self.metrics.wrote(
             encoded.len(),
             usize::try_from(compressed_len).unwrap_or(usize::MAX),
@@ -735,6 +746,23 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     #[must_use]
     pub fn spool_bytes(&self) -> u64 {
         self.spool_bytes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// What the spool holds: its records, their bytes as stored, and how long
+    /// ago the oldest was spilled, as of the drain's last pass. Reads counters
+    /// only, so it never touches the disk.
+    #[must_use]
+    pub fn spool_state(&self) -> SpoolState {
+        let entries = self.spool_count.load(AtomicOrdering::Relaxed);
+        SpoolState {
+            entries,
+            bytes: self.spool_bytes.load(AtomicOrdering::Relaxed),
+            oldest_age: if entries == 0 {
+                None
+            } else {
+                spool_codec::age(self.oldest_ms.load(AtomicOrdering::Acquire))
+            },
+        }
     }
 
     /// Whether the drain is held at a spilled entry the spill codec cannot
@@ -800,6 +828,17 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     }
 }
 
+/// What a tiered sink's spool holds, from [`TieredSink::spool_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpoolState {
+    /// Records spilled and not yet delivered.
+    pub entries: u64,
+    /// Their bytes as stored, compressed and framed, each with its 4-byte header.
+    pub bytes: u64,
+    /// How long ago the oldest was spilled. `None` when the spool is empty.
+    pub oldest_age: Option<Duration>,
+}
+
 /// One spill's item slot and `len` bytes of spool capacity, given back on drop
 /// unless `kept` is set once the record is on the spool.
 struct SpoolReservation<'a> {
@@ -854,11 +893,12 @@ fn drain_health(
 }
 
 /// What [`open_spill`] opened.
-type OpenedSpill = (Sender, yaque::Receiver, u64, u64, yaque::Options, u64);
+type OpenedSpill = (Sender, yaque::Receiver, u64, u64, yaque::Options, u64, u64);
 
 /// Opens the spill's queue on the blocking pool, and counts what it holds:
-/// its entries, the bytes they take on disk, the options it opened with, and
-/// the bytes of `max_spool_bytes` held back for one segment of read records.
+/// its entries, the bytes they take on disk, the options it opened with, the
+/// bytes of `max_spool_bytes` held back for one segment of read records, and
+/// when its front entry was written.
 async fn open_spill(config: &TieredSinkConfig) -> std::result::Result<OpenedSpill, String> {
     // A segment's read records stay on disk until it goes, so that much of
     // the cap is held back, and the segment shrinks to a quarter of the cap.
@@ -871,16 +911,17 @@ async fn open_spill(config: &TieredSinkConfig) -> std::result::Result<OpenedSpil
         segment_bytes,
         read_buffer_bytes: config.read_buffer_bytes,
         recycle_bytes: usize::try_from(config.drain_batch_max_bytes).unwrap_or(usize::MAX),
-        whole: None,
+        whole: Some(spool_codec::whole),
         store: STORE,
     };
     // Walks the segments' headers and may cut a torn tail, so it runs off the runtime.
     let path = config.spool_path.clone();
     let policy = config.on_corruption;
     tokio::task::spawn_blocking(move || {
-        let (sender, receiver) =
+        let (sender, mut receiver) =
             spool_codec::open_queue(&path, policy, options).map_err(|e| e.to_string())?;
         let (entries, bytes) = receiver.queued().unwrap_or((0, 0));
+        let front_ms = drainer::front_written_ms(&mut receiver);
         // The cap counts each entry's 4-byte header, as the disk does.
         Ok((
             sender,
@@ -889,6 +930,7 @@ async fn open_spill(config: &TieredSinkConfig) -> std::result::Result<OpenedSpil
             bytes + 4 * entries,
             options,
             segment_reserve,
+            front_ms,
         ))
     })
     .await
@@ -1523,8 +1565,7 @@ mod tests {
         config.compression = crate::compression::Compression::NONE;
         let payloads: Vec<Vec<u8>> = (0..10).map(|i| vec![b'0' + i; 1000]).collect();
         let encoded = rec(&payloads[0]).encode();
-        let stored =
-            (4 + crate::spool_codec::crc_prefix(config.crc, &encoded).1 + encoded.len()) as u64;
+        let stored = (4 + crate::spool_codec::PREFIX_LEN + encoded.len()) as u64;
         config.drain_batch_max_bytes = stored * 3 + stored / 2;
         let tiered = TieredSink::new(sink, config).await.unwrap();
         for payload in &payloads {
@@ -1750,68 +1791,67 @@ mod tests {
         tiered.shutdown().await;
     }
 
+    /// A spilled entry damaged on disk is dropped, counted once and logged, and
+    /// the drain delivers the entries on either side of it, in order.
     #[tokio::test]
-    async fn test_crc_drops_corrupt_spilled_record() {
-        // CRC enabled: a corrupt spilled record must be DROPPED on drain (logged),
-        // never replayed as garbage downstream.
+    async fn a_damaged_entry_is_dropped_counted_and_the_drain_goes_on() {
         let dir = tempdir().unwrap();
-        let spool_path = dir.path().join("crc-corrupt-queue");
-
-        // Spill one record with the sink down + compression off (predictable
-        // on-disk layout), then shut down to flush.
-        {
-            let sink = TestSink::new();
-            sink.set_available(false);
-            let mut config = TieredSinkConfig::new(&spool_path).crc(true);
-            config.compression = crate::compression::Compression::NONE;
-            config.circuit_failure_threshold = 1;
-            let tiered = TieredSink::new(sink, config).await.unwrap();
-            tiered.send(&rec(b"poison record bytes")).await.unwrap();
-            assert_eq!(tiered.spool_len().await, 1);
-            tiered.shutdown().await;
-        }
-
-        // Flip a byte in the CRC-covered region (past the 4-byte queue header +
-        // 4-byte CRC header) so the checksum must reject it.
-        let seg = spool_path.join("0.q");
-        let mut bytes = std::fs::read(&seg).unwrap();
-        bytes[8] ^= 0xFF;
-        std::fs::write(&seg, &bytes).unwrap();
-
-        // Reopen with the sink available. The corrupt record must be dropped, not
-        // delivered, and the spool must end up empty.
-        let sink = TestSink::new();
-        let mut config = TieredSinkConfig::new(&spool_path).crc(true);
+        let path = dir.path().join("damaged");
+        let mut config = spilling_config(&path);
         config.compression = crate::compression::Compression::NONE;
-        config.drain_interval_ms = 5;
-        let tiered = TieredSink::new(sink, config).await.unwrap();
+        let records: Vec<Vec<u8>> = (0..3).map(|i| format!("record-{i}").into_bytes()).collect();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let tiered = TieredSink::new(sink, config.clone()).await.unwrap();
+        for record in &records {
+            tiered.send(&rec(record)).await.unwrap();
+        }
+        tiered.shutdown().await;
+
+        // One body byte of the middle entry, past its 4-byte header and its prefix.
+        let entry = 4 + crate::spool_codec::PREFIX_LEN + rec(&records[1]).encode().len();
+        let segment = path.join("0.q");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes[entry + 4 + crate::spool_codec::PREFIX_LEN + 2] ^= 0xFF;
+        std::fs::write(&segment, &bytes).unwrap();
+
+        #[cfg(feature = "metrics")]
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        #[cfg(feature = "metrics")]
+        let _metrics = ::metrics::set_default_local_recorder(&recorder);
+        let tiered = TieredSink::new(TestSink::new(), config).await.unwrap();
         wait_for_drain(&tiered).await;
-        assert!(
-            tiered.spool_is_empty().await,
-            "corrupt record was drained (dropped)"
-        );
         assert_eq!(
-            tiered.inner().received_count().await,
-            0,
-            "a corrupt record must NEVER be delivered"
+            tiered.inner().received_payloads().await,
+            vec![records[0].clone(), records[2].clone()],
+            "the damaged entry is never delivered"
+        );
+        #[cfg(feature = "metrics")]
+        assert!(
+            recorder
+                .handle()
+                .render()
+                .contains("spool_damaged_entries_total{store=\"tiered_sink\"} 1"),
+            "counted once"
         );
         tiered.shutdown().await;
     }
 
-    /// A spill written under one codec and reopened under another holds the
-    /// drain at its first entry: nothing is committed, nothing delivered, and
-    /// readiness fails. Reopened under the first codec, every record arrives
-    /// in order.
+    /// Each spilled entry names its codec, so a spill reopened under another
+    /// codec, or holding runs of several, drains every entry in order and
+    /// never holds.
     #[tokio::test]
-    async fn a_codec_change_holds_the_spill_and_loses_nothing() {
+    async fn a_codec_change_drains_every_entry_under_its_own_codec() {
         use crate::compression::{Codec, Compression};
 
-        for (written, read) in [
-            (Codec::Zstd, Codec::Lz4),
-            (Codec::None, Codec::Zstd),
-            (Codec::Lz4, Codec::None),
-        ] {
-            let case = format!("{written} read as {read}");
+        let rows: [(&[Codec], Codec); 4] = [
+            (&[Codec::Zstd], Codec::Lz4),
+            (&[Codec::None], Codec::Zstd),
+            (&[Codec::Lz4], Codec::None),
+            (&[Codec::Zstd, Codec::Lz4, Codec::None], Codec::Zstd),
+        ];
+        for (written, read) in rows {
+            let case = format!("{written:?} read under {read}");
             let dir = tempdir().unwrap();
             let path = dir.path().join("codec-change");
             let under = |codec| {
@@ -1819,42 +1859,71 @@ mod tests {
                 config.compression = Compression::new(codec);
                 config
             };
-            let expected: Vec<Vec<u8>> =
-                (0..5).map(|i| format!("codec-{i}").into_bytes()).collect();
-            let sink = TestSink::new();
-            sink.set_available(false);
-            let tiered = TieredSink::new(sink, under(written)).await.unwrap();
-            for p in &expected {
-                tiered.send(&rec(p)).await.unwrap();
+            let mut expected = Vec::new();
+            for (run, codec) in written.iter().enumerate() {
+                let sink = TestSink::new();
+                sink.set_available(false);
+                let tiered = TieredSink::new(sink, under(*codec)).await.unwrap();
+                for i in 0..3 {
+                    let payload = format!("{codec}-{run}-{i}").into_bytes();
+                    tiered.send(&rec(&payload)).await.unwrap();
+                    expected.push(payload);
+                }
+                tiered.shutdown().await;
             }
-            tiered.shutdown().await;
 
             let tiered = TieredSink::new(TestSink::new(), under(read)).await.unwrap();
-            assert!(held_within(&tiered).await, "{case}: the drain holds");
-            assert_eq!(
-                tiered.spool_len().await,
-                expected.len(),
-                "{case}: none committed"
-            );
-            assert_eq!(
-                tiered.inner().received_count().await,
-                0,
-                "{case}: none delivered"
-            );
-            tiered.shutdown().await;
-
-            let tiered = TieredSink::new(TestSink::new(), under(written))
-                .await
-                .unwrap();
             wait_for_drain(&tiered).await;
             assert!(!tiered.is_drain_held(), "{case}");
             assert_eq!(
                 tiered.inner().received_payloads().await,
                 expected,
-                "{case}: every record, in order, under the codec that wrote it"
+                "{case}: every record, in order"
             );
             tiered.shutdown().await;
         }
+    }
+
+    /// An entry naming a codec this build does not know holds the drain:
+    /// the entries before it arrive, and it and every later one stay spooled.
+    #[tokio::test]
+    async fn an_entry_in_an_unknown_codec_holds_the_drain() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unknown-codec");
+        spill(&path, &payloads(2)).await;
+        {
+            let options = yaque::Options {
+                segment_bytes: 1 << 20,
+                read_buffer_bytes: 1024,
+                recycle_bytes: 1024,
+                whole: None,
+                store: STORE,
+            };
+            let (mut sender, _receiver) = yaque::channel(&path, options).unwrap();
+            let body = rec(b"unknown").encode();
+            let prefix = spool_codec::tagged(0x0F, true, spool_codec::now_ms(), &body);
+            sender.send(&prefix, &body).unwrap();
+            let body = rec(b"after").encode();
+            let prefix = spool_codec::prefix(
+                crate::compression::Codec::None,
+                true,
+                spool_codec::now_ms(),
+                &body,
+            );
+            sender.send(&prefix, &body).unwrap();
+        }
+
+        let tiered = TieredSink::new(TestSink::new(), spilling_config(&path))
+            .await
+            .unwrap();
+        assert!(held_within(&tiered).await, "held at the unknown codec");
+        assert_eq!(tiered.inner().received_payloads().await, payloads(2));
+        assert_eq!(
+            tiered.spool_len().await,
+            2,
+            "it and the entry after it stay"
+        );
+        tiered.shutdown().await;
     }
 
     /// Whether the drain holds within 5 s.
@@ -1866,47 +1935,6 @@ mod tests {
         })
         .await
         .is_ok()
-    }
-
-    /// A spill holding entries of two codecs drains the ones its codec reads
-    /// and holds at the first it does not, so each run comes out in order.
-    #[tokio::test]
-    async fn a_mixed_spill_drains_its_readable_prefix_then_holds() {
-        use crate::compression::{Codec, Compression};
-
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("mixed-codec");
-        let under = |codec| {
-            let mut config = spilling_config(&path);
-            config.compression = Compression::new(codec);
-            config
-        };
-        let first: Vec<Vec<u8>> = (0..3).map(|i| format!("zstd-{i}").into_bytes()).collect();
-        let second: Vec<Vec<u8>> = (0..2).map(|i| format!("lz4-{i}").into_bytes()).collect();
-        for (codec, payloads) in [(Codec::Zstd, &first), (Codec::Lz4, &second)] {
-            let sink = TestSink::new();
-            sink.set_available(false);
-            let tiered = TieredSink::new(sink, under(codec)).await.unwrap();
-            for p in payloads {
-                tiered.send(&rec(p)).await.unwrap();
-            }
-            tiered.shutdown().await;
-        }
-
-        let tiered = TieredSink::new(TestSink::new(), under(Codec::Zstd))
-            .await
-            .unwrap();
-        assert!(held_within(&tiered).await, "held at the first lz4 entry");
-        assert_eq!(tiered.inner().received_payloads().await, first);
-        assert_eq!(tiered.spool_len().await, second.len(), "the lz4 run stays");
-        tiered.shutdown().await;
-
-        let tiered = TieredSink::new(TestSink::new(), under(Codec::Lz4))
-            .await
-            .unwrap();
-        wait_for_drain(&tiered).await;
-        assert_eq!(tiered.inner().received_payloads().await, second);
-        tiered.shutdown().await;
     }
 
     #[tokio::test]
@@ -1952,7 +1980,7 @@ mod tests {
         let mut config = TieredSinkConfig::new(&spool_path);
         config.circuit_failure_threshold = 1;
         // Set a very small byte limit
-        config.max_spool_bytes = Some(50);
+        config.max_spool_bytes = Some(64);
 
         let tiered = TieredSink::new(sink, config).await.unwrap();
 
@@ -2111,6 +2139,62 @@ mod tests {
                 .shutdown()
                 .await;
         }
+    }
+
+    /// `spool_state` and the age gauge report the oldest spilled record from
+    /// its write time, after the first spill and after a reopen, and `None`
+    /// once the spool is drained.
+    #[tokio::test]
+    async fn spool_state_reports_the_oldest_spilled_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state");
+        let tiered = spilled(&path, &payloads(2)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let state = tiered.spool_state();
+        assert_eq!((state.entries, state.bytes), (2, tiered.spool_bytes()));
+        let aged = |state: SpoolState| {
+            state
+                .oldest_age
+                .is_some_and(|age| age >= Duration::from_millis(60))
+        };
+        assert!(aged(state), "after the spill: {state:?}");
+        tiered.shutdown().await;
+
+        #[cfg(feature = "metrics")]
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        #[cfg(feature = "metrics")]
+        let _metrics = ::metrics::set_default_local_recorder(&recorder);
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let tiered = TieredSink::new(sink, spilling_config(&path)).await.unwrap();
+        assert!(
+            aged(tiered.spool_state()),
+            "after the reopen: {:?}",
+            tiered.spool_state()
+        );
+        #[cfg(feature = "metrics")]
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let rendered = recorder.handle().render();
+            let gauge = rendered
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("spool_oldest_age_seconds{store=\"tiered_sink\"} ")
+                })
+                .and_then(|value| value.parse::<f64>().ok());
+            assert!(gauge.is_some_and(|age| age >= 0.06), "{rendered}");
+        }
+        tiered.inner().set_available(true);
+        wait_for_drain(&tiered).await;
+        assert_eq!(
+            tiered.spool_state(),
+            SpoolState {
+                entries: 0,
+                bytes: 0,
+                oldest_age: None,
+            }
+        );
+        tiered.shutdown().await;
     }
 
     #[tokio::test]
@@ -3222,15 +3306,17 @@ mod tests {
     /// yaque panics on a version file that is not a version or names another
     /// release, and on a `.q` file that is not a segment number, which ends a
     /// service built with `panic = "abort"`. `TieredSink::new` refuses each
-    /// under `fail` and sets the queue aside under `quarantine`.
+    /// under `fail` and sets the queue aside under `quarantine`. A spill in
+    /// another spool format is refused under both, and nothing is moved.
     #[tokio::test]
     async fn a_spill_queue_yaque_would_panic_on_is_an_open_failure() {
         let version = std::path::Path::new("version").join("contents");
-        for (name, corruption) in [
-            ("not a version", Some("not a version")),
-            ("another release", Some("0.5.2")),
-            ("only whitespace", Some("\n")),
-            ("not a segment", None),
+        for (name, corruption, other_format) in [
+            ("not a version", Some("not a version"), false),
+            ("the format before", Some("0.6.6"), true),
+            ("an older format", Some("0.5.2"), true),
+            ("only whitespace", Some("\n"), false),
+            ("not a segment", None, false),
         ] {
             let dir = tempdir().unwrap();
             let spool = dir.path().join("spool");
@@ -3248,9 +3334,17 @@ mod tests {
                 "{name}: fail refuses"
             );
 
-            let tiered = TieredSink::new(TestSink::new(), spilling_config(&spool))
-                .await
-                .unwrap_or_else(|e| panic!("{name}: quarantine opens a fresh queue: {e}"));
+            let opened = TieredSink::new(TestSink::new(), spilling_config(&spool)).await;
+            if other_format {
+                let Err(TieredSinkError::SpoolOpen { message, .. }) = opened else {
+                    panic!("{name}: another format is refused under quarantine too");
+                };
+                assert!(message.contains("spool format"), "{name}: {message}");
+                assert!(entries_with_prefix(&spool, "corrupt-").is_empty(), "{name}");
+                continue;
+            }
+            let tiered =
+                opened.unwrap_or_else(|e| panic!("{name}: quarantine opens a fresh queue: {e}"));
             assert_eq!(tiered.spool_len().await, 0, "{name}: a fresh queue");
             assert_eq!(
                 entries_with_prefix(&spool, "corrupt-").len(),

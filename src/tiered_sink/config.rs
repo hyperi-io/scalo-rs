@@ -31,9 +31,9 @@ pub struct TieredSinkConfig {
     pub send_timeout_ms: u64,
 
     /// Codec for spilled records: `none`, `zstd`, `lz4`, or `snappy` with the
-    /// `compression-snappy` feature. Default zstd at level 3. A cache keeps no
-    /// codec per record, so the drain holds at an entry another codec wrote
-    /// until the sink reopens under that codec. Change it on an empty spool.
+    /// `compression-snappy` feature. Default zstd at level 3. Each record names
+    /// the codec it was written with, so a change applies to new records and
+    /// the ones already spilled still drain.
     #[serde(default = "default_compression")]
     #[cfg_attr(
         feature = "config-schema",
@@ -97,20 +97,19 @@ pub struct TieredSinkConfig {
     #[serde(default)]
     pub disk_aware: Option<DiskAwareConfig>,
 
-    /// Prepend a CRC32C checksum to each spilled record and verify it on drain.
-    /// Detects torn writes / bit-rot that the queue's length-only header cannot
-    /// (a flipped payload byte would otherwise replay silently-wrong). A drained
-    /// record that fails the check is dropped and logged at error level, never
-    /// sent. No metric counts it.
-    /// Default false (on-disk format unchanged unless enabled).
-    #[serde(default)]
+    /// Write a CRC32C over each spilled record's codec tag, write time and body,
+    /// and check it on drain. A record that fails it is dropped, logged and
+    /// counted in `spool_damaged_entries_total`, never sent. Default true. Off,
+    /// the field is still written, as zeros, and only the length is checked.
+    #[serde(default = "default_true")]
     pub crc: bool,
 
     /// What to do when the spill cache cannot be opened (corrupt segments /
     /// metadata). Default [`CorruptionPolicy::Quarantine`]: move the corrupt
     /// queue's files into a timestamped `corrupt-*` subdirectory of
     /// `spool_path` and start fresh, so a poisoned spill cache can never block
-    /// startup. A cache another live sink holds is refused, never quarantined.
+    /// startup. A cache another live sink holds, or one written in another
+    /// spool format, is refused, never quarantined.
     #[serde(default)]
     pub on_corruption: CorruptionPolicy,
 
@@ -151,6 +150,10 @@ fn default_compression() -> Compression {
 #[cfg(feature = "config-schema")]
 fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     ACCEPTS.schema()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_send_timeout_ms() -> u64 {
@@ -213,7 +216,7 @@ impl TieredSinkConfig {
             drain_batch_max_records: default_drain_batch_max_records(),
             drain_batch_max_bytes: default_drain_batch_max_bytes(),
             disk_aware: None,
-            crc: false,
+            crc: true,
             on_corruption: CorruptionPolicy::Quarantine,
             sync_on_spill: false,
             sync_interval_ms: default_sync_interval_ms(),

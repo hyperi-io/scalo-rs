@@ -763,6 +763,20 @@ impl ServiceMetrics {
                     &["store"],
                 ),
                 (
+                    "spool_damaged_entries_total",
+                    "Spooled records dropped because they failed their CRC",
+                    MetricType::Counter,
+                    "",
+                    &["store"],
+                ),
+                (
+                    "spool_oldest_age_seconds",
+                    "Age of the oldest record a spool holds, 0 when it holds none",
+                    MetricType::Gauge,
+                    "seconds",
+                    &["store"],
+                ),
+                (
                     "spool_sync_seconds",
                     "Time one sync of a spool to disk took",
                     MetricType::Histogram,
@@ -1277,6 +1291,16 @@ mod tests {
             (
                 "test_app_spool_sync_seconds",
                 MetricType::Histogram,
+                vec!["store"],
+            ),
+            (
+                "test_app_spool_damaged_entries_total",
+                MetricType::Counter,
+                vec!["store"],
+            ),
+            (
+                "test_app_spool_oldest_age_seconds",
+                MetricType::Gauge,
                 vec!["store"],
             ),
             (

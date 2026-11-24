@@ -32,8 +32,7 @@ Each surface lists its codecs in an `Accepts`, and refuses anything else when it
 - Kafka maps onto librdkafka's `compression.type` and `compression.level`, so snappy needs no scalo feature there. The raw `producer_librdkafka` and `librdkafka_overrides` maps stay strings and win: a codec named there takes that codec's default level, unless a raw map names a level too. See [kafka-path.md](kafka-path.md#wire-compression).
 - Rotated files past the six newest get the codec's suffix, `.gz` or `.zst`. Retention reads every suffix, so changing the codec keeps old files in the count.
 - GeoIP downloads are gzip because the provider packages them that way, read through flate2 directly and never from config.
-- The tiered sink keeps no codec per record. Its drain holds, committing nothing, at an entry the current codec cannot read, and resumes when the sink reopens under the codec that wrote it ([pipeline/tiered-sink.md](pipeline/tiered-sink.md#changing-the-codec)).
-
+- A spool or tiered sink names the codec in each record, so a codec change still drains what was spilled. [pipeline/spool.md](pipeline/spool.md#compression) says which codec suits which host.
 The engines need features. The `compression` feature compiles the zstd, LZ4 and gzip engines, and tonic's gzip and zstd. `compression-snappy` adds snappy. tonic's zstd, and the zstd C library under it, comes only with `compression`, so gRPC zstd needs it. `tiered-sink`, `io` and `transport-http` each pull `compression`. Where a dependency applies a fixed codec, the feature pulls only that codec: `transport-grpc` turns on tonic's gzip, `transport-otlp` tonic's gzip and `flate2`, and `geoip-download` `flate2`.
 
 | API | For |

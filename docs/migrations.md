@@ -18,6 +18,12 @@ Under `when_full: block` a `send` the full spool refuses waits up to `when_full_
 
 **Consumer adjustment** -- a `match` on `SpoolError` adds a `DiskFull` arm. A service that sized `max_spool_bytes` by records raises it by one segment, or sets `segment_bytes` lower. `sync_interval_ms: 0` turns the timed sync off, and `when_full_wait_ms: 0` keeps a blocked `send` returning at once. An alert on `spool_stale_locks_cleared_total` goes.
 
+### Spool format 0.7 (BEHAVIOUR CHANGE)
+
+Each record now opens with its codec, a CRC32C and its write time, and `crc` defaults to true. A record that fails its CRC is dropped and counted in `spool_damaged_entries_total{store}`, and under `on_corruption: fail` the `Spool` pop also returns `Corrupted` once. `trigger="crc_mismatch"` is gone. A codec change drains what was already spilled. `TieredSink::spool_state()` and `spool_oldest_age_seconds` report the oldest record's age.
+
+**Consumer adjustment** -- drain each spool before the upgrade, or remove its directory: one in format 0.6 is refused at open under either `on_corruption`.
+
 ### `SinkStackConfig::backoff()` returns `scalo::backoff::Backoff`, and retries wait +/-20% (API and BEHAVIOUR CHANGE)
 
 `SinkStackConfig::backoff()` returns `scalo::backoff::Backoff` in place of `backon::ExponentialBuilder`. `Backoff::delays()` yields its waits as an endless iterator, which `backon` takes as a schedule, and `SinkStack` and `HttpClient` run `backon`'s retry loop on it.
