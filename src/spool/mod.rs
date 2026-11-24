@@ -12,8 +12,8 @@
 //! useful for buffering data when downstream systems are unavailable
 //! or for implementing store-and-forward patterns.
 //!
-//! Built on [yaque](https://crates.io/crates/yaque), a fast, async,
-//! persistent queue with transactional semantics.
+//! Built on yaque 0.6.6 (<https://github.com/tokahuke/yaque>), an async,
+//! persistent queue with transactional semantics, copied into scalo.
 //!
 //! ## Features
 //!

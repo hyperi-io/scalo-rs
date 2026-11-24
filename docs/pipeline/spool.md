@@ -1,6 +1,8 @@
 # Spool
 
-Disk-backed async FIFO queue built on [yaque](https://crates.io/crates/yaque). Crash-safe, persistent, with optional zstd compression and bounded size, for any pipeline that needs durable store-and-forward. `TieredSink` does not use `Spool`: it runs its own yaque queue for disk spillover and shares only the lock recovery and quarantine below.
+Disk-backed async FIFO queue built on yaque. Crash-safe, persistent, with optional zstd compression and bounded size, for any pipeline that needs durable store-and-forward. `TieredSink` does not use `Spool`: it runs its own yaque queue for disk spillover and shares only the lock recovery and quarantine below.
+
+The queue is yaque 0.6.6 (<https://github.com/tokahuke/yaque>, Apache-2.0), copied into scalo as the private module `src/yaque` because upstream looked abandoned: no release and no commit to its default branch since 2023-11. Its on-disk format is unchanged, so a spool an earlier scalo wrote opens as before.
 
 For most workloads you want `TieredSink` (transport + spool + circuit
 breaker + drain). Reach for `Spool` directly only when you're building
@@ -233,6 +235,7 @@ arrives). `pop_front` is the try-style alternative that returns
 - [`../../src/spool/queue.rs`](../../src/spool/queue.rs) -- `Spool`, yaque wrapper, item count recovery
 - [`../../src/spool/config.rs`](../../src/spool/config.rs)
 - [`../../src/spool/error.rs`](../../src/spool/error.rs)
+- [`../../src/yaque/`](../../src/yaque/) -- the queue, copied from yaque 0.6.6
 
 ---
 

@@ -13,12 +13,12 @@ use crate::tiered_sink::{
     TieredSinkError, drainer,
 };
 use crate::transport::{Record, SendResult, TransportSender};
+use crate::yaque::{Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, PoisonError};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use yaque::{Receiver, Sender};
 
 /// A tiered sink with automatic disk spillover.
 ///

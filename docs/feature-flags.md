@@ -209,7 +209,8 @@ A handful of dependencies aren't visible from the feature name alone:
   metric-aware.
 - `parse_guard` -- `json_depth_within` and `MAX_PARSE_DEPTH`, the nesting-depth check to run before parsing untrusted JSON -- compiles with `transport`, `worker-batch`, `rules` or `dlq`, and each pulls `wide` for its SIMD byte compares. There is no feature for the guard alone.
 - `rules` pulls `strmatch`, so its regex crates come along even when no row uses the `regex` test, and `expression`, so `cel` comes too.
-- `tiered-sink` pulls `tokio`, `tokio-util` (its shutdown token) and the spill cache's crates (`yaque`, `semver`, `zstd`), not the `spool` feature: `TieredSink` keeps a separate cache, and the standalone `Spool` type needs `spool`.
+- `tiered-sink` pulls `tokio`, `tokio-util` (its shutdown token) and the spill cache's crates (`notify`, `sysinfo`, `futures-util`, `semver`, `zstd`), not the `spool` feature: `TieredSink` keeps a separate cache, and the standalone `Spool` type needs `spool`.
+- `spool` and `tiered-sink` both compile `src/yaque`, scalo's copy of yaque 0.6.6. It pulls `notify` to wake a waiting receiver, `sysinfo` to see whether a lock's owner still runs, `futures-util` and `tracing`.
 - `spool` pulls `semver`, which checks a queue's version file, and `tokio`: `Spool::open` opens the queue on tokio's blocking
   pool, so it needs a tokio runtime.
 - `dlq` needs `concurrency` (for the `BackgroundSink` actor that
