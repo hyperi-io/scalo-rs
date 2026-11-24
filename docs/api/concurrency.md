@@ -133,6 +133,10 @@ let worker = PeriodicWorker::spawn(
 worker.join().await?;
 ```
 
+The first tick fires one interval after `spawn`, so a fleet that starts
+together doesn't hit a dependency at once. `spawn_immediate` ticks at
+spawn as well, for a gauge or pool size that is read from startup.
+
 The shutdown token argument is mandatory -- periodic workers always
 take the global cancellation token so they drain cleanly on SIGTERM.
 
@@ -203,7 +207,8 @@ join.join().await?;
 | `.pending() -> usize` | Current queue depth |
 | `BackgroundSinkHandle::join()` | Await the actor task exit (single-owner) |
 | `PeriodicTask` trait | Implement `tick()` |
-| `PeriodicWorker::spawn(task, interval, shutdown)` | Drive the schedule, returning `PeriodicWorker` |
+| `PeriodicWorker::spawn(task, interval, shutdown)` | Drive the schedule, first tick one interval in, returning `PeriodicWorker` |
+| `PeriodicWorker::spawn_immediate(task, interval, shutdown)` | As `spawn`, first tick at once |
 | `PeriodicWorker::join()` | Await worker exit |
 | `Actor` trait | Implement `handle(&mut self, Command)` |
 | `ActorHandle::spawn(actor, config, shutdown)` | Spawn an actor, returning `(ActorHandle, ActorJoinHandle)` |

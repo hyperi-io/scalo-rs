@@ -395,22 +395,28 @@ fn spawn_scaling_pressure_gauge(
     service_metrics: Arc<crate::metrics::ServiceMetrics>,
     interval: std::time::Duration,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                _ = tick.tick() => {
-                    if let Some(pressure) = crate::metrics::served_scaling_pressure(&served) {
-                        service_metrics.scaling_pressure(pressure);
-                    }
-                }
-            }
+) -> crate::concurrency::PeriodicWorker {
+    let gauge = ScalingPressureGauge {
+        served,
+        service_metrics,
+    };
+    crate::concurrency::PeriodicWorker::spawn_immediate(gauge, interval, shutdown)
+}
+
+#[cfg(all(feature = "scaling", feature = "service-metrics"))]
+struct ScalingPressureGauge {
+    served: crate::metrics::ScalingPressureSlot,
+    service_metrics: Arc<crate::metrics::ServiceMetrics>,
+}
+
+#[cfg(all(feature = "scaling", feature = "service-metrics"))]
+impl crate::concurrency::PeriodicTask for ScalingPressureGauge {
+    async fn tick(&mut self) -> Result<(), crate::concurrency::TickError> {
+        if let Some(pressure) = crate::metrics::served_scaling_pressure(&self.served) {
+            self.service_metrics.scaling_pressure(pressure);
         }
-    })
+        Ok(())
+    }
 }
 
 /// Describe every metric the scalo runtime emits into `manager`: the service
@@ -813,7 +819,7 @@ mod tests {
             assert_eq!(gauge(&handle), Some(10.0));
 
             shutdown.cancel();
-            tokio::time::timeout(SCALING_PRESSURE_GAUGE_INTERVAL, task)
+            tokio::time::timeout(SCALING_PRESSURE_GAUGE_INTERVAL, task.join())
                 .await
                 .expect("the task ends within one interval of the cancel")
                 .expect("the task does not panic");

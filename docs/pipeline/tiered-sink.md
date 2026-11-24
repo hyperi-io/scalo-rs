@@ -139,7 +139,7 @@ Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A 
 - `disk_aware: { max_usage_percent, poll_interval_secs }` -- background
   `statvfs` poller. Once filesystem use crosses the threshold,
   `disk_available` flips false and spool writes return
-  `DiskUnavailable`.
+  `DiskUnavailable`. A `poll_interval_secs` of 0 reads as 1.
 
 On a Kubernetes emptyDir `statvfs` reads the node's disk, not the volume's `sizeLimit`, so a spool past the limit gets the pod evicted and the spool lost. The scalo-service chart sets `SCALO_WRITABLE_PATH_LIMITS` to each emptyDir writable path with a `sizeLimit`. With `max_spool_bytes` unset, `TieredSink::new` caps a spool on such a path at nine tenths of its limit. On Kubernetes, `disk_aware` with no cap at all is refused with `SpoolOpen`.
 

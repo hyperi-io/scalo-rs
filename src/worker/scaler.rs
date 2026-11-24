@@ -46,12 +46,11 @@
 //! `tokio-metrics` (runtime busy-ratio), not a hand-rolled parser.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use sysinfo::System;
-use tokio_util::sync::CancellationToken;
 
 use super::pool::AdaptiveWorkerPool;
+use crate::concurrency::{PeriodicTask, TickError};
 
 /// Inputs to the watermark scaling algorithm.
 #[derive(Debug, Clone)]
@@ -144,32 +143,12 @@ impl ScalingController {
                 .ok(),
         }
     }
+}
 
-    /// Run the scaling loop until cancelled.
-    pub async fn run(mut self, cancel: CancellationToken) {
-        let interval_secs = {
-            let cfg = self.pool.config.read();
-            cfg.scale_interval_secs
-        };
-
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-
-        loop {
-            tokio::select! {
-                () = cancel.cancelled() => {
-                    tracing::info!("Worker pool scaling controller shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    self.tick();
-                }
-            }
-        }
-    }
-
-    fn tick(&mut self) {
+impl PeriodicTask for ScalingController {
+    async fn tick(&mut self) -> Result<(), TickError> {
         let Some(system) = self.system.as_mut() else {
-            return;
+            return Ok(());
         };
         // Sample CPU
         system.refresh_cpu_all();
@@ -266,6 +245,12 @@ impl ScalingController {
             metrics::gauge!("worker_pool_memory_psi_some").set(stall);
         }
         publish_saturation(&self.pool, cfg.max_threads);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> Result<(), TickError> {
+        tracing::info!("Worker pool scaling controller shutting down");
+        Ok(())
     }
 }
 

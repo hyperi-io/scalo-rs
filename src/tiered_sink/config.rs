@@ -346,7 +346,7 @@ pub struct DiskAwareConfig {
     #[serde(default = "default_max_usage_percent")]
     pub max_usage_percent: f64,
 
-    /// How often to check disk usage, in seconds.
+    /// How often to check disk usage, in seconds. 0 reads as 1.
     /// Default: 5 seconds.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,

@@ -31,7 +31,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -69,15 +69,32 @@ impl PeriodicWorker {
     /// common bug where every spawned worker bursts a tick immediately
     /// on startup, hammering downstream dependencies during deploy.
     pub fn spawn<T: PeriodicTask>(
+        task: T,
+        interval_duration: Duration,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self::start(task, interval_duration, interval_duration, shutdown)
+    }
+
+    /// [`spawn`](Self::spawn), with the first `tick()` at once: for a task
+    /// whose output is read from startup, such as a gauge or a pool size.
+    pub fn spawn_immediate<T: PeriodicTask>(
+        task: T,
+        interval_duration: Duration,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self::start(task, Duration::ZERO, interval_duration, shutdown)
+    }
+
+    fn start<T: PeriodicTask>(
         mut task: T,
+        first_tick: Duration,
         interval_duration: Duration,
         shutdown: CancellationToken,
     ) -> Self {
         let join = tokio::spawn(async move {
-            let mut tick = interval(interval_duration);
+            let mut tick = interval_at(Instant::now() + first_tick, interval_duration);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            // Consume the immediate first tick.
-            tick.tick().await;
 
             loop {
                 tokio::select! {
@@ -112,13 +129,18 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant;
 
+    /// Counts its ticks, and fails every one when `fail` is set.
     struct CountingTask {
         ticks: Arc<AtomicU32>,
+        fail: bool,
     }
 
     impl PeriodicTask for CountingTask {
         async fn tick(&mut self) -> Result<(), TickError> {
             self.ticks.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(TickError::Generic("simulated".into()));
+            }
             Ok(())
         }
     }
@@ -140,54 +162,38 @@ mod tests {
         }
     }
 
-    struct FailingTask {
-        ticks: Arc<AtomicU32>,
-    }
-
-    impl PeriodicTask for FailingTask {
-        async fn tick(&mut self) -> Result<(), TickError> {
-            self.ticks.fetch_add(1, Ordering::SeqCst);
-            Err(TickError::Generic("simulated".into()))
-        }
-    }
+    type Spawn = fn(CountingTask, Duration, CancellationToken) -> PeriodicWorker;
 
     // The clock is paused, so time advances only while every task is idle
     // and the tick count is exact whatever the host is doing.
     #[tokio::test(start_paused = true)]
-    async fn tick_fires_at_interval() {
-        let ticks = Arc::new(AtomicU32::new(0));
-        let shutdown = CancellationToken::new();
-        let _worker = PeriodicWorker::spawn(
-            CountingTask {
-                ticks: ticks.clone(),
-            },
-            Duration::from_millis(20),
-            shutdown.clone(),
-        );
-        tokio::time::sleep(Duration::from_millis(110)).await;
-        shutdown.cancel();
-        let n = ticks.load(Ordering::SeqCst);
-        assert_eq!(n, 5, "110ms over a 20ms interval is five ticks");
-    }
-
-    #[tokio::test]
-    async fn first_tick_is_delayed_not_immediate() {
-        // Regression test: ensure the worker does NOT fire a tick at
-        // t=0 (the common gotcha with tokio::time::interval).
-        let ticks = Arc::new(AtomicU32::new(0));
-        let shutdown = CancellationToken::new();
-        let _worker = PeriodicWorker::spawn(
-            CountingTask {
-                ticks: ticks.clone(),
-            },
-            Duration::from_millis(100),
-            shutdown.clone(),
-        );
-        // Check immediately -- should be 0 because interval consumed
-        // the first tick before the loop started.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        assert_eq!(ticks.load(Ordering::SeqCst), 0);
-        shutdown.cancel();
+    async fn ticks_by_first_tick_and_elapsed_time() {
+        let delayed: Spawn = PeriodicWorker::spawn;
+        let immediate: Spawn = PeriodicWorker::spawn_immediate;
+        // (case, spawn, interval ms, run ms, every tick fails, ticks wanted)
+        let cases = [
+            ("spawn waits one interval", delayed, 100, 10, false, 0),
+            ("spawn_immediate ticks at t=0", immediate, 100, 10, false, 1),
+            ("110ms over 20ms", delayed, 20, 110, false, 5),
+            ("110ms over 20ms, plus t=0", immediate, 20, 110, false, 6),
+            ("failing ticks keep going", delayed, 15, 80, true, 5),
+        ];
+        for (case, spawn, interval_ms, run_ms, fail, want) in cases {
+            let ticks = Arc::new(AtomicU32::new(0));
+            let shutdown = CancellationToken::new();
+            let worker = spawn(
+                CountingTask {
+                    ticks: ticks.clone(),
+                    fail,
+                },
+                Duration::from_millis(interval_ms),
+                shutdown.clone(),
+            );
+            tokio::time::sleep(Duration::from_millis(run_ms)).await;
+            shutdown.cancel();
+            worker.join().await.expect("clean exit");
+            assert_eq!(ticks.load(Ordering::SeqCst), want, "{case}");
+        }
     }
 
     #[tokio::test]
@@ -210,27 +216,6 @@ mod tests {
         assert_eq!(ticks.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn failing_tick_does_not_stop_worker() {
-        let ticks = Arc::new(AtomicU32::new(0));
-        let shutdown = CancellationToken::new();
-        let _worker = PeriodicWorker::spawn(
-            FailingTask {
-                ticks: ticks.clone(),
-            },
-            Duration::from_millis(15),
-            shutdown.clone(),
-        );
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        shutdown.cancel();
-        let n = ticks.load(Ordering::SeqCst);
-        // Every tick failed and the worker kept going: five, not one.
-        assert_eq!(
-            n, 5,
-            "80ms over a 15ms interval is five ticks, errors or not"
-        );
-    }
-
     #[tokio::test]
     async fn biased_select_prioritises_shutdown_over_tick() {
         // If a tick was due simultaneously with shutdown, the biased
@@ -242,6 +227,7 @@ mod tests {
         let worker = PeriodicWorker::spawn(
             CountingTask {
                 ticks: ticks.clone(),
+                fail: false,
             },
             Duration::from_millis(1), // very tight -- many tick opportunities
             shutdown.clone(),

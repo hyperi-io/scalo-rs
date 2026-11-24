@@ -68,7 +68,7 @@ strmatch = ["regex", "regex-automata", "regex-syntax", "aho-corasick", "memchr",
 # Tiers, and why `metrics` pulls the OTLP exporters: docs/core-pillars/metrics.md#feature-tiers.
 metrics-core = ["dep:metrics", "tracing"]
 metrics-process = ["metrics-core", "sysinfo"]
-metrics = ["metrics-process", "metrics-exporter-prometheus", "dep:crossbeam-epoch", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
+metrics = ["metrics-process", "concurrency", "metrics-exporter-prometheus", "dep:crossbeam-epoch", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
 
 # `metrics` enables `otel-metrics`, never the reverse: the other direction is a cargo feature cycle.
 otel = ["dep:opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp", "tracing", "tracing-opentelemetry", "serde_json"]
@@ -101,7 +101,7 @@ compression = ["zstd", "lz4_flex", "dep:flate2", "tonic?/gzip", "tonic?/zstd"]
 compression-snappy = ["compression", "snap"]
 
 spool = ["dep:notify", "sysinfo", "dep:futures-util", "dep:semver", "zstd", "dep:crc32c", "dep:jiff", "tokio", "tracing"]
-tiered-sink = ["transport", "compression", "dep:notify", "sysinfo", "dep:futures-util", "dep:semver", "tokio", "tokio-util", "libc", "tracing", "dep:crc32c", "dep:jiff"]
+tiered-sink = ["transport", "concurrency", "compression", "dep:notify", "sysinfo", "dep:futures-util", "dep:semver", "tokio", "tokio-util", "libc", "tracing", "dep:crc32c", "dep:jiff"]
 
 # docs/pipeline/sink-stack.md
 sink-stack = ["transport", "tower", "dep:backon", "governor", "tokio", "tracing"]
@@ -115,7 +115,7 @@ governor = ["memory", "tokio", "parking_lot", "dep:gcra"]
 scaling = ["parking_lot", "tracing"]
 
 # docs/feature-flags.md#worker-pool
-worker-pool = ["rayon", "config", "metrics", "tokio", "tokio-util", "sysinfo", "parking_lot", "tracing"]
+worker-pool = ["rayon", "config", "metrics", "concurrency", "tokio", "tokio-util", "sysinfo", "parking_lot", "tracing"]
 worker-batch = ["worker-pool", "sonic-rs", "dashmap", "bytes", "dep:wide"]
 worker = ["worker-batch"]
 
@@ -168,7 +168,7 @@ transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
 # Kafka config and token types with no librdkafka.
 transport-kafka-config = ["transport"]
-transport-kafka = ["transport-kafka-config", "rdkafka", "regex", "tokio-util"]
+transport-kafka = ["transport-kafka-config", "concurrency", "rdkafka", "regex", "tokio-util"]
 # Kafka fixtures for consumer test suites. Needs a Docker daemon at test time.
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 # Shaped senders and delivery approaches for tests and benches: src/transport/test_support/mod.rs
