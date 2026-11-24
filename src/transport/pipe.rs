@@ -26,6 +26,7 @@
 //! let records = transport.recv(10).await?.records;
 //! ```
 
+use super::core::{Lifecycle, Meter};
 use super::error::{TransportError, TransportResult};
 use super::traits::{CommitToken, RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
@@ -33,7 +34,7 @@ use super::work_batch::WorkBatch;
 use crate::framing::{DecodeLimits, Frame, Framing, Lf, StreamDecoder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Commit token for pipe transport.
@@ -111,13 +112,10 @@ struct ReadState {
 /// Receive reads lines from stdin, each becoming a message.
 /// Commit is a no-op (stdin cannot be rewound).
 pub struct PipeTransport {
-    /// Removes this component from the health registry when it drops.
-    #[cfg(feature = "health")]
-    _health_registration: crate::health::HealthRegistration,
     stdin: tokio::sync::Mutex<ReadState>,
     stdout: tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
     sequence: AtomicU64,
-    closed: Arc<AtomicBool>,
+    lifecycle: Lifecycle,
     recv_timeout_ms: u64,
     /// `Err` holds the rule compile error, and send and recv refuse while it stands.
     filter_engine: Result<super::filter::TransportFilterEngine, String>,
@@ -204,24 +202,8 @@ impl PipeTransport {
             "Pipe transport opened"
         );
 
-        let closed = Arc::new(AtomicBool::new(false));
-
-        #[cfg(feature = "health")]
-        let health_registration = {
-            let h = Arc::clone(&closed);
-            let filters_compiled = filter_engine.is_ok();
-            crate::health::HealthRegistry::register_scoped("transport:pipe", move || {
-                if filters_compiled && !h.load(Ordering::Relaxed) {
-                    crate::health::HealthStatus::Healthy
-                } else {
-                    crate::health::HealthStatus::Unhealthy
-                }
-            })
-        };
-
+        let filters_compiled = filter_engine.is_ok();
         Self {
-            #[cfg(feature = "health")]
-            _health_registration: health_registration,
             stdin: tokio::sync::Mutex::new(ReadState {
                 reader: BufReader::new(input),
                 decoder: StreamDecoder::new(Arc::new(Lf), DecodeLimits::UNBOUNDED),
@@ -229,7 +211,7 @@ impl PipeTransport {
             }),
             stdout: tokio::sync::Mutex::new(output),
             sequence: AtomicU64::new(0),
-            closed,
+            lifecycle: Lifecycle::new::<Self>(move || filters_compiled),
             recv_timeout_ms: config.recv_timeout_ms,
             filter_engine,
         }
@@ -245,7 +227,7 @@ impl PipeTransport {
 
 impl TransportBase for PipeTransport {
     async fn close(&self) -> TransportResult<()> {
-        self.closed.store(true, Ordering::Relaxed);
+        self.lifecycle.close();
 
         // Flush stdout before closing
         let mut stdout = self.stdout.lock().await;
@@ -258,16 +240,20 @@ impl TransportBase for PipeTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        self.filter_engine.is_ok() && !self.closed.load(Ordering::Relaxed)
+        self.lifecycle.is_healthy()
     }
 
     fn name(&self) -> &'static str {
-        "pipe"
+        Self::TRANSPORT
     }
 
     fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
         super::DeliveryGuarantee::Written
     }
+}
+
+impl Meter for PipeTransport {
+    const TRANSPORT: &'static str = "pipe";
 }
 
 impl TransportSender for PipeTransport {
@@ -284,7 +270,7 @@ impl TransportSender for PipeTransport {
     }
 
     async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
         let filter_engine = match self.filters() {
@@ -292,13 +278,8 @@ impl TransportSender for PipeTransport {
             Err(e) => return SendResult::Fatal(e),
         };
 
-        // Outbound filter check
-        if filter_engine.has_outbound_filters() {
-            match filter_engine.apply_outbound(&payload) {
-                super::filter::FilterDisposition::Pass => {}
-                super::filter::FilterDisposition::Drop => return SendResult::Ok,
-                super::filter::FilterDisposition::Dlq => return SendResult::FilteredDlq,
-            }
+        if let Some(settled) = filter_engine.outbound_one(&payload) {
+            return settled;
         }
 
         let mut stdout = self.stdout.lock().await;
@@ -318,12 +299,7 @@ impl TransportSender for PipeTransport {
             "Pipe transport: message sent to stdout"
         );
 
-        #[cfg(feature = "metrics")]
-        {
-            metrics::counter!("transport_sent_total", "transport" => "pipe").increment(1);
-            metrics::counter!("transport_sent_bytes_total", "transport" => "pipe")
-                .increment(payload.len() as u64);
-        }
+        Self::count_sent(1, payload.len() as u64);
 
         SendResult::Ok
     }
@@ -333,7 +309,7 @@ impl TransportReceiver for PipeTransport {
     type Token = PipeToken;
 
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return Err(TransportError::Closed);
         }
         let filter_engine = self.filters()?;
@@ -431,14 +407,7 @@ impl TransportReceiver for PipeTransport {
         }
 
         // Transport-level ingress (post-filter, batch-at-a-time).
-        #[cfg(feature = "metrics")]
-        if !messages.is_empty() {
-            let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
-            metrics::counter!("transport_received_bytes_total", "transport" => "pipe")
-                .increment(bytes as u64);
-            metrics::counter!("transport_received_events_total", "transport" => "pipe")
-                .increment(messages.len() as u64);
-        }
+        Self::count_received_messages(&messages);
 
         Ok(RecvBatch {
             messages,

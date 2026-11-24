@@ -1,0 +1,94 @@
+counter <name>
+counter pipeline_dead_letters_dropped_total reason=<super::ack::TOO_LARGE>
+counter self_regulation_kafka_gate_errors_total op=<op>
+counter transport_ack_refused_total transport=<inner.transport> reason=<reason.as_str()>
+counter transport_ack_refused_total transport=<self.label> reason=<reason>
+counter transport_ack_released_total transport="kafka" outcome=<label>
+counter transport_ack_released_total transport=<self.inner.transport> outcome=<outcome.as_str()>
+counter transport_ack_released_total transport=<self.label> outcome=<outcome>
+counter transport_auth_refused_total transport="kafka"
+counter transport_backpressured_total transport="grpc"
+counter transport_backpressured_total transport="grpc" reason="ceiling"
+counter transport_backpressured_total transport="grpc" reason="pressure"
+counter transport_backpressured_total transport="http"
+counter transport_backpressured_total transport="http" reason="in_flight_bytes"
+counter transport_backpressured_total transport="http" reason="pressure"
+counter transport_backpressured_total transport="kafka"
+counter transport_backpressured_total transport="otlp"
+counter transport_backpressured_total transport="syslog"
+counter transport_coalesced_blocks_total transport="grpc"
+counter transport_coalesced_calls_total transport="grpc"
+counter transport_coalesced_records_total transport="grpc"
+counter transport_coalesced_timeouts_total transport="grpc"
+counter transport_consumer_rebuilds_total transport="kafka" protocol=<protocol.as_str()>
+counter transport_filter_cel_payload_skip_total
+counter transport_filter_msgpack_bypass_total direction=<direction.to_string()>
+counter transport_filtered_total direction=<dir> action=<act>
+counter transport_message_too_large_total transport="file"
+counter transport_message_too_large_total transport="grpc"
+counter transport_message_too_large_total transport="kafka"
+counter transport_message_too_large_total transport="syslog"
+counter transport_proxy_refused_total transport=<transport>
+counter transport_received_bytes_total transport="file"
+counter transport_received_bytes_total transport="grpc"
+counter transport_received_bytes_total transport="http"
+counter transport_received_bytes_total transport="kafka"
+counter transport_received_bytes_total transport="pipe"
+counter transport_received_events_total transport="file"
+counter transport_received_events_total transport="grpc"
+counter transport_received_events_total transport="http"
+counter transport_received_events_total transport="kafka"
+counter transport_received_events_total transport="pipe"
+counter transport_recv_errors_total transport="kafka" class=<class>
+counter transport_redelivered_total transport="grpc" reason=<reason>
+counter transport_redelivered_total transport="syslog" reason="deadline"
+counter transport_redelivered_total transport="syslog" reason="reconnect"
+counter transport_refusal_rebuilds_total transport="kafka"
+counter transport_refused_total transport="grpc"
+counter transport_refused_total transport="http"
+counter transport_revoke_discarded_total transport="kafka" stage=<stage>
+counter transport_send_errors_total transport="grpc"
+counter transport_send_errors_total transport="http"
+counter transport_send_errors_total transport="kafka"
+counter transport_send_errors_total transport="otlp"
+counter transport_send_errors_total transport="syslog"
+counter transport_send_missing_topic_total transport="kafka"
+counter transport_sent_bytes_total transport="file"
+counter transport_sent_bytes_total transport="grpc"
+counter transport_sent_bytes_total transport="http"
+counter transport_sent_bytes_total transport="kafka"
+counter transport_sent_bytes_total transport="otlp"
+counter transport_sent_bytes_total transport="pipe"
+counter transport_sent_bytes_total transport="syslog"
+counter transport_sent_total transport="file"
+counter transport_sent_total transport="grpc"
+counter transport_sent_total transport="grpc" path="batch"
+counter transport_sent_total transport="http"
+counter transport_sent_total transport="kafka"
+counter transport_sent_total transport="otlp"
+counter transport_sent_total transport="pipe"
+counter transport_sent_total transport="syslog"
+counter transport_truncated_total transport="syslog"
+gauge <name>
+gauge kafka_partition_limited
+gauge pipeline_delivery_guarantee guarantee=<self.guarantee.as_str()> reason=<self.reason.as_str()>
+gauge pipeline_delivery_guarantee guarantee=<self.guarantee.as_str()> reason=<self.reason.as_str()> listener=<listener.to_owned()>
+gauge transport_ack_held transport="kafka"
+gauge transport_ack_held transport=<self.label>
+gauge transport_ack_held transport=<self.transport>
+gauge transport_ack_held_bytes transport="kafka"
+gauge transport_ack_held_bytes transport=<self.label>
+gauge transport_ack_held_bytes transport=<self.transport>
+gauge transport_ack_withheld transport="kafka"
+gauge transport_healthy transport="grpc"
+gauge transport_inflight transport="grpc"
+gauge transport_queue_size transport="grpc"
+histogram kafka_poll_duration_seconds
+histogram transport_ack_latency_seconds transport="kafka" outcome=<label>
+histogram transport_ack_latency_seconds transport=<self.inner.transport> outcome=<outcome.as_str()>
+histogram transport_ack_latency_seconds transport=<self.label> outcome=<outcome>
+histogram transport_send_duration_seconds transport="grpc"
+histogram transport_send_duration_seconds transport="http"
+histogram transport_send_duration_seconds transport="kafka"
+histogram transport_send_duration_seconds transport="otlp"
+histogram transport_send_duration_seconds transport="syslog"

@@ -258,13 +258,8 @@ impl MemoryTransport {
             return SendResult::Fatal(TransportError::Closed);
         }
 
-        // Outbound filter check
-        if self.filter_engine.has_outbound_filters() {
-            match self.filter_engine.apply_outbound(&payload) {
-                super::filter::FilterDisposition::Pass => {}
-                super::filter::FilterDisposition::Drop => return SendResult::Ok,
-                super::filter::FilterDisposition::Dlq => return SendResult::FilteredDlq,
-            }
+        if let Some(settled) = self.filter_engine.outbound_one(&payload) {
+            return settled;
         }
 
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);

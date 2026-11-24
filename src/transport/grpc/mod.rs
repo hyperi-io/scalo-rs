@@ -76,6 +76,7 @@ pub use token::GrpcToken;
 use super::ack::{
     AckControl, AcknowledgementsConfig, AcknowledgingReceiver, DeadLetterReason, SinkConfirmation,
 };
+use super::core::{Lifecycle, Meter};
 use super::error::{TransportError, TransportResult};
 use super::finalizer::DeliveryStatus;
 use super::proxy::Refusals;
@@ -85,7 +86,7 @@ use super::work_batch::{Record, WorkBatch};
 use pending::{Held, Outcome, PendingRegistry};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
@@ -156,15 +157,13 @@ impl OversizeSlot {
 /// The answer to a push the receive queue has no room for: `ResourceExhausted`,
 /// which a sender retries.
 fn receiver_full() -> Status {
-    #[cfg(feature = "metrics")]
-    metrics::counter!("transport_backpressured_total", "transport" => "grpc").increment(1);
+    GrpcTransport::count_backpressured();
     Status::resource_exhausted("receiver buffer full")
 }
 
 /// The answer to a push after `close()`: `Unavailable`, which a sender retries.
 pub(crate) fn receiver_closed() -> Status {
-    #[cfg(feature = "metrics")]
-    metrics::counter!("transport_refused_total", "transport" => "grpc").increment(1);
+    GrpcTransport::count_refused();
     Status::unavailable("receiver closed")
 }
 
@@ -306,14 +305,6 @@ pub(crate) fn answer<T>(outcome: Outcome, response: T) -> Result<Response<T>, St
     }
 }
 
-/// Count records the receive server queued for `recv`.
-#[cfg(feature = "metrics")]
-pub(crate) fn count_received(records: u64, bytes: usize) {
-    metrics::counter!("transport_received_bytes_total", "transport" => "grpc")
-        .increment(bytes as u64);
-    metrics::counter!("transport_received_events_total", "transport" => "grpc").increment(records);
-}
-
 /// The connections the receive server accepts, each with TCP_NODELAY on as the
 /// client sets it, so a small HTTP/2 frame is not held back waiting for a
 /// delayed ACK.
@@ -326,9 +317,6 @@ fn accepting(listener: tokio::net::TcpListener) -> tonic::transport::server::Tcp
 /// Implements both `TransportSender` and `TransportReceiver`, so it also
 /// satisfies the unified `Transport` trait via blanket impl.
 pub struct GrpcTransport {
-    /// Removes this component from the health registry when it drops.
-    #[cfg(feature = "health")]
-    _health_registration: crate::health::HealthRegistration,
     /// Client for sending and its send deadline (None if server-only mode).
     wire: Option<Wire>,
 
@@ -361,11 +349,8 @@ pub struct GrpcTransport {
     /// `JoinHandle` only detaches the task, leaving the listener bound.
     server_task: parking_lot::Mutex<Option<ServerTask>>,
 
-    /// Whether the transport is closed.
-    closed: AtomicBool,
-
-    /// Shared healthy flag -- read by health registry closure, written by close().
-    healthy: Arc<AtomicBool>,
+    /// Closed, or the send side's proxy refused: either fails readiness.
+    lifecycle: Lifecycle,
 
     /// Receive timeout (milliseconds).
     recv_timeout_ms: u64,
@@ -842,30 +827,18 @@ impl GrpcTransport {
             let _ = pressure;
         }
 
-        let healthy = Arc::new(AtomicBool::new(true));
-
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
             &config.filters_out,
             &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
-        #[cfg(feature = "health")]
-        let health_registration = {
-            let h = Arc::clone(&healthy);
+        let lifecycle = {
             let refusals = wire.as_ref().map(|w| w.refusals.clone());
-            crate::health::HealthRegistry::register_scoped("transport:grpc", move || {
-                if h.load(Ordering::Relaxed) && !refusals.as_ref().is_some_and(|r| r.is_refused()) {
-                    crate::health::HealthStatus::Healthy
-                } else {
-                    crate::health::HealthStatus::Unhealthy
-                }
-            })
+            Lifecycle::new::<Self>(move || !refusals.as_ref().is_some_and(Refusals::is_refused))
         };
 
         Ok(Self {
-            #[cfg(feature = "health")]
-            _health_registration: health_registration,
             wire,
             coalesce,
             receiver,
@@ -875,8 +848,7 @@ impl GrpcTransport {
             drain_deadline: options.drain_deadline,
             shutdown_tx: parking_lot::Mutex::new(shutdown_tx),
             server_task: parking_lot::Mutex::new(server_handle),
-            closed: AtomicBool::new(false),
-            healthy,
+            lifecycle,
             recv_timeout_ms: config.recv_timeout_ms,
             send_timeout_ms: config.send_timeout_ms,
             max_message_size: config.max_message_size,
@@ -990,8 +962,7 @@ fn too_large_result(
     limit: usize,
     detail: &str,
 ) -> SendResult {
-    #[cfg(feature = "metrics")]
-    metrics::counter!("transport_message_too_large_total", "transport" => "grpc").increment(1);
+    GrpcTransport::count_too_large();
     tracing::warn!(
         destination,
         encoded_len,
@@ -1045,47 +1016,42 @@ fn failed_rpc_result(status: &tonic::Status, refusals: &Refusals) -> SendResult 
         return refusals.hold(refused, "grpc");
     }
     if let Some(tls) = crate::tls::rustls_error(status) {
-        #[cfg(feature = "metrics")]
-        metrics::counter!("transport_send_errors_total", "transport" => "grpc").increment(1);
+        GrpcTransport::count_send_error();
         tracing::error!(error = %tls, "gRPC: TLS with the server failed");
         return SendResult::Fatal(TransportError::Config(format!(
             "gRPC: TLS with the server failed: {tls}"
         )));
     }
     if downstream_unavailable(status) {
+        GrpcTransport::count_backpressured();
         #[cfg(feature = "metrics")]
-        {
-            metrics::counter!("transport_backpressured_total", "transport" => "grpc").increment(1);
-            if let Some(reason) = redelivery_reason(status) {
-                metrics::counter!(
-                    "transport_redelivered_total",
-                    "transport" => "grpc",
-                    "reason" => reason
-                )
-                .increment(1);
-            }
+        if let Some(reason) = redelivery_reason(status) {
+            metrics::counter!(
+                "transport_redelivered_total",
+                "transport" => "grpc",
+                "reason" => reason
+            )
+            .increment(1);
         }
         SendResult::Backpressured
     } else {
-        #[cfg(feature = "metrics")]
-        metrics::counter!("transport_send_errors_total", "transport" => "grpc").increment(1);
+        GrpcTransport::count_send_error();
         SendResult::Fatal(TransportError::Send(status.message().to_string()))
     }
 }
 
+impl Meter for GrpcTransport {
+    const TRANSPORT: &'static str = "grpc";
+}
+
 impl TransportSender for GrpcTransport {
     async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
 
-        // Outbound filter check
-        if self.filter_engine.has_outbound_filters() {
-            match self.filter_engine.apply_outbound(&payload) {
-                super::filter::FilterDisposition::Pass => {}
-                super::filter::FilterDisposition::Drop => return SendResult::Ok,
-                super::filter::FilterDisposition::Dlq => return SendResult::FilteredDlq,
-            }
+        if let Some(settled) = self.filter_engine.outbound_one(&payload) {
+            return settled;
         }
 
         let Some(Wire {
@@ -1098,7 +1064,6 @@ impl TransportSender for GrpcTransport {
         };
 
         // Capture wire size before `payload` moves into the request.
-        #[cfg(feature = "metrics")]
         let payload_len = payload.len();
 
         // Checked uncompressed, as the receiver decompresses to this limit and
@@ -1121,8 +1086,7 @@ impl TransportSender for GrpcTransport {
             request.set_timeout(Duration::from_millis(self.send_timeout_ms));
         }
 
-        #[cfg(feature = "metrics")]
-        let start = std::time::Instant::now();
+        let timer = Self::send_timer();
 
         #[cfg(feature = "metrics")]
         let in_flight = InFlight::enter(&self.inflight);
@@ -1132,12 +1096,7 @@ impl TransportSender for GrpcTransport {
         let result = match within_send_timeout(self.send_timeout_ms, client.push(request)).await {
             Ok(_) => {
                 refusals.clear("grpc");
-                #[cfg(feature = "metrics")]
-                {
-                    metrics::counter!("transport_sent_total", "transport" => "grpc").increment(1);
-                    metrics::counter!("transport_sent_bytes_total", "transport" => "grpc")
-                        .increment(payload_len as u64);
-                }
+                Self::count_sent(1, payload_len as u64);
                 SendResult::Ok
             }
             // The receiver's limit can be below ours, and gzip can grow an
@@ -1152,14 +1111,8 @@ impl TransportSender for GrpcTransport {
         };
 
         #[cfg(feature = "metrics")]
-        {
-            drop(in_flight);
-            metrics::histogram!(
-                "transport_send_duration_seconds",
-                "transport" => "grpc"
-            )
-            .record(start.elapsed().as_secs_f64());
-        }
+        drop(in_flight);
+        timer.record();
 
         result
     }
@@ -1226,7 +1179,7 @@ impl TransportSender for GrpcTransport {
     /// Returns a [`SendResult`]. `Backpressured` maps the same transient gRPC
     /// codes as [`send`](TransportSender::send).
     async fn send_batch(&self, records: &[Record]) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
 
@@ -1270,23 +1223,16 @@ impl TransportSender for GrpcTransport {
     /// `RouteBatch`, or one an outbound `dlq` filter matches.
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
         // Measured as `send_batch` measures it: encoded, as a field of a batch.
-        let framed =
-            prost::encoding::message::encoded_len(1, &batch::record_to_proto(record.clone()));
+        let framed = as_field(record).len;
         if framed > self.max_message_size {
             return Some(DeadLetterReason::TooLarge {
                 bytes: framed,
                 limit: self.max_message_size,
             });
         }
-        if self.filter_engine.has_outbound_filters()
-            && matches!(
-                self.filter_engine.apply_outbound(&record.payload),
-                super::filter::FilterDisposition::Dlq
-            )
-        {
-            return Some(DeadLetterReason::OutboundFilter);
-        }
-        None
+        self.filter_engine
+            .outbound_dead_letter(&record.payload)
+            .then_some(DeadLetterReason::OutboundFilter)
     }
 }
 
@@ -1297,8 +1243,8 @@ struct Framed {
 }
 
 /// `record` as a field of a `Batch` body.
-fn as_field(record: Record) -> Framed {
-    let record = batch::record_to_proto(record);
+fn as_field(record: &Record) -> Framed {
+    let record = batch::record_ref_to_proto(record);
     // The record as a field of `Batch`: its tag, its length prefix, then the
     // record itself, so the parts sum to the body's encoded length.
     let len = prost::encoding::message::encoded_len(1, &record);
@@ -1307,11 +1253,10 @@ fn as_field(record: Record) -> Framed {
 
 /// `record` as a field of a `Batch` body, or `None`, warned and counted, when
 /// it is over `limit` on its own: the same bytes are refused on every retry.
-fn frame(record: Record, limit: usize) -> Option<Framed> {
+fn frame(record: &Record, limit: usize) -> Option<Framed> {
     let framed = as_field(record);
     if framed.len > limit {
-        #[cfg(feature = "metrics")]
-        metrics::counter!("transport_message_too_large_total", "transport" => "grpc").increment(1);
+        GrpcTransport::count_too_large();
         tracing::warn!(
             destination = framed.record.key.as_str(),
             encoded_len = framed.len,
@@ -1327,7 +1272,7 @@ fn frame(record: Record, limit: usize) -> Option<Framed> {
 
 /// `records` framed for `limit` again, for a block framed once before: a record
 /// over it was warned of and counted then, so it is left out quietly.
-fn reframed(records: Vec<Record>, limit: usize) -> Vec<Framed> {
+fn reframed(records: Vec<&Record>, limit: usize) -> Vec<Framed> {
     records
         .into_iter()
         .map(as_field)
@@ -1337,11 +1282,11 @@ fn reframed(records: Vec<Record>, limit: usize) -> Vec<Framed> {
 
 /// `records` framed for `limit`, in order, counting the ones left out in
 /// `left_out`.
-fn frames(
-    records: Vec<Record>,
+fn frames<'a>(
+    records: Vec<&'a Record>,
     limit: usize,
-    left_out: &mut u64,
-) -> impl Iterator<Item = Framed> + '_ {
+    left_out: &'a mut u64,
+) -> impl Iterator<Item = Framed> + 'a {
     records.into_iter().filter_map(move |record| {
         let framed = frame(record, limit);
         *left_out += u64::from(framed.is_none());
@@ -1373,14 +1318,14 @@ fn bodies_within(records: impl IntoIterator<Item = Framed>, limit: usize) -> Vec
 
 /// Split `records` into `Batch` bodies that each encode within `limit`, in
 /// order, and count the records left out.
-fn batches_within(records: Vec<Record>, limit: usize) -> (Vec<proto::Batch>, u64) {
+fn batches_within(records: Vec<&Record>, limit: usize) -> (Vec<proto::Batch>, u64) {
     let mut left_out = 0_u64;
     let batches = bodies_within(frames(records, limit, &mut left_out), limit);
     (batches, left_out)
 }
 
 /// `records` framed for `limit`, in order, and the count left out.
-fn framed_within(records: Vec<Record>, limit: usize) -> (Vec<Framed>, u64) {
+fn framed_within(records: Vec<&Record>, limit: usize) -> (Vec<Framed>, u64) {
     let mut left_out = 0_u64;
     let framed = frames(records, limit, &mut left_out).collect();
     (framed, left_out)
@@ -1404,31 +1349,11 @@ fn count_left_out(left_out: u64) {
 impl GrpcTransport {
     /// The records of `records` the outbound filters let through, and the
     /// answer for a block that sends them all: `FilteredDlq` when a `dlq`
-    /// filter matched one, else `Ok`.
-    fn outbound(&self, records: &[Record]) -> (Vec<Record>, SendResult) {
-        // Apply outbound filters BEFORE the wire: a record matched by a `drop`
-        // or `dlq` filter must NOT be transmitted. This path once bypassed the
-        // filter entirely -- a record told to drop sailed through.
-        let mut filtered_to_dlq = false;
-        let to_send: Vec<Record> = if self.filter_engine.has_outbound_filters() {
-            let mut keep = Vec::with_capacity(records.len());
-            for r in records {
-                match self.filter_engine.apply_outbound(&r.payload) {
-                    super::filter::FilterDisposition::Pass => keep.push(r.clone()),
-                    super::filter::FilterDisposition::Drop => {}
-                    super::filter::FilterDisposition::Dlq => filtered_to_dlq = true,
-                }
-            }
-            keep
-        } else {
-            records.to_vec()
-        };
-        let handled = if filtered_to_dlq {
-            SendResult::FilteredDlq
-        } else {
-            SendResult::Ok
-        };
-        (to_send, handled)
+    /// filter matched one, else `Ok`. A record matched by a `drop` or `dlq`
+    /// filter is never transmitted.
+    fn outbound<'a>(&self, records: &'a [Record]) -> (Vec<&'a Record>, SendResult) {
+        self.filter_engine
+            .partition_outbound(records, |r| &r.payload)
     }
 
     /// Send `to_send`, the outbound records of `records`, in a call joined with
@@ -1440,7 +1365,7 @@ impl GrpcTransport {
         stage: &coalesce::Coalescer,
         wire: &Wire,
         records: &[Record],
-        to_send: Vec<Record>,
+        to_send: Vec<&Record>,
     ) -> (SendResult, u64) {
         // Records over the ceiling on their own are left out here, so a joined
         // call carries only records within max_message_size.
@@ -1530,8 +1455,7 @@ impl Wire {
             request.set_timeout(Duration::from_millis(self.send_timeout_ms));
         }
 
-        #[cfg(feature = "metrics")]
-        let start = std::time::Instant::now();
+        let timer = GrpcTransport::send_timer();
         #[cfg(feature = "metrics")]
         let in_flight = InFlight::enter(&self.inflight);
 
@@ -1547,12 +1471,7 @@ impl Wire {
                 // (at-least-once).
                 let accepted = response.into_inner().accepted;
                 if accepted < sent_count as u64 {
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!(
-                        "transport_backpressured_total",
-                        "transport" => "grpc"
-                    )
-                    .increment(1);
+                    GrpcTransport::count_backpressured();
                     tracing::warn!(
                         accepted,
                         sent = sent_count,
@@ -1582,14 +1501,8 @@ impl Wire {
         };
 
         #[cfg(feature = "metrics")]
-        {
-            drop(in_flight);
-            metrics::histogram!(
-                "transport_send_duration_seconds",
-                "transport" => "grpc"
-            )
-            .record(start.elapsed().as_secs_f64());
-        }
+        drop(in_flight);
+        timer.record();
 
         Answer { result, code }
     }
@@ -1611,8 +1524,7 @@ impl TransportBase for GrpcTransport {
     /// On the send side, the joined calls in flight are stopped, and every
     /// `send_batch` still waiting on one is answered `Backpressured`.
     async fn close(&self) -> TransportResult<()> {
-        let first = !self.closed.swap(true, Ordering::AcqRel);
-        self.healthy.store(false, Ordering::Relaxed);
+        let first = self.lifecycle.close();
         if let Some(stage) = &self.coalesce {
             stage.close();
         }
@@ -1640,8 +1552,7 @@ impl TransportBase for GrpcTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        let refused = self.wire.as_ref().is_some_and(|w| w.refusals.is_refused());
-        let healthy = self.healthy.load(Ordering::Relaxed) && !refused;
+        let healthy = self.lifecycle.is_healthy();
         #[cfg(feature = "metrics")]
         metrics::gauge!("transport_healthy", "transport" => "grpc").set(if healthy {
             1.0
@@ -1652,7 +1563,7 @@ impl TransportBase for GrpcTransport {
     }
 
     fn name(&self) -> &'static str {
-        "grpc"
+        Self::TRANSPORT
     }
 
     fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
@@ -1678,7 +1589,7 @@ impl TransportReceiver for GrpcTransport {
     /// leaves every record still queued for the next one.
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
         let Some(receiver) = &self.receiver else {
-            if self.closed.load(Ordering::Relaxed) {
+            if self.lifecycle.is_closed() {
                 return Err(TransportError::Closed);
             }
             return Err(TransportError::Config(
@@ -1890,7 +1801,6 @@ impl proto::transport_server::Transport for TransportServiceImpl {
         let key = req.metadata.get("topic").map(|s| Arc::from(s.as_str()));
 
         // Capture wire size before `req.payload` moves into the message.
-        #[cfg(feature = "metrics")]
         let payload_len = req.payload.len();
 
         // `req.payload` is prost `Bytes` (`.bytes(".")`) -- zero-copy decode,
@@ -1906,9 +1816,9 @@ impl proto::transport_server::Transport for TransportServiceImpl {
 
         match self.sender.try_send(msg) {
             Ok(()) => {
+                GrpcTransport::count_received(1, payload_len as u64);
                 #[cfg(feature = "metrics")]
                 {
-                    count_received(1, payload_len);
                     metrics::gauge!("transport_queue_size", "transport" => "grpc").set(
                         self.sender
                             .max_capacity()
@@ -2012,8 +1922,7 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             }
         }
 
-        #[cfg(feature = "metrics")]
-        count_received(accepted, batch_bytes);
+        GrpcTransport::count_received(accepted, batch_bytes as u64);
 
         let response = proto::BatchAck { accepted };
         match held {
@@ -3127,7 +3036,7 @@ mod tests {
         let records: Vec<Record> = (0..40).map(|_| json_record(b"0123456789abcdef")).collect();
         let whole = prost::Message::encoded_len(&batch::records_to_proto(records.clone()));
         let limit = whole / 3;
-        let (batches, left_out) = batches_within(records, limit);
+        let (batches, left_out) = batches_within(records.iter().collect(), limit);
         assert_eq!(left_out, 0);
         assert!(batches.len() >= 3, "{} batches", batches.len());
         let total: usize = batches.iter().map(|b| b.records.len()).sum();

@@ -67,28 +67,64 @@ fn format_from_proto(format: i32) -> PayloadFormat {
 
 /// Map one scalo [`Record`] onto a proto [`Record`](proto::Record).
 ///
-/// The payload `Bytes` handle is MOVED onto the proto field (no copy). `key`
-/// `None` becomes the empty string. `Some(k)` carries the key text.
+/// The payload `Bytes` handle and the headers are MOVED onto the proto fields
+/// (no copy). `key` `None` becomes the empty string. `Some(k)` carries the key
+/// text.
 pub(crate) fn record_to_proto(record: Record) -> proto::Record {
-    let (timestamp_ms, has_timestamp_ms) = match record.metadata.timestamp_ms {
+    let headers = record
+        .headers
+        .into_iter()
+        .map(|(key, value)| proto::Header {
+            key,
+            value: Bytes::from(value),
+        })
+        .collect();
+    proto_record(
+        record.payload,
+        record.key.as_deref(),
+        headers,
+        &record.metadata,
+    )
+}
+
+/// Map a borrowed scalo [`Record`] onto a proto [`Record`](proto::Record), for
+/// a sender holding the caller's slice: the payload is shared by refcount and
+/// the headers are copied.
+pub(crate) fn record_ref_to_proto(record: &Record) -> proto::Record {
+    let headers = record
+        .headers
+        .iter()
+        .map(|(key, value)| proto::Header {
+            key: key.clone(),
+            value: Bytes::copy_from_slice(value),
+        })
+        .collect();
+    proto_record(
+        record.payload.clone(),
+        record.key.as_deref(),
+        headers,
+        &record.metadata,
+    )
+}
+
+/// The proto [`Record`](proto::Record) of its parts.
+fn proto_record(
+    payload: Bytes,
+    key: Option<&str>,
+    headers: Vec<proto::Header>,
+    metadata: &RecordMeta,
+) -> proto::Record {
+    let (timestamp_ms, has_timestamp_ms) = match metadata.timestamp_ms {
         Some(ts) => (ts, true),
         None => (0, false),
     };
-
     proto::Record {
-        payload: record.payload,
-        key: record.key.as_deref().unwrap_or("").to_string(),
-        headers: record
-            .headers
-            .into_iter()
-            .map(|(key, value)| proto::Header {
-                key,
-                value: Bytes::from(value),
-            })
-            .collect(),
+        payload,
+        key: key.unwrap_or("").to_string(),
+        headers,
         timestamp_ms,
         has_timestamp_ms,
-        format: format_to_proto(record.metadata.format).into(),
+        format: format_to_proto(metadata.format).into(),
     }
 }
 
@@ -173,6 +209,11 @@ mod tests {
     fn record_round_trips_byte_identical() {
         let original = full_record();
         let p = record_to_proto(original.clone());
+        assert_eq!(
+            record_ref_to_proto(&original),
+            p,
+            "borrowed and owned map alike"
+        );
 
         // The proto payload field is `bytes::Bytes` (zero-copy config). This
         // line would not compile if prost emitted `Vec<u8>` here.

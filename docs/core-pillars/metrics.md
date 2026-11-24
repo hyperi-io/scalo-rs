@@ -25,7 +25,7 @@ features are on, and container metrics read cgroup v1 and v2 transparently.
 | `metrics-process` | `metrics-core` + sysinfo. Exposes no API on its own | The shared base of `metrics` and `otel-metrics` |
 | `metrics` | `metrics-process` + Prometheus exporter + `/metrics` server + OTLP metric push and span export | Services |
 
-scalo gates the series it emits itself, the tiered sink's, the transports' and the spool's among them, on the `metrics` feature. A build where nothing enables `metrics` compiles them out, `otel-metrics` on its own included. Cargo unifies features across the build, so a library that depends on scalo without `metrics` still gets them once the service binary enables it.
+scalo gates the series it emits itself, the tiered sink's, the transports' and the spool's among them, on the `metrics` feature. A build where nothing enables `metrics` compiles them out, `otel-metrics` on its own included. The syslog transport's series are the exception: `metrics-core` alone sends them to a recorder the app installs. Cargo unifies features across the build, so a library that depends on scalo without `metrics` still gets them once the service binary enables it.
 
 A library crate that records its own series depends on the `metrics` crate directly, on the semver-compatible release scalo depends on so both share one global recorder, and leaves scalo's metrics feature to the service binary. scalo does not re-export the `metrics` crate, so `metrics-core` gives a dependent crate no macros.
 
@@ -151,7 +151,7 @@ A counter emitted both with and without labels is two series under one name, and
 
 ## Transport throughput
 
-The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe` / `memory`). A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are RAW wire bytes (summed `payload.len()` per `WorkBatch`), incremented once per batch send/recv -- not per event.
+The transport layer counts both events AND bytes, in both directions. All carry the `transport` label (backend kind: `kafka` / `grpc` / `http` / `file` / `pipe` / `syslog` / `otlp`), and the memory transport counts none. A record sent through a `RoutedSender` counts once, under the transport that sent it, and only once it has landed. Bytes are payload bytes, summed `payload.len()`.
 
 | Metric | Direction | Meaning |
 | --- | --- | --- |

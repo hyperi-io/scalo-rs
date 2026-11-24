@@ -39,6 +39,7 @@
 //! transport.send("events", bytes::Bytes::from_static(b"{\"msg\":\"hello\"}")).await;
 //! ```
 
+use super::core::{Lifecycle, Meter};
 use super::error::{TransportError, TransportResult};
 use super::traits::{CommitToken, RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
@@ -51,7 +52,6 @@ use crate::io::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -206,14 +206,11 @@ enum ReadLine {
 /// position tracking). Position is persisted to a `.pos` sidecar
 /// file so reads survive process restarts.
 pub struct FileTransport {
-    /// Removes this component from the health registry when it drops.
-    #[cfg(feature = "health")]
-    _health_registration: crate::health::HealthRegistration,
     config: FileTransportConfig,
     /// The send side's writer, opened on the first send.
     writer: Mutex<Option<Arc<NdjsonWriter>>>,
     reader: Mutex<Option<ReadState>>,
-    closed: Arc<AtomicBool>,
+    lifecycle: Lifecycle,
     filter_engine: super::filter::TransportFilterEngine,
 }
 
@@ -252,27 +249,11 @@ impl FileTransport {
             &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
-        let closed = Arc::new(AtomicBool::new(false));
-
-        #[cfg(feature = "health")]
-        let health_registration = {
-            let h = Arc::clone(&closed);
-            crate::health::HealthRegistry::register_scoped("transport:file", move || {
-                if h.load(Ordering::Relaxed) {
-                    crate::health::HealthStatus::Unhealthy
-                } else {
-                    crate::health::HealthStatus::Healthy
-                }
-            })
-        };
-
         Ok(Self {
-            #[cfg(feature = "health")]
-            _health_registration: health_registration,
             config: config.clone(),
             writer: Mutex::new(None),
             reader: Mutex::new(None),
-            closed,
+            lifecycle: Lifecycle::new::<Self>(|| true),
             filter_engine,
         })
     }
@@ -350,10 +331,6 @@ impl FileTransport {
 
     /// Writes `block`, holding `records` framed lines of `payload_bytes`
     /// before framing, in one write.
-    #[cfg_attr(
-        not(any(feature = "logger", feature = "metrics")),
-        allow(unused_variables)
-    )]
     async fn write_block(&self, block: Vec<u8>, records: u64, payload_bytes: u64) -> SendResult {
         let writer = match self.writer().await {
             Ok(writer) => writer,
@@ -381,13 +358,7 @@ impl FileTransport {
             "File transport: block written"
         );
 
-        #[cfg(feature = "metrics")]
-        {
-            metrics::counter!("transport_sent_total", "transport" => "file").increment(records);
-            metrics::counter!("transport_sent_bytes_total", "transport" => "file")
-                .increment(payload_bytes);
-        }
-
+        Self::count_sent(records, payload_bytes);
         SendResult::Ok
     }
 
@@ -439,7 +410,7 @@ impl FileTransport {
 
 impl TransportBase for FileTransport {
     async fn close(&self) -> TransportResult<()> {
-        self.closed.store(true, Ordering::Relaxed);
+        self.lifecycle.close();
 
         // Sync a durable writer, then drop it.
         if let Some(writer) = self.writer.lock().await.take() {
@@ -459,16 +430,20 @@ impl TransportBase for FileTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed)
+        self.lifecycle.is_healthy()
     }
 
     fn name(&self) -> &'static str {
-        "file"
+        Self::TRANSPORT
     }
 
     fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
         super::DeliveryGuarantee::Written
     }
+}
+
+impl Meter for FileTransport {
+    const TRANSPORT: &'static str = "file";
 }
 
 impl TransportSender for FileTransport {
@@ -483,17 +458,12 @@ impl TransportSender for FileTransport {
     }
 
     async fn send(&self, _destination: &str, payload: bytes::Bytes) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
 
-        // Outbound filter check
-        if self.filter_engine.has_outbound_filters() {
-            match self.filter_engine.apply_outbound(&payload) {
-                super::filter::FilterDisposition::Pass => {}
-                super::filter::FilterDisposition::Drop => return SendResult::Ok,
-                super::filter::FilterDisposition::Dlq => return SendResult::FilteredDlq,
-            }
+        if let Some(settled) = self.filter_engine.outbound_one(&payload) {
+            return settled;
         }
 
         let mut line = Vec::with_capacity(payload.len() + 1);
@@ -505,23 +475,12 @@ impl TransportSender for FileTransport {
     /// they dead-letter leaves the rest to be written and makes the answer
     /// `FilteredDlq`.
     async fn send_batch(&self, records: &[super::work_batch::Record]) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
-        let mut dead_lettered = false;
-        let mut passed: Vec<&[u8]> = Vec::with_capacity(records.len());
-        for record in records {
-            let disposition = if self.filter_engine.has_outbound_filters() {
-                self.filter_engine.apply_outbound(&record.payload)
-            } else {
-                super::filter::FilterDisposition::Pass
-            };
-            match disposition {
-                super::filter::FilterDisposition::Pass => passed.push(&record.payload),
-                super::filter::FilterDisposition::Drop => {}
-                super::filter::FilterDisposition::Dlq => dead_lettered = true,
-            }
-        }
+        let (passed, handled) = self
+            .filter_engine
+            .partition_outbound(records.iter().map(|r| r.payload.as_ref()), |p| p);
         if !passed.is_empty() {
             let payload_bytes: usize = passed.iter().map(|p| p.len()).sum();
             let mut block = Vec::with_capacity(payload_bytes + passed.len());
@@ -533,11 +492,7 @@ impl TransportSender for FileTransport {
                 return written;
             }
         }
-        if dead_lettered {
-            SendResult::FilteredDlq
-        } else {
-            SendResult::Ok
-        }
+        handled
     }
 }
 
@@ -545,7 +500,7 @@ impl TransportReceiver for FileTransport {
     type Token = FileToken;
 
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return Err(TransportError::Closed);
         }
 
@@ -586,9 +541,7 @@ impl TransportReceiver for FileTransport {
                         max_line_bytes = cap,
                         "File transport: a line over max_line_bytes is returned as a dead letter"
                     );
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!("transport_message_too_large_total", "transport" => "file")
-                        .increment(1);
+                    Self::count_too_large();
                     pending.push(ReadLine::TooLong(
                         super::filter::FilteredDlqEntry {
                             payload: head,
@@ -653,14 +606,7 @@ impl TransportReceiver for FileTransport {
             tracing::debug!(lines = messages.len(), "File transport: batch received");
         }
 
-        #[cfg(feature = "metrics")]
-        if !messages.is_empty() {
-            let bytes: usize = messages.iter().map(|m| m.payload.len()).sum();
-            metrics::counter!("transport_received_bytes_total", "transport" => "file")
-                .increment(bytes as u64);
-            metrics::counter!("transport_received_events_total", "transport" => "file")
-                .increment(messages.len() as u64);
-        }
+        Self::count_received_messages(&messages);
 
         Ok(RecvBatch {
             messages,
@@ -707,14 +653,10 @@ mod tests {
     /// replacement is not held unready by the one it replaced.
     #[cfg(feature = "health")]
     #[tokio::test]
-    #[allow(
-        clippy::used_underscore_binding,
-        reason = "the field is held only for its Drop, and this test reads its id"
-    )]
     async fn a_retired_transport_leaves_the_health_registry() {
         let dir = TempDir::new().unwrap();
         let transport = make_transport(&dir, "health.ndjson").await;
-        let id = transport._health_registration.id();
+        let id = transport.lifecycle.registration_id();
         assert!(crate::health::HealthRegistry::is_registered(id));
 
         transport.close().await.unwrap();

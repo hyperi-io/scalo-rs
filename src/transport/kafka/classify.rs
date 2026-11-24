@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::backoff::Backoff;
+use crate::transport::core::Meter;
 
 /// What a caller should do about a failed Kafka produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -625,8 +626,7 @@ impl DeliveryState {
     /// Count every failed delivery. Report the first of a run.
     pub(crate) fn record_failure(&self, err: &KafkaError, topic: &str, partition: i32) {
         self.failures.fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "metrics")]
-        ::metrics::counter!("transport_send_errors_total", "transport" => "kafka").increment(1);
+        super::KafkaTransport::count_send_error();
         if self.degraded.enter() {
             tracing::warn!(
                 topic,

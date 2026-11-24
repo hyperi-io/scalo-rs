@@ -726,9 +726,9 @@ mod tests {
             let stage = sender.coalesce.as_ref().expect("the sender joins blocks");
             let again = || {
                 prepared.fetch_add(1, Ordering::SeqCst);
-                vec![as_field(record(&name))]
+                vec![as_field(&record(&name))]
             };
-            let block = vec![as_field(record(&name))];
+            let block = vec![as_field(&record(&name))];
             stage.send(block, super::Deadline::after(0), again).await
         })
     }

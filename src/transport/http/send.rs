@@ -24,10 +24,11 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{HTTP_ACCEPTS, HttpTransportConfig};
+use super::{HTTP_ACCEPTS, HttpTransport, HttpTransportConfig};
 use crate::compression::CompressorPool;
 use crate::framing::Framing;
 use crate::sensitive::SensitiveString;
+use crate::transport::core::Meter;
 use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::proxy::{self, ProxyDialer, ProxyRefused, Refusals, Scheme};
 use crate::transport::types::SendResult;
@@ -480,12 +481,9 @@ impl Sender {
                 request = request.header(crate::transport::propagation::TRACEPARENT_HEADER, tp);
             }
 
-            #[cfg(feature = "metrics")]
-            let started = Instant::now();
+            let timer = HttpTransport::send_timer();
             let answered = request.send().await;
-            #[cfg(feature = "metrics")]
-            metrics::histogram!("transport_send_duration_seconds", "transport" => "http")
-                .record(started.elapsed().as_secs_f64());
+            timer.record();
 
             let response = match answered {
                 Ok(response) => response,
@@ -493,7 +491,7 @@ impl Sender {
                     let detail =
                         format!("HTTP request to {shown} cannot be built: {}", describe(e));
                     tracing::warn!(endpoint = %shown, records, "{detail}");
-                    count_error();
+                    HttpTransport::count_send_error();
                     return SendResult::Reject(TransportError::Send(detail));
                 }
                 Err(e) => {
@@ -502,7 +500,7 @@ impl Sender {
                     let tls = crate::tls::rustls_error(&e).map(ToString::to_string);
                     let detail = describe(e);
                     tracing::warn!(endpoint = %shown, records, error = %detail, "HTTP request failed");
-                    count_error();
+                    HttpTransport::count_send_error();
                     // A refused certificate, name or key pin is the config's to fix, so it
                     // holds the batch unless another endpoint takes it or can be retried.
                     if let Some(tls) = tls {
@@ -536,19 +534,13 @@ impl Sender {
                         status = status.as_u16(),
                         "HTTP batch delivered"
                     );
-                    #[cfg(feature = "metrics")]
-                    {
-                        metrics::counter!("transport_sent_total", "transport" => "http")
-                            .increment(records as u64);
-                        metrics::counter!("transport_sent_bytes_total", "transport" => "http")
-                            .increment(body.len() as u64);
-                    }
+                    HttpTransport::count_sent(records as u64, body.len() as u64);
                     return SendResult::Ok;
                 }
                 Answer::Reject => {
                     let detail = format!("HTTP {status} from {shown}");
                     tracing::warn!(endpoint = %shown, records, status = status.as_u16(), "HTTP batch rejected");
-                    count_error();
+                    HttpTransport::count_send_error();
                     return SendResult::Reject(if status == StatusCode::PAYLOAD_TOO_LARGE {
                         TransportError::MessageTooLarge {
                             bytes: framed_len,
@@ -567,16 +559,14 @@ impl Sender {
                         retry_after_ms = after.map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
                         "HTTP endpoint busy"
                     );
-                    #[cfg(feature = "metrics")]
-                    metrics::counter!("transport_backpressured_total", "transport" => "http")
-                        .increment(1);
+                    HttpTransport::count_backpressured();
                     retry = true;
                     wait = wait.max(after);
                     reasons.push(format!("{shown}: HTTP {status}"));
                 }
                 Answer::Hold => {
                     tracing::warn!(endpoint = %shown, records, status = status.as_u16(), "HTTP endpoint refused the request");
-                    count_error();
+                    HttpTransport::count_send_error();
                     reasons.push(format!("{shown}: HTTP {status}"));
                 }
             }
@@ -610,9 +600,4 @@ impl Sender {
             .refusal_of(target.scheme, &target.host, target.port, left)
             .await
     }
-}
-
-fn count_error() {
-    #[cfg(feature = "metrics")]
-    metrics::counter!("transport_send_errors_total", "transport" => "http").increment(1);
 }

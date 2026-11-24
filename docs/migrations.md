@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.37
 
+### A syslog sender fails readiness when closed or refused (BEHAVIOUR CHANGE)
+
+`SyslogTransport` registers a `transport:syslog` health entry, as the HTTP, OTLP and gRPC senders do. It is unhealthy once the sender is closed, and while the egress proxy refuses its CONNECT, until a send goes through. Dropping the sender removes the entry. Before, `/readyz` never saw a syslog sender, and only `is_healthy()` reported either state.
+
+**Consumer adjustment** -- a service whose syslog output may sit behind a refusing proxy no longer reports ready while it does. A service that closes a syslog sender and keeps it alive drops it instead, or `/readyz` stays unready.
+
 ### gRPC zstd needs the `compression` feature (BEHAVIOUR CHANGE)
 
 `transport-grpc` turns on tonic's gzip only, so a gRPC build links the zstd C library only with `compression`. Without it, `transport.grpc.compression: {codec: zstd}` and `VectorCompatClient::with_compression` with zstd fail validation naming `none, gzip`, and gRPC servers, gRPC clients and the OTLP gRPC client read gzip alone.

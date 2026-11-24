@@ -34,8 +34,6 @@ mod tests;
 pub use config::{OTLP_ACCEPTS, OtlpConfig, OtlpProtocol};
 pub use record::SEVERITY_HEADER;
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
@@ -46,9 +44,10 @@ use prost::Message as _;
 use tonic_types::StatusExt as _;
 
 use super::ack::{DeadLetterReason, SinkConfirmation};
+use super::core::{Lifecycle, Meter};
 use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
-use super::filter::{FilterDisposition, TransportFilterEngine, TransportFilterTierConfig};
+use super::filter::{TransportFilterEngine, TransportFilterTierConfig};
 use super::proxy::Scheme;
 use super::traits::{TransportBase, TransportSender};
 use super::types::{PayloadFormat, SendResult};
@@ -64,17 +63,15 @@ const MAX_DETAIL_CHARS: usize = 512;
 /// Every send answers within `timeout_ms`, and `send_batch_by` within its
 /// deadline too, whichever comes first.
 pub struct OtlpTransport {
-    /// Removes this component from the health registry when it drops.
-    #[cfg(feature = "health")]
-    _health_registration: crate::health::HealthRegistration,
     wire: Wire,
     resource: LogResource,
     timeout: Duration,
     max_retry_delay: Duration,
     /// The endpoint with any user name and password left out, for logs.
     endpoint: String,
-    closed: Arc<AtomicBool>,
-    /// Whether the proxy is refusing CONNECT, which fails readiness until an export goes through.
+    /// Closed, or `refusals` refused: either fails readiness.
+    lifecycle: Lifecycle,
+    /// Whether the proxy is refusing CONNECT, which lasts until an export goes through.
     refusals: crate::transport::proxy::Refusals,
     filter_engine: TransportFilterEngine,
 }
@@ -120,20 +117,10 @@ impl OtlpTransport {
             &config.filters_out,
             &TransportFilterTierConfig::from_cascade()?,
         )?;
-        let closed = Arc::new(AtomicBool::new(false));
         let refusals = crate::transport::proxy::Refusals::default();
-
-        #[cfg(feature = "health")]
-        let health_registration = {
-            let closed = Arc::clone(&closed);
+        let lifecycle = {
             let refusals = refusals.clone();
-            crate::health::HealthRegistry::register_scoped("transport:otlp", move || {
-                if closed.load(Ordering::Relaxed) || refusals.is_refused() {
-                    crate::health::HealthStatus::Unhealthy
-                } else {
-                    crate::health::HealthStatus::Healthy
-                }
-            })
+            Lifecycle::new::<Self>(move || !refusals.is_refused())
         };
 
         let endpoint = loggable(&parsed);
@@ -150,14 +137,12 @@ impl OtlpTransport {
             "OTLP logs transport built"
         );
         Ok(Self {
-            #[cfg(feature = "health")]
-            _health_registration: health_registration,
             wire,
             resource: LogResource::new(config),
             timeout: Duration::from_millis(config.timeout_ms),
             max_retry_delay: Duration::from_millis(config.max_retry_delay_ms),
             endpoint,
-            closed,
+            lifecycle,
             refusals,
             filter_engine,
         })
@@ -166,14 +151,17 @@ impl OtlpTransport {
     /// Send the records no outbound filter takes out as one export request,
     /// answering by `deadline` when there is one.
     async fn export(&self, records: &[Record], deadline: Option<Instant>) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
-        let (to_send, handled) = self.outbound(records);
+        let (to_send, handled) = self
+            .filter_engine
+            .partition_outbound(records, |r| &r.payload);
         if to_send.is_empty() {
             return handled;
         }
         let started = Instant::now();
+        let timer = Self::send_timer();
         let budget = deadline.map_or(self.timeout, |d| {
             self.timeout.min(d.saturating_duration_since(started))
         });
@@ -189,6 +177,7 @@ impl OtlpTransport {
             .await
             .unwrap_or(SendResult::Backpressured);
         self.observe(&result, sent, bytes, started, budget);
+        timer.record();
         if result.is_ok() {
             self.refusals.clear("otlp");
             handled
@@ -313,29 +302,6 @@ impl OtlpTransport {
         )
     }
 
-    /// The records outbound filters leave to send, and the result for the
-    /// block when every one of them is sent.
-    fn outbound<'a>(&self, records: &'a [Record]) -> (Vec<&'a Record>, SendResult) {
-        if !self.filter_engine.has_outbound_filters() {
-            return (records.iter().collect(), SendResult::Ok);
-        }
-        let mut dead_lettered = false;
-        let mut keep = Vec::with_capacity(records.len());
-        for record in records {
-            match self.filter_engine.apply_outbound(&record.payload) {
-                FilterDisposition::Pass => keep.push(record),
-                FilterDisposition::Drop => {}
-                FilterDisposition::Dlq => dead_lettered = true,
-            }
-        }
-        let handled = if dead_lettered {
-            SendResult::FilteredDlq
-        } else {
-            SendResult::Ok
-        };
-        (keep, handled)
-    }
-
     /// Log and count one export's result.
     fn observe(
         &self,
@@ -349,13 +315,7 @@ impl OtlpTransport {
         match result {
             SendResult::Ok => {
                 tracing::debug!(endpoint = %self.endpoint, records, bytes, elapsed_ms, "OTLP export accepted");
-                #[cfg(feature = "metrics")]
-                {
-                    metrics::counter!("transport_sent_total", "transport" => "otlp")
-                        .increment(records as u64);
-                    metrics::counter!("transport_sent_bytes_total", "transport" => "otlp")
-                        .increment(bytes as u64);
-                }
+                Self::count_sent(records as u64, bytes as u64);
             }
             SendResult::Backpressured | SendResult::RetryAfter(_) => {
                 // A refused tunnel is logged once per run, so each retry stays at debug.
@@ -371,50 +331,45 @@ impl OtlpTransport {
                         "OTLP export not taken; the records may have arrived and are sent again"
                     );
                 }
-                #[cfg(feature = "metrics")]
-                metrics::counter!("transport_backpressured_total", "transport" => "otlp")
-                    .increment(1);
+                Self::count_backpressured();
             }
             SendResult::Reject(error) => {
                 tracing::warn!(endpoint = %self.endpoint, records, error = %error, "OTLP export rejected; the records are dead-lettered");
-                #[cfg(feature = "metrics")]
-                metrics::counter!("transport_send_errors_total", "transport" => "otlp")
-                    .increment(1);
+                Self::count_send_error();
             }
             SendResult::Fatal(error) => {
                 tracing::error!(endpoint = %self.endpoint, records, error = %error, "OTLP export failed; fix the transport config or the collector");
-                #[cfg(feature = "metrics")]
-                metrics::counter!("transport_send_errors_total", "transport" => "otlp")
-                    .increment(1);
+                Self::count_send_error();
             }
             SendResult::FilteredDlq => {}
         }
-        #[cfg(feature = "metrics")]
-        metrics::histogram!("transport_send_duration_seconds", "transport" => "otlp")
-            .record(started.elapsed().as_secs_f64());
     }
 }
 
 impl TransportBase for OtlpTransport {
     /// Refuse further sends with `Fatal(Closed)`. Idempotent.
     async fn close(&self) -> TransportResult<()> {
-        self.closed.store(true, Ordering::Relaxed);
+        self.lifecycle.close();
         Ok(())
     }
 
     /// `false` after `close()`, and while the proxy refuses CONNECT. Does not
     /// probe the collector.
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed) && !self.refusals.is_refused()
+        self.lifecycle.is_healthy()
     }
 
     fn name(&self) -> &'static str {
-        "otlp"
+        Self::TRANSPORT
     }
 
     fn delivery_guarantee(&self) -> DeliveryGuarantee {
         DeliveryGuarantee::Acknowledged
     }
+}
+
+impl Meter for OtlpTransport {
+    const TRANSPORT: &'static str = "otlp";
 }
 
 impl TransportSender for OtlpTransport {

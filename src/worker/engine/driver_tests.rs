@@ -4591,6 +4591,76 @@ async fn effective_guarantee_reports_at_least_once_for_kafka_to_grpc() {
     );
 }
 
+/// A record an outbound `drop` filter matches counts once in
+/// `transport_filtered_total`, though the pipeline screens the block through
+/// the sender before the sink sends it. The `dlq` rule makes the screen read
+/// the filters, as it does for a sender that has one.
+#[cfg(feature = "metrics")]
+#[tokio::test(flavor = "current_thread")]
+async fn an_outbound_filtered_record_counts_once() {
+    use crate::transport::TransportSender as _;
+    use crate::transport::filter::{FilterAction, FilterRule};
+
+    let capture = Arc::new(GaugeCapture::default());
+    let _recorder = metrics::set_default_local_recorder(&*capture);
+    let rule = |expression: &str, action| FilterRule {
+        expression: expression.into(),
+        action,
+    };
+    let sender = MemoryTransport::new(&MemoryConfig {
+        filters_out: vec![
+            rule("has(noise)", FilterAction::Drop),
+            rule("has(poison)", FilterAction::Dlq),
+        ],
+        ..Default::default()
+    })
+    .expect("memory transport with valid filters must construct");
+    let source = HeldSource::new(AckKind::Pull, vec![vec![0, 1]]);
+    let shutdown = CancellationToken::new();
+    let stop = shutdown.clone();
+
+    default_engine()
+        .pipeline(&source)
+        .shutdown(shutdown.clone())
+        .sender(&sender)
+        .run(
+            |batch| {
+                Ok(batch.map_records(|records| {
+                    records
+                        .into_iter()
+                        .map(|mut record| {
+                            if record.payload.as_ref() == br#"{"seq":1}"# {
+                                record.payload = Bytes::from_static(br#"{"seq":1,"noise":true}"#);
+                            }
+                            record
+                        })
+                        .collect()
+                }))
+            },
+            |out: &WorkBatch<_>| {
+                let records = out.records.clone();
+                stop.cancel();
+                let sender = &sender;
+                async move {
+                    let sent = sender.send_batch(&records).await;
+                    assert!(sent.is_ok(), "{sent:?}");
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("clean shutdown");
+
+    let filtered = |action| {
+        capture.counter(
+            "transport_filtered_total",
+            &[("direction", "out"), ("action", action)],
+        )
+    };
+    assert_eq!(filtered("drop"), 1, "screened, then sent: one drop");
+    assert_eq!(filtered("dlq"), 0);
+}
+
 /// The producer ceiling of [`small_ceiling_kafka_sender`].
 #[cfg(feature = "transport-kafka")]
 const SMALL_CEILING: usize = 2_000_000;

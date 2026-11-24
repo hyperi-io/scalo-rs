@@ -57,6 +57,7 @@ pub const HTTP_ACCEPTS: Accepts = Accepts::new(
     &[Codec::None, Codec::Gzip, Codec::Zstd],
 );
 
+use super::core::{Lifecycle, Meter};
 use super::error::{TransportError, TransportResult};
 #[cfg(feature = "http-server")]
 use super::traits::RecvBatch;
@@ -69,10 +70,10 @@ use super::types::SendResult;
 use super::work_batch::WorkBatch;
 use crate::compression::{Accepts, Codec, Compression};
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "http-server", feature = "governor"))]
 use std::sync::Arc;
 #[cfg(feature = "http-server")]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The spawned axum serve loop.
 #[cfg(feature = "http-server")]
@@ -432,9 +433,6 @@ impl HttpTransportConfig {
 /// Supports send (POST to endpoint) and receive (embedded axum server).
 /// The receive side requires the `http-server` feature for axum.
 pub struct HttpTransport {
-    /// Removes this component from the health registry when it drops.
-    #[cfg(feature = "health")]
-    _health_registration: crate::health::HealthRegistration,
     /// The send side, `None` when no `endpoint` is set.
     sender: Option<send::Sender>,
 
@@ -462,11 +460,9 @@ pub struct HttpTransport {
     #[cfg(feature = "http-server")]
     server_task: parking_lot::Mutex<Option<ServerTask>>,
 
-    /// Whether the transport is closed.
-    closed: Arc<AtomicBool>,
-
-    /// Whether the proxy is refusing CONNECT, which fails readiness until a send goes through.
-    refusals: super::proxy::Refusals,
+    /// Closed, or refused by the proxy: either fails readiness, and a refusal
+    /// lasts until a send goes through.
+    lifecycle: Lifecycle,
 
     /// Receive timeout in milliseconds (used by receive side).
     #[cfg(feature = "http-server")]
@@ -622,28 +618,12 @@ impl HttpTransport {
             &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
-        let closed = Arc::new(AtomicBool::new(false));
         let refusals = sender
             .as_ref()
             .map(send::Sender::refusals)
             .unwrap_or_default();
 
-        #[cfg(feature = "health")]
-        let health_registration = {
-            let h = Arc::clone(&closed);
-            let refusals = refusals.clone();
-            crate::health::HealthRegistry::register_scoped("transport:http", move || {
-                if h.load(Ordering::Relaxed) || refusals.is_refused() {
-                    crate::health::HealthStatus::Unhealthy
-                } else {
-                    crate::health::HealthStatus::Healthy
-                }
-            })
-        };
-
         Ok(Self {
-            #[cfg(feature = "health")]
-            _health_registration: health_registration,
             sender,
             #[cfg(feature = "http-server")]
             receiver,
@@ -655,8 +635,7 @@ impl HttpTransport {
             shutdown_tx: parking_lot::Mutex::new(shutdown_tx),
             #[cfg(feature = "http-server")]
             server_task: parking_lot::Mutex::new(server_handle),
-            closed,
-            refusals,
+            lifecycle: Lifecycle::new::<Self>(move || !refusals.is_refused()),
             #[cfg(feature = "http-server")]
             recv_timeout_ms: config.recv_timeout_ms,
             filter_engine,
@@ -946,7 +925,6 @@ async fn ingest_handler(
     let timestamp_ms = crate::clock::epoch_millis();
 
     // Capture wire size before `body` moves into the message.
-    #[cfg(feature = "metrics")]
     let body_len = body.len();
 
     // `body` is `bytes::Bytes`, the request's or the decoded one, moved in.
@@ -963,24 +941,16 @@ async fn ingest_handler(
         Ok(()) => {
             // The queued record holds its bytes until `recv` hands it over.
             permit.forget();
-            #[cfg(feature = "metrics")]
-            {
-                metrics::counter!("transport_received_bytes_total", "transport" => "http")
-                    .increment(body_len as u64);
-                metrics::counter!("transport_received_events_total", "transport" => "http")
-                    .increment(1);
-            }
+            HttpTransport::count_received(1, body_len as u64);
             axum::http::StatusCode::OK.into_response()
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            #[cfg(feature = "metrics")]
-            metrics::counter!("transport_backpressured_total", "transport" => "http").increment(1);
+            HttpTransport::count_backpressured();
             shed_503()
         }
         // A closed receiver is shutting down: 503 so the sender retries, not drops.
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            #[cfg(feature = "metrics")]
-            metrics::counter!("transport_refused_total", "transport" => "http").increment(1);
+            HttpTransport::count_refused();
             shed_503()
         }
     }
@@ -1009,7 +979,7 @@ impl TransportBase for HttpTransport {
     /// returns. Waits for a `recv` in progress (at most `recv_timeout_ms`).
     /// Idempotent.
     async fn close(&self) -> TransportResult<()> {
-        self.closed.store(true, Ordering::Relaxed);
+        self.lifecycle.close();
 
         #[cfg(feature = "http-server")]
         {
@@ -1022,11 +992,11 @@ impl TransportBase for HttpTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed) && !self.refusals.is_refused()
+        self.lifecycle.is_healthy()
     }
 
     fn name(&self) -> &'static str {
-        "http"
+        Self::TRANSPORT
     }
 
     fn delivery_guarantee(&self) -> super::DeliveryGuarantee {
@@ -1042,27 +1012,15 @@ impl HttpTransport {
         records: impl Iterator<Item = (&str, &bytes::Bytes)>,
         deadline: Option<std::time::Instant>,
     ) -> SendResult {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
-        let filtered = self.filter_engine.has_outbound_filters();
-        let mut outcome = super::types::BlockOutcome::default();
-        let mut kept: Vec<(&str, &[u8])> = Vec::new();
-        for (destination, payload) in records {
-            if filtered {
-                match self.filter_engine.apply_outbound(payload) {
-                    super::filter::FilterDisposition::Pass => {}
-                    super::filter::FilterDisposition::Drop => continue,
-                    super::filter::FilterDisposition::Dlq => {
-                        let _ = outcome.add(SendResult::FilteredDlq);
-                        continue;
-                    }
-                }
-            }
-            kept.push((destination, payload.as_ref()));
-        }
+        let (kept, handled) = self.filter_engine.partition_outbound(
+            records.map(|(destination, payload)| (destination, payload.as_ref())),
+            |(_, payload)| payload,
+        );
         if kept.is_empty() {
-            return outcome.finish();
+            return handled;
         }
         let Some(sender) = &self.sender else {
             return SendResult::Fatal(TransportError::Config(
@@ -1085,11 +1043,12 @@ impl HttpTransport {
                     })
             }
         };
-        match outcome.add(sent) {
-            Some(ended) => ended,
-            None => outcome.finish(),
-        }
+        if sent.is_ok() { handled } else { sent }
     }
+}
+
+impl Meter for HttpTransport {
+    const TRANSPORT: &'static str = "http";
 }
 
 impl TransportSender for HttpTransport {
@@ -1144,7 +1103,7 @@ impl TransportReceiver for HttpTransport {
             use tokio::sync::mpsc::error::TryRecvError;
 
             let Some(receiver) = &self.receiver else {
-                if self.closed.load(Ordering::Relaxed) {
+                if self.lifecycle.is_closed() {
                     return Err(TransportError::Closed);
                 }
                 return Err(TransportError::Config(
@@ -1212,7 +1171,7 @@ impl TransportReceiver for HttpTransport {
         #[cfg(not(feature = "http-server"))]
         {
             let _ = max;
-            if self.closed.load(Ordering::Relaxed) {
+            if self.lifecycle.is_closed() {
                 return Err(TransportError::Closed);
             }
             Err(TransportError::Config(
@@ -1242,6 +1201,8 @@ impl super::traits::FromCascade for HttpTransportConfig {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "http-server")]
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn http_token_display() {
@@ -1547,8 +1508,10 @@ mod tests {
     #[tokio::test]
     async fn a_spooled_record_survives_a_server_error_and_is_delivered() {
         use crate::tiered_sink::{TieredSink, TieredSinkConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU16, Ordering};
 
-        let status = Arc::new(std::sync::atomic::AtomicU16::new(500));
+        let status = Arc::new(AtomicU16::new(500));
         let addr = switchable_endpoint(Arc::clone(&status)).await;
         let sender = HttpTransport::new(&HttpTransportConfig::sender(&format!("http://{addr}")))
             .await
@@ -1566,7 +1529,7 @@ mod tests {
             headers: Vec::new(),
             metadata: crate::transport::RecordMeta {
                 timestamp_ms: None,
-                format: PayloadFormat::Json,
+                format: crate::transport::PayloadFormat::Json,
             },
         };
         tiered.send(&record).await.expect("spooled on the 500");
@@ -1593,8 +1556,9 @@ mod tests {
     /// holds at the time.
     #[cfg(feature = "tiered-sink")]
     async fn switchable_endpoint(
-        status: Arc<std::sync::atomic::AtomicU16>,
+        status: std::sync::Arc<std::sync::atomic::AtomicU16>,
     ) -> std::net::SocketAddr {
+        use std::sync::atomic::Ordering;
         send_tests::Server::start(move |_| send_tests::reply(status.load(Ordering::SeqCst), &[]))
             .await
             .addr

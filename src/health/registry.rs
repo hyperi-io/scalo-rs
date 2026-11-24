@@ -168,6 +168,22 @@ impl HealthRegistry {
             .is_ok_and(|components| components.iter().any(|c| c.id == id))
     }
 
+    /// The name and current status of the entry `id`, while it is registered.
+    #[cfg(all(test, feature = "transport-syslog"))]
+    pub(crate) fn entry(id: u64) -> Option<(String, HealthStatus)> {
+        let found = Self::global()
+            .components
+            .lock()
+            .ok()
+            .and_then(|components| {
+                components
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| (c.name.clone(), Arc::clone(&c.check)))
+            });
+        found.map(|(name, check)| (name, check()))
+    }
+
     /// Snapshot every registered check, drop the registry lock, then run
     /// the checks. A check callback that re-enters
     /// [`HealthRegistry::register`] (or any other path that takes the
