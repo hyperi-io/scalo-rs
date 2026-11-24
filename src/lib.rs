@@ -144,6 +144,9 @@ pub mod registry;
 // Many encoded records in one unit, and back: NDJSON, JSON arrays, RFC 6587.
 pub mod framing;
 
+// One codec setting for every surface. The engines need `compression`.
+pub mod compression;
+
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 pub mod runtime;
@@ -380,8 +383,8 @@ pub use spool::{Spool, SpoolConfig, SpoolError};
 #[cfg(feature = "tiered-sink")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tiered-sink")))]
 pub use tiered_sink::{
-    CircuitBreaker, CircuitState, CompressionCodec, DrainStrategy, OrderingMode, TieredSink,
-    TieredSinkConfig, TieredSinkError,
+    CircuitBreaker, CircuitState, DrainStrategy, OrderingMode, TieredSink, TieredSinkConfig,
+    TieredSinkError,
 };
 
 #[cfg(feature = "secrets")]

@@ -101,12 +101,13 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Transport | [transport/backends.md](transport/backends.md) | Kafka, gRPC, Memory, File, Pipe, HTTP, Syslog, OTLP |
 | Transport | [transport/syslog.md](transport/syslog.md) | RFC 5424 and 3164 over TCP, TLS, UDP and RELP, and how each failure answers |
 | Transport | [transport/grpc.md](transport/grpc.md) | gRPC `send_batch` blocks joined into one call |
-| Transport | [transport/http.md](transport/http.md) | HTTP sending: credentials, body framing, gzip, failover, proxy, redirects, status answers |
+| Transport | [transport/http.md](transport/http.md) | HTTP sending: credentials, body framing, compression, failover, proxy, redirects, status answers |
 | Transport | [transport/otlp.md](transport/otlp.md) | OTLP log records to a collector over gRPC or HTTP, and how each answer maps |
 | Transport | [transport/filter-engine.md](transport/filter-engine.md) | 3-tier filter (SIMD / compiled CEL / complex CEL) |
 | Transport | [transport/routing.md](transport/routing.md) | `RoutedSender`, the named sink set: routes, fan-out |
 | Transport | [transport/delivery-path.md](transport/delivery-path.md) | Inline delivery, the gRPC fan-in buffer, the benched alternatives and their numbers, parked parallel fan-out |
 | Transport | [transport/custom.md](transport/custom.md) | Writing a custom sender, registering it by type name, the delivery guarantee |
+| Transport | [compression.md](compression.md) | The `compression` key every surface reads, the codecs each takes, the block and stream engines |
 | Transport | [transport/framing.md](transport/framing.md) | NDJSON, JSON array, RFC 6587 and the other batch framings, decode limits, streams, your own framing |
 | Deployment | [deployment/README.md](deployment/README.md) | Section landing |
 | Deployment | [deployment/contract.md](deployment/contract.md) | `DeploymentContract` struct, schema versioning |

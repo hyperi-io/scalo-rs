@@ -20,7 +20,7 @@
 //!     path: /var/spool/scalo/dlq
 //!     rotation: hourly
 //!     max_age_days: 30
-//!     compress_rotated: true
+//!     compress_rotated: {codec: gzip}
 //!   kafka:
 //!     enabled: true
 //!     routing: per_table
@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 // Re-export RotationPeriod from the shared io module so existing consumers
 // of `dlq::RotationPeriod` continue to work without changes.
+use crate::compression::{Codec, Compression};
 pub use crate::io::RotationPeriod;
 use crate::io::{DEFAULT_SPOOL_ROOT, FileWriteOptions, FileWriterConfig};
 
@@ -144,8 +145,13 @@ pub struct FileDlqConfig {
     /// Auto-cleanup files older than this many days.
     pub max_age_days: u32,
 
-    /// Gzip rotated files, keeping the six newest uncompressed.
-    pub compress_rotated: bool,
+    /// Codec for rotated files past the six newest: `none`, `gzip` or `zstd`.
+    /// Default gzip.
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(schema_with = "crate::io::compress_rotated_schema")
+    )]
+    pub compress_rotated: Compression,
 
     /// Size rotation, retention by count, `durable` and file modes.
     #[serde(flatten)]
@@ -159,7 +165,7 @@ impl Default for FileDlqConfig {
             path: PathBuf::from(DEFAULT_SPOOL_ROOT).join("dlq"),
             rotation: RotationPeriod::default(),
             max_age_days: 30,
-            compress_rotated: true,
+            compress_rotated: Compression::new(Codec::Gzip),
             write: FileWriteOptions::default(),
         }
     }
@@ -267,7 +273,7 @@ mod tests {
         assert!(config.file.enabled);
         assert_eq!(config.file.path, PathBuf::from("/var/spool/scalo/dlq"));
         assert_eq!(config.file.max_age_days, 30);
-        assert!(config.file.compress_rotated);
+        assert_eq!(config.file.compress_rotated, Compression::new(Codec::Gzip));
         assert_eq!(config.file.rotation, RotationPeriod::Hourly);
     }
 
@@ -317,7 +323,7 @@ mod tests {
                 path: "/tmp/test-dlq".into(),
                 rotation: RotationPeriod::Daily,
                 max_age_days: 7,
-                compress_rotated: false,
+                compress_rotated: crate::compression::Compression::NONE,
                 write: crate::io::FileWriteOptions {
                     max_bytes: Some(1 << 20),
                     max_files: Some(4),

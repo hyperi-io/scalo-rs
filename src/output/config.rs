@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::compression::{Codec, Compression};
 use crate::io::{DEFAULT_SPOOL_ROOT, FileWriteOptions, FileWriterConfig, RotationPeriod};
 
 /// File output sink configuration.
@@ -37,8 +38,9 @@ pub struct FileOutputConfig {
     /// Auto-cleanup files older than this many days.
     pub max_age_days: u32,
 
-    /// Gzip rotated files, keeping the six newest uncompressed.
-    pub compress_rotated: bool,
+    /// Codec for rotated files past the six newest: `none`, `gzip` or `zstd`.
+    /// Default gzip.
+    pub compress_rotated: Compression,
 
     /// Size rotation, retention by count, `durable` and file modes.
     #[serde(flatten)]
@@ -53,7 +55,7 @@ impl Default for FileOutputConfig {
             filename: "events.ndjson".to_string(),
             rotation: RotationPeriod::Hourly,
             max_age_days: 7,
-            compress_rotated: true,
+            compress_rotated: Compression::new(Codec::Gzip),
             write: FileWriteOptions::default(),
         }
     }
@@ -85,7 +87,7 @@ mod tests {
         assert_eq!(config.filename, "events.ndjson");
         assert_eq!(config.rotation, RotationPeriod::Hourly);
         assert_eq!(config.max_age_days, 7);
-        assert!(config.compress_rotated);
+        assert_eq!(config.compress_rotated, Compression::new(Codec::Gzip));
         assert_eq!(config.write, FileWriteOptions::default());
     }
 
@@ -97,7 +99,7 @@ mod tests {
             filename: "data.ndjson".into(),
             rotation: RotationPeriod::Daily,
             max_age_days: 30,
-            compress_rotated: false,
+            compress_rotated: crate::compression::Compression::NONE,
             write: FileWriteOptions {
                 max_bytes: Some(4096),
                 durable: true,

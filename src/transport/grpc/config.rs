@@ -8,7 +8,22 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compression::{Accepts, Codec, Compression};
 use crate::transport::tonic_channel::DEFAULT_SEND_TIMEOUT_MS;
+
+/// The codecs a gRPC or Vector-compat client sends with. tonic applies them
+/// and fixes the level, so none is taken and scalo's engine is not needed.
+pub const GRPC_ACCEPTS: Accepts = Accepts::new(
+    "transport.grpc.compression",
+    &[Codec::None, Codec::Gzip, Codec::Zstd],
+)
+.without_level()
+.external();
+
+#[cfg(feature = "config-schema")]
+fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    GRPC_ACCEPTS.schema()
+}
 
 /// gRPC transport configuration.
 ///
@@ -64,8 +79,13 @@ pub struct GrpcConfig {
     /// Maximum message size in bytes (both send and receive).
     pub max_message_size: usize,
 
-    /// Enable gzip compression for gRPC messages.
-    pub compression: bool,
+    /// Codec the client sends requests with: `none` (default), `gzip` or
+    /// `zstd`, with no level. The server reads either on every connection.
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(schema_with = "compression_schema")
+    )]
+    pub compression: Compression,
 
     // --- Client TLS, mapped onto tonic's ClientTlsConfig by crate::tls. In-cluster
     // gRPC is usually mesh mTLS, so these are for direct TLS to a remote endpoint. ---
@@ -151,7 +171,7 @@ impl Default for GrpcConfig {
             recv_timeout_ms: 100,
             send_timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
             max_message_size: 16 * 1024 * 1024, // 16 MB
-            compression: false,
+            compression: Compression::NONE,
             tls_enabled: false,
             tls_ca_path: None,
             tls_domain: None,
@@ -196,11 +216,23 @@ impl GrpcConfig {
         }
     }
 
-    /// Enable gzip compression.
+    /// Send requests compressed with `compression`.
     #[must_use]
-    pub fn with_compression(mut self) -> Self {
-        self.compression = true;
+    pub fn with_compression(mut self, compression: Compression) -> Self {
+        self.compression = compression;
         self
+    }
+
+    /// `compression`, if [`GRPC_ACCEPTS`] takes it.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` naming the codecs gRPC takes, or a level.
+    pub fn check_compression(&self) -> crate::transport::TransportResult<()> {
+        GRPC_ACCEPTS
+            .check(self.compression)
+            .map(drop)
+            .map_err(|e| crate::transport::TransportError::Config(e.to_string()))
     }
 
     /// Set max message size.

@@ -8,6 +8,32 @@ release and the target before bumping.
 
 ## 2.14.35
 
+### Every compression setting is one `{codec, level}` key, `scalo::compression` (API and BEHAVIOUR CHANGE)
+
+`scalo::compression::{Codec, Compression, Accepts}` is the one compression setting, read as `{codec: zstd, level: 3}` everywhere, with the codec's default level when `level` is unset (zstd 3, gzip 6). Each surface refuses a codec or level it does not take when it is built. The `compression` feature holds the zstd, LZ4 and gzip engines (`Compressor`, `Encoder`, `Decoder`) and tonic's gzip and zstd, and `compression-snappy` adds snappy. See [compression.md](compression.md). The old keys are gone, with no alias:
+
+| Surface | Was | Is |
+| --- | --- | --- |
+| Tiered sink | `compression: {zstd: {level: 1}}`, `CompressionCodec`, default zstd 1 | `compression: {codec: zstd}`, `Compression`, default zstd 3. snappy needs `compression-snappy` |
+| DLQ file, file output, `FileWriterConfig` | `compress_rotated: true` | `compress_rotated: {codec: gzip}`, the default. `zstd` writes `.zst` |
+| File transport | `compress_rotated: false` | `compress_rotated: {codec: none}`, the default |
+| HTTP send | `gzip: true`, level 1 | `compression: {codec: gzip}`, level 6, or `zstd` |
+| OTLP | `compression: gzip`, `OtlpCompression` | `compression: {codec: gzip}`, no level. `OtlpCompression` is gone |
+| gRPC | `compression: true` (gzip), `with_compression()` | `compression: {codec: gzip}` or `zstd`, no level, `with_compression(Compression)` |
+| Kafka producer | `sizing.producer.compression_type: lz4` | `sizing.producer.compression: {codec: lz4}`. A gzip producer now sets `compression.level` 6, librdkafka's own default |
+
+Behaviour that changes with no config:
+
+- A tiered sink spills at zstd level 3, where it was 1. Records spilled at level 1 still drain.
+- A gRPC server reads zstd as well as gzip, and every gRPC and OTLP client accepts both in answers.
+- The HTTP receive side decodes a gzip or zstd `Content-Encoding` before queueing, to at most `max_body_bytes` (413 past it, 400 for bytes that do not decode), reserving `max_body_bytes` more in-flight bytes while it decodes. Any other coding is 415, where the body was queued undecoded.
+- A tiered sink's drain no longer drops an entry that does not decompress or decode under its codec. It holds with that entry on disk, sets `tiered_sink_drain_held`, fails readiness and resumes when the sink reopens under the codec that wrote it. A CRC failure is still dropped.
+- `VectorCompatClient` still pushes gzip, and `with_compression` sets another codec.
+- A file writer refuses `compress_rotated` set to `lz4` or `snappy` at open, and retention counts `.zst` files as rotated.
+- `tiered-sink` no longer pulls `snap`, and `tonic` is built with `zstd` as well as `gzip`.
+
+**Consumer adjustment** -- rewrite each key in the table, in YAML, env (`..._COMPRESSION__CODEC=gzip`) and struct literals (`Compression::new(Codec::Gzip)`, `Compression::NONE`). A tiered sink set to `snappy` enables `compression-snappy`. Drain a tiered sink's spill cache before changing its codec: entries carry no codec tag.
+
 ### A refused proxy CONNECT holds the records (BEHAVIOUR CHANGE)
 
 A proxy that refused the CONNECT, as a 403 for a port it doesn't allow or a 407 for credentials it wants, was `Reject` on the gRPC, HTTP, OTLP and syslog transports, so a caller dead-lettered every record. It is `Backpressured` and the caller keeps the records and retries them, as for a Kafka client the broker refuses. The first refusal of a run is logged with the proxy's status and the target port, and each one adds to `transport_proxy_refused_total{transport}`. `is_healthy()` and the `transport:grpc`, `transport:http` and `transport:otlp` health checks report not-ready until a send goes through. `transport::proxy::rejected` is gone, and `transport::proxy::Refusals` replaces it. See [transport/http.md](transport/http.md#proxy-redirects-and-logs).

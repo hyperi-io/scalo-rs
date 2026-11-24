@@ -194,7 +194,7 @@ mod tests {
             filename: "events.ndjson".into(),
             rotation: RotationPeriod::Daily,
             max_age_days: 1,
-            compress_rotated: false,
+            compress_rotated: crate::compression::Compression::NONE,
             ..FileOutputConfig::default()
         }
     }

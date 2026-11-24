@@ -876,7 +876,7 @@ mod tests {
                 path: dir.to_path_buf(),
                 rotation: RotationPeriod::Daily,
                 max_age_days: 1,
-                compress_rotated: false,
+                compress_rotated: crate::compression::Compression::NONE,
                 ..FileDlqConfig::default()
             },
             mode: DlqMode::FileOnly,

@@ -12,7 +12,7 @@ transport:
       headers:
         authorization: "Bearer <token>"
       timeout_ms: 10000
-      compression: gzip           # default none
+      compression: {codec: gzip}  # default none. No level
       max_retry_delay_ms: 300000
       service_name: my-app
       resource_attributes:

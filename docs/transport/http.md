@@ -15,7 +15,7 @@ transport:
       headers: { X-Tenant: acme }
       user_agent: "my-app/1.4"
       framing: { type: json_wrapped, key: events }        # default single
-      gzip: true                                          # default false
+      compression: {codec: gzip}                          # gzip or zstd, default none
       success_status: [200, 201, 204]                     # default any 2xx
       proxy: system                                       # none (default), system or a URL
       follow_redirects: false                             # default false
@@ -68,7 +68,7 @@ register_framing("counted", Arc::new(Counted))?;
 // transport.output.http.framing: { type: counted }
 ```
 
-`gzip: true` compresses each body at the fastest level and sends `Content-Encoding: gzip`.
+`compression` compresses each body and sends the codec as `Content-Encoding`: `gzip` (level 6 unless `level` is set) or `zstd` (level 3). The receiver must decode it, as scalo's own HTTP receive side does ([backends.md](backends.md#http)). LZ4 and snappy have no HTTP content coding, so they are refused at build. See [../compression.md](../compression.md).
 
 ## Answers, failover and the deadline
 
@@ -93,7 +93,7 @@ Each body goes to `endpoint`, then each `failover` endpoint in order, starting f
 - `proxy: none`, the default, connects directly whatever `HTTP_PROXY` says. `system` takes `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` from the environment, then fills what they leave unset from the machine WinHTTP proxy on Windows (`netsh winhttp set proxy`) or the System Settings proxies on macOS. A URL sends every request through that proxy, and `user:password@` in it is basic proxy auth, never logged. Only an `http://` proxy is taken. An https endpoint goes through a CONNECT tunnel. A CONNECT the proxy refuses is `Backpressured`, so the batch is held and sent again: the proxy's policy is the operator's to fix and the records are fine, and many proxies allow CONNECT to port 443 only. Each refusal adds to `transport_proxy_refused_total`, the first of a run is logged with the proxy's status and the endpoint's port, and `is_healthy()` and the `transport:http` health check report not-ready until a send goes through. The gRPC transport takes the same `proxy` key.
 - Redirects are refused: a 3xx is `Fatal(Config)`, and the `Location` is never requested. `follow_redirects: true` follows up to 5 redirects within the endpoint's own scheme, host and port, so a credential never goes to a host the config didn't name. A 307 or 308 resends the body. A 301, 302 or 303 turns the POST into a body-less GET, which an intake answers with an error.
 
-- `info` once at build: the endpoints, the `auth` kind, the header names, framing, gzip, proxy kind and redirect setting.
+- `info` once at build: the endpoints, the `auth` kind, the header names, framing, compression, proxy kind and redirect setting.
 - `warn` per endpoint that fails a body, `error` when no endpoint takes it for a reason a retry won't fix, `debug` per body delivered, `trace` per record framed.
 - `transport_sent_total` counts records, `transport_sent_bytes_total` bytes on the wire, `transport_backpressured_total` and `transport_send_errors_total` endpoint answers, and `transport_send_duration_seconds` each request.
 

@@ -16,7 +16,7 @@
 //!
 //! `NdjsonWriter` handles:
 //! - Rotation by local time (hourly, daily), by size, or both
-//! - Gzip of rotated files, keeping the six newest plain
+//! - Compression of rotated files (`compress_rotated`, gzip by default), keeping the six newest plain
 //! - Removal of rotated files by age and by count
 //! - Optional `durable` writes, synced to disk before they return
 //! - File and directory modes on Unix, the umask's unless set
@@ -31,7 +31,10 @@ mod config;
 mod ndjson_writer;
 mod rotating;
 
+#[cfg(feature = "config-schema")]
+pub(crate) use config::compress_rotated_schema;
 pub use config::{
-    DEFAULT_SPOOL_ROOT, FileMode, FileWriteOptions, FileWriterConfig, RotationPeriod,
+    DEFAULT_SPOOL_ROOT, FileMode, FileWriteOptions, FileWriterConfig, ROTATED_ACCEPTS,
+    RotationPeriod,
 };
 pub use ndjson_writer::{AsyncNdjsonWriter, NdjsonWriter};

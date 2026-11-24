@@ -502,6 +502,7 @@ mod tests {
     use super::super::batch::{record_to_proto, records_to_proto};
     use super::super::proto;
     use super::super::{CoalesceConfig, GrpcConfig, GrpcTransport, as_field};
+    use crate::compression::{Codec, Compression};
     use crate::transport::error::TransportError;
     use crate::transport::filter::{FilterAction, FilterRule};
     use crate::transport::traits::{TransportBase, TransportSender};
@@ -1299,7 +1300,10 @@ mod tests {
     async fn a_joined_call_past_the_receivers_limit_goes_again_block_by_block() {
         const LIMIT: usize = 1024;
         let (calls, uri) = recording_within(0, LIMIT).await;
-        let sender = sender(client(&uri, joining(1 << 16, 1)).with_compression()).await;
+        let sender = sender(
+            client(&uri, joining(1 << 16, 1)).with_compression(Compression::new(Codec::Gzip)),
+        )
+        .await;
         let first = offer(&sender, &["x"]);
         calls.arrived(1).await;
         // Four blocks of 600 bytes: each fits the receiver, and no two do.

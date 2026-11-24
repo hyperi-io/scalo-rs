@@ -44,6 +44,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+
+use crate::compression::{Accepts, Codec, Compression};
 use std::fmt;
 use std::str::FromStr;
 
@@ -81,19 +83,22 @@ pub const PARTITION_FETCH_BYTES: i32 = 1_048_576;
 // Producer codec
 // ============================================================================
 
-/// The codec every sizing profile produces with.
+/// The codec every sizing profile produces with, at its default level 3.
 ///
 /// Every app image has to link a librdkafka built with zstd: without it,
 /// producer creation fails on this default, and a consumer cannot read the
 /// batches it writes.
-pub(crate) const DEFAULT_PRODUCER_CODEC: &str = "zstd";
+pub(crate) const DEFAULT_PRODUCER_COMPRESSION: Compression = Compression::new(Codec::Zstd);
 
-/// The `compression.level` zstd runs at unless a raw map names one.
-///
-/// librdkafka reads a level against whichever codec is set, and lz4 switches
-/// to its slow high-compression mode from 3, so the level is only ever set
-/// while the codec is zstd.
-pub(crate) const ZSTD_COMPRESSION_LEVEL: &str = "3";
+/// The codecs `sizing.producer.compression` takes. librdkafka applies them, so
+/// snappy needs no scalo feature.
+pub const KAFKA_ACCEPTS: Accepts =
+    Accepts::new("kafka.sizing.producer.compression", &Codec::ALL).external();
+
+#[cfg(feature = "config-schema")]
+fn producer_compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    KAFKA_ACCEPTS.schema()
+}
 
 // ============================================================================
 // Consumer group protocol (KIP-848)
@@ -264,7 +269,7 @@ impl SelfRegulationProfile {
                 // 20 ms -- enough time to fill the 128 KiB batch.
                 linger_ms: Some(20),
                 // The same codec on every profile. The level follows it.
-                compression_type: Some(DEFAULT_PRODUCER_CODEC.to_string()),
+                compression: Some(DEFAULT_PRODUCER_COMPRESSION),
                 // 64 MiB total producer queue (queue.buffering.max.kbytes in KiB).
                 buffer_memory_bytes: Some(67_108_864),
                 // 5 in-flight per connection -- matches exactly-once safe limit.
@@ -279,7 +284,7 @@ impl SelfRegulationProfile {
             Self::Balanced => ProducerKnobs {
                 batch_size_bytes: Some(65_536), // 64 KiB
                 linger_ms: Some(5),
-                compression_type: Some(DEFAULT_PRODUCER_CODEC.to_string()),
+                compression: Some(DEFAULT_PRODUCER_COMPRESSION),
                 buffer_memory_bytes: Some(33_554_432), // 32 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
@@ -288,7 +293,7 @@ impl SelfRegulationProfile {
             Self::LowLatency => ProducerKnobs {
                 batch_size_bytes: Some(16_384), // 16 KiB
                 linger_ms: Some(0),             // send immediately
-                compression_type: Some(DEFAULT_PRODUCER_CODEC.to_string()),
+                compression: Some(DEFAULT_PRODUCER_COMPRESSION),
                 buffer_memory_bytes: Some(16_777_216), // 16 MiB
                 max_in_flight: Some(5),
                 idempotence: None,
@@ -376,17 +381,20 @@ pub struct ProducerKnobs {
     #[serde(default)]
     pub linger_ms: Option<u32>,
 
-    /// Compression codec for MessageSets.
+    /// Codec and level for MessageSets: librdkafka's `compression.type` and
+    /// `compression.level`. Codec `none`, `gzip`, `snappy`, `lz4` or `zstd`.
+    /// Default (all profiles): zstd at level 3.
     ///
-    /// librdkafka: `compression.type` (alias for `compression.codec`).
-    /// Valid values: `none`, `gzip`, `snappy`, `lz4`, `zstd`.
-    /// Default (all profiles): `zstd` at `compression.level` 3.
-    ///
-    /// The level is set only while the resolved codec is `zstd`, so another
-    /// codec named here runs at librdkafka's own default level for it. To run
-    /// zstd at another level, set `compression.level` in `producer_librdkafka`.
+    /// An unset level is the codec's default (zstd 3, gzip 6), and lz4, snappy
+    /// and none set no level, so lz4 never drops into its slow high-compression
+    /// mode. A raw map that names a codec takes that codec's default level, or
+    /// keeps this level when it names this codec.
     #[serde(default)]
-    pub compression_type: Option<String>,
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(schema_with = "producer_compression_schema")
+    )]
+    pub compression: Option<Compression>,
 
     /// Total byte budget for the producer's in-memory queue.
     ///
@@ -605,9 +613,10 @@ impl KafkaSizingConfig {
     /// The transport applies [`KafkaConfig::librdkafka_overrides`] after this
     /// map on every producer path.
     ///
-    /// `compression.level` follows the codec: 3 while the resolved codec is
-    /// `zstd` and no raw map names a level, unset for any other codec. A raw
-    /// key also replaces its librdkafka alias from the layers below it.
+    /// `compression.level` follows the codec: the named compression's level,
+    /// or the default level of a codec a raw map names, unless a raw map names
+    /// a level. A raw key also replaces its librdkafka alias from the layers
+    /// below it.
     ///
     /// KIP-794 note: librdkafka does not support `partitioner.ignore.keys` (a
     /// Java-client-only property). The librdkafka equivalent for uniform sticky
@@ -638,8 +647,16 @@ impl KafkaSizingConfig {
         }
         let layers = [raw_layer(&self.producer_librdkafka), outer];
         overlay_raw_layers(&mut map, &layers);
-        settle_compression_level(&mut map, &layers);
+        settle_compression_level(&mut map, &layers, self.producer_compression());
         map
+    }
+
+    /// The named producer compression: the knob, else the profile's.
+    fn producer_compression(&self) -> Compression {
+        self.producer
+            .compression
+            .or(self.profile.producer_defaults().compression)
+            .unwrap_or(Compression::NONE)
     }
 
     /// The producer map from the profile and the named knobs alone.
@@ -656,12 +673,7 @@ impl KafkaSizingConfig {
             .linger_ms
             .or(profile_knobs.linger_ms)
             .unwrap_or(5);
-        let compression_type = self
-            .producer
-            .compression_type
-            .clone()
-            .or(profile_knobs.compression_type)
-            .unwrap_or_else(|| "none".to_string());
+        let compression = self.producer_compression();
         let buffer_memory_bytes = self
             .producer
             .buffer_memory_bytes
@@ -695,7 +707,13 @@ impl KafkaSizingConfig {
         let mut map = BTreeMap::new();
         map.insert("batch.size".to_string(), batch_size_bytes.to_string());
         map.insert("linger.ms".to_string(), linger_ms.to_string());
-        map.insert("compression.type".to_string(), compression_type);
+        map.insert(
+            "compression.type".to_string(),
+            compression.codec.name().to_string(),
+        );
+        if let Some(level) = compression.effective_level() {
+            map.insert("compression.level".to_string(), level.to_string());
+        }
         map.insert(
             "queue.buffering.max.kbytes".to_string(),
             buffer_kib.to_string(),
@@ -830,21 +848,34 @@ fn overlay_raw_layers(map: &mut BTreeMap<String, String>, layers: &[RawLayer<'_>
     }
 }
 
-/// Give zstd [`ZSTD_COMPRESSION_LEVEL`] unless one of `layers` named a level.
-fn settle_compression_level(map: &mut BTreeMap<String, String>, layers: &[RawLayer<'_>]) {
-    let level_named = layers
-        .iter()
-        .flatten()
-        .any(|&(k, _)| k == "compression.level");
-    let codec = map
-        .get("compression.type")
-        .or_else(|| map.get("compression.codec"));
-    if !level_named && codec.is_some_and(|c| c.eq_ignore_ascii_case(DEFAULT_PRODUCER_CODEC)) {
-        map.insert(
-            "compression.level".to_string(),
-            ZSTD_COMPRESSION_LEVEL.to_string(),
-        );
+/// Match `compression.level` to a codec a raw layer chose, unless a raw layer
+/// named a level: `named`'s level when it is the same codec, else that codec's
+/// default, else no level. librdkafka reads a level against whichever codec is
+/// set, so a level never outlives the codec it was for.
+fn settle_compression_level(
+    map: &mut BTreeMap<String, String>,
+    layers: &[RawLayer<'_>],
+    named: Compression,
+) {
+    let raw_named = |key: &str| layers.iter().flatten().any(|&(k, _)| k == key);
+    if raw_named("compression.level")
+        || !(raw_named("compression.type") || raw_named("compression.codec"))
+    {
+        return;
     }
+    let codec: Option<Codec> = map
+        .get("compression.type")
+        .or_else(|| map.get("compression.codec"))
+        .and_then(|c| c.parse().ok());
+    let level = match codec {
+        Some(codec) if codec == named.codec => named.effective_level(),
+        Some(codec) => codec.default_level(),
+        None => None,
+    };
+    match level {
+        Some(level) => map.insert("compression.level".to_string(), level.to_string()),
+        None => map.remove("compression.level"),
+    };
 }
 
 // ============================================================================
@@ -1503,7 +1534,7 @@ pub struct KafkaConfig {
     ///     consumer:
     ///       fetch_min_bytes: 2097152  # 2 MiB, overrides profile default
     ///     producer:
-    ///       compression_type: lz4     # the default is zstd at level 3
+    ///       compression: {codec: lz4} # the default is zstd at level 3
     ///     consumer_librdkafka:
     ///       fetch.wait.max.ms: "75"   # raw override wins over the knobs
     ///     producer_librdkafka:
@@ -2087,6 +2118,11 @@ impl KafkaConfig {
                 "kafka: SASL PLAIN requires security_protocol=sasl_ssl (got {protocol}, with \
                  {plain}) -- never send a PLAIN password over a plaintext transport"
             ));
+        }
+        if let Some(compression) = self.sizing.producer.compression {
+            KAFKA_ACCEPTS
+                .check(compression)
+                .map_err(|e| format!("kafka: {e}"))?;
         }
         if !is_production {
             return Ok(());
@@ -3437,7 +3473,7 @@ mod tests {
             profile: SelfRegulationProfile::Throughput,
             producer: ProducerKnobs {
                 linger_ms: Some(99), // override the 20 ms throughput default
-                compression_type: Some("lz4".to_string()),
+                compression: Some(Compression::new(Codec::Lz4)),
                 ..Default::default()
             },
             ..Default::default()
@@ -3488,8 +3524,8 @@ mod tests {
         let s = KafkaSizingConfig {
             profile: SelfRegulationProfile::Throughput,
             producer: ProducerKnobs {
-                linger_ms: Some(20),                       // named knob
-                compression_type: Some("lz4".to_string()), // named knob
+                linger_ms: Some(20),                             // named knob
+                compression: Some(Compression::new(Codec::Lz4)), // named knob
                 ..Default::default()
             },
             producer_librdkafka: producer_raw,
@@ -3504,7 +3540,7 @@ mod tests {
             map["compression.type"], "gzip",
             "raw producer_librdkafka compression must win"
         );
-        assert!(!map.contains_key("compression.level"));
+        assert_eq!(map["compression.level"], "6", "gzip's default level");
     }
 
     // --- KIP-794 / sticky partitioner ---
@@ -3532,96 +3568,125 @@ mod tests {
 
     // --- the producer codec and its level ---
 
-    /// The profiles differ in batching and latency, never in codec.
+    /// The codec and level each layer gives, and the level that follows a raw
+    /// codec. Profiles differ in batching, never codec. lz4 turns to its slow
+    /// high-compression mode at 3, so it never inherits a level.
     #[test]
-    fn every_profile_produces_zstd_at_level_3() {
-        for profile in [
-            SelfRegulationProfile::Throughput,
-            SelfRegulationProfile::Balanced,
-            SelfRegulationProfile::LowLatency,
-        ] {
-            let map = sizing_for_profile(profile).resolved_producer_map();
-            assert_eq!(map["compression.type"], "zstd", "profile {profile:?}");
-            assert_eq!(map["compression.level"], "3", "profile {profile:?}");
-        }
-    }
-
-    /// A level means something different to each codec, and lz4 turns to its
-    /// slow high-compression mode at 3, so no other codec inherits it.
-    #[test]
-    fn a_named_codec_other_than_zstd_gets_no_level() {
-        for codec in ["lz4", "gzip", "snappy", "none"] {
+    fn the_producer_codec_and_level_follow_each_layer() {
+        use SelfRegulationProfile::{Balanced, LowLatency, Throughput};
+        type Raw = &'static [(&'static str, &'static str)];
+        let zstd_9 = Some(Compression::new(Codec::Zstd).with_level(9));
+        let lz4 = Some(Compression::new(Codec::Lz4));
+        // (case, profile, named knob, raw producer map, want type, want level)
+        let rows: [(&str, _, Option<Compression>, Raw, &str, Option<&str>); 13] = [
+            ("throughput", Throughput, None, &[], "zstd", Some("3")),
+            ("balanced", Balanced, None, &[], "zstd", Some("3")),
+            ("low_latency", LowLatency, None, &[], "zstd", Some("3")),
+            ("named lz4", Throughput, lz4, &[], "lz4", None),
+            (
+                "named snappy",
+                Throughput,
+                Some(Compression::new(Codec::Snappy)),
+                &[],
+                "snappy",
+                None,
+            ),
+            (
+                "named none",
+                Throughput,
+                Some(Compression::NONE),
+                &[],
+                "none",
+                None,
+            ),
+            (
+                "named gzip",
+                Throughput,
+                Some(Compression::new(Codec::Gzip)),
+                &[],
+                "gzip",
+                Some("6"),
+            ),
+            ("named zstd 9", Throughput, zstd_9, &[], "zstd", Some("9")),
+            (
+                "raw lz4 drops the level",
+                Throughput,
+                None,
+                &[("compression.type", "lz4")],
+                "lz4",
+                None,
+            ),
+            (
+                "raw zstd over named lz4",
+                Throughput,
+                lz4,
+                &[("compression.type", "zstd")],
+                "zstd",
+                Some("3"),
+            ),
+            (
+                "raw zstd keeps named zstd 9",
+                Throughput,
+                zstd_9,
+                &[("compression.type", "zstd")],
+                "zstd",
+                Some("9"),
+            ),
+            (
+                "raw level kept",
+                Throughput,
+                None,
+                &[("compression.level", "6")],
+                "zstd",
+                Some("6"),
+            ),
+            (
+                "raw lz4 and level",
+                Throughput,
+                None,
+                &[("compression.type", "lz4"), ("compression.level", "1")],
+                "lz4",
+                Some("1"),
+            ),
+        ];
+        for (case, profile, named, raw, want_type, want_level) in rows {
             let s = KafkaSizingConfig {
+                profile,
                 producer: ProducerKnobs {
-                    compression_type: Some(codec.to_string()),
+                    compression: named,
                     ..Default::default()
                 },
+                producer_librdkafka: raw
+                    .iter()
+                    .map(|&(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
                 ..Default::default()
             };
             let map = s.resolved_producer_map();
-            assert_eq!(map["compression.type"], codec);
-            assert!(
-                !map.contains_key("compression.level"),
-                "{codec} must run at librdkafka's own level for it"
+            assert_eq!(map["compression.type"], want_type, "{case}");
+            assert_eq!(
+                map.get("compression.level").map(String::as_str),
+                want_level,
+                "{case}"
             );
         }
     }
 
-    /// A raw codec override is the one the producer runs, so the zstd level
-    /// goes with the zstd codec it replaced.
+    /// `validate` takes every codec librdkafka has and refuses a bad level.
     #[test]
-    fn a_raw_codec_override_drops_the_zstd_level() {
-        let s = KafkaSizingConfig {
-            producer_librdkafka: BTreeMap::from([(
-                "compression.type".to_string(),
-                "lz4".to_string(),
-            )]),
-            ..Default::default()
+    fn validate_checks_the_producer_compression() {
+        let with = |compression| {
+            let mut config = KafkaConfig::default();
+            config.sizing.producer.compression = Some(compression);
+            config.validate(false)
         };
-        let map = s.resolved_producer_map();
-        assert_eq!(map["compression.type"], "lz4");
-        assert!(!map.contains_key("compression.level"));
-    }
-
-    /// A raw layer that picks zstd over a named codec gets the zstd level too.
-    #[test]
-    fn a_raw_zstd_override_gets_the_zstd_level() {
-        let s = KafkaSizingConfig {
-            producer: ProducerKnobs {
-                compression_type: Some("lz4".to_string()),
-                ..Default::default()
-            },
-            producer_librdkafka: BTreeMap::from([(
-                "compression.type".to_string(),
-                "zstd".to_string(),
-            )]),
-            ..Default::default()
-        };
-        assert_eq!(s.resolved_producer_map()["compression.level"], "3");
-    }
-
-    /// A level an operator names is theirs, whatever the codec.
-    #[test]
-    fn a_raw_level_is_kept() {
-        let zstd_six = KafkaSizingConfig {
-            producer_librdkafka: BTreeMap::from([(
-                "compression.level".to_string(),
-                "6".to_string(),
-            )]),
-            ..Default::default()
-        };
-        let map = zstd_six.resolved_producer_map();
-        assert_eq!(map["compression.type"], "zstd");
-        assert_eq!(map["compression.level"], "6");
-
-        let lz4_one = KafkaSizingConfig {
-            producer_librdkafka: BTreeMap::from([
-                ("compression.type".to_string(), "lz4".to_string()),
-                ("compression.level".to_string(), "1".to_string()),
-            ]),
-            ..Default::default()
-        };
-        assert_eq!(lz4_one.resolved_producer_map()["compression.level"], "1");
+        assert!(with(Compression::new(Codec::Snappy)).is_ok());
+        let refused = with(Compression::new(Codec::Zstd).with_level(30)).unwrap_err();
+        assert!(
+            refused.contains("kafka.sizing.producer.compression"),
+            "{refused}"
+        );
+        assert!(with(Compression::new(Codec::Lz4).with_level(1)).is_err());
     }
 
     /// rdkafka hands its settings to librdkafka in hash order, so a raw key

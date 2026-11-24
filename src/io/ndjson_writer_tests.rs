@@ -18,7 +18,7 @@ fn test_config(dir: &Path) -> FileWriterConfig {
         path: dir.to_path_buf(),
         rotation: RotationPeriod::Daily,
         max_age_days: 1,
-        compress_rotated: false,
+        compress_rotated: crate::compression::Compression::NONE,
         write: FileWriteOptions::default(),
     }
 }
@@ -283,44 +283,63 @@ fn retention_leaves_other_files_alone() {
     );
 }
 
-/// With compression on, all but the six newest rotated files are gzipped and
-/// read back whole.
+/// With a codec set, all but the six newest rotated files are compressed
+/// under that codec's suffix and read back whole. A codec rotated files do
+/// not take fails the open.
 #[test]
 fn compression_keeps_six_rotated_files_plain() {
+    use crate::compression::{Codec, Compression};
     use std::io::Read as _;
 
+    for codec in [Codec::Gzip, Codec::Zstd] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = FileWriteOptions {
+            max_bytes: Some(1),
+            ..FileWriteOptions::default()
+        };
+        let config = FileWriterConfig {
+            compress_rotated: Compression::new(codec),
+            ..with_write(dir.path(), RotationPeriod::Never, write)
+        };
+        let writer = NdjsonWriter::new(&config, "", "out.ndjson", "test").expect("create");
+        for n in 0..9 {
+            writer
+                .write_line(format!("{n}\n").as_bytes())
+                .expect("write");
+        }
+        let rotated = rotated_names(dir.path(), "out.ndjson");
+        let ext = codec.extension().expect("a codec has a suffix");
+        let packed: Vec<&String> = rotated
+            .iter()
+            .filter(|n| Path::new(n).extension().is_some_and(|e| e == ext))
+            .collect();
+        assert_eq!(rotated.len(), 8, "{codec}: {rotated:?}");
+        assert_eq!(packed.len(), 2, "{codec}: {rotated:?}");
+        let mut text = String::new();
+        for name in packed {
+            let file = std::fs::File::open(dir.path().join(name)).expect("open");
+            Compression::new(codec)
+                .decoder(file)
+                .expect("decoder")
+                .read_to_string(&mut text)
+                .expect("decompress");
+        }
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(lines, ["0", "1"], "{codec}: the two oldest are compressed");
+    }
+
     let dir = tempfile::tempdir().expect("tempdir");
-    let write = FileWriteOptions {
-        max_bytes: Some(1),
-        ..FileWriteOptions::default()
+    let lz4 = FileWriterConfig {
+        compress_rotated: Compression::new(Codec::Lz4),
+        ..test_config(dir.path())
     };
-    let config = FileWriterConfig {
-        compress_rotated: true,
-        ..with_write(dir.path(), RotationPeriod::Never, write)
-    };
-    let writer = NdjsonWriter::new(&config, "", "out.ndjson", "test").expect("create");
-    for n in 0..9 {
-        writer
-            .write_line(format!("{n}\n").as_bytes())
-            .expect("write");
-    }
-    let rotated = rotated_names(dir.path(), "out.ndjson");
-    let gz: Vec<&String> = rotated
-        .iter()
-        .filter(|n| Path::new(n).extension().is_some_and(|e| e == "gz"))
-        .collect();
-    assert_eq!(rotated.len(), 8, "{rotated:?}");
-    assert_eq!(gz.len(), 2, "{rotated:?}");
-    let mut text = String::new();
-    for name in gz {
-        let file = std::fs::File::open(dir.path().join(name)).expect("open");
-        flate2::read::GzDecoder::new(file)
-            .read_to_string(&mut text)
-            .expect("gunzip");
-    }
-    let mut lines: Vec<&str> = text.lines().collect();
-    lines.sort_unstable();
-    assert_eq!(lines, ["0", "1"], "the two oldest are compressed");
+    let refused = NdjsonWriter::new(&lz4, "", "out.ndjson", "test").expect_err("lz4 is refused");
+    assert_eq!(
+        refused.kind(),
+        std::io::ErrorKind::InvalidInput,
+        "{refused}"
+    );
 }
 
 /// Durable or not, the bytes and the rotation are the same. A flush syncs

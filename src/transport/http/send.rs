@@ -15,7 +15,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +24,8 @@ use reqwest::header::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::HttpTransportConfig;
+use super::{HTTP_ACCEPTS, HttpTransportConfig};
+use crate::compression::CompressorPool;
 use crate::framing::Framing;
 use crate::sensitive::SensitiveString;
 use crate::transport::error::{TransportError, TransportResult};
@@ -200,15 +200,6 @@ fn describe(error: reqwest::Error) -> String {
     text
 }
 
-fn gzip(body: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = flate2::write::GzEncoder::new(
-        Vec::with_capacity(body.len() / 4),
-        flate2::Compression::fast(),
-    );
-    encoder.write_all(body)?;
-    encoder.finish()
-}
-
 /// What a response status says about the body that drew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Answer {
@@ -301,7 +292,11 @@ pub(super) struct Sender {
     refusals: Refusals,
     targets: Vec<Target>,
     framing: Arc<dyn Framing>,
-    gzip: bool,
+    /// One body codec context per send compressing at once, kept between
+    /// bodies. `None` sends as framed.
+    compressors: Option<CompressorPool>,
+    /// The `Content-Encoding` a compressed body goes with.
+    encoding: Option<&'static str>,
     success: Vec<StatusCode>,
     max_retry_after: Duration,
     send_timeout: Duration,
@@ -328,6 +323,16 @@ impl Sender {
             .framing
             .build()
             .map_err(|e| TransportError::Config(format!("HTTP body framing: {e}")))?;
+        let compression = HTTP_ACCEPTS
+            .check(config.compression)
+            .map_err(|e| TransportError::Config(e.to_string()))?;
+        let compressors = if compression.is_none() {
+            None
+        } else {
+            let pool = CompressorPool::new(compression)
+                .map_err(|e| TransportError::Config(e.to_string()))?;
+            Some(pool)
+        };
         let success = config
             .success_status
             .iter()
@@ -355,7 +360,7 @@ impl Sender {
             auth = config.auth.kind(),
             headers = ?config.headers.keys().collect::<Vec<&String>>(),
             framing = %config.framing.framing_type,
-            gzip = config.gzip,
+            compression = %compression,
             proxy = config.proxy.kind(),
             follow_redirects = config.follow_redirects,
             success_status = ?config.success_status,
@@ -367,7 +372,8 @@ impl Sender {
             refusals: Refusals::default(),
             targets,
             framing,
-            gzip: config.gzip,
+            compressors,
+            encoding: (!compression.is_none()).then_some(compression.codec.name()),
             success,
             max_retry_after: Duration::from_millis(config.max_retry_after_ms),
             send_timeout: Duration::from_millis(config.send_timeout_ms),
@@ -416,17 +422,21 @@ impl Sender {
         SendResult::Ok
     }
 
-    /// The body as sent, gzipped when `gzip` is set.
+    /// The body as sent, compressed when `compression` names a codec.
     fn body(&self, framed: Vec<u8>) -> Result<bytes::Bytes, SendResult> {
-        if !self.gzip {
+        let Some(pool) = &self.compressors else {
             return Ok(bytes::Bytes::from(framed));
-        }
-        gzip(&framed).map(bytes::Bytes::from).map_err(|e| {
-            SendResult::Fatal(TransportError::Internal(format!(
-                "HTTP gzip of a {}-byte body: {e}",
-                framed.len()
-            )))
-        })
+        };
+        let mut body = Vec::new();
+        pool.compress_into(&framed, &mut body)
+            .map(|()| bytes::Bytes::from(body))
+            .map_err(|e| {
+                SendResult::Fatal(TransportError::Internal(format!(
+                    "HTTP {} of a {}-byte body: {e}",
+                    pool.compression().codec,
+                    framed.len()
+                )))
+            })
     }
 
     /// Post one body to each endpoint in turn until one stores or rejects it.
@@ -459,8 +469,8 @@ impl Sender {
                 .timeout(budget)
                 .header(CONTENT_TYPE, self.framing.content_type())
                 .body(body.clone());
-            if self.gzip {
-                request = request.header(CONTENT_ENCODING, "gzip");
+            if let Some(encoding) = self.encoding {
+                request = request.header(CONTENT_ENCODING, encoding);
             }
             if let Some((name, value)) = &target.auth {
                 request = request.header(name.clone(), value.clone());

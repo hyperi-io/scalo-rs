@@ -13,7 +13,7 @@
 //! ## Send
 //!
 //! POSTs each run of records with the same key to `{endpoint}/{key}` as one
-//! body, framed by `framing` and gzipped when `gzip` is set. `failover`
+//! body, framed by `framing` and compressed by `compression`. `failover`
 //! endpoints are tried in order after `endpoint`. Redirects are refused unless
 //! `follow_redirects` is set, and no proxy is used unless `proxy` names one.
 //! The guide is `docs/transport/http.md`.
@@ -51,6 +51,12 @@ mod send_tests;
 
 pub use send::{HttpAuth, HttpEndpoint};
 
+/// The codecs an HTTP request body takes.
+pub const HTTP_ACCEPTS: Accepts = Accepts::new(
+    "transport.http.compression",
+    &[Codec::None, Codec::Gzip, Codec::Zstd],
+);
+
 use super::error::{TransportError, TransportResult};
 #[cfg(feature = "http-server")]
 use super::traits::RecvBatch;
@@ -61,6 +67,7 @@ use super::types::Message;
 use super::types::PayloadFormat;
 use super::types::SendResult;
 use super::work_batch::WorkBatch;
+use crate::compression::{Accepts, Codec, Compression};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 #[cfg(feature = "http-server")]
@@ -185,9 +192,10 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_framing")]
     pub framing: crate::framing::FramingConfig,
 
-    /// Gzip request bodies, with `Content-Encoding: gzip`. Default off.
+    /// Request body codec, sent as `Content-Encoding`: `none` (default),
+    /// `gzip` or `zstd`. The receiver must decode it.
     #[serde(default)]
-    pub gzip: bool,
+    pub compression: Compression,
 
     /// Statuses that mean the body is stored. Empty, the default, is any 2xx.
     #[serde(default)]
@@ -292,7 +300,7 @@ impl Default for HttpTransportConfig {
             headers: std::collections::BTreeMap::new(),
             user_agent: None,
             framing: default_framing(),
-            gzip: false,
+            compression: Compression::NONE,
             success_status: Vec::new(),
             proxy: crate::transport::ProxyConfig::None,
             follow_redirects: false,
@@ -326,7 +334,7 @@ impl std::fmt::Debug for HttpTransportConfig {
             .field("headers", &self.headers)
             .field("user_agent", &self.user_agent)
             .field("framing", &self.framing)
-            .field("gzip", &self.gzip)
+            .field("compression", &self.compression)
             .field("success_status", &self.success_status)
             .field("proxy", &self.proxy)
             .field("follow_redirects", &self.follow_redirects)
@@ -557,6 +565,7 @@ impl HttpTransport {
                     sequence,
                     in_flight: Arc::clone(&in_flight),
                     max_body_bytes: config.max_body_bytes,
+                    decoders: Arc::new(BodyDecoders::new()?),
                     #[cfg(feature = "governor")]
                     pressure: pressure.clone(),
                 },
@@ -736,6 +745,8 @@ struct ReceiverState {
     /// Body bytes read or queued, see [`HttpTransportConfig::max_in_flight_bytes`].
     in_flight: Arc<tokio::sync::Semaphore>,
     max_body_bytes: usize,
+    /// Decoding contexts for a compressed request body, kept between requests.
+    decoders: Arc<BodyDecoders>,
     /// Optional pressure governor (`governor` feature). `None` by default
     /// -> the handler never consults it. When `Some`, the handler rejects with
     /// 503 while `UnifiedPressure::should_hold` holds -- pressure-driven
@@ -744,7 +755,80 @@ struct ReceiverState {
     pressure: Option<Arc<crate::governor::UnifiedPressure>>,
 }
 
+/// One decoder pool per `Content-Encoding` the receive side reads.
+#[cfg(feature = "http-server")]
+struct BodyDecoders {
+    gzip: crate::compression::CompressorPool,
+    zstd: crate::compression::CompressorPool,
+}
+
+#[cfg(feature = "http-server")]
+impl BodyDecoders {
+    fn new() -> TransportResult<Self> {
+        let pool = |codec| {
+            crate::compression::CompressorPool::new(Compression::new(codec))
+                .map_err(|e| TransportError::Config(e.to_string()))
+        };
+        Ok(Self {
+            gzip: pool(Codec::Gzip)?,
+            zstd: pool(Codec::Zstd)?,
+        })
+    }
+
+    fn get(&self, codec: Codec) -> Option<&crate::compression::CompressorPool> {
+        match codec {
+            Codec::Gzip => Some(&self.gzip),
+            Codec::Zstd => Some(&self.zstd),
+            _ => None,
+        }
+    }
+}
+
+/// The codec a request's `Content-Encoding` names: none when absent or
+/// `identity`, gzip or zstd. Anything else, a list of codings included, is
+/// `None`, answered 415.
+#[cfg(feature = "http-server")]
+fn body_codec(headers: &axum::http::HeaderMap) -> Option<Codec> {
+    let mut values = headers.get_all(axum::http::header::CONTENT_ENCODING).iter();
+    let Some(value) = values.next() else {
+        return Some(Codec::None);
+    };
+    if values.next().is_some() {
+        return None;
+    }
+    match value.to_str().ok()?.trim().to_ascii_lowercase().as_str() {
+        "" | "identity" => Some(Codec::None),
+        "gzip" | "x-gzip" => Some(Codec::Gzip),
+        "zstd" => Some(Codec::Zstd),
+        _ => None,
+    }
+}
+
+/// `body` decoded, held to `limit` bytes, on the blocking pool.
+#[cfg(feature = "http-server")]
+async fn decode_body(
+    decoders: Arc<BodyDecoders>,
+    codec: Codec,
+    body: bytes::Bytes,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let pool = decoders
+            .get(codec)
+            .ok_or_else(|| std::io::Error::other(format!("no decoder for {codec}")))?;
+        let mut decoded = Vec::new();
+        pool.decompress_into(&body, &mut decoded, limit)?;
+        Ok(decoded)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 /// POST handler that accepts raw bytes and queues them into the mpsc channel.
+///
+/// A `Content-Encoding` of gzip or zstd is decoded first, to at most
+/// `max_body_bytes`, and the decoded bytes are what the in-flight budget
+/// counts. Any other coding is a 415, answered before the body is read.
 ///
 /// The pressure check and the byte reservation come before the body is read,
 /// so a held governor or a spent budget costs no body buffer. Answers 200 once
@@ -770,6 +854,10 @@ async fn ingest_handler(
             .increment(1);
         return shed_503();
     }
+
+    let Some(codec) = body_codec(request.headers()) else {
+        return axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    };
 
     let declared = request
         .headers()
@@ -817,6 +905,42 @@ async fn ingest_handler(
     // Keep exactly the bytes read. A short body returns the rest of its reservation.
     drop(permit.split(permit.num_permits().saturating_sub(body.len())));
 
+    let body = if codec == Codec::None {
+        body
+    } else {
+        // Decoding holds the body and up to `max_body_bytes` decoded at once.
+        let Some(decoding) = u32::try_from(state.max_body_bytes)
+            .ok()
+            .and_then(|n| Arc::clone(&state.in_flight).try_acquire_many_owned(n).ok())
+        else {
+            #[cfg(feature = "metrics")]
+            metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "in_flight_bytes")
+                .increment(1);
+            return shed_503();
+        };
+        permit.merge(decoding);
+        let decoded = match decode_body(
+            Arc::clone(&state.decoders),
+            codec,
+            body,
+            state.max_body_bytes,
+        )
+        .await
+        {
+            Ok(decoded) => decoded,
+            Err(e) if e.kind() == std::io::ErrorKind::FileTooLarge => {
+                return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+            }
+            Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+        };
+        if decoded.is_empty() {
+            return axum::http::StatusCode::BAD_REQUEST.into_response();
+        }
+        // The compressed body is gone: keep exactly the decoded bytes.
+        drop(permit.split(permit.num_permits().saturating_sub(decoded.len())));
+        bytes::Bytes::from(decoded)
+    };
+
     let seq = state.sequence.fetch_add(1, Ordering::Relaxed);
     let format = PayloadFormat::detect(&body);
     let timestamp_ms = crate::clock::epoch_millis();
@@ -825,8 +949,7 @@ async fn ingest_handler(
     #[cfg(feature = "metrics")]
     let body_len = body.len();
 
-    // `body` is `axum::body::Bytes` (= `bytes::Bytes`) -- move it directly,
-    // no copy needed.
+    // `body` is `bytes::Bytes`, the request's or the decoded one, moved in.
     let msg = Message {
         key: None,
         payload: body,
@@ -1592,6 +1715,79 @@ mod tests {
         receiver.close().await.unwrap();
     }
 
+    /// A scalo sender's gzip and zstd bodies arrive decoded. Any other
+    /// `Content-Encoding` is a 415, a body that decodes past `max_body_bytes`
+    /// a 413 and one that does not decode a 400, and none of those queues
+    /// anything.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn compressed_bodies_decode_and_refusals_queue_nothing() {
+        use crate::compression::{Codec, Compression};
+
+        enum Post {
+            Scalo(Codec),
+            Raw(&'static str, Vec<u8>, u16),
+        }
+        let receiver = HttpTransport::new(&HttpTransportConfig {
+            listen: Some("127.0.0.1:0".to_string()),
+            recv_timeout_ms: 200,
+            max_body_bytes: 1024,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let addr = receiver.local_addr().expect("receiver bound");
+        let bomb = Compression::new(Codec::Gzip)
+            .compress(&[b'x'; 4096])
+            .unwrap();
+        assert!(bomb.len() < 1024, "the body itself is under the cap");
+        let rows = [
+            ("scalo gzip", Post::Scalo(Codec::Gzip)),
+            ("scalo zstd", Post::Scalo(Codec::Zstd)),
+            ("scalo none", Post::Scalo(Codec::None)),
+            ("brotli", Post::Raw("br", b"{}".to_vec(), 415)),
+            ("two codings", Post::Raw("gzip, zstd", b"{}".to_vec(), 415)),
+            ("decodes past the cap", Post::Raw("gzip", bomb, 413)),
+            ("not gzip", Post::Raw("gzip", b"{\"a\":1}".to_vec(), 400)),
+        ];
+        let client = reqwest::Client::new();
+        for (case, post) in rows {
+            match post {
+                Post::Scalo(codec) => {
+                    let sender = HttpTransport::new(&HttpTransportConfig {
+                        compression: Compression::new(codec),
+                        ..HttpTransportConfig::sender(&format!("http://{addr}"))
+                    })
+                    .await
+                    .unwrap();
+                    let payload = format!(r#"{{"case":"{case}","pad":"{}"}}"#, "a".repeat(200));
+                    let sent = sender
+                        .send("ingest", bytes::Bytes::from(payload.clone()))
+                        .await;
+                    assert!(sent.is_ok(), "{case}: {sent:?}");
+                    let records = receiver.recv(10).await.unwrap().records;
+                    assert_eq!(records.len(), 1, "{case}");
+                    assert_eq!(records[0].payload.as_ref(), payload.as_bytes(), "{case}");
+                    sender.close().await.unwrap();
+                }
+                Post::Raw(encoding, body, want) => {
+                    let status = client
+                        .post(format!("http://{addr}/ingest"))
+                        .header(reqwest::header::CONTENT_ENCODING, encoding)
+                        .body(body)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status();
+                    assert_eq!(status.as_u16(), want, "{case}");
+                    let records = receiver.recv(10).await.unwrap().records;
+                    assert!(records.is_empty(), "{case}: nothing queued");
+                }
+            }
+        }
+        receiver.close().await.unwrap();
+    }
+
     /// Test recv without listen returns config error.
     #[cfg(feature = "http-server")]
     #[tokio::test]
@@ -1955,6 +2151,7 @@ mod tests {
             sequence: Arc::new(AtomicU64::new(0)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(1024)),
             max_body_bytes: 1024,
+            decoders: Arc::new(BodyDecoders::new().expect("decoders")),
             #[cfg(feature = "governor")]
             pressure: None,
         };

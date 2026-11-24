@@ -82,7 +82,7 @@ kafka:
     consumer:
       fetch_min_bytes: 2097152      # 2 MiB, overrides the profile default
     producer:
-      compression_type: lz4         # the default is zstd at level 3
+      compression: {codec: lz4}     # the default is zstd at level 3
     consumer_librdkafka:
       fetch.wait.max.ms: "75"       # raw override -- wins over the knobs
     producer_librdkafka:
@@ -152,11 +152,10 @@ Every profile produces with `zstd` at `compression.level` 3. The profiles differ
 
 Change it per stage:
 
-- Codec -- `kafka.sizing.producer.compression_type` (`lz4`, `gzip`, `snappy` or `none`). Another codec runs at librdkafka's own default level for it.
-- zstd level -- `compression.level` in `kafka.sizing.producer_librdkafka`. librdkafka takes -1 to 12.
-- Either, over everything -- `kafka.librdkafka_overrides`, applied after the whole sizing surface.
+- Codec and level -- `kafka.sizing.producer.compression`, the shape every scalo surface reads ([compression.md](compression.md)): `{codec: zstd, level: 6}`. Codec `none`, `gzip`, `snappy`, `lz4` or `zstd`. An unset level is the codec's default, zstd 3 or gzip 6, and lz4, snappy and none set none.
+- Raw -- `compression.type` and `compression.level` in `kafka.sizing.producer_librdkafka`, or in `kafka.librdkafka_overrides`, applied after the whole sizing surface. Both stay strings.
 
-The level follows the codec. scalo sets 3 only while the resolved codec is zstd and no raw map names a level, because librdkafka reads the level against whichever codec is set, and lz4 switches to its slow high-compression mode from 3.
+The level follows the codec. A raw map that names a codec and no level gets that codec's default level, or keeps the named level when it names the same codec, because librdkafka reads the level against whichever codec is set, and lz4 switches to its slow high-compression mode from 3. A level a raw map names is kept whatever the codec. `KafkaConfig::validate` refuses a named codec or level librdkafka cannot run.
 
 Every image that runs a scalo producer or consumer needs a librdkafka built with zstd. Without it the producer fails at creation on this default, and a consumer cannot read the batches. The consumer decompresses whatever codec the producer used, so no consumer setting changes.
 

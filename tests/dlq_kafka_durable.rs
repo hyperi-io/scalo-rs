@@ -191,7 +191,7 @@ fn dlq_config(mode: DlqMode, topic: &str, file_dir: Option<&Path>) -> DlqConfig 
             path: file_dir.map_or_else(|| "/nonexistent".into(), Path::to_path_buf),
             rotation: RotationPeriod::Daily,
             max_age_days: 1,
-            compress_rotated: false,
+            compress_rotated: scalo::compression::Compression::NONE,
             ..FileDlqConfig::default()
         },
         kafka: KafkaDlqConfig {

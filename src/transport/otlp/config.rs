@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::compression::{Accepts, Codec, Compression};
 use crate::otel_endpoint::{DEFAULT_GRPC_ENDPOINT, append_signal_path, endpoint_for_protocol};
 use crate::sensitive::SensitiveString;
 use crate::tls::{ClientTls, ClientTlsConfig};
@@ -43,16 +44,13 @@ impl OtlpProtocol {
     }
 }
 
-/// Compression of each export request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OtlpCompression {
-    /// Sent as encoded.
-    #[default]
-    None,
-    /// gzip: `grpc-encoding: gzip` on gRPC, `Content-Encoding: gzip` on HTTP.
-    Gzip,
-}
+/// The codecs an export request takes: `grpc-encoding` on gRPC,
+/// `Content-Encoding` on HTTP. tonic fixes the gRPC level, so no level is
+/// taken on either. tonic and flate2 apply it, not scalo's engine.
+pub const OTLP_ACCEPTS: Accepts =
+    Accepts::new("transport.otlp.compression", &[Codec::None, Codec::Gzip])
+        .without_level()
+        .external();
 
 /// OTLP logs transport configuration, read from `transport.otlp` or from the
 /// `otlp` section of a [`TransportConfig`](crate::transport::TransportConfig).
@@ -77,8 +75,8 @@ pub struct OtlpConfig {
     /// milliseconds. Default 10000. A send past it is `Backpressured`.
     pub timeout_ms: u64,
 
-    /// `none` (default) or `gzip`.
-    pub compression: OtlpCompression,
+    /// `{codec: none}` (default) or `{codec: gzip}`. No level.
+    pub compression: Compression,
 
     /// The longest wait a collector's `Retry-After` or `RetryInfo` is taken
     /// at, in milliseconds. Default 300000 (5 min), so a collector cannot hold
@@ -116,7 +114,7 @@ impl Default for OtlpConfig {
             protocol: OtlpProtocol::Grpc,
             headers: BTreeMap::new(),
             timeout_ms: 10_000,
-            compression: OtlpCompression::None,
+            compression: Compression::NONE,
             max_retry_delay_ms: 300_000,
             service_name: None,
             resource_attributes: BTreeMap::new(),
@@ -211,13 +209,17 @@ impl OtlpConfig {
     ///
     /// # Errors
     ///
-    /// `TransportError::Config` for a `timeout_ms` of 0.
+    /// `TransportError::Config` for a `timeout_ms` of 0, or a `compression`
+    /// [`OTLP_ACCEPTS`] refuses.
     pub(super) fn validate(&self) -> TransportResult<()> {
         if self.timeout_ms == 0 {
             return Err(TransportError::Config(
                 "OTLP: timeout_ms must be above 0".to_string(),
             ));
         }
+        OTLP_ACCEPTS
+            .check(self.compression)
+            .map_err(|e| TransportError::Config(format!("OTLP: {e}")))?;
         Ok(())
     }
 }
@@ -239,7 +241,7 @@ mod tests {
             dir.path().join("settings.yaml"),
             "transport:\n  otlp:\n    endpoint: https://collector.example:4318\n    \
              protocol: grpc\n    headers:\n      authorization: Bearer yaml\n      \
-             x-tenant: blue\n    timeout_ms: 2500\n    compression: none\n    \
+             x-tenant: blue\n    timeout_ms: 2500\n    compression: {codec: none}\n    \
              max_retry_delay_ms: 60000\n    service_name: from-yaml\n    \
              resource_attributes:\n      team: data\n    tls:\n      trust: bundle\n      \
              ca_path: /etc/tls/ca.pem\n      client_cert_path: /etc/tls/client.pem\n      \
@@ -251,7 +253,7 @@ mod tests {
         temp_env::with_vars(
             [
                 ("OTLPCFG__TRANSPORT__OTLP__PROTOCOL", Some("http")),
-                ("OTLPCFG__TRANSPORT__OTLP__COMPRESSION", Some("gzip")),
+                ("OTLPCFG__TRANSPORT__OTLP__COMPRESSION__CODEC", Some("gzip")),
                 (
                     "OTLPCFG__TRANSPORT__OTLP__HEADERS__AUTHORIZATION",
                     Some("Bearer env"),
@@ -288,7 +290,7 @@ mod tests {
             Some("blue")
         );
         assert_eq!(config.timeout_ms, 2500);
-        assert_eq!(config.compression, OtlpCompression::Gzip);
+        assert_eq!(config.compression, Compression::new(Codec::Gzip));
         assert_eq!(config.max_retry_delay_ms, 60_000);
         assert_eq!(config.service_name.as_deref(), Some("from-env"));
         assert_eq!(
@@ -415,6 +417,17 @@ mod tests {
             .is_err(),
             "a timeout of 0 is refused"
         );
+        for (compression, ok) in [
+            (Compression::new(Codec::Gzip), true),
+            (Compression::new(Codec::Zstd), false),
+            (Compression::new(Codec::Gzip).with_level(9), false),
+        ] {
+            let config = OtlpConfig {
+                compression,
+                ..OtlpConfig::default()
+            };
+            assert_eq!(config.validate().is_ok(), ok, "{compression}");
+        }
         assert!(OtlpConfig::default().validate().is_ok());
     }
 }

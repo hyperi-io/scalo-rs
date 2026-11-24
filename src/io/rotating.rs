@@ -11,7 +11,7 @@
 //! Opening cuts a last line with no newline back to the newline before it. An
 //! append lands whole or is cut back off. Rotation renames the live file to
 //! `<name>.<local YYYYMMDDTHHMMSS>[.N]`, then applies the count and age limits
-//! and gzips all but the six newest rotated files.
+//! and compresses all but the six newest rotated files with `compress_rotated`.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -24,8 +24,9 @@ use jiff::{SignedDuration, Timestamp};
 use tracing::{debug, warn};
 
 use super::config::{FileMode, FileWriterConfig, RotationPeriod};
+use crate::compression::Codec;
 
-/// Rotated files left uncompressed when `compress_rotated` is on, newest first.
+/// Rotated files left uncompressed when `compress_rotated` names a codec, newest first.
 const KEEP_UNCOMPRESSED: usize = 6;
 
 /// Suffix format of a rotated file, in local time.
@@ -306,15 +307,27 @@ struct Rotated {
     compressed: bool,
 }
 
-/// Parses `<live>.<stamp>[.N][.gz]`, refusing every other name so a sidecar
-/// such as `<live>.pos` is never touched.
+/// The suffix of `name` if it ends in a codec's extension, such as `.gz`.
+fn compressed_suffix(name: &str) -> Option<&'static str> {
+    Codec::ALL
+        .into_iter()
+        .filter_map(Codec::extension)
+        .find(|ext| {
+            name.strip_suffix(ext)
+                .is_some_and(|rest| rest.ends_with('.'))
+        })
+}
+
+/// Parses `<live>.<stamp>[.N][.<codec extension>]`, refusing every other name
+/// so a sidecar such as `<live>.pos` is never touched. Every codec's extension
+/// counts, so retention keeps working after `compress_rotated` changes.
 fn parse_rotated(live: &OsStr, name: &OsStr) -> Option<(String, u32, bool)> {
     let rest = name
         .to_str()?
         .strip_prefix(live.to_str()?)?
         .strip_prefix('.')?;
-    let (rest, compressed) = match rest.strip_suffix(".gz") {
-        Some(rest) => (rest, true),
+    let (rest, compressed) = match compressed_suffix(rest) {
+        Some(ext) => (&rest[..rest.len() - ext.len() - 1], true),
         None => (rest, false),
     };
     let (stamp, number) = match rest.split_once('.') {
@@ -369,14 +382,24 @@ pub(super) fn rename_live(live: &Path) -> io::Result<PathBuf> {
         .map_or(0, |newest| newest.number + 1);
     loop {
         let target = rotated_name(live, &now, number);
-        let mut gz = target.clone().into_os_string();
-        gz.push(".gz");
-        if !target.exists() && !Path::new(&gz).exists() {
+        let taken = Codec::ALL
+            .into_iter()
+            .filter_map(Codec::extension)
+            .any(|ext| with_extension(&target, ext).exists());
+        if !target.exists() && !taken {
             fs::rename(live, &target)?;
             return Ok(target);
         }
         number += 1;
     }
+}
+
+/// `path` with `.<ext>` appended.
+fn with_extension(path: &Path, ext: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".");
+    name.push(ext);
+    PathBuf::from(name)
 }
 
 fn rotated_name(live: &Path, stamp: &str, number: u32) -> PathBuf {
@@ -425,7 +448,7 @@ pub(super) fn retain(live: &Path, config: &FileWriterConfig, label: &str) {
         }
         false
     });
-    if config.compress_rotated {
+    if !config.compress_rotated.is_none() {
         for file in kept
             .iter()
             .skip(KEEP_UNCOMPRESSED)
@@ -438,14 +461,15 @@ pub(super) fn retain(live: &Path, config: &FileWriterConfig, label: &str) {
     }
 }
 
-/// Gzips `path` to `<path>.gz` and removes it. A failed copy removes the
-/// partial `.gz` and leaves `path`.
+/// Compresses `path` to `<path>.<codec extension>` and removes it. A failed
+/// copy removes the partial file and leaves `path`.
 fn compress(path: &Path, config: &FileWriterConfig) -> io::Result<()> {
-    let mut gz = path.as_os_str().to_owned();
-    gz.push(".gz");
-    let gz = PathBuf::from(gz);
-    if let Err(e) = write_gz(path, &gz, config) {
-        let _ = fs::remove_file(&gz);
+    let Some(ext) = config.compress_rotated.codec.extension() else {
+        return Ok(());
+    };
+    let packed = with_extension(path, ext);
+    if let Err(e) = write_compressed(path, &packed, config) {
+        let _ = fs::remove_file(&packed);
         return Err(e);
     }
     fs::remove_file(path)?;
@@ -453,14 +477,14 @@ fn compress(path: &Path, config: &FileWriterConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn write_gz(source: &Path, gz: &Path, config: &FileWriterConfig) -> io::Result<()> {
+fn write_compressed(source: &Path, packed: &Path, config: &FileWriterConfig) -> io::Result<()> {
     let mut source = File::open(source)?;
     let dest = file_options(config.write.file_mode)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(gz)?;
-    let mut encoder = flate2::write::GzEncoder::new(dest, flate2::Compression::default());
+        .open(packed)?;
+    let mut encoder = config.compress_rotated.encoder(dest)?;
     io::copy(&mut source, &mut encoder)?;
     let dest = encoder.finish()?;
     if config.write.durable {
@@ -507,7 +531,7 @@ mod tests {
     #[test]
     fn parse_rotated_takes_only_rotated_names() {
         let live = OsStr::new("events.ndjson");
-        let cases: [(&str, Option<(&str, u32, bool)>); 10] = [
+        let cases: [(&str, Option<(&str, u32, bool)>); 12] = [
             (
                 "events.ndjson.20260302T140000",
                 Some(("20260302T140000", 0, false)),
@@ -524,6 +548,11 @@ mod tests {
                 "events.ndjson.20260302T140000.12.gz",
                 Some(("20260302T140000", 12, true)),
             ),
+            (
+                "events.ndjson.20260302T140000.zst",
+                Some(("20260302T140000", 0, true)),
+            ),
+            ("events.ndjson.20260302T140000.xgz", None),
             ("events.ndjson", None),
             ("events.ndjson.pos", None),
             ("events.ndjson.pos.tmp", None),

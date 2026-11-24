@@ -11,9 +11,33 @@
 
 use std::time::Duration;
 
+use tonic::codec::CompressionEncoding;
+
+use crate::compression::Codec;
+
 /// Default send limit of a gRPC client, and its HTTP/2 PING period when it
 /// has none.
 pub(crate) const DEFAULT_SEND_TIMEOUT_MS: u64 = 30_000;
+
+/// Every encoding a tonic client here reads in answers. `transport-grpc`
+/// turns on tonic's zstd, and `transport-otlp` alone turns on gzip only.
+#[cfg(feature = "transport-grpc")]
+pub(crate) const ACCEPTED_ENCODINGS: &[CompressionEncoding] =
+    &[CompressionEncoding::Gzip, CompressionEncoding::Zstd];
+#[cfg(not(feature = "transport-grpc"))]
+pub(crate) const ACCEPTED_ENCODINGS: &[CompressionEncoding] = &[CompressionEncoding::Gzip];
+
+/// tonic's encoding for `codec`, which fixes the level. `None` for
+/// [`Codec::None`] and for a codec tonic lacks, which an `Accepts` check
+/// refuses first.
+pub(crate) fn encoding(codec: Codec) -> Option<CompressionEncoding> {
+    match codec {
+        Codec::Gzip => Some(CompressionEncoding::Gzip),
+        #[cfg(feature = "transport-grpc")]
+        Codec::Zstd => Some(CompressionEncoding::Zstd),
+        _ => None,
+    }
+}
 
 /// A lazily dialled channel to `ep`, direct or through `proxy`.
 ///

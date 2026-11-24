@@ -14,6 +14,18 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::compression::{Accepts, Codec, Compression};
+
+/// The codecs `compress_rotated` takes. Each writes its own suffix: `.gz`, `.zst`.
+pub const ROTATED_ACCEPTS: Accepts =
+    Accepts::new("compress_rotated", &[Codec::None, Codec::Gzip, Codec::Zstd]);
+
+/// The schema of a `compress_rotated` key, narrowed to [`ROTATED_ACCEPTS`].
+#[cfg(feature = "config-schema")]
+pub(crate) fn compress_rotated_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    ROTATED_ACCEPTS.schema()
+}
+
 /// Root of the default spool paths: the file writer's, the file output sink's
 /// (`output/`) and the file DLQ's (`dlq/`). The output sink and the DLQ append
 /// the service name, so apps sharing one volume keep separate directories.
@@ -182,8 +194,9 @@ pub struct FileWriterConfig {
     /// Delete rotated files older than this many days, at each rotation.
     pub max_age_days: u32,
 
-    /// Gzip rotated files, keeping the six newest uncompressed.
-    pub compress_rotated: bool,
+    /// Codec for rotated files past the six newest: `none`, `gzip` or `zstd`.
+    /// Default gzip, which log shippers read.
+    pub compress_rotated: Compression,
 
     /// Size rotation, retention by count, syncing and permissions.
     #[serde(flatten)]
@@ -196,7 +209,7 @@ impl Default for FileWriterConfig {
             path: PathBuf::from(DEFAULT_SPOOL_ROOT),
             rotation: RotationPeriod::default(),
             max_age_days: 30,
-            compress_rotated: true,
+            compress_rotated: Compression::new(Codec::Gzip),
             write: FileWriteOptions::default(),
         }
     }
@@ -212,7 +225,7 @@ mod tests {
         assert_eq!(config.path, PathBuf::from("/var/spool/scalo"));
         assert_eq!(config.rotation, RotationPeriod::Hourly);
         assert_eq!(config.max_age_days, 30);
-        assert!(config.compress_rotated);
+        assert_eq!(config.compress_rotated, Compression::new(Codec::Gzip));
         assert_eq!(config.write, FileWriteOptions::default());
         assert_eq!(config.write.file_mode, None, "the umask decides");
         assert_eq!(config.write.dir_mode, None, "the umask decides");
@@ -253,7 +266,7 @@ mod tests {
             path: "/tmp/test".into(),
             rotation: RotationPeriod::Daily,
             max_age_days: 7,
-            compress_rotated: false,
+            compress_rotated: Compression::new(Codec::Zstd).with_level(9),
             write: FileWriteOptions {
                 max_bytes: Some(1024),
                 max_files: Some(3),
@@ -268,7 +281,11 @@ mod tests {
         assert_eq!(parsed.path, PathBuf::from("/tmp/test"));
         assert_eq!(parsed.rotation, RotationPeriod::Daily);
         assert_eq!(parsed.max_age_days, 7);
-        assert!(!parsed.compress_rotated);
+        assert_eq!(parsed.compress_rotated, config.compress_rotated);
+        assert!(
+            json.contains(r#""compress_rotated":{"codec":"zstd","level":9}"#),
+            "{json}"
+        );
         assert_eq!(parsed.write, config.write);
     }
 
@@ -276,11 +293,11 @@ mod tests {
     #[cfg(feature = "serde_json")]
     #[test]
     fn test_write_options_are_flat_and_optional() {
-        let bare = r#"{"path":"/x","rotation":"never","max_age_days":1,"compress_rotated":false}"#;
+        let bare = r#"{"path":"/x","rotation":"never","max_age_days":1,"compress_rotated":{"codec":"none"}}"#;
         let parsed: FileWriterConfig = serde_json::from_str(bare).expect("deserialise");
         assert_eq!(parsed.write, FileWriteOptions::default());
 
-        let flat = r#"{"path":"/x","rotation":"never","max_age_days":1,"compress_rotated":false,
+        let flat = r#"{"path":"/x","rotation":"never","max_age_days":1,"compress_rotated":{"codec":"none"},
             "max_bytes":10,"max_files":2,"durable":true}"#;
         let parsed: FileWriterConfig = serde_json::from_str(flat).expect("deserialise");
         assert_eq!(parsed.write.max_bytes, Some(10));
