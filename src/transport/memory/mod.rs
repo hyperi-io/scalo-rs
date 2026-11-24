@@ -107,11 +107,23 @@ impl MemoryTransport {
     /// fails to compile, so a misconfigured filter fails construction rather
     /// than letting every message through.
     pub fn new(config: &MemoryConfig) -> super::error::TransportResult<Self> {
+        Self::with_tiers(
+            config,
+            &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
+        )
+    }
+
+    /// A memory transport whose filters compile against `tiers` rather than
+    /// the cascade's gates.
+    pub(crate) fn with_tiers(
+        config: &MemoryConfig,
+        tiers: &crate::transport::filter::TransportFilterTierConfig,
+    ) -> super::error::TransportResult<Self> {
         let (sender, receiver) = mpsc::channel(config.buffer_size);
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
             &config.filters_out,
-            &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
+            tiers,
         )?;
         Ok(Self {
             sender,

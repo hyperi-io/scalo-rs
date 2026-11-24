@@ -505,3 +505,89 @@ async fn rate_limit_paces_sequential_sends() {
         start.elapsed()
     );
 }
+
+/// A memory transport sending to itself, its outbound filters compiled
+/// against `tiers`.
+#[cfg(feature = "transport-memory")]
+fn filtering_memory(
+    filters_out: Vec<crate::transport::filter::FilterRule>,
+    tiers: &crate::transport::filter::TransportFilterTierConfig,
+) -> Arc<crate::transport::memory::MemoryTransport> {
+    let config = crate::transport::memory::MemoryConfig {
+        filters_out,
+        ..Default::default()
+    };
+    Arc::new(crate::transport::memory::MemoryTransport::with_tiers(&config, tiers).unwrap())
+}
+
+/// A record the screen keeps has its outbound filter evaluated once: by the
+/// screen, not again by the send.
+#[cfg(feature = "transport-memory")]
+#[tokio::test]
+async fn a_kept_record_is_filtered_once() {
+    use crate::transport::filter::{FilterAction, FilterRule, TransportFilterTierConfig};
+
+    let sender = filtering_memory(
+        vec![FilterRule {
+            expression: "has(poison)".into(),
+            action: FilterAction::Dlq,
+        }],
+        &TransportFilterTierConfig::default(),
+    );
+    let stack = SinkStack::new(sender, &fast_cfg());
+    let before = crate::transport::filter::compiled::evaluations();
+    let outcome = stack.send_batch(vec![rec(b"{\"seq\":1}")]).await;
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+    assert_eq!(
+        crate::transport::filter::compiled::evaluations() - before,
+        1
+    );
+}
+
+/// A payload over the CEL budget skips the filter once, and counts once in
+/// `transport_filter_cel_payload_skip_total`.
+#[cfg(all(
+    feature = "transport-memory",
+    feature = "metrics",
+    feature = "expression"
+))]
+#[tokio::test]
+async fn an_oversize_kept_record_skips_its_cel_filter_once() {
+    use crate::transport::filter::{FilterAction, FilterRule, TransportFilterTierConfig};
+
+    let mut tiers = TransportFilterTierConfig::default();
+    tiers.allow_cel_filters_out = true;
+    tiers.budget.max_payload_bytes = 16;
+    let sender = filtering_memory(
+        vec![FilterRule {
+            expression: "severity > 3".into(),
+            action: FilterAction::Dlq,
+        }],
+        &tiers,
+    );
+    let stack = SinkStack::new(sender, &fast_cfg());
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let before = crate::transport::filter::compiled::evaluations();
+    let outcome = stack
+        .send_batch(vec![rec(
+            b"{\"severity\":1,\"padding\":\"over sixteen bytes\"}",
+        )])
+        .await;
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+    let evaluated = crate::transport::filter::compiled::evaluations() - before;
+    let skipped: Vec<String> = handle
+        .render()
+        .lines()
+        .filter(|line| line.starts_with("transport_filter_cel_payload_skip_total "))
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        (evaluated, skipped),
+        (
+            1,
+            vec!["transport_filter_cel_payload_skip_total 1".to_string()]
+        )
+    );
+}

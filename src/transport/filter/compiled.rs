@@ -260,6 +260,8 @@ impl CompiledFilter {
     #[inline]
     #[must_use]
     pub fn evaluate(&self, payload: &[u8]) -> Option<FilterAction> {
+        #[cfg(test)]
+        EVALUATIONS.with(|n| n.set(n.get() + 1));
         match self {
             Self::FieldExists {
                 path,
@@ -575,6 +577,18 @@ fn with_path_refs<R>(path: &[String], f: impl FnOnce(&[&str]) -> R) -> R {
             f(refs.as_slice())
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Filter evaluations on this thread, for tests that count them.
+    static EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Filter evaluations on this thread so far.
+#[cfg(all(test, feature = "sink-stack", feature = "transport-memory"))]
+pub(crate) fn evaluations() -> u64 {
+    EVALUATIONS.with(std::cell::Cell::get)
 }
 
 /// Evaluate a Tier 2/3 CEL expression against a JSON payload.
