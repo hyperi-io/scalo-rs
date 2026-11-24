@@ -806,9 +806,22 @@ fn checked_config(config: &KafkaConfig) -> TransportResult<KafkaConfig> {
     let mut checked = config.clone();
     checked.apply_provider().map_err(TransportError::Config)?;
     checked
-        .validate(crate::env::is_production())
+        .validate(is_production())
         .map_err(TransportError::Config)?;
     Ok(checked)
+}
+
+/// [`crate::env::is_production`]. In this crate's tests the read holds
+/// temp-env's lock, so a test's scoped `APP_ENV` never reaches another test.
+fn is_production() -> bool {
+    #[cfg(test)]
+    {
+        temp_env::with_vars([] as [(&str, Option<&str>); 0], crate::env::is_production)
+    }
+    #[cfg(not(test))]
+    {
+        crate::env::is_production()
+    }
 }
 
 /// Checks every client constructor runs against [`checked_config`]'s refusals.
