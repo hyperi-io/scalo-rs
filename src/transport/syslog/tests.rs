@@ -418,12 +418,19 @@ async fn each_stream_protocol_and_framing_round_trips() {
     }
 }
 
-/// `tcp`, `tls` and `relp` go through the proxy's CONNECT tunnel, TLS inside
-/// it.
+/// `tcp`, `tls` and `relp` go through a real Squid's CONNECT tunnel, TLS inside
+/// it. The target name resolves only inside Squid, so a message that arrives
+/// went through it.
+#[cfg(all(feature = "transport-proxy-test-support", unix))]
 #[tokio::test]
 async fn sends_go_through_a_connect_proxy() {
     use crate::transport::ProxyConfig;
-    use crate::transport::proxy::test_proxy::{ConnectProxy, Policy};
+    use crate::transport::proxy::squid::{Squid, TARGET_HOST};
+    use crate::transport::proxy::test_front::plain_front;
+
+    let Some(squid) = Squid::shared().await else {
+        return;
+    };
 
     let (pki, server_tls) = Pki::start().await;
     // (case, protocol, TLS)
@@ -450,18 +457,13 @@ async fn sends_go_through_a_connect_proxy() {
                     }),
                 )
             };
-        let proxy = ConnectProxy::start(Policy::Allow).await;
+        let front = plain_front(addr).await;
         let mut cfg = config(addr, protocol);
+        cfg.address = format!("{TARGET_HOST}:{}", front.port());
         cfg.tls = tls.then(|| pki.client("ca.pem"));
-        cfg.proxy = ProxyConfig::Url(crate::sensitive::SensitiveString::new(proxy.url()));
+        cfg.proxy = ProxyConfig::Url(crate::sensitive::SensitiveString::new(squid.open()));
         let sender = SyslogTransport::new(&cfg).unwrap();
         let result = sender.send_batch(&records(&["through"])).await;
-
-        let seen = proxy.seen();
-        assert!(
-            !seen.is_empty() && seen.iter().all(|c| c.target == addr.to_string()),
-            "{case}: {seen:?}"
-        );
         assert!(matches!(result, SendResult::Ok), "{case}: got {result:?}");
         let until = Instant::now() + Duration::from_secs(5);
         while check().is_empty() && Instant::now() < until {

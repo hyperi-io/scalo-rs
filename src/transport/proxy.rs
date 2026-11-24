@@ -14,9 +14,11 @@
 //! CONNECT tunnel. TLS runs over the tunnel with the target's name for SNI, as
 //! it would over a direct connection.
 
+#[cfg(all(feature = "transport-proxy-test-support", unix))]
+pub mod squid;
 mod system;
 #[cfg(test)]
-pub(crate) mod test_proxy;
+pub(crate) mod test_front;
 #[cfg(test)]
 mod tests;
 

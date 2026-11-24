@@ -8,24 +8,24 @@
 
 //! A proxy that refuses a CONNECT holds the records.
 //!
-//! NO mocks: Squid runs in a container, set to open tunnels to port 443 only
-//! (403) or to ask for credentials nobody has (407). Each transport sends to a
+//! NO mocks: the run's Squid container opens tunnels to port 443 only (403) or
+//! asks for credentials the sender lacks or gets wrong (407). Each transport sends to a
 //! target on port 8443 through it, which Squid refuses before it resolves the
 //! name, so no target runs. The records come back `Backpressured` instead of
 //! `Reject`, which a caller would dead-letter. The refusal counts in
 //! `transport_proxy_refused_total` and fails readiness, and the log carries the
 //! proxy's status once.
 //!
-//! They need a Docker daemon: without one they skip on a developer's machine and
-//! fail when `CI` is set.
+//! They need a Docker daemon on the machine running them: without one they skip
+//! on a developer's machine and fail when `CI` is set.
 //!
 //! ```text
-//! cargo nextest run --features testcontainers,metrics,health,transport-grpc,transport-http,transport-otlp,transport-syslog --test proxy_refusal --no-capture
+//! cargo nextest run --features transport-proxy-test-support,metrics,health,transport-grpc,transport-http,transport-otlp,transport-syslog --test proxy_refusal --no-capture
 //! ```
 
 #![cfg(all(
     unix,
-    feature = "testcontainers",
+    feature = "transport-proxy-test-support",
     feature = "metrics",
     feature = "health",
     feature = "transport-grpc",
@@ -34,8 +34,6 @@
     feature = "transport-syslog"
 ))]
 
-mod common;
-
 use bytes::Bytes;
 use scalo::health::{HealthRegistry, HealthStatus};
 use scalo::sensitive::SensitiveString;
@@ -43,17 +41,44 @@ use scalo::transport::grpc::{GrpcConfig, GrpcTransport};
 use scalo::transport::http::{HttpTransport, HttpTransportConfig};
 use scalo::transport::otlp::{OtlpConfig, OtlpProtocol, OtlpTransport};
 use scalo::transport::proxy::Scheme;
+use scalo::transport::proxy::squid::{PASSWORD, Squid, TARGET_HOST, USER};
 use scalo::transport::syslog::{SyslogConfig, SyslogProtocol, SyslogTransport};
 use scalo::transport::{
     PayloadFormat, ProxyConfig, ProxyError, Record, RecordMeta, SendResult, TransportSender,
 };
 
-use common::squid::{ALLOWED_PORT, Refusal, Squid};
-
-/// The target every transport sends to: a port the proxy refuses a tunnel to,
-/// on a name nothing resolves.
-const TARGET_HOST: &str = "target.test";
+/// The port every transport sends to, which the proxy refuses a tunnel to.
 const TARGET_PORT: u16 = 8443;
+
+/// Why the proxy refuses the CONNECT.
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    /// A tunnel to port 443 only, so any other port is 403.
+    PortOnly,
+    /// Credentials wanted and none sent, 407.
+    AuthRequired,
+    /// Credentials sent with the wrong password, 407.
+    WrongPassword,
+}
+
+impl Refusal {
+    const ALL: [Self; 3] = [Self::PortOnly, Self::AuthRequired, Self::WrongPassword];
+
+    fn status(self) -> u16 {
+        match self {
+            Self::PortOnly => 403,
+            Self::AuthRequired | Self::WrongPassword => 407,
+        }
+    }
+
+    fn proxy(self, squid: &Squid) -> String {
+        match self {
+            Self::PortOnly => squid.port_only(),
+            Self::AuthRequired => squid.auth(),
+            Self::WrongPassword => squid.auth_with(USER, &format!("{PASSWORD}-wrong")),
+        }
+    }
+}
 
 /// A transport under test, and the name its readiness check registers under, if any.
 #[derive(Debug, Clone, Copy)]
@@ -217,24 +242,22 @@ async fn assert_proxy_refuses(proxy: &str, refusal: Refusal) {
 /// and failing readiness, whether the proxy refuses the port or asks for credentials.
 #[tokio::test]
 async fn a_refused_connect_holds_the_records() {
-    if !scalo::deployment::test_support::docker_available() {
-        common::skip_or_fail("no Docker daemon answers");
+    let Some(squid) = Squid::shared().await else {
         return;
-    }
+    };
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     // A current-thread runtime runs every send on this thread, which sees the recorder.
     let _local = metrics::set_default_local_recorder(&recorder);
 
-    for refusal in [Refusal::PortOnly, Refusal::AuthRequired] {
-        let squid = Squid::start(&format!("refused-{refusal:?}").to_lowercase(), refusal).await;
-        assert_proxy_refuses(&squid.url, refusal).await;
-        assert_ne!(TARGET_PORT, ALLOWED_PORT);
+    for refusal in Refusal::ALL {
+        let proxy = refusal.proxy(squid);
+        assert_proxy_refuses(&proxy, refusal).await;
 
         for case in Case::ALL {
             let name = format!("{refusal:?} {case:?}");
             let before = refused_total(&handle.render(), case.label());
-            let got = send_through(case, &squid.url).await;
+            let got = send_through(case, &proxy).await;
 
             assert!(
                 matches!(got.single, SendResult::Backpressured),

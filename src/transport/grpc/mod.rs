@@ -2668,56 +2668,48 @@ mod tests {
         (server, format!("http://{addr}"))
     }
 
-    /// A send goes through the proxy's CONNECT tunnel, plain or with TLS
-    /// inside it, with the proxy's credentials where it asks for them.
+    /// A send goes through a real Squid's CONNECT tunnel, plain or with TLS
+    /// inside it, with the proxy's credentials where it asks for them. The
+    /// target name resolves only inside Squid, so a record that arrives went
+    /// through it.
+    #[cfg(all(feature = "transport-proxy-test-support", unix))]
     #[tokio::test]
     async fn sends_go_through_a_connect_proxy() {
         use crate::sensitive::SensitiveString;
         use crate::transport::ProxyConfig;
-        use crate::transport::proxy::test_proxy::{ConnectProxy, Policy, credentials, tls_front};
+        use crate::transport::proxy::squid::{PASSWORD, Squid, TARGET_HOST, USER};
+        use crate::transport::proxy::test_front::{plain_front, tls_front};
 
-        let (server, plain) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
+        let Some(squid) = Squid::shared().await else {
+            return;
+        };
+        let (server, _) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
         let listening = server.local_addr().unwrap();
+        let plain = format!(
+            "http://{TARGET_HOST}:{}",
+            plain_front(listening).await.port()
+        );
         let (front, ca) = tls_front(listening, &[b"h2"]).await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
         tokio::fs::write(ca_file.path(), &ca).await.unwrap();
-        let tls = format!("https://localhost:{}", front.port());
-        let good = credentials();
-        let auth = good.header.clone();
-        // (policy, credentials, TLS inside the tunnel)
+        let tls = format!("https://{TARGET_HOST}:{}", front.port());
+        // (proxy URL, TLS inside the tunnel)
         let rows = [
-            (Policy::Allow, None, false),
-            (Policy::Allow, None, true),
-            (Policy::Auth(auth), Some(&good), true),
+            (squid.open(), false),
+            (squid.open(), true),
+            (squid.auth_with(USER, PASSWORD), true),
         ];
-        for (policy, credentials, over_tls) in &rows {
-            let name = format!(
-                "{policy:?} credentials={} tls={over_tls}",
-                credentials.is_some()
-            );
-            let proxy = ConnectProxy::start(policy.clone()).await;
-            let url = credentials.map_or_else(|| proxy.url(), |c| proxy.url_with(c));
+        for (proxy, over_tls) in &rows {
             let mut config = GrpcConfig::client(if *over_tls { &tls } else { &plain });
-            config.proxy = ProxyConfig::Url(SensitiveString::new(url));
-            config.send_timeout_ms = 5_000;
+            config.proxy = ProxyConfig::Url(SensitiveString::new(proxy.as_str()));
+            config.send_timeout_ms = 10_000;
             if *over_tls {
                 config.tls_enabled = true;
                 config.tls_ca_path = Some(ca_file.path().to_string_lossy().into_owned());
             }
             let client = GrpcTransport::new(&config).await.unwrap();
             let result = client.send("events", filled(8)).await;
-
-            let tunnel = if *over_tls {
-                format!("localhost:{}", front.port())
-            } else {
-                listening.to_string()
-            };
-            let seen = proxy.seen();
-            assert!(
-                !seen.is_empty() && seen.iter().all(|c| c.target == tunnel),
-                "{name}: {seen:?}"
-            );
-            assert!(result.is_ok(), "{name}: got {result:?}");
+            assert!(result.is_ok(), "tls={over_tls}: got {result:?}");
         }
         assert_eq!(server.recv(10).await.unwrap().records.len(), rows.len());
     }

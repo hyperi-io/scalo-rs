@@ -357,14 +357,19 @@ impl OtlpTransport {
                 }
             }
             SendResult::Backpressured | SendResult::RetryAfter(_) => {
-                tracing::warn!(
-                    endpoint = %self.endpoint,
-                    records,
-                    elapsed_ms,
-                    budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
-                    retry_after_ms = result.retry_after().map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
-                    "OTLP export not taken; the records may have arrived and are sent again"
-                );
+                // A refused tunnel is logged once per run, so each retry stays at debug.
+                if self.refusals.is_refused() {
+                    tracing::debug!(endpoint = %self.endpoint, records, "OTLP export held behind a refused proxy");
+                } else {
+                    tracing::warn!(
+                        endpoint = %self.endpoint,
+                        records,
+                        elapsed_ms,
+                        budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+                        retry_after_ms = result.retry_after().map(|w| u64::try_from(w.as_millis()).unwrap_or(u64::MAX)),
+                        "OTLP export not taken; the records may have arrived and are sent again"
+                    );
+                }
                 #[cfg(feature = "metrics")]
                 metrics::counter!("transport_backpressured_total", "transport" => "otlp")
                     .increment(1);
