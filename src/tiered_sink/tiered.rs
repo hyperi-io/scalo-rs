@@ -9,6 +9,7 @@
 //! TieredSink implementation.
 
 use crate::compression::{Compressor, CompressorPool};
+use crate::concurrency::{PeriodicTask, PeriodicWorker, TickError};
 use crate::tiered_sink::{
     CircuitBreaker, CircuitState, OrderingMode, Result, TieredSinkConfig, TieredSinkError, drainer,
 };
@@ -52,7 +53,7 @@ pub struct TieredSink<S: TransportSender> {
     shutdown: CancellationToken,
     drain_handle: Option<JoinHandle<()>>,
     disk_available: Arc<std::sync::atomic::AtomicBool>,
-    disk_poller_handle: Option<JoinHandle<()>>,
+    disk_poller_handle: Option<PeriodicWorker>,
     /// Set once `shutdown` has joined both tasks, so its own drop of `self` is not reported as one.
     shut_down: bool,
 
@@ -198,19 +199,14 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
         // Start disk-aware capacity poller if configured
         let disk_poller_handle = config.disk_aware.as_ref().map(|disk_cfg| {
-            let spool_path = config.spool_path.clone();
-            let disk_flag = Arc::clone(&disk_available);
-            let shutdown_clone = shutdown.clone();
-            let poll_interval = std::time::Duration::from_secs(disk_cfg.poll_interval_secs);
-            let max_usage = disk_cfg.max_usage_percent;
-
-            tokio::spawn(disk_capacity_poller(
-                spool_path,
-                disk_flag,
-                max_usage,
-                poll_interval,
-                shutdown_clone,
-            ))
+            let poller = DiskCapacityPoller {
+                spool_path: config.spool_path.clone(),
+                disk_available: Arc::clone(&disk_available),
+                max_usage_percent: disk_cfg.max_usage_percent,
+            };
+            // A zero interval would panic the timer, so it reads as the smallest whole second.
+            let every = std::time::Duration::from_secs(disk_cfg.poll_interval_secs.max(1));
+            PeriodicWorker::spawn(poller, every, shutdown.clone())
         });
 
         let dead_letters = drainer::DeadLetters::default();
@@ -668,9 +664,11 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// in the spill cache stay on disk and replay on the next open.
     pub async fn shutdown(mut self) {
         self.shutdown.cancel();
-        let handles = [self.drain_handle.take(), self.disk_poller_handle.take()];
-        for handle in handles.into_iter().flatten() {
-            let _ = handle.await;
+        if let Some(drain) = self.drain_handle.take() {
+            let _ = drain.await;
+        }
+        if let Some(poller) = self.disk_poller_handle.take() {
+            let _ = poller.join().await;
         }
         self.shut_down = true;
     }
@@ -740,25 +738,15 @@ fn check_disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 /// Background poller that checks disk usage and sets a flag.
-async fn disk_capacity_poller(
+struct DiskCapacityPoller {
     spool_path: std::path::PathBuf,
     disk_available: Arc<std::sync::atomic::AtomicBool>,
     max_usage_percent: f64,
-    poll_interval: std::time::Duration,
-    shutdown: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.cancelled() => {
-                #[cfg(feature = "tracing")]
-                tracing::debug!("Disk capacity poller shutting down");
-                return;
-            }
-            () = tokio::time::sleep(poll_interval) => {}
-        }
+}
 
-        let disk_space = check_disk_space(&spool_path);
+impl PeriodicTask for DiskCapacityPoller {
+    async fn tick(&mut self) -> std::result::Result<(), TickError> {
+        let disk_space = check_disk_space(&self.spool_path);
 
         #[cfg(feature = "metrics")]
         if let Some((total, avail)) = disk_space {
@@ -771,19 +759,27 @@ async fn disk_capacity_poller(
                 return true;
             }
             let used_ratio = 1.0 - (avail as f64 / total as f64);
-            let ok = used_ratio < max_usage_percent;
+            let ok = used_ratio < self.max_usage_percent;
             #[cfg(feature = "tracing")]
             if !ok {
                 tracing::warn!(
                     used_percent = format!("{:.1}%", used_ratio * 100.0),
-                    threshold = format!("{:.1}%", max_usage_percent * 100.0),
+                    threshold = format!("{:.1}%", self.max_usage_percent * 100.0),
                     "Disk usage exceeds threshold, pausing spool writes"
                 );
             }
             ok
         });
 
-        disk_available.store(available, std::sync::atomic::Ordering::Relaxed);
+        self.disk_available
+            .store(available, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::result::Result<(), TickError> {
+        #[cfg(feature = "tracing")]
+        tracing::debug!("Disk capacity poller shutting down");
+        Ok(())
     }
 }
 
@@ -2379,7 +2375,7 @@ mod tests {
         drop(tiered);
         tokio::time::timeout(SHUTDOWN_BOUND, async {
             drainer.await.unwrap();
-            poller.await.unwrap();
+            poller.join().await.unwrap();
         })
         .await
         .expect("dropping the sink must stop both background tasks");

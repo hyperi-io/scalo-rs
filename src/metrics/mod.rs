@@ -100,6 +100,11 @@ use thiserror::Error;
 #[cfg(feature = "metrics")]
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+#[cfg(feature = "metrics")]
+use tokio_util::sync::{CancellationToken, DropGuard};
+
+#[cfg(feature = "metrics")]
+use crate::concurrency::{PeriodicTask, PeriodicWorker, TickError};
 
 /// Readiness check callback type.
 pub type ReadinessFn = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -1216,8 +1221,12 @@ async fn run_server(
     readiness_fn: ReadinessSlot,
     #[cfg(feature = "scaling")] scaling_pressure: ScalingPressureSlot,
 ) {
-    let mut update_interval = tokio::time::interval(update_interval);
-    let mut upkeep = upkeep_interval();
+    let _refresh = spawn_refresh(
+        handle.clone(),
+        update_interval,
+        process_metrics,
+        container_metrics,
+    );
     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     // Owned, so connections still open at shutdown are aborted with the loop.
     let mut tasks = tokio::task::JoinSet::new();
@@ -1228,15 +1237,6 @@ async fn run_server(
                 break;
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-            _ = upkeep.tick() => run_upkeep(&handle),
-            _ = update_interval.tick() => {
-                if let Some(ref pm) = process_metrics {
-                    pm.update();
-                }
-                if let Some(ref cm) = container_metrics {
-                    cm.update();
-                }
-            }
             result = listener.accept() => {
                 if let Ok((stream, _)) = result {
                     // Over the cap the connection is closed unanswered.
@@ -1273,24 +1273,61 @@ async fn run_server(
 #[cfg(feature = "metrics")]
 const PROMETHEUS_UPKEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A ticker for [`PROMETHEUS_UPKEEP_INTERVAL`] that does not burst after a stall.
+/// Refresh the process and container gauges every `update_interval`, and run
+/// the histogram [`Upkeep`] every [`PROMETHEUS_UPKEEP_INTERVAL`], each first
+/// at once, until the returned guard drops.
 #[cfg(feature = "metrics")]
-fn upkeep_interval() -> tokio::time::Interval {
-    let mut upkeep = tokio::time::interval(PROMETHEUS_UPKEEP_INTERVAL);
-    upkeep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    upkeep
+fn spawn_refresh(
+    handle: PrometheusHandle,
+    update_interval: Duration,
+    process_metrics: Option<ProcessMetrics>,
+    container_metrics: Option<ContainerMetrics>,
+) -> DropGuard {
+    let stop = CancellationToken::new();
+    PeriodicWorker::spawn_immediate(Upkeep(handle), PROMETHEUS_UPKEEP_INTERVAL, stop.clone());
+    let gauges = GaugeRefresh {
+        process_metrics,
+        container_metrics,
+    };
+    PeriodicWorker::spawn_immediate(gauges, update_interval, stop.clone());
+    stop.drop_guard()
 }
 
-/// Drain recorded histogram samples into their series and free the drained
+#[cfg(feature = "metrics")]
+struct GaugeRefresh {
+    process_metrics: Option<ProcessMetrics>,
+    container_metrics: Option<ContainerMetrics>,
+}
+
+#[cfg(feature = "metrics")]
+impl PeriodicTask for GaugeRefresh {
+    async fn tick(&mut self) -> Result<(), TickError> {
+        if let Some(pm) = &self.process_metrics {
+            pm.update();
+        }
+        if let Some(cm) = &self.container_metrics {
+            cm.update();
+        }
+        Ok(())
+    }
+}
+
+/// Drains recorded histogram samples into their series and frees the drained
 /// blocks.
 ///
 /// The recorder hands drained blocks to crossbeam's epoch collector, which
 /// frees them only after enough later pins. An idle service pins too rarely
 /// for that, so the flush runs the collector here.
 #[cfg(feature = "metrics")]
-fn run_upkeep(handle: &PrometheusHandle) {
-    handle.run_upkeep();
-    crossbeam_epoch::pin().flush();
+struct Upkeep(PrometheusHandle);
+
+#[cfg(feature = "metrics")]
+impl PeriodicTask for Upkeep {
+    async fn tick(&mut self) -> Result<(), TickError> {
+        self.0.run_upkeep();
+        crossbeam_epoch::pin().flush();
+        Ok(())
+    }
 }
 
 /// Longest request line we will read before giving up.
@@ -1505,27 +1542,7 @@ async fn run_axum_server(
     process_metrics: Option<ProcessMetrics>,
     container_metrics: Option<ContainerMetrics>,
 ) {
-    let mut interval = tokio::time::interval(update_interval);
-    let mut upkeep = upkeep_interval();
-
-    // Spawn the metrics update loop
-    let (update_stop_tx, mut update_stop_rx) = oneshot::channel::<()>();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut update_stop_rx => break,
-                _ = upkeep.tick() => run_upkeep(&handle),
-                _ = interval.tick() => {
-                    if let Some(ref pm) = process_metrics {
-                        pm.update();
-                    }
-                    if let Some(ref cm) = container_metrics {
-                        cm.update();
-                    }
-                }
-            }
-        }
-    });
+    let _refresh = spawn_refresh(handle, update_interval, process_metrics, container_metrics);
 
     // Run axum server with graceful shutdown
     axum::serve(listener, app)
@@ -1534,8 +1551,6 @@ async fn run_axum_server(
         })
         .await
         .unwrap_or_else(|e| tracing::error!(error = %e, "Metrics axum server error"));
-
-    let _ = update_stop_tx.send(());
 }
 
 /// Standard latency histogram buckets.
@@ -1633,14 +1648,22 @@ mod tests {
     }
 
     /// A Prometheus handle without installing a global recorder.
-    #[cfg(all(feature = "metrics", feature = "http-server"))]
+    #[cfg(all(
+        feature = "metrics",
+        feature = "http-server",
+        any(feature = "scaling", feature = "memory")
+    ))]
     fn test_prometheus_handle() -> PrometheusHandle {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
             .handle()
     }
 
-    #[cfg(all(feature = "metrics", feature = "http-server"))]
+    #[cfg(all(
+        feature = "metrics",
+        feature = "http-server",
+        any(feature = "scaling", feature = "memory")
+    ))]
     async fn probe(app: &axum::Router, path: &str) -> axum::http::StatusCode {
         use tower::ServiceExt;
 

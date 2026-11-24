@@ -1979,26 +1979,27 @@ impl KafkaTransport {
         interval: Duration,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(interval);
-            tick.tick().await; // consume the immediate first tick
-            loop {
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    _ = tick.tick() => {
-                        // The diagnostic does synchronous broker round-trips
-                        // (fetch_metadata + fetch_group_list). Run them OFF the
-                        // async runtime worker so a slow broker cannot pin it.
-                        let this = Arc::clone(&self);
-                        match tokio::task::spawn_blocking(move || this.check_partition_limited()).await {
-                            Ok(Err(e)) => tracing::debug!(error = %e, "partition-limited diagnostic tick failed"),
-                            Err(e) => tracing::debug!(error = %e, "partition-limited diagnostic task join failed"),
-                            Ok(Ok(_)) => {}
-                        }
-                    }
-                }
-            }
-        });
+        crate::concurrency::PeriodicWorker::spawn(PartitionLimitedTick(self), interval, shutdown);
+    }
+}
+
+/// [`KafkaTransport::spawn_partition_limited_tick`]'s task.
+#[cfg(feature = "governor")]
+struct PartitionLimitedTick(Arc<KafkaTransport>);
+
+#[cfg(feature = "governor")]
+impl crate::concurrency::PeriodicTask for PartitionLimitedTick {
+    async fn tick(&mut self) -> Result<(), crate::concurrency::TickError> {
+        // The diagnostic does synchronous broker round-trips
+        // (fetch_metadata + fetch_group_list). Run them OFF the
+        // async runtime worker so a slow broker cannot pin it.
+        let this = Arc::clone(&self.0);
+        match tokio::task::spawn_blocking(move || this.check_partition_limited()).await {
+            Ok(Err(e)) => tracing::debug!(error = %e, "partition-limited diagnostic tick failed"),
+            Err(e) => tracing::debug!(error = %e, "partition-limited diagnostic task join failed"),
+            Ok(Ok(_)) => {}
+        }
+        Ok(())
     }
 }
 

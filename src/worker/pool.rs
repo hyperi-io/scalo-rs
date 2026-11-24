@@ -482,11 +482,13 @@ impl AdaptiveWorkerPool {
 
     /// Start the background scaling controller.
     ///
-    /// The controller samples CPU/memory every `scale_interval_secs` and adjusts
-    /// the semaphore permits based on watermark bands. Stops on cancellation.
+    /// The controller samples CPU/memory at once and then every
+    /// `scale_interval_secs`, and adjusts the semaphore permits based on
+    /// watermark bands. Stops on cancellation.
     pub fn start_scaling_loop(self: &Arc<Self>, cancel: tokio_util::sync::CancellationToken) {
+        let every = std::time::Duration::from_secs(self.config.read().scale_interval_secs);
         let controller = super::scaler::ScalingController::new(self.clone());
-        tokio::spawn(controller.run(cancel));
+        crate::concurrency::PeriodicWorker::spawn_immediate(controller, every, cancel);
     }
 
     /// Attach a `MemoryGuard` for dual-source memory pressure reading.

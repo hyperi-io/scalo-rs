@@ -217,7 +217,7 @@ A handful of dependencies aren't visible from the feature name alone:
 - `spool` pulls `semver`, which checks a queue's version file, and `tokio`: `Spool::open` opens the queue on tokio's blocking
   pool, so it needs a tokio runtime.
 - `dlq` needs `concurrency` (for the `BackgroundSink` actor that
-  drains queued entries).
+  drains queued entries). `metrics`, `worker-pool`, `tiered-sink` and `transport-kafka` pull it for their `PeriodicWorker` timers, and it adds no crate any of them lacked.
 
 Across the service stack:
 
