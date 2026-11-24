@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::otel_endpoint::{DEFAULT_GRPC_ENDPOINT, append_signal_path, endpoint_for_protocol};
+use crate::sensitive::SensitiveString;
 use crate::tls::{ClientTls, ClientTlsConfig};
 use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::filter::FilterRule;
@@ -67,10 +68,10 @@ pub struct OtlpConfig {
     pub protocol: OtlpProtocol,
 
     /// Headers sent with every request: gRPC metadata or HTTP headers,
-    /// commonly an API key. Never serialised back out, as the admin `/config`
-    /// endpoint redacts by field name and would print a token held here.
+    /// commonly an API key. Each value is a [`SensitiveString`], so `Debug`
+    /// and logs show it redacted, and the map is never serialised back out.
     #[serde(skip_serializing)]
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, SensitiveString>,
 
     /// Limit on each export, connect and TLS handshake included, in
     /// milliseconds. Default 10000. A send past it is `Backpressured`.
@@ -276,11 +277,14 @@ mod tests {
         assert_eq!(config.endpoint, "https://collector.example:4318");
         assert_eq!(config.protocol, OtlpProtocol::Http);
         assert_eq!(
-            config.headers.get("authorization").map(String::as_str),
+            config
+                .headers
+                .get("authorization")
+                .map(SensitiveString::expose),
             Some("Bearer env")
         );
         assert_eq!(
-            config.headers.get("x-tenant").map(String::as_str),
+            config.headers.get("x-tenant").map(SensitiveString::expose),
             Some("blue")
         );
         assert_eq!(config.timeout_ms, 2500);
@@ -311,6 +315,10 @@ mod tests {
         assert!(
             !serde_json::to_string(&config).unwrap().contains("Bearer"),
             "headers are never serialised back out"
+        );
+        assert!(
+            !format!("{config:?}").contains("Bearer"),
+            "Debug redacts header values"
         );
     }
 

@@ -644,7 +644,7 @@ async fn each_collector_answer_maps_onto_a_send_result() {
             endpoint: endpoint(case, &seen, &ca, &pinned).await,
             protocol: case.protocol,
             service_name: Some("stub-test".to_string()),
-            headers: [("x-tenant".to_string(), "blue".to_string())]
+            headers: [("x-tenant".to_string(), "blue".into())]
                 .into_iter()
                 .collect(),
             ..OtlpConfig::default()
@@ -666,13 +666,20 @@ async fn each_collector_answer_maps_onto_a_send_result() {
         }
         (case.tweak)(&mut config);
         let gzip = config.compression == OtlpCompression::Gzip;
-        let sender = AnySender::from_transport_config(&TransportConfig {
+        let transport_config = TransportConfig {
             transport_type: TransportType::Otlp,
             otlp: Some(config),
             ..TransportConfig::default()
-        })
-        .await
-        .unwrap_or_else(|e| panic!("{}: build: {e}", case.name));
+        };
+        // check_seen asserts the collector got the real value.
+        assert!(
+            !format!("{transport_config:?}").contains("blue"),
+            "{}: Debug redacts header values",
+            case.name
+        );
+        let sender = AnySender::from_transport_config(&transport_config)
+            .await
+            .unwrap_or_else(|e| panic!("{}: build: {e}", case.name));
 
         let started = Instant::now();
         let result = match case.deadline_ms {
@@ -727,7 +734,7 @@ async fn a_bad_setting_fails_the_build_and_a_closed_transport_refuses() {
         (
             "a header name gRPC cannot send",
             OtlpConfig {
-                headers: [("bad header".to_string(), "x".to_string())]
+                headers: [("bad header".to_string(), "x".into())]
                     .into_iter()
                     .collect(),
                 ..OtlpConfig::default()
@@ -737,7 +744,7 @@ async fn a_bad_setting_fails_the_build_and_a_closed_transport_refuses() {
         (
             "a header value HTTP cannot send",
             OtlpConfig {
-                headers: [("x-key".to_string(), "line\nbreak".to_string())]
+                headers: [("x-key".to_string(), "line\nbreak".into())]
                     .into_iter()
                     .collect(),
                 ..OtlpConfig::http("http://collector:4318")

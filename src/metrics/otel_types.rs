@@ -65,13 +65,11 @@ pub struct OtelMetricsConfig {
     /// Override via `OTEL_SERVICE_NAME` env var.
     pub service_name: String,
 
-    /// Additional OTLP headers, commonly a backend API key.
-    ///
-    /// Never serialised back out: this section is reachable through the admin
-    /// `/config` endpoint, and the redaction there matches on field NAMES, so
-    /// a token sitting in a map value would be printed in clear.
+    /// Additional OTLP headers, commonly a backend API key. Each value is a
+    /// [`SensitiveString`](crate::sensitive::SensitiveString), so `Debug` and
+    /// logs show it redacted, and the map is never serialised back out.
     #[serde(skip_serializing)]
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, crate::sensitive::SensitiveString>,
 
     /// Additional resource attributes.
     pub resource_attributes: HashMap<String, String>,

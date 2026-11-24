@@ -6,6 +6,14 @@ release and the target before bumping.
 
 ---
 
+## 2.14.35
+
+### `OtlpConfig.headers` and `OtelMetricsConfig.headers` hold `SensitiveString` values (API CHANGE)
+
+`OtlpConfig.headers` is a `BTreeMap<String, SensitiveString>`, where it was `BTreeMap<String, String>`, and `OtelMetricsConfig.headers` is a `HashMap<String, SensitiveString>`, where it was `HashMap<String, String>`. `Debug` and logs show each value redacted. The YAML and env shape is unchanged. `KafkaConfig` and `KafkaSizingConfig` redact credential values in every raw librdkafka map (`librdkafka_overrides`, `extra_config`, `sizing.producer_librdkafka`, `sizing.consumer_librdkafka`) in `Debug`. A credential key contains `password` or `secret`, or is `ssl.key.pem`, `sasl.oauthbearer.config` or a `sasl.oauthbearer.assertion.private.key` `pem` or `passphrase`.
+
+**Consumer adjustment** -- a struct literal builds each value with `.into()` (`From<&str>` and `From<String>` exist). Code that reads a value calls `.expose()`.
+
 ## 2.14.34
 
 ### The HTTP transport holds a batch every endpoint refuses at TLS (BEHAVIOUR CHANGE)
