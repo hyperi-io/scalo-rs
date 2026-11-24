@@ -44,7 +44,7 @@ use std::fmt;
 use serde::de::Deserializer;
 use serde::ser::Serializer;
 
-const REDACTED: &str = "***REDACTED***";
+pub(crate) const REDACTED: &str = "***REDACTED***";
 
 /// Name fragments that mark a field as secret.
 ///

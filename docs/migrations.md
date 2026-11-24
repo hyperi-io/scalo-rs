@@ -14,6 +14,12 @@ A proxy that refused the CONNECT, as a 403 for a port it doesn't allow or a 407 
 
 **Consumer adjustment** -- code that matched `Reject` to spot a proxy refusal matches `Backpressured` and alerts on `transport_proxy_refused_total`. A caller of `proxy::rejected` calls `Refusals::hold`. A pod behind a proxy that refuses its target fails readiness until the proxy policy or the `proxy` setting is fixed.
 
+### `OtlpConfig.headers` and `OtelMetricsConfig.headers` hold `SensitiveString` values (API CHANGE)
+
+`OtlpConfig.headers` is a `BTreeMap<String, SensitiveString>`, where it was `BTreeMap<String, String>`, and `OtelMetricsConfig.headers` is a `HashMap<String, SensitiveString>`, where it was `HashMap<String, String>`. `Debug` and logs show each value redacted. The YAML and env shape is unchanged. `KafkaConfig` and `KafkaSizingConfig` redact credential values in every raw librdkafka map (`librdkafka_overrides`, `extra_config`, `sizing.producer_librdkafka`, `sizing.consumer_librdkafka`) in `Debug`. A credential key contains `password` or `secret`, or is `ssl.key.pem`, `sasl.oauthbearer.config` or a `sasl.oauthbearer.assertion.private.key` `pem` or `passphrase`.
+
+**Consumer adjustment** -- a struct literal builds each value with `.into()` (`From<&str>` and `From<String>` exist). Code that reads a value calls `.expose()`.
+
 ## 2.14.34
 
 ### The HTTP transport holds a batch every endpoint refuses at TLS (BEHAVIOUR CHANGE)

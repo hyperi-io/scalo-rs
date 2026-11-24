@@ -496,8 +496,9 @@ fn grpc_wire(
         let key = AsciiMetadataKey::from_bytes(name.as_bytes())
             .map_err(|_| config_error(format!("header {name:?} is not a gRPC metadata name")))?;
         // The value is never shown: it is commonly a credential.
-        let value = AsciiMetadataValue::try_from(value.as_str())
+        let mut value = AsciiMetadataValue::try_from(value.expose())
             .map_err(|_| config_error(format!("header {name:?} has a value gRPC cannot send")))?;
+        value.set_sensitive(true);
         metadata.insert(key, value);
     }
     Ok(Wire::Grpc { client, metadata })
@@ -535,7 +536,7 @@ fn http_wire(
     for (name, value) in &config.headers {
         let key = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| config_error(format!("header {name:?} is not an HTTP header name")))?;
-        let mut value = HeaderValue::from_str(value)
+        let mut value = HeaderValue::from_str(value.expose())
             .map_err(|_| config_error(format!("header {name:?} has a value HTTP cannot send")))?;
         value.set_sensitive(true);
         headers.insert(key, value);
