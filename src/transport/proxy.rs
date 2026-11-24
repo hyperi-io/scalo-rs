@@ -22,6 +22,7 @@ mod tests;
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hyper_util::client::proxy::matcher::Matcher;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -363,18 +364,57 @@ pub fn refusal<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a P
     None
 }
 
-/// The send result for a refused CONNECT: `Reject`, logged once with the
-/// proxy's status and the target port.
-#[must_use]
-pub fn rejected(refused: &ProxyRefused, transport: &str) -> SendResult {
-    tracing::warn!(
-        transport,
-        proxy = %refused.proxy,
-        target = %format!("{}:{}", refused.host, refused.port),
-        status = refused.status,
-        "proxy refused CONNECT; many proxies allow CONNECT to port 443 only"
-    );
-    SendResult::Reject(TransportError::Connection(refused.to_string()))
+/// Whether a transport's proxy is refusing CONNECT, shared by its senders and
+/// its readiness check. Cheap to clone.
+///
+/// A refusal is the proxy's policy or the config's to fix, and the records are
+/// fine, so [`hold`](Self::hold) answers `Backpressured` and the caller keeps
+/// them. The warning is logged when a run of refusals starts, and the run ends
+/// at the next send the target takes.
+#[derive(Debug, Clone, Default)]
+pub struct Refusals {
+    refused: Arc<AtomicBool>,
+}
+
+impl Refusals {
+    /// Records a refused CONNECT: counts it in `transport_proxy_refused_total`,
+    /// and logs the proxy's status and the target port when it starts a run of
+    /// refusals.
+    pub fn note(&self, refused: &ProxyRefused, transport: &'static str) {
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_proxy_refused_total", "transport" => transport).increment(1);
+        if !self.refused.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                transport,
+                proxy = %refused.proxy,
+                target = %format!("{}:{}", refused.host, refused.port),
+                status = refused.status,
+                "proxy refused CONNECT, so the records are held and sent again; \
+                 many proxies allow CONNECT to port 443 only"
+            );
+        }
+    }
+
+    /// The send result for a refused CONNECT: [`note`](Self::note), then
+    /// `Backpressured`.
+    #[must_use]
+    pub fn hold(&self, refused: &ProxyRefused, transport: &'static str) -> SendResult {
+        self.note(refused, transport);
+        SendResult::Backpressured
+    }
+
+    /// Ends a run of refusals. Call it when a send the target took comes back.
+    pub fn clear(&self, transport: &'static str) {
+        if self.refused.load(Ordering::Relaxed) && self.refused.swap(false, Ordering::Relaxed) {
+            tracing::info!(transport, "proxy opened a CONNECT tunnel again");
+        }
+    }
+
+    /// Whether the last CONNECT the proxy answered was a refusal.
+    #[must_use]
+    pub fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
 }
 
 /// The resolved proxy entries and the hosts that bypass them.

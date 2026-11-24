@@ -72,7 +72,7 @@ One connection is held and reused, behind a lock, so concurrent sends go one aft
 | Connect refused or timed out, DNS failed | `Backpressured` |
 | Write broke off mid-batch, or the deadline passed | `Backpressured`, the connection dropped, never `Ok` |
 | TLS refused the receiver's certificate or ours | `Fatal(Config)` |
-| The proxy refused CONNECT | `Reject`, with the proxy's status and the receiver's port: many proxies allow CONNECT to port 443 only |
+| The proxy refused CONNECT | `Backpressured`, with the proxy's status and the receiver's port logged once per run and `is_healthy()` false until a send goes through: many proxies allow CONNECT to port 443 only |
 | RELP session lost mid-batch | reconnect once in the same call and send only the unanswered messages, then `Backpressured` if that fails too |
 | RELP answer other than `200` for a message | `Backpressured`, the session kept |
 | RELP receiver refuses the session, or offers no `syslog` command | `Fatal(Config)` |

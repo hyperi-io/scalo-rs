@@ -93,6 +93,8 @@ pub struct SyslogTransport {
     filter_engine: TransportFilterEngine,
     state: Mutex<State>,
     closed: AtomicBool,
+    /// Whether the proxy is refusing CONNECT, which fails readiness until a send goes through.
+    refusals: crate::transport::proxy::Refusals,
 }
 
 impl SyslogTransport {
@@ -153,6 +155,7 @@ impl SyslogTransport {
             filter_engine,
             state: Mutex::new(State::default()),
             closed: AtomicBool::new(false),
+            refusals: crate::transport::proxy::Refusals::default(),
         };
         tracing::info!(
             address = %config.address,
@@ -251,6 +254,9 @@ impl SyslogTransport {
             SyslogProtocol::Udp => self.deliver_udp(current, &messages).await,
         };
         *session = kept;
+        if result.is_ok() {
+            self.refusals.clear("syslog");
+        }
         result
     }
 
@@ -481,7 +487,7 @@ impl SyslogTransport {
                 tracing::warn!(address = %self.address, error = %e, "syslog: cannot connect");
                 SendResult::Backpressured
             }
-            ConnectError::Refused(refused) => crate::transport::proxy::rejected(refused, "syslog"),
+            ConnectError::Refused(refused) => self.refusals.hold(refused, "syslog"),
             ConnectError::Trust(_) => {
                 tracing::error!(address = %self.address, error = %e, "syslog: TLS refused");
                 SendResult::Fatal(TransportError::Config(format!(
@@ -522,7 +528,7 @@ impl TransportBase for SyslogTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed)
+        !self.closed.load(Ordering::Relaxed) && !self.refusals.is_refused()
     }
 
     fn name(&self) -> &'static str {

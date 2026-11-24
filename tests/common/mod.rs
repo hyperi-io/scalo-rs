@@ -21,6 +21,9 @@ pub mod openbao;
 #[cfg(all(feature = "transport-kafka-test-support", unix))]
 pub mod kafka;
 
+#[cfg(all(feature = "deployment-test-support", unix))]
+pub mod squid;
+
 /// This suite, for container names, labels, the run log and the
 /// `HYPERI_TEST_*` lookup.
 #[cfg(all(feature = "deployment-test-support", unix))]

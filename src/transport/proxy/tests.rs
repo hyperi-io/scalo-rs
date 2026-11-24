@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::system::{Settings, from_winhttp, wildcard_to_rule};
 use super::test_proxy::{ConnectProxy, Credentials, Policy, credentials, echo};
-use super::{ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Scheme, refusal, rejected};
+use super::{ProxyConfig, ProxyDialer, ProxyError, ProxyRefused, Refusals, Scheme, refusal};
 use crate::sensitive::SensitiveString;
 use crate::transport::error::TransportError;
 use crate::transport::types::SendResult;
@@ -339,7 +339,7 @@ async fn tls_through_the_tunnel() {
 }
 
 #[test]
-fn a_refusal_is_found_in_a_cause_chain_and_rejected() {
+fn a_refusal_is_found_in_a_cause_chain() {
     let refused = ProxyRefused {
         proxy: "p:3128".into(),
         host: "t.example".into(),
@@ -352,9 +352,30 @@ fn a_refusal_is_found_in_a_cause_chain_and_rejected() {
     assert_eq!(refusal(boxed.as_ref()), Some(&refused));
     assert_eq!(refusal(&chained), Some(&refused));
     assert_eq!(refusal(&std::io::Error::other("other")), None);
+}
 
-    let SendResult::Reject(TransportError::Connection(text)) = rejected(&refused, "test") else {
-        panic!("a refusal is not Reject");
+/// A refused CONNECT holds the records and fails readiness until a send goes
+/// through, and every clone of the state sees both.
+#[test]
+fn a_refusal_holds_the_records_until_a_send_goes_through() {
+    let refused = ProxyRefused {
+        proxy: "p:3128".into(),
+        host: "t.example".into(),
+        port: 6514,
+        status: 403,
     };
-    assert!(text.contains("403") && text.contains("6514"), "{text}");
+    let refusals = Refusals::default();
+    let shared = refusals.clone();
+    assert!(!shared.is_refused());
+
+    for _ in 0..2 {
+        assert!(matches!(
+            refusals.hold(&refused, "test"),
+            SendResult::Backpressured
+        ));
+        assert!(shared.is_refused());
+    }
+
+    shared.clear("test");
+    assert!(!refusals.is_refused());
 }

@@ -456,6 +456,9 @@ pub struct HttpTransport {
     /// Whether the transport is closed.
     closed: Arc<AtomicBool>,
 
+    /// Whether the proxy is refusing CONNECT, which fails readiness until a send goes through.
+    refusals: super::proxy::Refusals,
+
     /// Receive timeout in milliseconds (used by receive side).
     #[cfg(feature = "http-server")]
     recv_timeout_ms: u64,
@@ -610,12 +613,17 @@ impl HttpTransport {
         )?;
 
         let closed = Arc::new(AtomicBool::new(false));
+        let refusals = sender
+            .as_ref()
+            .map(send::Sender::refusals)
+            .unwrap_or_default();
 
         #[cfg(feature = "health")]
         let health_registration = {
             let h = Arc::clone(&closed);
+            let refusals = refusals.clone();
             crate::health::HealthRegistry::register_scoped("transport:http", move || {
-                if h.load(Ordering::Relaxed) {
+                if h.load(Ordering::Relaxed) || refusals.is_refused() {
                     crate::health::HealthStatus::Unhealthy
                 } else {
                     crate::health::HealthStatus::Healthy
@@ -638,6 +646,7 @@ impl HttpTransport {
             #[cfg(feature = "http-server")]
             server_task: parking_lot::Mutex::new(server_handle),
             closed,
+            refusals,
             #[cfg(feature = "http-server")]
             recv_timeout_ms: config.recv_timeout_ms,
             filter_engine,
@@ -889,7 +898,7 @@ impl TransportBase for HttpTransport {
     }
 
     fn is_healthy(&self) -> bool {
-        !self.closed.load(Ordering::Relaxed)
+        !self.closed.load(Ordering::Relaxed) && !self.refusals.is_refused()
     }
 
     fn name(&self) -> &'static str {

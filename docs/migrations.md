@@ -6,6 +6,14 @@ release and the target before bumping.
 
 ---
 
+## 2.14.35
+
+### A refused proxy CONNECT holds the records (BEHAVIOUR CHANGE)
+
+A proxy that refused the CONNECT, as a 403 for a port it doesn't allow or a 407 for credentials it wants, was `Reject` on the gRPC, HTTP, OTLP and syslog transports, so a caller dead-lettered every record. It is `Backpressured` and the caller keeps the records and retries them, as for a Kafka client the broker refuses. The first refusal of a run is logged with the proxy's status and the target port, and each one adds to `transport_proxy_refused_total{transport}`. `is_healthy()` and the `transport:grpc`, `transport:http` and `transport:otlp` health checks report not-ready until a send goes through. `transport::proxy::rejected` is gone, and `transport::proxy::Refusals` replaces it. See [transport/http.md](transport/http.md#proxy-redirects-and-logs).
+
+**Consumer adjustment** -- code that matched `Reject` to spot a proxy refusal matches `Backpressured` and alerts on `transport_proxy_refused_total`. A caller of `proxy::rejected` calls `Refusals::hold`. A pod behind a proxy that refuses its target fails readiness until the proxy policy or the `proxy` setting is fixed.
+
 ## 2.14.34
 
 ### The HTTP transport holds a batch every endpoint refuses at TLS (BEHAVIOUR CHANGE)
