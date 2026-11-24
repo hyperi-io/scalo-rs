@@ -106,7 +106,9 @@ See [src/transport/filter/classify.rs](../../src/transport/filter/classify.rs).
 - `drop` action silently discards. Every match, `drop` or `dlq`, counts
   in the `transport_filtered_total` counter, labelled `direction` and `action`.
   A record a sender's `dead_letter_reason` screens and the send then filters
-  counts once: the screen counts only the `dlq` match it takes out.
+  counts once: the screen counts only the `dlq` match it takes out. Its
+  filters are still evaluated twice when the sender has a `dlq` rule, once by
+  the screen and once by the send, a known cost of screening.
 - `dlq` action produces a `FilteredDlqEntry` returned **inline** in
   `recv()`'s `WorkBatch.dlq_entries` (alongside the passing
   `WorkBatch.records`) -- the transport does **not** route to a DLQ
@@ -176,7 +178,7 @@ misconfigured drop/dlq rule never runs as an empty filter engine that
 lets every message through. `PipeTransport::new` rejects traffic
 instead -- see [Where it's embedded](#where-its-embedded).
 
-`transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule, which then does not match, and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature).
+`transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule, which then does not match, and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature). A screened record counts its skip once, at the send, or at the screen when a `dlq` rule takes it out.
 
 ### `expression.*` -- the app-wide CEL function profile
 

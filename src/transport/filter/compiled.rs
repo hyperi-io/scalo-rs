@@ -260,6 +260,8 @@ impl CompiledFilter {
     #[inline]
     #[must_use]
     pub fn evaluate(&self, payload: &[u8]) -> Option<FilterAction> {
+        #[cfg(test)]
+        EVALUATIONS.with(|n| n.set(n.get() + 1));
         match self {
             Self::FieldExists {
                 path,
@@ -577,6 +579,57 @@ fn with_path_refs<R>(path: &[String], f: impl FnOnce(&[&str]) -> R) -> R {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Filter evaluations on this thread, for tests that count them.
+    static EVALUATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Filter evaluations on this thread so far.
+#[cfg(all(test, feature = "sink-stack", feature = "transport-memory"))]
+pub(crate) fn evaluations() -> u64 {
+    EVALUATIONS.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// The CEL payload skips held back while a sender's dead-letter screen
+    /// runs, `None` outside one.
+    static HELD_SKIPS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `screen` holding back its CEL payload skips, and return them with its
+/// result. The send that follows a kept record counts its skip, so the screen
+/// counts only the skips of a record it takes out.
+pub(super) fn holding_skips<R>(screen: impl FnOnce() -> R) -> (R, u64) {
+    let outer = HELD_SKIPS.replace(Some(0));
+    let result = screen();
+    let held = HELD_SKIPS.replace(outer).unwrap_or(0);
+    (result, held)
+}
+
+/// Count `skips` CEL payload skips in `transport_filter_cel_payload_skip_total`.
+pub(super) fn count_cel_skips(skips: u64) {
+    #[cfg(feature = "metrics")]
+    if skips > 0 {
+        metrics::counter!("transport_filter_cel_payload_skip_total").increment(skips);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = skips;
+}
+
+/// Hold one CEL payload skip back when a screen is running: `false` outside
+/// one.
+#[cfg(feature = "expression")]
+fn hold_skip() -> bool {
+    HELD_SKIPS.with(|held| match held.get() {
+        Some(n) => {
+            held.set(Some(n + 1));
+            true
+        }
+        None => false,
+    })
+}
+
 /// Evaluate a Tier 2/3 CEL expression against a JSON payload.
 ///
 /// Allocation profile per call:
@@ -600,8 +653,9 @@ fn evaluate_cel(
     // Gate 2: skip oversized payloads (pass-through). Data-driven
     // CEL cost scales with payload size -- caps the worst case.
     if payload.len() > max_payload_bytes {
-        #[cfg(feature = "metrics")]
-        metrics::counter!("transport_filter_cel_payload_skip_total").increment(1);
+        if !hold_skip() {
+            count_cel_skips(1);
+        }
         return None;
     }
 

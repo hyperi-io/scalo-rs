@@ -319,17 +319,20 @@ impl TransportFilterEngine {
     /// Whether an outbound `dlq` filter takes `payload`: the answer a sender's
     /// `dead_letter_reason` gives for a filter match.
     ///
-    /// Counted in `transport_filtered_total` only when it answers `true`, as
-    /// the record is then taken out before the send. Any other outcome is the
-    /// send's to count when it filters the record.
+    /// Counted in `transport_filtered_total` and
+    /// `transport_filter_cel_payload_skip_total` only when it answers `true`,
+    /// as the record is then taken out before the send. Any other outcome is
+    /// the send's to count when it filters the record.
     #[must_use]
     pub fn outbound_dead_letter(&self, payload: &[u8]) -> bool {
         if !self.has_dlq_filters_out() || is_likely_msgpack(payload) {
             return false;
         }
-        let dead_lettered = first_match(payload, &self.filters_out) == Some(FilterAction::Dlq);
+        let (matched, skips) = compiled::holding_skips(|| first_match(payload, &self.filters_out));
+        let dead_lettered = matched == Some(FilterAction::Dlq);
         if dead_lettered {
             self.metrics.record(FilterDirection::Out, FilterAction::Dlq);
+            compiled::count_cel_skips(skips);
         }
         dead_lettered
     }

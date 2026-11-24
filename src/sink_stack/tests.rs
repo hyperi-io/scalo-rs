@@ -505,3 +505,95 @@ async fn rate_limit_paces_sequential_sends() {
         start.elapsed()
     );
 }
+
+/// A memory transport sending to itself, its outbound filters compiled
+/// against `tiers`.
+#[cfg(feature = "transport-memory")]
+fn filtering_memory(
+    filters_out: Vec<crate::transport::filter::FilterRule>,
+    tiers: &crate::transport::filter::TransportFilterTierConfig,
+) -> Arc<crate::transport::memory::MemoryTransport> {
+    let config = crate::transport::memory::MemoryConfig {
+        filters_out,
+        ..Default::default()
+    };
+    Arc::new(crate::transport::memory::MemoryTransport::with_tiers(&config, tiers).unwrap())
+}
+
+/// A record the screen keeps is evaluated twice when a `dlq` rule exists: by
+/// the screen, then by the send. A known cost.
+#[cfg(feature = "transport-memory")]
+#[tokio::test]
+async fn a_kept_record_is_evaluated_by_the_screen_and_the_send() {
+    use crate::transport::filter::{FilterAction, FilterRule, TransportFilterTierConfig};
+
+    let sender = filtering_memory(
+        vec![FilterRule {
+            expression: "has(poison)".into(),
+            action: FilterAction::Dlq,
+        }],
+        &TransportFilterTierConfig::default(),
+    );
+    let stack = SinkStack::new(sender, &fast_cfg());
+    let before = crate::transport::filter::compiled::evaluations();
+    let outcome = stack.send_batch(vec![rec(b"{\"seq\":1}")]).await;
+    assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+    assert_eq!(
+        crate::transport::filter::compiled::evaluations() - before,
+        2
+    );
+}
+
+/// A payload over the CEL budget counts once in
+/// `transport_filter_cel_payload_skip_total`, whether the screen keeps it for
+/// the send or a `dlq` rule takes it out.
+#[cfg(all(
+    feature = "transport-memory",
+    feature = "metrics",
+    feature = "expression"
+))]
+#[tokio::test]
+async fn an_oversize_record_counts_one_cel_skip() {
+    use crate::transport::filter::{FilterAction, FilterRule, TransportFilterTierConfig};
+
+    let mut tiers = TransportFilterTierConfig::default();
+    tiers.allow_cel_filters_out = true;
+    tiers.budget.max_payload_bytes = 16;
+    let rule = |expression: &str| FilterRule {
+        expression: expression.into(),
+        action: FilterAction::Dlq,
+    };
+    // (case, payload, dead letters)
+    let cases: [(&str, &'static [u8], usize); 2] = [
+        ("kept", b"{\"severity\":1,\"padding\":\"over sixteen\"}", 0),
+        (
+            "dead-lettered",
+            b"{\"severity\":1,\"poison\":\"over sixteen\"}",
+            1,
+        ),
+    ];
+    for (case, payload, dead_letters) in cases {
+        let sender = filtering_memory(vec![rule("severity > 3"), rule("has(poison)")], &tiers);
+        let stack = SinkStack::new(sender, &fast_cfg());
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let local = metrics::set_default_local_recorder(&recorder);
+        let outcome = stack.send_batch(vec![rec(payload)]).await;
+        drop(local);
+        assert!(outcome.result.is_ok(), "{case}: {:?}", outcome.result);
+        let skipped: Vec<String> = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("transport_filter_cel_payload_skip_total "))
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            (outcome.dead_letters.len(), skipped),
+            (
+                dead_letters,
+                vec!["transport_filter_cel_payload_skip_total 1".to_string()]
+            ),
+            "{case}"
+        );
+    }
+}
