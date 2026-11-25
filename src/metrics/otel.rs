@@ -852,7 +852,7 @@ mod tests {
 
     /// Each facade unit exports as the UCUM code the semantic conventions use,
     /// a `{annotation}` opening an undescribed unit's text becomes the unit,
-    /// and a gauge exports as a gauge.
+    /// a gauge exports as a gauge, and the process gauges carry their units.
     #[test]
     fn each_facade_unit_exports_as_its_ucum_code() {
         let (provider, exporter, bare, units) = otel();
@@ -944,7 +944,32 @@ mod tests {
             })
             .collect();
         want.sort();
-        assert_eq!(exported(&provider, &exporter), want);
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::ProcessMetrics::new("").update();
+        });
+
+        let (process, described): (Vec<Exported>, Vec<Exported>) = exported(&provider, &exporter)
+            .into_iter()
+            .partition(|(name, ..)| name.starts_with("process_"));
+        assert_eq!(described, want);
+        // (process gauge, unit). Open descriptors are read on Linux alone.
+        let process_units = [
+            ("process_cpu_seconds_total", "s"),
+            ("process_open_fds", "1"),
+            ("process_resident_memory_bytes", "By"),
+            ("process_start_time_seconds", "s"),
+            ("process_virtual_memory_bytes", "By"),
+        ];
+        let got: Vec<(&str, &str)> = process
+            .iter()
+            .map(|(name, unit, ..)| (name.as_str(), unit.as_str()))
+            .collect();
+        for found in &got {
+            assert!(process_units.contains(found), "{found:?}");
+        }
+        if cfg!(target_os = "linux") {
+            assert_eq!(got, process_units, "every process gauge on Linux");
+        }
     }
 
     /// `Counter::absolute` exports the value given, cumulatively, not the sum

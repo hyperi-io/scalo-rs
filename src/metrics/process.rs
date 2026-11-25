@@ -11,6 +11,8 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use metrics::Unit;
+
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// Process metrics collector.
@@ -60,19 +62,27 @@ impl ProcessMetrics {
     fn register_metrics() {
         metrics::describe_gauge!(
             "process_cpu_seconds_total",
+            Unit::Seconds,
             "Total user and system CPU time spent in seconds"
         );
         metrics::describe_gauge!(
             "process_resident_memory_bytes",
+            Unit::Bytes,
             "Resident memory size in bytes"
         );
         metrics::describe_gauge!(
             "process_virtual_memory_bytes",
+            Unit::Bytes,
             "Virtual memory size in bytes"
         );
-        metrics::describe_gauge!("process_open_fds", "Number of open file descriptors");
+        metrics::describe_gauge!(
+            "process_open_fds",
+            Unit::Count,
+            "Number of open file descriptors"
+        );
         metrics::describe_gauge!(
             "process_start_time_seconds",
+            Unit::Seconds,
             "Start time of the process since unix epoch in seconds"
         );
     }
