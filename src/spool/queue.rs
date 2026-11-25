@@ -968,13 +968,12 @@ mod tests {
     }
 
     /// A spool in the format before opens, restamped: its records read back,
-    /// then the ones pushed after them, and one that decodes past the cap is
-    /// dropped as damaged.
+    /// one past the 4 MiB drain cap included, then the ones pushed after them.
     #[tokio::test]
     async fn a_spool_of_the_format_before_reads_on() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("before");
-        let oversized = vec![b'o'; spool_codec::PREVIOUS_DECODE_CAP + 1];
+        let large = vec![b'l'; 5 << 20];
         {
             let options = yaque::Options {
                 shape: None,
@@ -983,7 +982,7 @@ mod tests {
             let (mut sender, _receiver) = yaque::channel(&path, options).unwrap();
             for (codec, record) in [
                 (Codec::None, &b"before-0"[..]),
-                (Codec::Zstd, &oversized[..]),
+                (Codec::Zstd, &large[..]),
                 (Codec::Zstd, b"before-1"),
             ] {
                 let mut body = Vec::new();
@@ -1008,7 +1007,7 @@ mod tests {
         while let Some(record) = spool.pop_front().await.unwrap() {
             read.push(record);
         }
-        assert_eq!(read, [&b"before-0"[..], b"before-1", b"after"]);
+        assert_eq!(read, [&b"before-0"[..], &large[..], b"before-1", b"after"]);
     }
 
     /// A damaged header in the newest segment keeps every record before it.

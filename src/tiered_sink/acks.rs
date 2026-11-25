@@ -11,8 +11,9 @@
 //! A piece handed to `send_acked` or `send_batch_acked` whose records spill
 //! waits here, keyed by where its entry ends. A sync reports every piece up to
 //! the end it read `Delivered` once its flush holds, and `Errored` when the
-//! flush fails. A drain commit reports every piece up to the committed
-//! position `Delivered`, since the sink confirmed them.
+//! flush fails. A drain commit reports each piece with its entry's outcome:
+//! `Delivered` when the sink took its records, `Rejected` or `Dropped` when
+//! some were dead letters, `Errored` when the entry failed its CRC.
 
 use std::collections::VecDeque;
 
@@ -46,6 +47,27 @@ impl Acks {
             waiting.drain(..through).map(|(_, piece)| piece).collect()
         };
         for piece in done {
+            piece.report(status);
+        }
+    }
+
+    /// Reports each piece waiting on one of the `drained` entries, given in
+    /// read order by where each ends, with that entry's status. A piece at or
+    /// below the last that names none of them reports `Errored`, so its
+    /// source delivers again rather than lose it.
+    pub(crate) fn report_drained(&self, drained: &[(QueueState, DeliveryStatus)]) {
+        let Some(&(last, _)) = drained.last() else {
+            return;
+        };
+        let done: Vec<(QueueState, PieceFinalizer)> = {
+            let mut waiting = self.waiting.lock();
+            let through = waiting.partition_point(|(at, _)| *at <= last);
+            waiting.drain(..through).collect()
+        };
+        for (at, piece) in done {
+            let status = drained
+                .binary_search_by_key(&at, |(end, _)| *end)
+                .map_or(DeliveryStatus::Errored, |found| drained[found].1);
             piece.report(status);
         }
     }
@@ -111,5 +133,38 @@ mod tests {
         acks.fail_all();
         assert_eq!(reported(), [(3, DeliveryStatus::Errored)]);
         assert!(acks.lock().is_empty());
+    }
+
+    /// A drain reports each piece with its own entry's status, and a piece
+    /// below the last entry that names none of them Errored, never Delivered.
+    #[test]
+    fn drained_pieces_report_their_own_entry_status() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let acks = Acks::default();
+        for (n, end) in [at(0, 10), at(0, 20), at(0, 25), at(0, 30), at(0, 40)]
+            .into_iter()
+            .enumerate()
+        {
+            let tx = tx.clone();
+            let finalizer = BatchFinalizer::new(move |status| tx.send((n, status)).unwrap());
+            acks.lock().push_back((end, finalizer.piece()));
+            finalizer.seal();
+        }
+        acks.report_drained(&[
+            (at(0, 10), DeliveryStatus::Delivered),
+            (at(0, 20), DeliveryStatus::Errored),
+            (at(0, 30), DeliveryStatus::Rejected),
+        ]);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [
+                (0, DeliveryStatus::Delivered),
+                (1, DeliveryStatus::Errored),
+                (2, DeliveryStatus::Errored),
+                (3, DeliveryStatus::Rejected),
+            ],
+            "entry 25 was not among the drained, so it errors"
+        );
+        assert_eq!(acks.lock().len(), 1, "the piece past the last stays");
     }
 }

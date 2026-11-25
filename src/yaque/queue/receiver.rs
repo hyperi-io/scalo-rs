@@ -194,6 +194,12 @@ impl Receiver {
         &self.taken
     }
 
+    /// Where each of the open transaction's entries ends, oldest first.
+    #[cfg(feature = "tiered-sink")]
+    pub(crate) fn ends(&self) -> &[QueueState] {
+        &self.ends
+    }
+
     /// Bytes the open transaction holds reserved with the memory guard.
     pub(crate) fn reserved_bytes(&self) -> u64 {
         self.reserved

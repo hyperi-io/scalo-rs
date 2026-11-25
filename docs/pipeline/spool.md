@@ -112,7 +112,7 @@ A push copies nothing: the record goes to the disk from the caller's bytes, or f
 
 `version/contents` names the spool format, which follows the layout on disk, never scalo's release. Each format reads the one before it and writes only its own. That is the one place the spool keeps compatibility: an app on the edge updates itself while its sink is down, and must not strand what it spilled.
 
-- 0.8 opens a 0.7 queue as it is. A 0.7 entry has no count bit, so it reads as one record, its decode capped at 4 MiB, the default drain cap, and past that it is damaged. The open restamps the queue 0.8.0, synced, before the first 0.8 entry, so a 0.7 build refuses it as a later format rather than misread it.
+- 0.8 opens a 0.7 queue as it is. A 0.7 entry has no count bit, so it reads as one record, its decode capped at the 64 MiB a queue entry holds, so no record 0.7 wrote is lost to the upgrade. The open restamps the queue 0.8.0, synced, before the first 0.8 entry, so a 0.7 build refuses it as a later format rather than misread it.
 - An older format opens once it holds no unread record. The open counts them from the saved position by walking the headers every format shares, then deletes the segments and `recv-metadata`, stamps 0.8 and logs it at info.
 - An older format still holding records is refused with `Open` under either policy, naming how many and their bytes, and nothing moves. Drain it with the release that wrote it, or remove the directory, losing them. So is one whose header count stops at a damaged header, one in a later format, and one whose `send.lock` or `recv.lock` still names a 0.6 owner. That last refusal comes before the open takes its locks, so it changes no file.
 

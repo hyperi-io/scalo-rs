@@ -188,6 +188,7 @@ The knobs trade CPU for disk. zstd 3 on one 200 B record saves about a tenth for
 | --- | --- |
 | The sink took it on the hot path | `Delivered`, at once |
 | Spilled | `Delivered` once a sync covers its entry, or the drain delivers it |
+| Spilled, settled by the drain before a sync | The worst of its records: `Delivered`, `Rejected` for a dead letter the DLQ holds, `Dropped` for one with no DLQ, `Errored` for an entry that failed its CRC |
 | Shed by `when_full: drop_newest` | `Dropped` |
 | Written to the DLQ by `when_full: dlq` | `Rejected` |
 | Any `Err`, a full spool or disk, a failed sync, a quarantine of its entry | `Errored` |

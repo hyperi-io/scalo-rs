@@ -95,8 +95,9 @@ const CHECKED: u8 = 0x80;
 const COUNTED: u8 = 0x40;
 
 /// The most an entry of the format before may decode to, which names no
-/// decoded length: the default drain cap.
-pub(crate) const PREVIOUS_DECODE_CAP: usize = 4 << 20;
+/// decoded length: the 64 MiB a queue entry holds, so no record that format
+/// could write is dropped on the upgrade.
+pub(crate) const PREVIOUS_DECODE_CAP: usize = 64 << 20;
 
 const _: () = assert!(PREFIX_LEN <= crate::yaque::SHAPE_BYTES);
 
@@ -548,7 +549,10 @@ fn recv_position_is_usable(path: &Path, saved: &[u8], segments: &[u64]) -> bool 
 /// `sync_all` is `FlushFileBuffers` on it.
 #[cfg_attr(
     not(any(unix, windows)),
-    allow(clippy::unnecessary_wraps, reason = "only the unix and Windows flushes can fail")
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "only the unix and Windows flushes can fail"
+    )
 )]
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]

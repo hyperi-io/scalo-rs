@@ -684,6 +684,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// | --- | --- |
     /// | The sink took it | `Delivered`, at once |
     /// | Spilled | `Delivered` after the sync covering it, or the drain delivering it |
+    /// | Settled by the drain before a sync | The worst of its entry's records: `Rejected` or `Dropped` for a dead letter with or without a DLQ, `Errored` for an entry that failed its CRC |
     /// | Shed by `when_full: drop_newest` | `Dropped` |
     /// | Written to the DLQ by `when_full: dlq` | `Rejected` |
     /// | Any `Err`, a failed sync or a quarantine of its entry | `Errored` |
@@ -4262,20 +4263,20 @@ mod tests {
     }
 
     /// The spill reads the format before: its entries count and drain as one
-    /// record each, behind which new entries spill and drain in order, and
-    /// one that decodes past the drain cap is dropped as damaged. The queue
-    /// is restamped before the first new entry.
+    /// record each, behind which new entries spill and drain in order. A
+    /// record past the 4 MiB drain cap, which that format could write, still
+    /// drains. The queue is restamped before the first new entry.
     #[tokio::test]
     async fn entries_of_the_format_before_drain_as_one_record_each() {
         use crate::compression::{Codec, Compression, Compressor};
         let dir = tempdir().unwrap();
         let path = dir.path().join("q");
-        let oversized = vec![b'o'; spool_codec::PREVIOUS_DECODE_CAP + 1];
+        let large = vec![b'l'; 5 << 20];
         {
             let (mut sender, _receiver) = yaque::channel(&path, raw_options()).unwrap();
             for (codec, payload) in [
                 (Codec::None, &b"before-0"[..]),
-                (Codec::Zstd, &oversized[..]),
+                (Codec::Zstd, &large[..]),
                 (Codec::Zstd, b"before-1"),
             ] {
                 let mut body = Vec::new();
@@ -4303,11 +4304,77 @@ mod tests {
             tiered.inner().received_payloads().await,
             vec![
                 b"before-0".to_vec(),
+                large,
                 b"before-1".to_vec(),
                 b"after".to_vec()
             ]
         );
         tiered.shutdown().await;
+    }
+
+    /// A piece the drain settles reports its own entry's outcome: Delivered
+    /// when the sink took it, Errored when its entry failed its CRC, so the
+    /// source delivers it again, and for a dead letter Rejected with an
+    /// enabled DLQ or Dropped without one. None of them waited on a sync.
+    #[tokio::test]
+    async fn a_drained_piece_reports_its_own_entrys_outcome() {
+        for with_dlq in [false, cfg!(feature = "dlq")] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("q");
+            let sink = TestSink::new();
+            sink.set_available(false);
+            let mut config = acked_config(&path);
+            config.compression = crate::compression::Compression::NONE;
+            config.circuit_reset_timeout_ms = 3_600_000;
+            config.drain_strategy = crate::tiered_sink::DrainStrategy::Greedy;
+            let tiered = TieredSink::new(sink, config).await.unwrap();
+            #[cfg(feature = "dlq")]
+            let dlq = with_dlq.then(|| file_dlq(&dir.path().join("dlq")));
+            #[cfg(feature = "dlq")]
+            let tiered = match &dlq {
+                Some((dlq, _)) => tiered.with_dlq(Arc::clone(dlq)),
+                None => tiered,
+            };
+            let mut waiting = Vec::new();
+            for payload in [&b"good"[..], b"damaged", b"poison"] {
+                let (piece, rx) = watched();
+                tiered.send_acked(&rec(payload), piece).await.unwrap();
+                waiting.push(rx);
+            }
+            // One body byte of the middle entry, past its header and prefix.
+            let first = 4 + spool_codec::PREFIX_LEN + framed_body(&[rec(b"good")]).len();
+            let segment = path.join("0.q");
+            let mut bytes = std::fs::read(&segment).unwrap();
+            bytes[first + 4 + spool_codec::PREFIX_LEN + 2] ^= 0xFF;
+            std::fs::write(&segment, &bytes).unwrap();
+            tiered.inner().refuse_payload(Some(b"poison"));
+            tiered.inner().set_available(true);
+            tiered.reset_circuit().await;
+
+            let mut outcomes = Vec::new();
+            for rx in waiting {
+                outcomes.push(reported(rx).await);
+            }
+            let dead = if with_dlq {
+                DeliveryStatus::Rejected
+            } else {
+                DeliveryStatus::Dropped
+            };
+            assert_eq!(
+                outcomes,
+                [DeliveryStatus::Delivered, DeliveryStatus::Errored, dead],
+                "with a DLQ: {with_dlq}"
+            );
+            assert_eq!(
+                tiered.inner().received_payloads().await,
+                vec![b"good".to_vec()]
+            );
+            tiered.shutdown().await;
+            #[cfg(feature = "dlq")]
+            if let Some((_, stop)) = dlq {
+                stop.cancel();
+            }
+        }
     }
 
     /// A refused record inside a batched entry is found by sending the

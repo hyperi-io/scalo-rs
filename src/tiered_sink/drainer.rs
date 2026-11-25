@@ -12,8 +12,8 @@ use crate::spool_codec::{Decoders, QueueCell, StoreMetrics, Unreadable, written_
 use crate::tiered_sink::acks::Acks;
 use crate::tiered_sink::tiered::Spill;
 use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
-use crate::transport::{Record, SendResult, TransportSender};
-use crate::yaque::{self, Receiver, Taken};
+use crate::transport::{DeliveryStatus, Record, SendResult, TransportSender};
+use crate::yaque::{self, QueueState, Receiver, Taken};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -282,6 +282,18 @@ impl DeadLetters {
     #[cfg(feature = "dlq")]
     pub(crate) fn dlq(&self) -> Option<Arc<crate::dlq::Dlq>> {
         self.dlq.read().clone()
+    }
+
+    /// What a written dead letter reports for its source: `Rejected` when an
+    /// enabled DLQ holds it, `Dropped` when there is none and it was dropped.
+    pub(crate) fn status(&self) -> DeliveryStatus {
+        #[cfg(feature = "dlq")]
+        if self.dlq().is_some_and(|dlq| dlq.is_enabled()) {
+            return DeliveryStatus::Rejected;
+        }
+        #[cfg(not(feature = "dlq"))]
+        let _ = self;
+        DeliveryStatus::Dropped
     }
 
     /// Whether writing `dead` would store it: a DLQ is set, enabled, and has a
@@ -567,30 +579,28 @@ impl DrainQueue {
         Ok(taken)
     }
 
-    /// Commits the first `entries` read and returns the rest, on the blocking
-    /// pool: a commit can delete segments and save the position. Reports the
-    /// pieces waiting on the committed entries delivered, since the sink took
-    /// them. Returns when the entry left at the front was written, 0 for none.
-    async fn commit(&self, entries: usize) -> u64 {
+    /// Commits the `settled` entries, the first of those read, and returns the
+    /// rest, on the blocking pool: a commit can delete segments and save the
+    /// position. Reports the pieces waiting on the settled entries with each
+    /// entry's status. Returns when the entry left at the front was written,
+    /// 0 for none.
+    async fn commit(&self, settled: &[(QueueState, DeliveryStatus)]) -> u64 {
+        let entries = settled.len();
         let receiver = Arc::clone(&self.receiver);
         let guard = self.guard();
         let committed = tokio::task::spawn_blocking(move || {
             receiver.lock().as_mut().map(|receiver| {
                 let kept = receiver.taken().get(entries).map(|raw| written_ms(raw));
                 receiver.commit(entries, guard.as_deref());
-                let at = receiver.position();
                 let front = kept.unwrap_or_else(|| front_written_ms(receiver));
-                (receiver.disk_bytes(), front, at)
+                (receiver.disk_bytes(), front)
             })
         })
         .await;
         self.metrics.reserved(0, false);
         match committed {
-            Ok(Some((disk, front, at))) => {
-                if entries > 0 {
-                    self.acks
-                        .report_through(at, crate::transport::DeliveryStatus::Delivered);
-                }
+            Ok(Some((disk, front))) => {
+                self.acks.report_drained(settled);
                 self.metrics.disk(disk);
                 front
             }
@@ -688,7 +698,7 @@ async fn drain_once<S: TransportSender>(
     send_timeout: Duration,
     counters: &Counters,
     dead_letters: &DeadLetters,
-    cursor: Option<&mut usize>,
+    cursor: Option<&mut Cursor>,
 ) -> (Vec<DrainResult>, usize) {
     let taken = match queue.read(cap, batch.max_bytes).await {
         Ok(taken) if taken.entries == 0 => return (vec![DrainResult::Empty], 0),
@@ -698,7 +708,7 @@ async fn drain_once<S: TransportSender>(
         }
         Err(e) => return (vec![DrainResult::IoError(e.to_string())], 0),
     };
-    let (outcome, commit) = deliver(
+    let (outcome, settled) = deliver(
         sink,
         queue,
         taken,
@@ -710,14 +720,32 @@ async fn drain_once<S: TransportSender>(
         cursor,
     )
     .await;
-    counters.front(queue.commit(commit).await);
-    (outcome, commit)
+    counters.front(queue.commit(&settled).await);
+    (outcome, settled.len())
 }
 
-/// Decode, send and dead-letter the `taken` entries the receiver holds. Returns
-/// the outcome and how many entries to commit, the rest going back to the
-/// queue. With a `cursor`, only the head entry's next record goes, and the
-/// entry commits once the cursor passes its last.
+/// Where the drain is in the head entry while it sends records one at a
+/// time: the records already settled, and the worst outcome among them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Cursor {
+    at: usize,
+    worst: DeliveryStatus,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self {
+            at: 0,
+            worst: DeliveryStatus::Delivered,
+        }
+    }
+}
+
+/// Decode, send and dead-letter the `taken` entries the receiver holds.
+/// Returns the outcome and the entries to commit, each with where it ends and
+/// its status for the pieces waiting on it, the rest going back to the queue.
+/// With a `cursor`, only the head entry's next record goes, and the entry
+/// commits once the cursor passes its last.
 #[allow(clippy::too_many_arguments)]
 async fn deliver<S: TransportSender>(
     sink: &S,
@@ -728,11 +756,14 @@ async fn deliver<S: TransportSender>(
     send_timeout: Duration,
     counters: &Counters,
     dead_letters: &DeadLetters,
-    cursor: Option<&mut usize>,
-) -> (Vec<DrainResult>, usize) {
-    let mut read_back = Vec::with_capacity(taken);
+    cursor: Option<&mut Cursor>,
+) -> (Vec<DrainResult>, Vec<(QueueState, DeliveryStatus)>) {
+    // Each record read, with the index of the entry it came from.
+    let mut read_back: Vec<(Record, usize)> = Vec::with_capacity(taken);
     let mut unreadable = Vec::new();
     let mut wrong_codec = None;
+    // Each entry's end and status, worst of its records.
+    let mut settled: Vec<(QueueState, DeliveryStatus)> = Vec::with_capacity(taken);
     // What the entries take on disk, each 4-byte header included, and the
     // records they count for in the spool.
     let (mut stored, mut held) = (0_u64, 0_u64);
@@ -740,25 +771,29 @@ async fn deliver<S: TransportSender>(
     {
         let receiver = queue.receiver.lock();
         let Some(receiver) = receiver.as_ref() else {
-            return (vec![DrainResult::Empty], 0);
+            return (vec![DrainResult::Empty], Vec::new());
         };
-        for (index, raw) in receiver.taken().iter().enumerate() {
-            match decode_entry(raw, decoders, scratch, queue.previous_cap) {
+        for (index, (raw, end)) in receiver.taken().iter().zip(receiver.ends()).enumerate() {
+            let status = match decode_entry(raw, decoders, scratch, queue.previous_cap) {
                 Ok(records) => {
                     if index == 0 {
                         head_records = records.len();
                     }
-                    read_back.extend(records);
+                    read_back.extend(records.into_iter().map(|record| (record, index)));
+                    DeliveryStatus::Delivered
                 }
+                // Dropped as damaged: its source delivers it again.
                 Err(Unreadable::Damaged(e)) => {
                     queue.metrics.damaged(&e);
                     unreadable.push(DrainResult::Corrupt);
+                    DeliveryStatus::Errored
                 }
                 Err(Unreadable::Codec(e)) => {
                     wrong_codec = Some((index, e));
                     break;
                 }
-            }
+            };
+            settled.push((*end, status));
             stored += 4 + raw.len() as u64;
             held += crate::spool_codec::shape(raw).records;
         }
@@ -767,22 +802,30 @@ async fn deliver<S: TransportSender>(
     // stay spooled in order.
     let take = match wrong_codec {
         None => taken,
-        Some((0, error)) => return (vec![DrainResult::Held(error)], 0),
+        Some((0, error)) => return (vec![DrainResult::Held(error)], Vec::new()),
         Some((index, _)) => index,
     };
-    if let Some(at) = cursor.as_deref() {
-        read_back = read_back.into_iter().skip(*at).take(1).collect();
+    if let Some(cursor) = cursor.as_deref() {
+        read_back = read_back.into_iter().skip(cursor.at).take(1).collect();
     }
     let mut records = Vec::with_capacity(read_back.len());
+    let mut owners = Vec::with_capacity(read_back.len());
     let mut dead = Vec::new();
-    for record in read_back {
+    let mut dead_owners = Vec::new();
+    for (record, owner) in read_back {
         match sink.dead_letter_reason(&record) {
-            None => records.push(record),
-            Some(reason) => dead.push(Undeliverable {
-                label: reason.as_str(),
-                reason: reason.to_string(),
-                record,
-            }),
+            None => {
+                records.push(record);
+                owners.push(owner);
+            }
+            Some(reason) => {
+                dead.push(Undeliverable {
+                    label: reason.as_str(),
+                    reason: reason.to_string(),
+                    record,
+                });
+                dead_owners.push(owner);
+            }
         }
     }
 
@@ -800,17 +843,17 @@ async fn deliver<S: TransportSender>(
         // may not have reached the sink) and a closed or misconfigured sink
         // keep the whole batch spooled (at-least-once).
         Some(SendResult::Backpressured | SendResult::RetryAfter(_)) => {
-            return (vec![DrainResult::SinkUnavailable], 0);
+            return (vec![DrainResult::SinkUnavailable], Vec::new());
         }
         Some(SendResult::Fatal(e)) if e.is_fatal() => {
-            return (vec![DrainResult::SinkUnavailable], 0);
+            return (vec![DrainResult::SinkUnavailable], Vec::new());
         }
         // A refusal or dead letter in a batch cannot say which record: keep
         // them all and send them one at a time until that one is past.
         Some(SendResult::Fatal(_) | SendResult::Reject(_) | SendResult::FilteredDlq)
             if records.len() > 1 =>
         {
-            return (vec![DrainResult::Isolate(take)], 0);
+            return (vec![DrainResult::Isolate(take)], Vec::new());
         }
         // On its own, the refused record is its own fault: dead-letter it.
         Some(SendResult::Fatal(e) | SendResult::Reject(e)) => {
@@ -819,6 +862,7 @@ async fn deliver<S: TransportSender>(
                 reason: e.to_string(),
                 record,
             }));
+            dead_owners.append(&mut owners);
             0
         }
         Some(SendResult::FilteredDlq) => {
@@ -827,6 +871,7 @@ async fn deliver<S: TransportSender>(
                 reason: crate::transport::DeadLetterReason::Rejected.to_string(),
                 record,
             }));
+            dead_owners.append(&mut owners);
             0
         }
     };
@@ -836,7 +881,13 @@ async fn deliver<S: TransportSender>(
             .write(dead, send_timeout, OnRefusal::Drop)
             .await
     {
-        return (vec![DrainResult::DeadLetterUnwritten], 0);
+        return (vec![DrainResult::DeadLetterUnwritten], Vec::new());
+    }
+    let dead_status = dead_letters.status();
+    for owner in dead_owners {
+        if let Some((_, status)) = settled.get_mut(owner) {
+            *status = (*status).max(dead_status);
+        }
     }
     let mut results = unreadable;
     if dead_lettered > 0 {
@@ -845,16 +896,22 @@ async fn deliver<S: TransportSender>(
     if delivered > 0 {
         results.push(DrainResult::Success(delivered));
     }
-    // A record of the head entry is settled. The entry commits after its last.
-    if let Some(at) = cursor {
-        *at += 1;
-        if *at < head_records {
-            return (results, 0);
+    settled.truncate(take);
+    // A record of the head entry is settled. The entry commits after its
+    // last, with the worst outcome among its records.
+    if let Some(cursor) = cursor {
+        if let Some((_, status)) = settled.first_mut() {
+            cursor.worst = cursor.worst.max(*status);
+            *status = cursor.worst;
         }
-        *at = 0;
+        cursor.at += 1;
+        if cursor.at < head_records {
+            return (results, Vec::new());
+        }
+        *cursor = Cursor::default();
     }
     release_many(&counters.count, &counters.bytes, held, stored);
-    (results, take)
+    (results, settled)
 }
 
 /// Passes in a row that find nothing while the spool counts records, before
@@ -892,7 +949,7 @@ pub async fn drain_loop<S: TransportSender + 'static>(
     // Entries still to send a record at a time after a refused batch, and the
     // records of the head one already settled.
     let mut isolate = 0_usize;
-    let mut cursor = 0_usize;
+    let mut cursor = Cursor::default();
     // Decompressed entries land here, reused across passes.
     let mut scratch = Vec::new();
     let mut read_failing = false;
@@ -986,13 +1043,13 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                 }
                 DrainResult::Isolate(entries) => {
                     isolate = *entries;
-                    cursor = 0;
+                    cursor = Cursor::default();
                     pause = Duration::ZERO;
                 }
                 DrainResult::Damaged(reason) => {
                     queue.quarantine(reason.clone(), &counters).await;
                     isolate = 0;
-                    cursor = 0;
+                    cursor = Cursor::default();
                     progressed = true;
                 }
                 DrainResult::Empty => {

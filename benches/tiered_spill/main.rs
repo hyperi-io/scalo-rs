@@ -177,7 +177,12 @@ fn cpu_seconds() -> f64 {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
         usage.assume_init()
     };
-    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    // The field widths differ by platform, so go through Duration.
+    let seconds = |t: libc::timeval| {
+        (Duration::from_secs(u64::try_from(t.tv_sec).unwrap_or(0))
+            + Duration::from_micros(u64::try_from(t.tv_usec).unwrap_or(0)))
+        .as_secs_f64()
+    };
     seconds(usage.ru_utime) + seconds(usage.ru_stime)
 }
 
