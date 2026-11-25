@@ -388,9 +388,23 @@ fn app_env_from_cascade() -> Option<String> {
     crate::config::loaded()?.get_string(APP_ENV_KEY)
 }
 
+/// The app's own default, `ConfigOptions::app_env` of the loaded cascade.
+#[cfg(feature = "config")]
+fn app_env_from_options() -> Option<String> {
+    crate::config::loaded()?
+        .app_env_default()
+        .map(str::to_string)
+}
+
 /// Without the `config` feature there is no cascade to name it.
 #[cfg(not(feature = "config"))]
 fn app_env_from_cascade() -> Option<String> {
+    None
+}
+
+/// Without the `config` feature there are no config options to name it.
+#[cfg(not(feature = "config"))]
+fn app_env_from_options() -> Option<String> {
     None
 }
 
@@ -399,28 +413,35 @@ static DEFAULT_POSTURE_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Get the current application environment name (dev, staging, prod).
 ///
-/// Returns the first of `APP_ENV`, `ENVIRONMENT` and `ENV` that holds a
-/// value, else the config cascade's `app_env` once the cascade is set up,
-/// trimmed of surrounding whitespace, else "development". A variable or key
-/// that is empty or only whitespace counts as unset, so resolution moves on
-/// to the next one.
+/// Returns the first that holds a value, trimmed of surrounding whitespace,
+/// else "development": `APP_ENV`, `ENVIRONMENT`, `ENV`, then once the cascade
+/// is set up its `app_env` key, then `ConfigOptions::app_env`, the app's own
+/// default. A source that is empty or only whitespace counts as unset, so
+/// resolution moves on to the next one.
 ///
 /// Falling back to the default turns off every [`is_production`] check, so
 /// the first fallback a log subscriber would record emits one warning per
-/// process. Setting any of the three variables, or `app_env`, to a non-blank
-/// value silences it.
+/// process. Setting any of those sources to a non-blank value silences it.
 #[must_use]
 pub fn get_app_env() -> String {
-    app_env_or_default(&DEFAULT_POSTURE_WARNED, app_env_from_cascade)
+    app_env_or_default(
+        &DEFAULT_POSTURE_WARNED,
+        app_env_from_cascade,
+        app_env_from_options,
+    )
 }
 
-/// Resolve the app environment, `from_cascade` below the variables, claiming
-/// `warned` to log the default once.
+/// Resolve the app environment, the variables first, then `from_cascade`, then
+/// `from_options`, claiming `warned` to log the default once.
 fn app_env_or_default(
     warned: &AtomicBool,
     from_cascade: impl FnOnce() -> Option<String>,
+    from_options: impl FnOnce() -> Option<String>,
 ) -> String {
-    if let Some(app_env) = app_env_from_vars().or_else(|| non_blank(&from_cascade()?)) {
+    if let Some(app_env) = app_env_from_vars()
+        .or_else(|| non_blank(&from_cascade()?))
+        .or_else(|| non_blank(&from_options()?))
+    {
         return app_env;
     }
     // Claimed only once a subscriber would record it: config can load before the logger.
@@ -702,7 +723,7 @@ mod tests {
         temp_env::with_vars(UNSET, || {
             tracing::subscriber::with_default(subscriber, || {
                 for _ in 0..3 {
-                    assert_eq!(app_env_or_default(&warned, || None), "development");
+                    assert_eq!(app_env_or_default(&warned, || None, || None), "development");
                 }
             });
         });
@@ -716,34 +737,52 @@ mod tests {
         );
     }
 
-    /// Any set variable, or a set `app_env` in the cascade, names the
-    /// environment and silences the warning, and a variable wins over the key.
+    /// Any set variable, a set `app_env` in the cascade, or the app's own
+    /// default names the environment and silences the warning, in that order.
     #[cfg(feature = "logger")]
     #[test]
     fn any_set_variable_silences_the_warning() {
-        // (variable set, `app_env` in the cascade, resolved)
+        // (variable set, `app_env` in the cascade, `ConfigOptions::app_env`, resolved)
         let cases = [
-            (None, Some(" production "), "production"),
-            (None, Some("staging"), "staging"),
-            (Some(("APP_ENV", "staging")), Some("production"), "staging"),
-            (Some(("ENV", "prod")), Some("staging"), "prod"),
-            (None, Some("  "), "development"),
+            (None, Some(" production "), None, "production"),
+            (None, Some("staging"), None, "staging"),
+            (
+                Some(("APP_ENV", "staging")),
+                Some("production"),
+                None,
+                "staging",
+            ),
+            (Some(("ENV", "prod")), Some("staging"), None, "prod"),
+            (None, Some("  "), None, "development"),
+            (None, None, Some("production"), "production"),
+            (
+                Some(("APP_ENV", "staging")),
+                None,
+                Some("production"),
+                "staging",
+            ),
+            (None, Some("staging"), Some("production"), "staging"),
+            (None, Some(" "), Some(" "), "development"),
         ];
-        for (var, cascade, resolved) in cases {
+        for (var, cascade, options, resolved) in cases {
             let warned = AtomicBool::new(false);
             let (subscriber, buf) = capture();
             let vars = var.map_or(UNSET, |(name, value)| only(name, value));
             temp_env::with_vars(vars, || {
                 tracing::subscriber::with_default(subscriber, || {
                     let from_cascade = || cascade.map(str::to_string);
-                    assert_eq!(app_env_or_default(&warned, from_cascade), resolved);
+                    let from_options = || options.map(str::to_string);
+                    assert_eq!(
+                        app_env_or_default(&warned, from_cascade, from_options),
+                        resolved
+                    );
                 });
             });
             let defaulted = resolved == "development";
             assert_eq!(
                 captured(&buf).contains(NAMES_THE_VARIABLES),
                 defaulted,
-                "{var:?} beside app_env {cascade:?}"
+                "{var:?} beside app_env {cascade:?} and options {options:?}"
             );
         }
         for var in ["APP_ENV", "ENVIRONMENT", "ENV"] {
@@ -752,7 +791,7 @@ mod tests {
                 let (subscriber, buf) = capture();
                 temp_env::with_vars(only(var, value), || {
                     tracing::subscriber::with_default(subscriber, || {
-                        assert_eq!(app_env_or_default(&warned, || None), value);
+                        assert_eq!(app_env_or_default(&warned, || None, || None), value);
                     });
                 });
                 assert!(captured(&buf).is_empty(), "{var}={value} must not warn");
@@ -773,7 +812,7 @@ mod tests {
             let (subscriber, buf) = capture();
             temp_env::with_vars(UNSET.map(|(name, _)| (name, Some(blank))), || {
                 tracing::subscriber::with_default(subscriber, || {
-                    assert_eq!(app_env_or_default(&warned, || None), "development");
+                    assert_eq!(app_env_or_default(&warned, || None, || None), "development");
                 });
             });
             let out = captured(&buf);
@@ -794,12 +833,12 @@ mod tests {
         let (subscriber, buf) = capture();
         temp_env::with_vars(UNSET, || {
             tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-                assert_eq!(app_env_or_default(&warned, || None), "development");
+                assert_eq!(app_env_or_default(&warned, || None, || None), "development");
             });
             assert!(!warned.load(std::sync::atomic::Ordering::Relaxed));
 
             tracing::subscriber::with_default(subscriber, || {
-                assert_eq!(app_env_or_default(&warned, || None), "development");
+                assert_eq!(app_env_or_default(&warned, || None, || None), "development");
             });
         });
         assert_eq!(captured(&buf).matches(NAMES_THE_VARIABLES).count(), 1);

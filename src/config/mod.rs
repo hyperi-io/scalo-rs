@@ -144,7 +144,10 @@ pub struct ConfigOptions {
     /// Environment variable prefix (e.g., "MYAPP" for MYAPP_DATABASE_HOST).
     pub env_prefix: String,
 
-    /// Override the detected app environment (dev, staging, prod).
+    /// The app's own default app environment (dev, staging, prod), below
+    /// `APP_ENV`, `ENVIRONMENT`, `ENV` and the cascade's `app_env` key. It
+    /// picks `settings.{env}.yaml` and is what `get_app_env` returns when none
+    /// of those names the environment.
     pub app_env: Option<String>,
 
     /// Application name for user-scoped config discovery.
@@ -230,6 +233,8 @@ struct SearchPaths<'a> {
 pub struct Config {
     figment: Figment,
     env_prefix: String,
+    /// `ConfigOptions::app_env`, when it holds a value.
+    app_env_default: Option<String>,
     /// The env layers' text, for a field that refuses a parsed env value.
     env_text: EnvText,
 }
@@ -314,14 +319,13 @@ impl Config {
             figment = figment.merge(YamlFile::new(path));
         }
 
-        // 4. settings.{env}.yaml, for the environment the variables name, else
-        // the one `app_env` names in the finished cascade.
-        let app_env = match opts.app_env {
-            Some(app_env) => app_env,
-            None => crate::env::app_env_from_vars()
-                .or_else(|| Self::app_env_key(&figment, managed, &opts.env_prefix))
-                .unwrap_or_else(|| crate::env::DEFAULT_APP_ENV.to_string()),
-        };
+        // 4. settings.{env}.yaml, for the environment `get_app_env` resolves
+        // once the cascade is set up.
+        let app_env_default = opts.app_env.as_deref().and_then(crate::env::non_blank);
+        let app_env = crate::env::app_env_from_vars()
+            .or_else(|| Self::app_env_key(&figment, managed, &opts.env_prefix))
+            .or_else(|| app_env_default.clone())
+            .unwrap_or_else(|| crate::env::DEFAULT_APP_ENV.to_string());
         let env_settings = format!("settings.{app_env}");
         for path in Self::find_config_files(&env_settings, &search) {
             figment = figment.merge(YamlFile::new(path));
@@ -355,8 +359,15 @@ impl Config {
         Ok(Self {
             figment,
             env_prefix: opts.env_prefix,
+            app_env_default,
             env_text,
         })
+    }
+
+    /// `ConfigOptions::app_env`, the app's own default app environment, when
+    /// it holds a value.
+    pub(crate) fn app_env_default(&self) -> Option<&str> {
+        self.app_env_default.as_deref()
     }
 
     /// Load `.env` files: `~/.env` (global defaults) then `project_dir/.env`

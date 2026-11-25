@@ -215,12 +215,20 @@ fn test_env_specific_settings_development() {
 fn test_env_specific_settings_production() {
     let (_dir, path) = setup_config_dir();
 
-    let config = Config::new(ConfigOptions {
-        config_paths: vec![path],
-        app_env: Some("production".to_string()),
-        ..Default::default()
-    })
-    .expect("config should load");
+    // ConfigOptions::app_env is a default, below the variables.
+    let unset = [
+        ("APP_ENV", None::<&str>),
+        ("ENVIRONMENT", None),
+        ("ENV", None),
+    ];
+    let config = temp_env::with_vars(unset, || {
+        Config::new(ConfigOptions {
+            config_paths: vec![path],
+            app_env: Some("production".to_string()),
+            ..Default::default()
+        })
+        .expect("config should load")
+    });
 
     // settings.production.yaml overrides settings.yaml
     assert_eq!(

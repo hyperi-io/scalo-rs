@@ -97,12 +97,13 @@ duplicated cgroup file reads.
 2. `ENVIRONMENT`
 3. `ENV`
 4. the config cascade's top-level `app_env` key, once `config::setup` has run
+5. `ConfigOptions::app_env`, the app's own default, once `config::setup` has run
 
 A variable or key that is empty or only whitespace counts as unset, so `APP_ENV=""` beside `ENVIRONMENT=production` resolves to `production`. A padded value resolves to the name inside it: `" production"` and `"production\n"` are `production`.
 
-`app_env` is for an app that cannot set the process environment, such as an agent installed on a host: `app_env: production` in `settings.yaml`, or `MYAPP_APP_ENV=production` under the `MYAPP` prefix. The variables still win over it.
+`app_env` is for an app that cannot set the process environment, such as an agent installed on a host: `app_env: production` in `settings.yaml`, or `MYAPP_APP_ENV=production` under the `MYAPP` prefix. An app whose config file has its own schema and cannot take the key passes its default in `ConfigOptions::app_env` instead. The variables win over both, and the key over the default.
 
-The config cascade uses the name to pick `settings.{env}.yaml` -- see [config.md](../core-pillars/config.md). An `app_env` key read from `defaults.yaml`, `settings.yaml`, the managed policy or a prefixed variable picks that file too. It is the `deployment.environment.name` attribute on OTel metrics (`otel-metrics`).
+The config cascade uses the name, in the same order, to pick `settings.{env}.yaml` -- see [config.md](../core-pillars/config.md). An `app_env` key read from `defaults.yaml`, `settings.yaml`, the managed policy or a prefixed variable picks that file too. It is the `deployment.environment.name` attribute on OTel metrics (`otel-metrics`).
 
 `is_production()` is true when that name is `production` or `prod`, in any letter case. Every other value, `staging` and `production-eu` included, is not production. It gates these refusals, each of which fails the constructor in production and passes in any other environment:
 
@@ -118,7 +119,7 @@ Set `APP_ENV=production`, or `app_env: production`, on every production deployme
 WARN scalo::env: none of APP_ENV, ENVIRONMENT or ENV is set and the config has no app_env, so the app environment defaults to development and production-only safety checks are disabled -- set APP_ENV=production, or app_env: production in the config, on a production deployment app_env="development"
 ```
 
-Setting any of the three variables, or `app_env`, to a non-blank value silences it, and an empty or whitespace-only value does not. The warning is compiled in with the `tracing` dependency, which the default features and every feature that reaches the refusals above enable.
+Setting any of the three variables, the `app_env` key or `ConfigOptions::app_env` to a non-blank value silences it, and an empty or whitespace-only value does not. The warning is compiled in with the `tracing` dependency, which the default features and every feature that reaches the refusals above enable.
 
 `is_helm()` is the other helper in `env.rs` -- returns true if
 `HELM_RELEASE_NAME` is set or `/etc/podinfo/labels` contains
