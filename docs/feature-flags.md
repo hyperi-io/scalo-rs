@@ -15,6 +15,8 @@ What a feature does is in the subsystem doc each row links. This page says which
 scalo = "<version>"   # default features: config, logger
 ```
 
+To build against an unreleased commit, depend on it by git and `rev`, with the same `default-features` and `features`: `scalo = { git = "https://github.com/hyperi-io/scalo-rs", rev = "<sha>" }`. A `[patch.crates-io]` entry does not apply: the repository's `Cargo.toml` says `0.0.0`, and the release stamps the real version, so Cargo reports the patch as unused.
+
 That's it. The default set covers:
 
 - 7-layer config cascade, with YAML parsed through `scalo::yaml`
