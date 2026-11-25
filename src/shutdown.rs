@@ -137,7 +137,8 @@ fn prestop_delay_secs() -> u64 {
     }
 }
 
-/// Wait for SIGTERM or SIGINT.
+/// Wait for SIGTERM or SIGINT, or on Windows Ctrl+C, a console close or a
+/// system shutdown.
 async fn wait_for_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
@@ -162,13 +163,33 @@ async fn wait_for_signal() {
         }
     };
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    let terminate = async {
+        use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
+        match (ctrl_close(), ctrl_shutdown()) {
+            (Ok(mut close), Ok(mut shutdown)) => {
+                tokio::select! {
+                    _ = close.recv() => {},
+                    _ = shutdown.recv() => {},
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!(
+                    error = %e,
+                    "Failed to install the console close and shutdown handlers, only Ctrl+C will trigger shutdown"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(any(unix, windows))]
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     ctrl_c.await;
 }
 

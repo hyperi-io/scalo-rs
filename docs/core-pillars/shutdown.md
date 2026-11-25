@@ -2,8 +2,9 @@
 
 `shutdown::install_signal_handler()` is called once at startup and returns a
 `tokio_util::sync::CancellationToken` that every long-running task clones and
-awaits via `token.cancelled().await`. On SIGTERM/SIGINT the handler sleeps for a
-K8s pre-stop delay, then cancels the token. All tasks unblock together, drain
+awaits via `token.cancelled().await`. On SIGTERM/SIGINT, or on Windows Ctrl+C, a
+console close or a system shutdown, the handler sleeps for a
+K8s pre-stop delay, then cancels the token. A Windows service calls `shutdown::trigger()` on its own stop control ([../platforms.md](../platforms.md)). All tasks unblock together, drain
 in-flight work and exit. The process exits when `main` returns.
 
 The pre-stop delay keeps traffic off a pod that has stopped accepting work.
@@ -34,9 +35,9 @@ The handler sleeps the pre-stop delay before it cancels the token, so the pod se
 ```mermaid
 flowchart LR
     accTitle: L4 Detail -- Shutdown sequence
-    accDescr: On SIGTERM or SIGINT the handler sleeps for the pre-stop delay when it is above 0, counts the eviction on Kubernetes when metrics are on, then cancels the shared token. Application tasks watch the token, finish and return, and then main returns.
+    accDescr: On SIGTERM or SIGINT, or a console close or system shutdown on Windows, the handler sleeps for the pre-stop delay when it is above 0, counts the eviction on Kubernetes when metrics are on, then cancels the shared token. Application tasks watch the token, finish and return, and then main returns.
 
-    signal(["SIGTERM<br/>or SIGINT"])
+    signal(["SIGTERM, SIGINT<br/>or Windows close"])
     sleep["Sleep<br/>pre-stop delay"]
     count["Count the<br/>eviction"]
     cancel["Cancel the<br/>token"]
@@ -120,7 +121,7 @@ Each tokio method states its cancel safety in its own docs under "Cancel safety"
 
 | Item | Purpose |
 | --- | --- |
-| `shutdown::install_signal_handler() -> CancellationToken` | Installs the SIGTERM/SIGINT handler, spawns the wait task and returns the global token |
+| `shutdown::install_signal_handler() -> CancellationToken` | Installs the SIGTERM/SIGINT handler (Ctrl+C, console close and system shutdown on Windows), spawns the wait task and returns the global token |
 | `shutdown::token() -> CancellationToken` | Clone the global token (created lazily if no handler installed) |
 | `shutdown::trigger()` | Cancel the global token, idempotent: for tests, integration drivers or an internal watchdog |
 | `shutdown::is_shutdown() -> bool` | Check cancellation state without awaiting |

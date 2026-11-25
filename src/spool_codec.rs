@@ -394,6 +394,10 @@ fn recv_position_is_usable(path: &Path, saved: &[u8], segments: &[u64]) -> bool 
 /// Flush a directory's entries to stable storage, so a file created or renamed
 /// in it survives a power loss. Windows has no directory sync: there the
 /// segment's own flush is the last step, and this does nothing.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::unnecessary_wraps, reason = "only the unix flush can fail")
+)]
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(path)?.sync_all()?;

@@ -5,8 +5,9 @@ Shared Rust library for data-plane services. A service built on `run_app` gets t
 This is the index. Read [architecture.md](architecture.md) for the
 10,000-foot view of how the modules fit together, [integration.md](integration.md)
 for a recipe walkthrough on building a data-plane service, [auto-wiring.md](auto-wiring.md)
-for what is wired in for you, and [feature-flags.md](feature-flags.md)
-for how features cascade into one another.
+for what is wired in for you, [feature-flags.md](feature-flags.md)
+for how features cascade into one another, and [platforms.md](platforms.md)
+for what differs on macOS and Windows.
 
 ---
 

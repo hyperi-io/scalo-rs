@@ -54,7 +54,7 @@ transport:
 
 The header names are `TIME_UNIX_NANO_HEADER` and `SEVERITY_HEADER` in `scalo::transport::otlp`. A source with the time in nanoseconds sets the header, and the millisecond timestamp stays for every other transport.
 
-The resource carries `service.name` (`service_name`, else `OTEL_SERVICE_NAME`, else `unknown_service`), the replica identity metrics and spans carry (`service.instance.id`, `k8s.pod.name`), `service.version` from `SERVICE_VERSION`, the host's `host.name`, `host.id` (the machine id on Linux and macOS, left off when empty) and `host.arch`, `os.type`, `OTEL_RESOURCE_ATTRIBUTES`, and `resource_attributes`, which win over the rest. A key `OTEL_RESOURCE_ATTRIBUTES` sets is never replaced by a detected one. An app that needs another mapping registers its own sender ([custom.md](custom.md)).
+The resource carries `service.name` (`service_name`, else `OTEL_SERVICE_NAME`, else `unknown_service`), `deployment.environment.name` from the resolved app env as the metrics resource has it ([../runtime/runtime-context.md](../runtime/runtime-context.md#app-env-and-production-mode)), the replica identity metrics and spans carry (`service.instance.id`, `k8s.pod.name`), `service.version` from `SERVICE_VERSION`, the host's `host.name`, `host.id` (the machine id on Linux and macOS, left off when empty) and `host.arch`, `os.type`, `OTEL_RESOURCE_ATTRIBUTES`, and `resource_attributes`, which win over the rest. A key `OTEL_RESOURCE_ATTRIBUTES` sets is never replaced by a detected one. An app that needs another mapping registers its own sender ([custom.md](custom.md)).
 
 ## Collector answers
 

@@ -43,6 +43,10 @@ const SERVICE_VERSION: &str = "service.version";
 /// Semantic-convention key for the operating system.
 const OS_TYPE: &str = "os.type";
 
+/// Semantic-convention key for the deployment tier, the resolved app env.
+#[cfg(any(feature = "otel-metrics", feature = "transport-otlp"))]
+pub(crate) const DEPLOYMENT_ENVIRONMENT: &str = "deployment.environment.name";
+
 /// `service.instance.id`, `k8s.pod.name` when the pod can be named,
 /// `service.version` when `SERVICE_VERSION` is set, and the host's
 /// attributes, leaving out any key `OTEL_RESOURCE_ATTRIBUTES` already sets so

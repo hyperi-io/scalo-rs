@@ -92,6 +92,8 @@ Permission, full-disk, read-only and quota errors are returned under either poli
 
 A push the disk has no room for (`StorageFull`, a quota, or a file size limit) is cut back, writes nothing, and returns `Err(SpoolError::DiskFull)`. The caller backs off as it does at `max_size_bytes`. Pushes are then refused without touching the disk until a retry is due, the wait doubling from 100 ms to 5 s, or until a pop deletes a consumed segment. The first push that fits ends the wait. While the disk is full the `spool_disk` health component is Degraded. `spool_disk_full_refused_bytes_total` counts the refused bytes, and `spool_disk_full_wait_milliseconds_total` the time spent waiting.
 
+Room comes back a whole segment at a time, when a pop commits the last record in a segment and its file goes. A caller that waits for room should wait longer than its reader takes to consume one segment, `segment_bytes` at the reader's rate, or it gives up while the next deletion is still coming. The tiered sink's `when_full_wait_ms` is that wait ([tiered-sink.md](tiered-sink.md#spool-sizing-and-disk-awareness)).
+
 ### Disk use
 
 A segment file goes as soon as every record in it is committed. Once the spool is empty, a segment holding a sixteenth of `segment_bytes` or more is closed and deleted, so a drained spool stops holding its disk. Nothing is preallocated. `spool_disk_bytes` reports what the segment files hold.

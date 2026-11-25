@@ -269,6 +269,11 @@ pub struct MetricsSettings {
     #[cfg(feature = "otel-metrics")]
     #[serde(default)]
     pub otel: OtelMetricsConfig,
+
+    /// Seconds between refreshes of the process and container gauges, under
+    /// `metrics.update_interval_secs`. Unset, 15. 0 does not parse.
+    #[serde(default)]
+    pub update_interval_secs: Option<std::num::NonZeroU64>,
 }
 
 impl MetricsSettings {
@@ -305,11 +310,17 @@ impl MetricsSettings {
             otel
         };
 
+        let defaults = MetricsConfig::default();
         MetricsConfig {
             namespace: self.namespace,
+            update_interval: self
+                .update_interval_secs
+                .map_or(defaults.update_interval, |secs| {
+                    Duration::from_secs(secs.get())
+                }),
             #[cfg(feature = "otel-metrics")]
             otel,
-            ..MetricsConfig::default()
+            ..defaults
         }
     }
 }
@@ -672,6 +683,13 @@ impl MetricsManager {
             || nothing_to_refresh
             || tokio::runtime::Handle::try_current().is_err()
         {
+            return;
+        }
+        // A zero period panics the timer.
+        if self.config.update_interval.is_zero() {
+            tracing::warn!(
+                "metrics update_interval is 0; the process and container gauges are not refreshed"
+            );
             return;
         }
         let stop = CancellationToken::new();
@@ -1813,6 +1831,19 @@ mod tests {
         // Empty object -> bare (serde default).
         let bare: MetricsSettings = serde_json::from_str("{}").expect("valid empty");
         assert_eq!(bare.namespace, "");
+
+        // The refresh interval: 15 s unset, the value given, and 0 refused.
+        assert_eq!(
+            bare.into_config("app").update_interval,
+            Duration::from_secs(15)
+        );
+        let every_five: MetricsSettings =
+            serde_json::from_str(r#"{"update_interval_secs":5}"#).expect("valid interval");
+        assert_eq!(
+            every_five.into_config("app").update_interval,
+            Duration::from_secs(5)
+        );
+        assert!(serde_json::from_str::<MetricsSettings>(r#"{"update_interval_secs":0}"#).is_err());
     }
 
     #[test]

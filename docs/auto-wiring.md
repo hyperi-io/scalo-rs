@@ -84,7 +84,7 @@ The app never passes a `Logger` or `MetricsManager` into a module, so a `Transpo
 | Config | Already loaded by `app.load_config` before `ServiceRuntime::build` runs |
 | Metrics | `MetricsManager::with_config(...)` built from the `metrics` config section, bare names unless `metrics.namespace` sets a prefix, with the scalo runtime metric set described |
 | Health | Not touched: `HealthRegistry` is created on first use, and modules `register` themselves |
-| Shutdown | `CancellationToken` created, SIGTERM/SIGINT handlers attached, K8s pre-stop delay configured |
+| Shutdown | `CancellationToken` created, SIGTERM/SIGINT handlers attached (Ctrl+C, console close and system shutdown on Windows), K8s pre-stop delay configured |
 | Runtime context | `env::runtime_context()` detects once, results cached |
 | Memory guard | `MemoryGuard` constructed if `memory` feature on |
 | Scaling pressure | `ScalingPressure` built if `scaling` feature on, with `app.scaling_components(config)`. With `service-metrics` on, the served value is written to the `scaling_pressure` gauge once a second |

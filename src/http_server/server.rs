@@ -458,7 +458,25 @@ async fn shutdown_signal() {
             .await;
     };
 
-    #[cfg(not(unix))]
+    // A console close or a system shutdown, which Windows gives the process
+    // only a few seconds to act on.
+    #[cfg(windows)]
+    let terminate = async {
+        match (
+            signal::windows::ctrl_close(),
+            signal::windows::ctrl_shutdown(),
+        ) {
+            (Ok(mut close), Ok(mut shutdown)) => {
+                tokio::select! {
+                    _ = close.recv() => {},
+                    _ = shutdown.recv() => {},
+                }
+            }
+            _ => std::future::pending::<()>().await,
+        }
+    };
+
+    #[cfg(not(any(unix, windows)))]
     let terminate = std::future::pending::<()>();
 
     tokio::select! {

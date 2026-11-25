@@ -114,8 +114,9 @@ impl RuntimePaths {
             temp_dir: std::env::temp_dir().join(app_name),
             logs_dir: data_dir.join("logs"),
             cache_dir,
+            // No runtime dir off Linux, so the temp dir, which every OS has.
             run_dir: dirs::runtime_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .unwrap_or_else(std::env::temp_dir)
                 .join(app_name),
         }
     }

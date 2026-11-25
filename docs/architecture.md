@@ -42,7 +42,7 @@ Two modules sit inside another rather than calling it: `transport::filter` lives
 | `metrics` | `metrics` or `otel-metrics` (`metrics-core` and `metrics-process` are the parts they pull in) | Lock-free counters/gauges/histograms, Prometheus exporter, `/metrics` + `/metrics/manifest`, OTLP metrics push |
 | `otel_tracing` | `otel`, `otel-tracing`, and `metrics`, which pulls `otel-metrics` and `otel-tracing` | OTLP exporter, OTel SDK bridge for `tracing` spans |
 | `health` | `health` | `HealthRegistry`, which `/readyz` consults |
-| `shutdown` | `shutdown` | `CancellationToken`, SIGTERM/SIGINT, K8s pre-stop delay |
+| `shutdown` | `shutdown` | `CancellationToken`, SIGTERM/SIGINT (Windows console close and shutdown), K8s pre-stop delay |
 
 Pillars are singletons. Modules in higher layers call into them via macros
 (`tracing::info!`, `metrics::counter!`) or global getters

@@ -408,6 +408,7 @@ fn key_to_filename(key: &str) -> String {
 /// Ensure `dir` exists. Chmod to `mode` on Unix when `mode` is
 /// `Some`. `None` skips chmod -- used by operators on S3-FUSE,
 /// root-squashed NFS, or other mounts that reject chmod.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn ensure_dir_private(dir: &std::path::Path, mode: Option<u32>) -> SecretsResult<()> {
     std::fs::create_dir_all(dir).map_err(|e| {
         SecretsError::CacheError(format!(
@@ -431,6 +432,7 @@ fn ensure_dir_private(dir: &std::path::Path, mode: Option<u32>) -> SecretsResult
 /// Atomic-write `bytes` to `path`. Chmod to `mode` on Unix when
 /// `mode` is `Some`. Sets perms BEFORE rename so the file is never
 /// visible at the umask default even briefly.
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn write_private_file_atomic(
     path: &std::path::Path,
     bytes: &[u8],

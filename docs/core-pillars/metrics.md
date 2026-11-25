@@ -11,7 +11,17 @@ and to `docs/metrics-manifest.json` via the `metrics-manifest` CLI subcommand.
 That manifest is the only source of metric metadata for downstream tools (Grafana
 provisioning, alert validators, the data-plane docs site).
 
-Process and container metrics (RSS, CPU, FDs, cgroup limits) refresh every `update_interval` via [sysinfo](https://crates.io/crates/sysinfo) while the `/metrics` server or OTLP push runs, and container metrics read cgroup v1 and v2 transparently.
+Process and container metrics (RSS, CPU, open descriptors, cgroup limits) refresh every `update_interval` via [sysinfo](https://crates.io/crates/sysinfo) while the `/metrics` server or OTLP push runs, and container metrics read cgroup v1 and v2 transparently. `update_interval` is 15 s, and `metrics.update_interval_secs` sets it from the cascade (0 does not parse). Each refresh reads this process's CPU time and memory alone.
+
+| Gauge | Unit | Where |
+| --- | --- | --- |
+| `process_cpu_seconds_total` | `s` | everywhere sysinfo reads the process |
+| `process_resident_memory_bytes`, `process_virtual_memory_bytes` | `By` | everywhere sysinfo reads the process |
+| `process_start_time_seconds` | `s` | everywhere |
+| `process_open_fds` | `1` | Linux |
+| `process_open_handles` | `1` | Windows |
+| `container_memory_limit_bytes`, `container_memory_usage_bytes` | `By` | Linux, from cgroup v1 or v2 |
+| `container_cpu_limit_cores` | `1` | Linux, from cgroup v1 or v2 |
 
 ---
 
