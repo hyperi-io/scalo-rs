@@ -64,6 +64,8 @@ pub struct TieredSinkConfig {
 
     /// Milliseconds a `send` the full spool blocks waits for the drain to make
     /// room before it returns `SpoolFull`. 0 returns at once. Default 1000.
+    /// Room comes back a segment at a time, so set it above the time the
+    /// drain takes to deliver one [`segment_bytes`](Self::segment_bytes).
     #[serde(default = "default_when_full_wait_ms")]
     pub when_full_wait_ms: u64,
 

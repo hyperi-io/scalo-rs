@@ -154,6 +154,8 @@ A spill reserves its item slot and bytes before it writes, and gives them back i
 
 A blocked `send` waits outside the `StrictFifo` gate and retries the whole send each time a drain pass delivers, dead-letters or drops records, so the caller is held to the drain's pace. `when_full_wait_ms: 0` returns `SpoolFull` at once.
 
+Spool bytes and disk space come back a whole segment at a time: a delivered record stays on disk until every record in its segment is delivered and the segment file goes. So set `when_full_wait_ms` above the time the drain takes to deliver one segment, `segment_bytes` at the sink's throughput plus `drain_interval_ms`. Below that, a blocked `send` returns `SpoolFull` while the drain is still working through the segment that would free the room. Smaller segments free room sooner.
+
 A disk that fills before either cap (`StorageFull`, a quota, or a file size limit) applies `when_full` too: the spill is cut back, nothing is written, and spills are refused without touching the disk until a retry is due, the wait doubling from 100 ms to 5 s. A spill is tried again at once when the drain deletes a delivered segment, and a blocked `send` woken by that pass tries again. The first spill that fits ends the wait. Readiness is Degraded while the disk is full, `spool_disk_full_refused_bytes_total{store="tiered_sink"}` counts the refused bytes and `spool_disk_full_wait_milliseconds_total` the wait.
 
 Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailable)` whatever `when_full` says. The caller decides what to do with either error -- the typical pattern is to route the record to the DLQ.
