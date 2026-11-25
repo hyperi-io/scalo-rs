@@ -29,9 +29,9 @@ pub(super) enum ConnectError {
     /// The receiver could not be reached in time, or the handshake broke off:
     /// try again later.
     Unreachable(io::Error),
-    /// The TLS handshake refused the receiver's certificate or ours: no retry
-    /// fixes it.
-    Trust(io::Error),
+    /// The TLS handshake failed: a refused certificate, name or key pin, or no
+    /// version, suite or group in common. No retry fixes it.
+    Trust(String),
     /// The proxy refused to open a tunnel to the receiver.
     Refused(ProxyRefused),
 }
@@ -51,22 +51,30 @@ pub(super) struct Connector {
     host: String,
     port: u16,
     timeout: Duration,
-    tls: Option<(TlsConnector, ServerName<'static>)>,
+    tls: Option<ConnectorTls>,
     dialer: ProxyDialer,
+}
+
+/// The client TLS a connector runs over each connection.
+pub(super) struct ConnectorTls {
+    pub(super) config: Arc<rustls::ClientConfig>,
+    pub(super) server_name: ServerName<'static>,
+    /// Names a handshake failure.
+    pub(super) posture: crate::tls::Posture,
 }
 
 impl Connector {
     pub(super) fn new(
         (host, port): (String, u16),
         timeout: Duration,
-        tls: Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>,
+        tls: Option<ConnectorTls>,
         dialer: ProxyDialer,
     ) -> Self {
         Self {
             host,
             port,
             timeout,
-            tls: tls.map(|(config, name)| (TlsConnector::from(config), name)),
+            tls,
             dialer,
         }
     }
@@ -96,11 +104,11 @@ impl Connector {
             tcp.set_nodelay(true).map_err(ConnectError::Unreachable)?;
             let stream: Stream = match &self.tls {
                 None => Box::new(tcp),
-                Some((connector, name)) => Box::new(
-                    connector
-                        .connect(name.clone(), tcp)
+                Some(tls) => Box::new(
+                    TlsConnector::from(Arc::clone(&tls.config))
+                        .connect(tls.server_name.clone(), tcp)
                         .await
-                        .map_err(classify_handshake)?,
+                        .map_err(|e| classify_handshake(e, tls.posture))?,
                 ),
             };
             Ok(stream)
@@ -115,13 +123,12 @@ impl Connector {
     }
 }
 
-/// A rustls refusal (bad certificate, unknown CA, wrong name, key pin) is a
-/// trust error.
-fn classify_handshake(e: io::Error) -> ConnectError {
-    if crate::tls::rustls_error(&e).is_some() {
-        ConnectError::Trust(e)
-    } else {
-        ConnectError::Unreachable(e)
+/// A rustls failure (refused certificate, name or key pin, nothing in common)
+/// is a trust error, named on `posture`.
+fn classify_handshake(e: io::Error, posture: crate::tls::Posture) -> ConnectError {
+    match crate::tls::describe_failure(&e, posture) {
+        Some(reason) => ConnectError::Trust(reason),
+        None => ConnectError::Unreachable(e),
     }
 }
 

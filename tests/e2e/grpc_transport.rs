@@ -957,9 +957,12 @@ async fn tls_client(addr: std::net::SocketAddr, send_timeout_ms: u64) -> GrpcTra
     ca.flush().expect("flush ca");
 
     let mut config = GrpcConfig::client(&format!("https://{addr}"));
-    config.tls_enabled = true;
-    config.tls_ca_path = Some(ca.path().to_string_lossy().into_owned());
-    config.tls_domain = Some("localhost".to_string());
+    config.tls = Some(scalo::tls::ClientTlsConfig {
+        trust: scalo::tls::TrustChoice::Bundle,
+        ca_paths: vec![ca.path().to_path_buf()],
+        server_name: Some("localhost".to_string()),
+        ..scalo::tls::ClientTlsConfig::default()
+    });
     config.send_timeout_ms = send_timeout_ms;
     GrpcTransport::new(&config).await.expect("client")
 }

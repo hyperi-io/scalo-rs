@@ -46,8 +46,9 @@ pub struct GrpcConfig {
     /// When set, the transport accepts incoming Push RPCs.
     pub listen: Option<String>,
 
-    /// Client endpoint URI (e.g., "http://loader:6000").
-    /// When set, the transport can send messages to a remote server.
+    /// Client endpoint URI (e.g., "http://loader:6000"). When set, the
+    /// transport can send messages to a remote server, over TLS when it is
+    /// `https://`.
     pub endpoint: Option<String>,
 
     /// Receive buffer size (messages buffered from incoming RPCs).
@@ -86,25 +87,12 @@ pub struct GrpcConfig {
     )]
     pub compression: Compression,
 
-    // --- Client TLS, mapped onto tonic's ClientTlsConfig by crate::tls. In-cluster
-    // gRPC is usually mesh mTLS, so these are for direct TLS to a remote endpoint. ---
-    /// Enable client TLS for the `endpoint` connection.
-    #[serde(default)]
-    pub tls_enabled: bool,
-    /// CA PEM file, trusted alone when set. Unset with `tls_enabled`, the OS
-    /// native roots are trusted. The HTTP transport's `tls_ca_path` differs:
-    /// by default it adds the CA beside the OS store.
-    #[serde(default)]
-    pub tls_ca_path: Option<String>,
-    /// Domain name for SNI / certificate verification (overrides the URI host).
-    #[serde(default)]
-    pub tls_domain: Option<String>,
-    /// Client certificate PEM for mTLS (with `tls_client_key_path`).
-    #[serde(default)]
-    pub tls_client_cert_path: Option<String>,
-    /// Client key PEM for mTLS (with `tls_client_cert_path`).
-    #[serde(default)]
-    pub tls_client_key_path: Option<String>,
+    /// Client TLS for an `https://` endpoint, the
+    /// [`ClientTlsConfig`](crate::tls::ClientTlsConfig) every transport reads.
+    /// An `https://` endpoint with no section takes the defaults: `strong`,
+    /// the OS root store, the endpoint's host as the name. A section beside an
+    /// `http://` endpoint is refused.
+    pub tls: Option<crate::tls::ClientTlsConfig>,
 
     /// Proxy the `endpoint` connection goes through: `none` (default),
     /// `system` (the machine's proxy) or a proxy URL. The connection is an
@@ -171,11 +159,7 @@ impl Default for GrpcConfig {
             send_timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
             max_message_size: 16 * 1024 * 1024, // 16 MB
             compression: Compression::NONE,
-            tls_enabled: false,
-            tls_ca_path: None,
-            tls_domain: None,
-            tls_client_cert_path: None,
-            tls_client_key_path: None,
+            tls: None,
             proxy: crate::transport::ProxyConfig::None,
             #[cfg(feature = "transport-grpc-vector-compat")]
             vector_compat: false,

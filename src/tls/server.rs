@@ -9,8 +9,8 @@
 //! Server TLS with certificate reload.
 //!
 //! [`ServerTls`] reads a certificate, its key and an optional client CA from
-//! files or secret specs and builds a rustls [`ServerConfig`] on the
-//! [`CryptoProfile`] posture. The certificate sits in a [`CertResolver`] that
+//! files or secret specs and builds a rustls [`ServerConfig`] on the config's
+//! [`CryptoProfile`]. The certificate sits in a [`CertResolver`] that
 //! every handshake asks, so swapping it reaches every listener built from the
 //! same `ServerTls` on its next handshake. A changed client CA rebuilds the
 //! config, which [`ServerTls::acceptor`] and [`ServerTls::accept`] pick up per
@@ -25,7 +25,7 @@
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -37,123 +37,24 @@ use rustls::sign::CertifiedKey;
 use rustls::{NamedGroup, ProtocolVersion, RootCertStore, ServerConfig};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
-use super::{TlsError, posture_provider, protocol_versions};
-use crate::crypto::CryptoProfile;
-
-/// Whether a server asks clients for a certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ClientAuth {
-    /// No client certificate is asked for.
-    #[default]
-    None,
-    /// A client certificate is checked against the CA when one is presented.
-    #[serde(alias = "request")]
-    Optional,
-    /// Every client presents a certificate that chains to the CA.
-    #[serde(alias = "require")]
-    Required,
-}
-
-impl fmt::Display for ClientAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::None => "none",
-            Self::Optional => "optional",
-            Self::Required => "required",
-        })
-    }
-}
-
-/// Where a server's certificate, key and client CA come from.
-///
-/// Each of the three takes a `*_file` path or a `*_secret` spec, never both. A
-/// spec is anything [`crate::secrets::resolve`] reads (`vault:`, `file:`,
-/// `aws:`, `env:`) and needs the `secrets` feature.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ServerTlsConfig {
-    /// PEM certificate chain, leaf first.
-    pub cert_file: Option<PathBuf>,
-    /// Secret spec for the PEM certificate chain.
-    pub cert_secret: Option<String>,
-    /// PEM private key.
-    pub key_file: Option<PathBuf>,
-    /// Secret spec for the PEM private key.
-    pub key_secret: Option<String>,
-    /// PEM CA bundle that client certificates must chain to.
-    pub ca_file: Option<PathBuf>,
-    /// Secret spec for the PEM CA bundle.
-    pub ca_secret: Option<String>,
-    /// Whether clients are asked for a certificate. Default `none`.
-    pub client_auth: ClientAuth,
-    /// How often the sources are re-read, in seconds. `0` turns reload off.
-    /// Default 30.
-    pub reload_interval_secs: u64,
-    /// How long a client has to finish its handshake, in milliseconds.
-    /// Default 10,000.
-    pub handshake_timeout_ms: u64,
-}
-
-impl Default for ServerTlsConfig {
-    fn default() -> Self {
-        Self {
-            cert_file: None,
-            cert_secret: None,
-            key_file: None,
-            key_secret: None,
-            ca_file: None,
-            ca_secret: None,
-            client_auth: ClientAuth::None,
-            reload_interval_secs: 30,
-            handshake_timeout_ms: 10_000,
-        }
-    }
-}
-
-impl fmt::Debug for ServerTlsConfig {
-    /// Secret specs print as set or unset: a literal spec is the secret.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let set = |spec: &Option<String>| spec.as_ref().map(|_| "<set>");
-        f.debug_struct("ServerTlsConfig")
-            .field("cert_file", &self.cert_file)
-            .field("cert_secret", &set(&self.cert_secret))
-            .field("key_file", &self.key_file)
-            .field("key_secret", &set(&self.key_secret))
-            .field("ca_file", &self.ca_file)
-            .field("ca_secret", &set(&self.ca_secret))
-            .field("client_auth", &self.client_auth)
-            .field("reload_interval_secs", &self.reload_interval_secs)
-            .field("handshake_timeout_ms", &self.handshake_timeout_ms)
-            .finish()
-    }
-}
-
-impl ServerTlsConfig {
-    /// A config serving the certificate and key at these paths.
-    #[must_use]
-    pub fn from_files(cert_file: impl Into<PathBuf>, key_file: impl Into<PathBuf>) -> Self {
-        Self {
-            cert_file: Some(cert_file.into()),
-            key_file: Some(key_file.into()),
-            ..Self::default()
-        }
-    }
-}
+use super::TlsError;
+use super::profile::Posture;
+use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
+use crate::tls_config::{ClientAuth, ServerTlsConfig};
 
 /// Code-side choices for a [`ServerTls`], as opposed to deployment config.
 #[derive(Debug, Clone, Default)]
 pub struct ServerTlsOptions {
-    /// Protocol versions and key-exchange groups. Default [`CryptoProfile::Prod`].
-    pub profile: CryptoProfile,
     /// ALPN protocols offered, most preferred first. Empty offers none.
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// Per-profile settings. `None` reads the `tls.profiles` cascade section
+    /// at load.
+    pub profiles: Option<TlsProfiles>,
 }
 
 impl ServerTlsOptions {
@@ -161,15 +62,15 @@ impl ServerTlsOptions {
     #[must_use]
     pub fn http() -> Self {
         Self {
-            profile: CryptoProfile::default(),
             alpn_protocols: vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            profiles: None,
         }
     }
 
-    /// Replace the crypto profile.
+    /// Take the per-profile settings from `profiles`, not the cascade.
     #[must_use]
-    pub fn with_profile(mut self, profile: CryptoProfile) -> Self {
-        self.profile = profile;
+    pub fn with_profiles(mut self, profiles: TlsProfiles) -> Self {
+        self.profiles = Some(profiles);
         self
     }
 }
@@ -243,6 +144,7 @@ pub struct ServerTls {
 struct Inner {
     config: ServerTlsConfig,
     options: ServerTlsOptions,
+    posture: Posture,
     provider: Arc<CryptoProvider>,
     resolver: Arc<CertResolver>,
     server_config: ArcSwap<ServerConfig>,
@@ -260,7 +162,7 @@ impl fmt::Debug for ServerTls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerTls")
             .field("config", &self.inner.config)
-            .field("profile", &self.inner.options.profile)
+            .field("posture", &self.inner.posture)
             .finish_non_exhaustive()
     }
 }
@@ -283,30 +185,43 @@ impl ServerTls {
     /// [`TlsError::MissingSource`] or [`TlsError::ConflictingSource`] for a
     /// certificate, key or CA set up wrongly, [`TlsError::ClientCaRequired`]
     /// when client certificates are asked for with no CA, a read or parse
-    /// error for any source, and [`TlsError::Build`] for a key that does not
-    /// match its certificate.
+    /// error for any source, [`TlsError::Profiles`] for refused profile
+    /// settings, and [`TlsError::Build`] for a key that does not match its
+    /// certificate.
     pub async fn load_with(
         config: &ServerTlsConfig,
         options: ServerTlsOptions,
     ) -> Result<Self, TlsError> {
         let sources = Sources::of(config)?;
         if config.client_auth == ClientAuth::None
-            && (config.ca_file.is_some() || config.ca_secret.is_some())
+            && (!config.ca_files.is_empty() || config.ca_secret.is_some())
         {
             tracing::warn!("TLS client CA is set but client_auth is none, so it is unused");
         }
+        let profiles = match options.profiles {
+            Some(profiles) => profiles,
+            None => TlsProfiles::from_cascade().map_err(TlsError::Profiles)?,
+        };
+        let posture = Posture::new(config.profile, &profiles, KeyShare::Profile);
         let material = sources.read().await?;
-        let provider = posture_provider(options.profile.pqc());
+        let provider = posture.provider();
 
         let key = certified_key(&material.cert, &material.key, &provider)?;
         let resolver = Arc::new(CertResolver::new(key));
         let verifier = client_verifier(config.client_auth, material.ca.as_deref(), &provider)?;
-        let server_config = build_server_config(&options, &provider, verifier, &resolver)?;
+        let server_config = build_server_config(&options, posture, &provider, verifier, &resolver)?;
+        tracing::info!(
+            profile = posture.profile.as_str(),
+            allow_tls12 = posture.allow_tls12,
+            client_auth = %config.client_auth,
+            "TLS server config built"
+        );
 
         let tls = Self {
             inner: Arc::new(Inner {
                 config: config.clone(),
                 options,
+                posture,
                 provider,
                 resolver,
                 server_config: ArcSwap::from_pointee(server_config),
@@ -326,6 +241,13 @@ impl ServerTls {
     #[must_use]
     pub fn server_config(&self) -> Arc<ServerConfig> {
         self.inner.server_config.load_full()
+    }
+
+    /// The profile, with its settings, every config from this `ServerTls` is
+    /// built on.
+    #[must_use]
+    pub fn posture(&self) -> Posture {
+        self.inner.posture
     }
 
     /// The certificate resolver every config from this `ServerTls` uses.
@@ -350,8 +272,9 @@ impl ServerTls {
     /// Run the server handshake on `io`, bounded by the handshake timeout.
     ///
     /// Counts `tls_handshakes_total{protocol, key_exchange}` on success and
-    /// `tls_handshake_failures_total{reason}` on failure. `peer` goes into the
-    /// failure's log and security event.
+    /// `tls_handshake_failures_total{reason}` on failure. A TLS 1.2 handshake
+    /// is warned and counted on `tls_tls12_handshakes_total` as well. `peer`
+    /// goes into the failure's log and security event.
     ///
     /// # Errors
     ///
@@ -372,6 +295,7 @@ impl ServerTls {
                 record_handshake(
                     connection.protocol_version(),
                     connection.negotiated_key_exchange_group().map(|g| g.name()),
+                    self.inner.posture.profile,
                 );
                 Ok(stream)
             }
@@ -490,6 +414,7 @@ impl Inner {
             )?;
             Some(build_server_config(
                 &self.options,
+                self.posture,
                 &self.provider,
                 verifier,
                 &self.resolver,
@@ -524,7 +449,7 @@ impl Part {
         match self {
             Self::Cert => "cert_file",
             Self::Key => "key_file",
-            Self::Ca => "ca_file",
+            Self::Ca => "ca_files",
         }
     }
 
@@ -539,24 +464,25 @@ impl Part {
 
 #[derive(Clone, Copy)]
 enum Source<'a> {
-    File(&'a Path),
+    /// One file, or several read as one PEM in order.
+    Files(&'a [PathBuf]),
     Secret(&'a str, Part),
 }
 
 impl<'a> Source<'a> {
     fn of(
-        file: Option<&'a PathBuf>,
+        files: &'a [PathBuf],
         secret: Option<&'a String>,
         part: Part,
     ) -> Result<Option<Self>, TlsError> {
-        match (file, secret) {
-            (Some(_), Some(_)) => Err(TlsError::ConflictingSource {
+        match (files.is_empty(), secret) {
+            (false, Some(_)) => Err(TlsError::ConflictingSource {
                 file: part.file_field(),
                 secret: part.secret_field(),
             }),
-            (Some(path), None) => Ok(Some(Self::File(path))),
-            (None, Some(spec)) => Ok(Some(Self::Secret(spec, part))),
-            (None, None) => Ok(None),
+            (false, None) => Ok(Some(Self::Files(files))),
+            (true, Some(spec)) => Ok(Some(Self::Secret(spec, part))),
+            (true, None) => Ok(None),
         }
     }
 
@@ -565,7 +491,12 @@ impl<'a> Source<'a> {
         secret: Option<&'a String>,
         part: Part,
     ) -> Result<Self, TlsError> {
-        Self::of(file, secret, part)?.ok_or(TlsError::MissingSource {
+        Self::of(
+            file.map(std::slice::from_ref).unwrap_or_default(),
+            secret,
+            part,
+        )?
+        .ok_or(TlsError::MissingSource {
             file: part.file_field(),
             secret: part.secret_field(),
         })
@@ -573,10 +504,18 @@ impl<'a> Source<'a> {
 
     async fn read(self) -> Result<Vec<u8>, TlsError> {
         match self {
-            Self::File(path) => tokio::fs::read(path).await.map_err(|e| TlsError::PemRead {
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            }),
+            Self::Files(paths) => {
+                let mut pem = Vec::new();
+                for path in paths {
+                    let bytes = tokio::fs::read(path).await.map_err(|e| TlsError::PemRead {
+                        path: path.clone(),
+                        reason: e.to_string(),
+                    })?;
+                    pem.extend_from_slice(&bytes);
+                    pem.push(b'\n');
+                }
+                Ok(pem)
+            }
             Self::Secret(spec, part) => read_secret(spec, part).await,
         }
     }
@@ -623,7 +562,7 @@ impl<'a> Sources<'a> {
             config.key_secret.as_ref(),
             Part::Key,
         )?;
-        let ca = Source::of(config.ca_file.as_ref(), config.ca_secret.as_ref(), Part::Ca)?;
+        let ca = Source::of(&config.ca_files, config.ca_secret.as_ref(), Part::Ca)?;
         let ca = match (config.client_auth, ca) {
             (ClientAuth::Optional | ClientAuth::Required, None) => {
                 return Err(TlsError::ClientCaRequired {
@@ -739,13 +678,14 @@ fn client_verifier(
 
 fn build_server_config(
     options: &ServerTlsOptions,
+    posture: Posture,
     provider: &Arc<CryptoProvider>,
     verifier: Arc<dyn ClientCertVerifier>,
     resolver: &Arc<CertResolver>,
 ) -> Result<ServerConfig, TlsError> {
     let resolver: Arc<dyn ResolvesServerCert> = Arc::clone(resolver) as _;
     let mut config = ServerConfig::builder_with_provider(Arc::clone(provider))
-        .with_protocol_versions(protocol_versions(options.profile.tls_floor()))
+        .with_protocol_versions(posture.versions())
         .map_err(|e| TlsError::Build(e.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(resolver);
@@ -754,7 +694,14 @@ fn build_server_config(
 }
 
 #[cfg_attr(not(feature = "metrics-core"), allow(unused_variables))]
-fn record_handshake(protocol: Option<ProtocolVersion>, group: Option<NamedGroup>) {
+fn record_handshake(
+    protocol: Option<ProtocolVersion>,
+    group: Option<NamedGroup>,
+    profile: CryptoProfile,
+) {
+    if protocol == Some(ProtocolVersion::TLSv1_2) {
+        super::pin::note_tls12("server", profile);
+    }
     #[cfg(feature = "metrics-core")]
     {
         let protocol = match protocol {
@@ -762,8 +709,8 @@ fn record_handshake(protocol: Option<ProtocolVersion>, group: Option<NamedGroup>
             Some(ProtocolVersion::TLSv1_2) => "1.2",
             _ => "other",
         };
-        let key_exchange = if group.is_some_and(super::is_hybrid_pqc) {
-            "hybrid"
+        let key_exchange = if group.is_some_and(super::profile::is_post_quantum) {
+            "post_quantum"
         } else {
             "classical"
         };

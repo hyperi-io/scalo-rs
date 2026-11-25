@@ -337,7 +337,7 @@ impl Pki {
     async fn server(&self, name: &str) -> ServerTls {
         let path = |file: String| self.dir.path().join(file);
         ServerTls::load(&ServerTlsConfig {
-            ca_file: Some(path("ca.pem".into())),
+            ca_files: vec![path("ca.pem".into())],
             client_auth: ClientAuth::Required,
             reload_interval_secs: 0,
             ..ServerTlsConfig::from_files(path(format!("{name}.pem")), path(format!("{name}.key")))
@@ -348,17 +348,16 @@ impl Pki {
 
     /// Client TLS trusting `ca` (a file under the dir), with the client cert,
     /// pinned to the server's key.
-    fn client(&self, ca: &str) -> SyslogTlsConfig {
+    fn client(&self, ca: &str) -> ClientTlsConfig {
         let path = |name: &str| self.dir.path().join(name);
-        SyslogTlsConfig {
-            client: ClientTlsConfig {
-                trust: TrustChoice::Bundle,
-                ca_path: Some(path(ca)),
-                client_cert_path: Some(path("client.pem")),
-                client_key_path: Some(path("client.key")),
-                pin_sha256: vec![self.pin],
-            },
+        ClientTlsConfig {
+            trust: TrustChoice::Bundle,
+            ca_paths: vec![path(ca)],
+            client_cert_path: Some(path("client.pem")),
+            client_key_path: Some(path("client.key")),
+            pin_sha256: vec![self.pin],
             server_name: Some("localhost".into()),
+            ..ClientTlsConfig::default()
         }
     }
 }
@@ -416,6 +415,46 @@ async fn each_stream_protocol_and_framing_round_trips() {
         assert_eq!(got, want, "{case}");
         sender.close().await.unwrap();
     }
+}
+
+/// The `tls` section reaches the handshake: a cnsa2 client against a cnsa2
+/// receiver agrees ML-KEM-1024 and AES-256, where the default strong client
+/// would agree P-384.
+#[tokio::test]
+async fn the_tls_section_reaches_the_handshake() {
+    use crate::crypto::CryptoProfile;
+    use crate::tls::test_pki::{Agreed, Front, server_tls};
+
+    let peer = StreamPeer::start(None, StreamMode::Keep).await;
+    let ca = TestCa::new("syslog handshake ca");
+    let (tls, files) = server_tls(&ca, CryptoProfile::Cnsa2, &[]).await;
+    let front = Front::start(tls, peer.addr).await;
+    let ca_file = files.path().join("ca.pem");
+    write(&ca_file, &ca.pem());
+    let mut cfg = config(front.addr, SyslogProtocol::Tls);
+    cfg.tls = Some(ClientTlsConfig {
+        profile: CryptoProfile::Cnsa2,
+        trust: TrustChoice::Bundle,
+        ca_paths: vec![ca_file],
+        server_name: Some("localhost".into()),
+        ..ClientTlsConfig::default()
+    });
+    let sender = SyslogTransport::new(&cfg).unwrap();
+    let result = sender.send_batch(&records(&["x"])).await;
+    assert!(result.is_ok(), "{result:?}");
+    // The message reaching the receiver means the front finished its side.
+    assert_eq!(
+        peer.messages(SyslogFraming::OctetCounting, 1).await.len(),
+        1
+    );
+    assert_eq!(
+        front.agreed(),
+        [Agreed::tls13(
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::NamedGroup::MLKEM1024
+        )]
+    );
+    sender.close().await.unwrap();
 }
 
 /// `tcp`, `tls` and `relp` go through a real Squid's CONNECT tunnel, TLS inside
@@ -780,7 +819,7 @@ fn configs_that_cannot_send_are_refused_at_build() {
         (
             "tls on tcp",
             SyslogConfig {
-                tls: Some(SyslogTlsConfig::default()),
+                tls: Some(ClientTlsConfig::default()),
                 ..base()
             },
             "use protocol tls",
@@ -828,13 +867,10 @@ fn configs_that_cannot_send_are_refused_at_build() {
         (
             "tls file missing",
             SyslogConfig {
-                tls: Some(SyslogTlsConfig {
-                    client: ClientTlsConfig {
-                        trust: TrustChoice::Bundle,
-                        ca_path: Some("/nonexistent/ca.pem".into()),
-                        ..ClientTlsConfig::default()
-                    },
-                    server_name: None,
+                tls: Some(ClientTlsConfig {
+                    trust: TrustChoice::Bundle,
+                    ca_paths: vec!["/nonexistent/ca.pem".into()],
+                    ..ClientTlsConfig::default()
                 }),
                 ..SyslogConfig::new("logs.example:6514", SyslogProtocol::Tls)
             },
@@ -843,12 +879,9 @@ fn configs_that_cannot_send_are_refused_at_build() {
         (
             "half a client identity",
             SyslogConfig {
-                tls: Some(SyslogTlsConfig {
-                    client: ClientTlsConfig {
-                        client_cert_path: Some("/etc/tls/client.pem".into()),
-                        ..ClientTlsConfig::default()
-                    },
-                    server_name: None,
+                tls: Some(ClientTlsConfig {
+                    client_cert_path: Some("/etc/tls/client.pem".into()),
+                    ..ClientTlsConfig::default()
                 }),
                 ..SyslogConfig::new("logs.example:6514", SyslogProtocol::Tls)
             },
@@ -883,7 +916,7 @@ fn every_key_reaches_the_config_through_the_cascade() {
          severity: warning\n    hostname: h1\n    app_name: a1\n    proc_id: p1\n    \
          msg_id: m1\n    structured_data:\n      meta@1:\n        k: v\n    \
          max_message_bytes: 4096\n    connect_timeout_ms: 7\n    send_timeout_ms: 8\n    \
-         relp_window: 9\n    proxy: system\n    tls:\n      trust: bundle\n      ca_path: /etc/tls/ca.pem\n      \
+         relp_window: 9\n    proxy: system\n    tls:\n      trust: bundle\n      ca_paths: /etc/tls/ca.pem\n      \
          client_cert_path: /etc/tls/c.pem\n      client_key_path: /etc/tls/c.key\n      \
          pin_sha256: [\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"]\n      \
          server_name: logs.internal\n    filters_out:\n      - expression: 'level == \"debug\"'\n        \
@@ -929,19 +962,18 @@ fn every_key_reaches_the_config_through_the_cascade() {
         send_timeout_ms: 8,
         relp_window: 9,
         proxy: crate::transport::ProxyConfig::System,
-        tls: Some(SyslogTlsConfig {
-            client: ClientTlsConfig {
-                trust: TrustChoice::Platform,
-                ca_path: Some("/etc/tls/ca.pem".into()),
-                client_cert_path: Some("/etc/tls/c.pem".into()),
-                client_key_path: Some("/etc/tls/c.key".into()),
-                pin_sha256: vec![
-                    "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
-                        .parse()
-                        .unwrap(),
-                ],
-            },
+        tls: Some(ClientTlsConfig {
+            trust: TrustChoice::Platform,
+            ca_paths: vec!["/etc/tls/ca.pem".into()],
+            client_cert_path: Some("/etc/tls/c.pem".into()),
+            client_key_path: Some("/etc/tls/c.key".into()),
+            pin_sha256: vec![
+                "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+                    .parse()
+                    .unwrap(),
+            ],
             server_name: Some("logs.internal".into()),
+            ..ClientTlsConfig::default()
         }),
         filters_out: cfg.filters_out.clone(),
     };

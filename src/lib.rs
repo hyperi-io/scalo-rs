@@ -256,6 +256,21 @@ pub mod memory;
 #[cfg_attr(docsrs, doc(cfg(feature = "tls")))]
 pub mod tls;
 
+#[cfg(any(
+    feature = "tls",
+    feature = "http-server",
+    feature = "transport-kafka-config"
+))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "tls",
+        feature = "http-server",
+        feature = "transport-kafka-config"
+    )))
+)]
+pub mod tls_config;
+
 #[cfg(feature = "scaling")]
 #[cfg_attr(docsrs, doc(cfg(feature = "scaling")))]
 pub mod scaling;

@@ -15,8 +15,7 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 
-use super::{ClientAuth, HandshakeError, Reloaded, ServerTls, ServerTlsConfig, ServerTlsOptions};
-use crate::crypto::CryptoProfile;
+use super::{ClientAuth, HandshakeError, Reloaded, ServerTls, ServerTlsConfig};
 use crate::tls::TlsError;
 use crate::tls::test_pki::{Leaf, TestCa, connect, connector, write};
 
@@ -133,10 +132,29 @@ async fn load_refuses_a_config_it_cannot_serve() {
             "client auth required with a CA",
             ServerTlsConfig {
                 client_auth: ClientAuth::Required,
-                ca_file: Some(files.ca()),
+                ca_files: vec![files.ca()],
                 ..base.clone()
             },
             Ok(()),
+        ),
+        (
+            "client auth required with two CA files",
+            ServerTlsConfig {
+                client_auth: ClientAuth::Required,
+                ca_files: vec![files.ca(), files.ca()],
+                ..base.clone()
+            },
+            Ok(()),
+        ),
+        (
+            "client CA from files and a secret",
+            ServerTlsConfig {
+                client_auth: ClientAuth::Required,
+                ca_files: vec![files.ca()],
+                ca_secret: cert_spec.clone(),
+                ..base.clone()
+            },
+            Err("conflicting ca_files"),
         ),
         (
             "no certificate",
@@ -182,7 +200,7 @@ async fn load_refuses_a_config_it_cannot_serve() {
             "CA file with no certificate",
             ServerTlsConfig {
                 client_auth: ClientAuth::Required,
-                ca_file: Some(empty_ca.path().to_path_buf()),
+                ca_files: vec![empty_ca.path().to_path_buf()],
                 ..base.clone()
             },
             Err("invalid client CA"),
@@ -378,7 +396,11 @@ async fn client_auth_modes_admit_the_clients_they_should() {
     for (name, mode, identity, admitted) in cases {
         let config = ServerTlsConfig {
             client_auth: mode,
-            ca_file: (mode != ClientAuth::None).then(|| files.ca()),
+            ca_files: if mode == ClientAuth::None {
+                Vec::new()
+            } else {
+                vec![files.ca()]
+            },
             ..files.config()
         };
         let tls = ServerTls::load(&config).await.unwrap();
@@ -401,7 +423,7 @@ async fn a_rotated_client_ca_admits_the_new_clients() {
     let files = Files::new(&server_ca.server("server"), &old_ca.pem());
     let config = ServerTlsConfig {
         client_auth: ClientAuth::Required,
-        ca_file: Some(files.ca()),
+        ca_files: vec![files.ca()],
         ..files.config()
     };
     let tls = ServerTls::load(&config).await.unwrap();
@@ -441,30 +463,6 @@ async fn a_silent_client_times_out() {
         "{result:?}"
     );
     drop(silent);
-}
-
-#[tokio::test]
-async fn highsec_negotiates_tls13() {
-    let ca = TestCa::new("highsec ca");
-    let files = Files::new(&ca.server("server"), &ca.pem());
-    let options = ServerTlsOptions::default().with_profile(CryptoProfile::HighSec);
-    let tls = ServerTls::load_with(&files.config(), options)
-        .await
-        .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server_tls = tls.clone();
-    let server = tokio::spawn(async move {
-        let (stream, peer) = listener.accept().await.unwrap();
-        server_tls.accept(stream, Some(peer)).await.map(|s| {
-            let (_, connection) = s.get_ref();
-            connection.protocol_version()
-        })
-    });
-    let client = connect(&connector(&ca.pem(), None, &[]), addr).await;
-    let negotiated = server.await.unwrap().unwrap();
-    drop(client);
-    assert_eq!(negotiated, Some(rustls::ProtocolVersion::TLSv1_3));
 }
 
 #[test]

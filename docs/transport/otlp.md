@@ -18,8 +18,9 @@ transport:
       resource_attributes:
         deployment.environment.name: prod
       tls:
-        trust: bundle             # native (default), platform (http only) or bundle
-        ca_path: /etc/tls/ca.pem
+        profile: strong           # strong (default), commercial or cnsa2
+        trust: bundle             # native (default), platform or bundle
+        ca_paths: [/etc/tls/ca.pem]
         client_cert_path: /etc/tls/client.pem
         client_key_path: /etc/tls/client.key
       proxy: system               # none (default), system or a proxy URL
@@ -33,7 +34,7 @@ transport:
   - an `https://` endpoint naming no port keeps 443, where hosted collectors behind a TLS gateway listen
   - a named port is used as given, so `http://localhost:4317` under `http` stays on 4317
   - under `http`, `/v1/logs` and `/v1/metrics` are appended, and an endpoint ending in either is read as the base before it, so `https://collector:4318/v1/logs` sends metrics to `https://collector:4318/v1/metrics`
-- TLS: an `https://` endpoint with no `tls` section trusts the OS root store, and a `tls` section beside an `http://` endpoint is refused at build. The section is the `ClientTlsConfig` that syslog reads too ([../api/tls.md](../api/tls.md#client-trust)). gRPC takes `native` or `bundle` and no `pin_sha256`, which `http` checks.
+- TLS: an `https://` endpoint with no `tls` section takes the defaults (`strong`, the OS root store), and a `tls` section beside an `http://` endpoint is refused at build. The section is the `ClientTlsConfig` every transport reads ([../api/tls.md](../api/tls.md#client-trust)), and both protocols take every key, but `server_name` under `grpc` only: under `http` the endpoint's host is the name checked.
 - Headers: gRPC metadata or HTTP headers on every request, commonly an API key. They are never logged or serialised back out, and a name or value the protocol cannot carry fails the build, naming the header and not its value.
 - Deadline: `timeout_ms` (default 10 s, 0 refused) bounds each export, connect and TLS handshake included. `send_batch_by` answers by its deadline when that comes first. Either one running out is `Backpressured`: the records may have arrived, so the retry can duplicate them. gRPC sends the limit as `grpc-timeout` too.
 - Proxy: `proxy` is `none`, `system` or an `http://` proxy URL, as for the HTTP transport ([http.md](http.md#proxy-redirects-and-logs)). gRPC and an `https` collector go through an HTTP CONNECT tunnel. A refused CONNECT is `Backpressured`, so the records are held and sent again. It is counted in `transport_proxy_refused_total`, logged once per run with the proxy's status and the collector's port, and fails `is_healthy()` and the `transport:otlp` health check until an export goes through.
@@ -66,7 +67,7 @@ The resource carries `service.name` (`service_name`, else `OTEL_SERVICE_NAME`, e
 | gRPC `RESOURCE_EXHAUSTED` | `RetryAfter(wait)` with `RetryInfo`, else `Reject`: without one it is most often a request over the collector's size limit |
 | gRPC `CANCELLED`, `DEADLINE_EXCEEDED`, `ABORTED`, `OUT_OF_RANGE`, `DATA_LOSS`, or no answer (refused, reset, timed out) | `Backpressured` |
 | HTTP 401, 403, 404, 405, 407, 410, 421, 1xx and 3xx, gRPC `UNAUTHENTICATED`, `PERMISSION_DENIED`, `NOT_FOUND`, `UNIMPLEMENTED` | `Fatal(Config)`: the credential or endpoint is wrong, which says nothing about the records |
-| a TLS refusal of the collector's certificate or name, and over `http` a key off the pin or the client certificate turned away | `Fatal(Config)`, naming the rustls error |
+| a failed TLS handshake: the collector's certificate, name or key, no version, suite or group in common, and over `http` the client certificate turned away | `Fatal(Config)`, naming the `TlsFailure` |
 | HTTP 413 | `Reject(MessageTooLarge)` |
 | any other HTTP 4xx or 5xx, any other gRPC code | `Reject` |
 

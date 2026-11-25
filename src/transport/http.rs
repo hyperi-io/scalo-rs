@@ -263,33 +263,14 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_max_in_flight_bytes")]
     pub max_in_flight_bytes: usize,
 
-    /// CA PEM file the send-side HTTPS client trusts, beside the OS store
-    /// under `native` and `platform`, and alone under `bundle`. The gRPC
-    /// transport's `tls_ca_path` differs: it trusts that CA alone.
+    /// Client TLS for `https://` endpoints, the [`ClientTlsConfig`] every
+    /// transport reads: profile, trust, CA files, client certificate and key
+    /// pins. The endpoint's host is the name checked, so `server_name` is
+    /// refused.
+    ///
+    /// [`ClientTlsConfig`]: crate::tls::ClientTlsConfig
     #[serde(default)]
-    pub tls_ca_path: Option<String>,
-
-    /// Which certificates the send-side client accepts the server's from:
-    /// `native`, `platform` or `bundle` (see [`crate::tls::TrustChoice`]).
-    /// Unset is `native` when any other `tls_*` key is set, and the HTTP
-    /// client library's own verifier, the OS one, when none is.
-    #[serde(default)]
-    pub tls_trust: Option<crate::tls::TrustChoice>,
-
-    /// Client certificate PEM for mutual TLS, with `tls_client_key_path`.
-    #[serde(default)]
-    pub tls_client_cert_path: Option<String>,
-
-    /// Client private key PEM for mutual TLS, with `tls_client_cert_path`.
-    /// May name the same file when it holds both.
-    #[serde(default)]
-    pub tls_client_key_path: Option<String>,
-
-    /// SHA-256 pins on the server's public key, in base64 or hex (see
-    /// [`crate::tls::SpkiPin`]). Once the chain verifies, the key must match
-    /// one. Empty (the default) checks no key.
-    #[serde(default)]
-    pub tls_pin_sha256: Vec<crate::tls::SpkiPin>,
+    pub tls: crate::tls::ClientTlsConfig,
 }
 
 impl Default for HttpTransportConfig {
@@ -316,11 +297,7 @@ impl Default for HttpTransportConfig {
             send_timeout_ms: default_send_timeout_ms(),
             max_body_bytes: default_max_body_bytes(),
             max_in_flight_bytes: default_max_in_flight_bytes(),
-            tls_ca_path: None,
-            tls_trust: None,
-            tls_client_cert_path: None,
-            tls_client_key_path: None,
-            tls_pin_sha256: Vec::new(),
+            tls: crate::tls::ClientTlsConfig::default(),
         }
     }
 }
@@ -350,11 +327,7 @@ impl std::fmt::Debug for HttpTransportConfig {
             .field("send_timeout_ms", &self.send_timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_in_flight_bytes", &self.max_in_flight_bytes)
-            .field("tls_ca_path", &self.tls_ca_path)
-            .field("tls_trust", &self.tls_trust)
-            .field("tls_client_cert_path", &self.tls_client_cert_path)
-            .field("tls_client_key_path", &self.tls_client_key_path)
-            .field("tls_pin_sha256", &self.tls_pin_sha256)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -370,43 +343,20 @@ impl HttpTransportConfig {
         <Self as super::traits::FromCascade>::from_cascade_key("transport.http")
     }
 
-    /// The client TLS the `tls_*` keys name, or `None` when none is set and
-    /// the HTTP client keeps its own verifier.
+    /// The client TLS the `tls` section names.
     ///
     /// # Errors
     ///
-    /// `TransportError::Config` when only one of the client certificate and
-    /// key is set.
-    fn client_tls(&self) -> TransportResult<Option<crate::tls::ClientTls>> {
-        let identity = match (&self.tls_client_cert_path, &self.tls_client_key_path) {
-            (Some(cert), Some(key)) => Some((cert, key)),
-            (None, None) => None,
-            _ => {
-                return Err(TransportError::Config(
-                    "HTTP client TLS: mutual TLS needs both tls_client_cert_path and \
-                     tls_client_key_path"
-                        .to_string(),
-                ));
-            }
-        };
-        if self.tls_trust.is_none()
-            && self.tls_ca_path.is_none()
-            && identity.is_none()
-            && self.tls_pin_sha256.is_empty()
-        {
-            return Ok(None);
+    /// `TransportError::Config` for half a client identity, a `server_name`,
+    /// or refused profile settings.
+    fn client_tls(&self) -> TransportResult<crate::tls::ClientTls> {
+        let fail = |e: &dyn std::fmt::Display| TransportError::Config(format!("HTTP client {e}"));
+        if self.tls.server_name.is_some() {
+            return Err(fail(
+                &"TLS: tls.server_name is not taken: the endpoint's host is the name checked",
+            ));
         }
-        let mut tls = crate::tls::ClientTls::new(self.tls_trust.unwrap_or_default());
-        if let Some(ca) = &self.tls_ca_path {
-            tls = tls.with_ca(ca);
-        }
-        if let Some((cert, key)) = identity {
-            tls = tls.with_identity(cert, key);
-        }
-        for pin in &self.tls_pin_sha256 {
-            tls = tls.with_pin(*pin);
-        }
-        Ok(Some(tls))
+        self.tls.client_tls().map_err(|e| fail(&e))
     }
 
     /// Create a send-only config pointing at the given endpoint URL.
@@ -520,20 +470,24 @@ impl HttpTransport {
             .connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms))
             .timeout(std::time::Duration::from_millis(config.send_timeout_ms));
 
-        if let Some(tls) = config.client_tls()? {
-            let tls_cfg =
-                crate::tls::build_client_tls(crate::crypto::CryptoProfile::default(), &tls)
-                    .map_err(|e| TransportError::Config(format!("HTTP client TLS: {e}")))?;
-            client_builder = client_builder.use_preconfigured_tls((*tls_cfg).clone());
-        } else {
-            tracing::debug!("HTTP transport client TLS: the client library's own verifier");
-        }
-
-        let sender = config
-            .endpoint
-            .as_deref()
-            .map(|endpoint| send::Sender::new(config, endpoint, client_builder))
-            .transpose()?;
+        let sender = match config.endpoint.as_deref() {
+            Some(endpoint) => {
+                let tls = config.client_tls()?;
+                let posture = tls
+                    .posture()
+                    .map_err(|e| TransportError::Config(format!("HTTP client {e}")))?;
+                let tls_cfg = crate::tls::build_client_tls(&tls)
+                    .map_err(|e| TransportError::Config(format!("HTTP client {e}")))?;
+                client_builder = client_builder.use_preconfigured_tls((*tls_cfg).clone());
+                Some(send::Sender::new(
+                    config,
+                    endpoint,
+                    client_builder,
+                    posture,
+                )?)
+            }
+            None => None,
+        };
         if sender.is_none() && !config.failover.is_empty() {
             return Err(TransportError::Config(
                 "HTTP failover endpoints need an endpoint to fail over from".into(),
@@ -1236,24 +1190,27 @@ mod tests {
         assert!(config.listen.is_none());
     }
 
-    /// Every `tls_*` key reaches the config through the cascade, from YAML and
-    /// from the environment, which wins.
+    /// Every `tls` key reaches the config through the cascade, from YAML and
+    /// from the environment, which wins, and a single CA path reads as a list.
     #[cfg(feature = "config")]
     #[test]
     fn tls_keys_reach_the_config_through_the_cascade() {
+        use crate::tls::{ClientTlsConfig, CryptoProfile, KeyShare, TrustChoice};
+
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("settings.yaml"),
-            "transport:\n  http:\n    tls_trust: bundle\n    tls_ca_path: /etc/tls/ca.pem\n    \
-             tls_client_cert_path: /etc/tls/client.pem\n    tls_client_key_path: /etc/tls/yaml.key\n    \
-             tls_pin_sha256: [\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"]\n",
+            "transport:\n  http:\n    tls:\n      profile: commercial\n      trust: bundle\n      \
+             ca_paths: /etc/tls/ca.pem\n      client_cert_path: /etc/tls/client.pem\n      \
+             client_key_path: /etc/tls/yaml.key\n      key_share: classical\n      \
+             pin_sha256: [\"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\"]\n",
         )
         .unwrap();
         temp_env::with_vars(
             [
-                ("HTTPTLS__TRANSPORT__HTTP__TLS_TRUST", Some("platform")),
+                ("HTTPTLS__TRANSPORT__HTTP__TLS__TRUST", Some("platform")),
                 (
-                    "HTTPTLS__TRANSPORT__HTTP__TLS_CLIENT_KEY_PATH",
+                    "HTTPTLS__TRANSPORT__HTTP__TLS__CLIENT_KEY_PATH",
                     Some("/etc/tls/env.key"),
                 ),
             ],
@@ -1269,107 +1226,65 @@ mod tests {
             },
         );
         let config = HttpTransportConfig::from_cascade().unwrap();
-        assert_eq!(config.tls_trust, Some(crate::tls::TrustChoice::Platform));
-        assert_eq!(config.tls_ca_path.as_deref(), Some("/etc/tls/ca.pem"));
         assert_eq!(
-            config.tls_client_cert_path.as_deref(),
-            Some("/etc/tls/client.pem")
+            config.tls,
+            ClientTlsConfig {
+                profile: CryptoProfile::Commercial,
+                trust: TrustChoice::Platform,
+                ca_paths: vec!["/etc/tls/ca.pem".into()],
+                client_cert_path: Some("/etc/tls/client.pem".into()),
+                client_key_path: Some("/etc/tls/env.key".into()),
+                pin_sha256: vec![
+                    "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+                        .parse()
+                        .unwrap()
+                ],
+                server_name: None,
+                key_share: KeyShare::Classical,
+            }
         );
-        assert_eq!(
-            config.tls_client_key_path.as_deref(),
-            Some("/etc/tls/env.key")
-        );
-        let pins: Vec<String> = config
-            .tls_pin_sha256
-            .iter()
-            .map(|p| p.to_string())
-            .collect();
-        assert_eq!(pins, ["47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="]);
     }
 
-    /// The `tls_*` keys map onto the client TLS they name, and leave the HTTP
-    /// client's own verifier in place when none is set.
+    /// The `tls` section refuses what HTTP cannot honour, and a key the
+    /// section does not have, at load.
     #[test]
-    fn tls_keys_map_onto_client_tls() {
-        use crate::tls::{ClientTls, TrustChoice};
-        type Mapped = Result<Option<ClientTls>, String>;
-        let with = |trust, ca: Option<&str>, cert: Option<&str>, key: Option<&str>| -> Mapped {
-            HttpTransportConfig {
-                tls_trust: trust,
-                tls_ca_path: ca.map(str::to_string),
-                tls_client_cert_path: cert.map(str::to_string),
-                tls_client_key_path: key.map(str::to_string),
-                ..HttpTransportConfig::default()
-            }
-            .client_tls()
-            .map_err(|e| e.to_string())
-        };
-        let native = || ClientTls::new(TrustChoice::Native);
-        let cases: [(&str, Mapped, Mapped); 6] = [
-            ("nothing set", with(None, None, None, None), Ok(None)),
+    fn the_tls_section_refuses_what_http_cannot_honour() {
+        let refused = [
             (
-                "a CA alone is native plus the CA",
-                with(None, Some("ca.pem"), None, None),
-                Ok(Some(native().with_ca("ca.pem"))),
+                "a server name",
+                serde_json::json!({"tls": {"server_name": "other.example"}}),
+                "tls.server_name is not taken",
             ),
             (
-                "an explicit native",
-                with(Some(TrustChoice::Native), None, None, None),
-                Ok(Some(native())),
+                "half an identity",
+                serde_json::json!({"tls": {"client_cert_path": "c.pem"}}),
+                "needs both client_cert_path and client_key_path",
             ),
             (
-                "the pin with an identity",
-                with(
-                    Some(TrustChoice::Bundle),
-                    Some("ca.pem"),
-                    Some("c.pem"),
-                    Some("k.pem"),
-                ),
-                Ok(Some(
-                    ClientTls::pinned("ca.pem").with_identity("c.pem", "k.pem"),
-                )),
+                "a malformed pin",
+                serde_json::json!({"tls": {"pin_sha256": ["not a pin"]}}),
+                "\"not a pin\" is not a SHA-256",
             ),
             (
-                "an identity alone is native",
-                with(None, None, Some("c.pem"), Some("k.pem")),
-                Ok(Some(native().with_identity("c.pem", "k.pem"))),
+                "the old one-file ca_path key",
+                serde_json::json!({"tls": {"ca_path": "ca.pem"}}),
+                "unknown field `ca_path`",
             ),
             (
-                "a certificate without its key",
-                with(Some(TrustChoice::Platform), None, Some("c.pem"), None),
-                Err(
-                    "transport config error: HTTP client TLS: mutual TLS needs both \
-                     tls_client_cert_path and tls_client_key_path"
-                        .to_string(),
-                ),
+                "the fips profile",
+                serde_json::json!({"tls": {"profile": "fips"}}),
+                "needs a FIPS 140-3 build",
             ),
         ];
-        for (name, got, expected) in cases {
-            assert_eq!(got, expected, "{name}");
+        for (name, value, want) in refused {
+            let got = serde_json::from_value::<HttpTransportConfig>(value)
+                .map_err(|e| e.to_string())
+                .and_then(|config| config.client_tls().map(drop).map_err(|e| e.to_string()));
+            assert!(
+                got.as_ref().is_err_and(|e| e.contains(want)),
+                "{name}: {got:?}"
+            );
         }
-
-        let pin: crate::tls::SpkiPin = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
-            .parse()
-            .unwrap();
-        let pinned = HttpTransportConfig {
-            tls_pin_sha256: vec![pin],
-            ..HttpTransportConfig::default()
-        };
-        assert_eq!(
-            pinned.client_tls().map_err(|e| e.to_string()),
-            Ok(Some(native().with_pin(pin))),
-            "a pin alone is native plus the pin"
-        );
-        let bad = serde_json::from_value::<HttpTransportConfig>(
-            serde_json::json!({"tls_pin_sha256": ["not a pin"]}),
-        )
-        .map(|_| ())
-        .map_err(|e| e.to_string());
-        assert!(
-            bad.as_ref()
-                .is_err_and(|e| e.contains("\"not a pin\" is not a SHA-256")),
-            "a malformed pin fails the config load: {bad:?}"
-        );
     }
 
     /// A send over HTTPS to a server that asks for a client certificate, under
@@ -1388,9 +1303,9 @@ mod tests {
             std::fs::write(&path, text).unwrap();
             path.to_string_lossy().into_owned()
         };
-        let ca_path = file("ca.pem", &ca.pem());
-        let cert = file("client.pem", &client_leaf.cert_pem);
-        let key = file("client.key", &client_leaf.key_pem);
+        let ca_path: std::path::PathBuf = file("ca.pem", &ca.pem()).into();
+        let cert: std::path::PathBuf = file("client.pem", &client_leaf.cert_pem).into();
+        let key: std::path::PathBuf = file("client.key", &client_leaf.key_pem).into();
         let addr = crate::tls::test_pki::mtls_ok_server(&ca, &server_leaf).await;
         let endpoint = format!("https://localhost:{}", addr.port());
 
@@ -1412,10 +1327,13 @@ mod tests {
         ];
         for (name, trust, identity, delivered) in cases {
             let config = HttpTransportConfig {
-                tls_trust: Some(trust),
-                tls_ca_path: Some(ca_path.clone()),
-                tls_client_cert_path: identity.then(|| cert.clone()),
-                tls_client_key_path: identity.then(|| key.clone()),
+                tls: crate::tls::ClientTlsConfig {
+                    trust,
+                    ca_paths: vec![ca_path.clone()],
+                    client_cert_path: identity.then(|| cert.clone()),
+                    client_key_path: identity.then(|| key.clone()),
+                    ..crate::tls::ClientTlsConfig::default()
+                },
                 ..HttpTransportConfig::sender(&endpoint)
             };
             let transport = HttpTransport::new(&config).await.unwrap();
@@ -1426,8 +1344,11 @@ mod tests {
         }
 
         let missing = HttpTransportConfig {
-            tls_trust: Some(TrustChoice::Bundle),
-            tls_ca_path: Some(dir.path().join("gone.pem").to_string_lossy().into_owned()),
+            tls: crate::tls::ClientTlsConfig {
+                trust: TrustChoice::Bundle,
+                ca_paths: vec![dir.path().join("gone.pem")],
+                ..crate::tls::ClientTlsConfig::default()
+            },
             ..HttpTransportConfig::sender(&endpoint)
         };
         let error = HttpTransport::new(&missing)

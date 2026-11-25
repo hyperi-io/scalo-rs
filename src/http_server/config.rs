@@ -66,17 +66,12 @@ pub struct HttpServerConfig {
     #[serde(default = "default_true")]
     pub enable_http2: bool,
 
-    /// PEM certificate chain to serve TLS with. Set with `tls_key_path`.
-    ///
-    /// Needs the `tls` feature. The files are re-read every 30 s and a
-    /// changed certificate is served from the next handshake. For a secret,
-    /// client certificates or other settings use `HttpServer::with_tls`.
+    /// Server TLS, the [`ServerTlsConfig`](crate::tls_config::ServerTlsConfig)
+    /// every server reads: profile, certificate and key from files or secrets,
+    /// client CAs, client auth and reload. Needs the `tls` feature. Unset, the
+    /// server is plain HTTP.
     #[serde(default)]
-    pub tls_cert_path: Option<String>,
-
-    /// PEM private key for `tls_cert_path`.
-    #[serde(default)]
-    pub tls_key_path: Option<String>,
+    pub tls: Option<crate::tls_config::ServerTlsConfig>,
 
     /// Graceful drain budget in ms. Default 30 s. Caps drain time
     /// to fit under K8s `terminationGracePeriodSeconds`.
@@ -120,8 +115,7 @@ impl Default for HttpServerConfig {
             enable_metrics_endpoint: false,
             enable_config_endpoint: false,
             enable_http2: true,
-            tls_cert_path: None,
-            tls_key_path: None,
+            tls: None,
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
         }
     }
@@ -155,42 +149,28 @@ impl HttpServerConfig {
         Duration::from_millis(self.shutdown_timeout_ms)
     }
 
-    /// Whether both TLS paths are set.
+    /// Whether a `tls` section is set.
     #[must_use]
     pub fn is_tls_enabled(&self) -> bool {
-        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
-    }
-
-    /// The server TLS config the two paths describe, when both are set.
-    #[cfg(feature = "tls")]
-    #[must_use]
-    pub fn tls_files(&self) -> Option<crate::tls::ServerTlsConfig> {
-        match (&self.tls_cert_path, &self.tls_key_path) {
-            (Some(cert), Some(key)) => Some(crate::tls::ServerTlsConfig::from_files(cert, key)),
-            _ => None,
-        }
+        self.tls.is_some()
     }
 
     /// Refuse a TLS setting the server would not honour, so it never binds
-    /// cleartext while the config asks for TLS. `serve` calls this first.
+    /// cleartext while the config asks for TLS. `serve` calls this first, and
+    /// loading the section checks its sources.
     ///
     /// # Errors
     ///
-    /// One TLS path set without the other, or either set in a build without
-    /// the `tls` feature.
+    /// A `tls` section in a build without the `tls` feature.
     pub fn validate(&self) -> Result<(), String> {
-        match (&self.tls_cert_path, &self.tls_key_path) {
-            (None, None) => Ok(()),
-            (Some(_), None) | (None, Some(_)) => {
-                Err("http_server: set both tls_cert_path and tls_key_path, or neither".to_string())
-            }
-            (Some(_), Some(_)) if cfg!(feature = "tls") => Ok(()),
-            (Some(_), Some(_)) => Err(
-                "http_server: tls_cert_path / tls_key_path need scalo's `tls` feature, \
-                 which this build does not enable"
+        if self.tls.is_some() && !cfg!(feature = "tls") {
+            return Err(
+                "http_server: a tls section needs scalo's `tls` feature, which this build \
+                 does not enable"
                     .to_string(),
-            ),
+            );
         }
+        Ok(())
     }
 }
 
@@ -218,42 +198,19 @@ mod tests {
         assert_eq!(config.bind_address, "127.0.0.1:3000");
     }
 
-    #[test]
-    fn test_tls_enabled() {
-        let mut config = HttpServerConfig::default();
-        assert!(!config.is_tls_enabled());
-
-        config.tls_cert_path = Some("/path/to/cert.pem".to_string());
-        assert!(!config.is_tls_enabled());
-
-        config.tls_key_path = Some("/path/to/key.pem".to_string());
-        assert!(config.is_tls_enabled());
-    }
-
+    /// A `tls` section is refused in a build that cannot terminate TLS, rather
+    /// than served in clear text.
     #[test]
     fn validate_refuses_tls_it_would_not_serve() {
-        let path = |p: &str| Some(p.to_string());
-        let cases = [
-            ("no TLS", None, None, true),
-            ("cert only", path("/c.pem"), None, false),
-            ("key only", None, path("/k.pem"), false),
-            // Without the tls feature the server cannot terminate TLS, so a
-            // config asking for it is refused rather than served cleartext.
-            (
-                "both",
-                path("/c.pem"),
-                path("/k.pem"),
-                cfg!(feature = "tls"),
-            ),
-        ];
-        for (name, cert, key, valid) in cases {
-            let config = HttpServerConfig {
-                tls_cert_path: cert,
-                tls_key_path: key,
-                ..HttpServerConfig::default()
-            };
-            assert_eq!(config.validate().is_ok(), valid, "{name}");
-        }
+        let tls = HttpServerConfig {
+            tls: Some(crate::tls_config::ServerTlsConfig::from_files(
+                "/c.pem", "/k.pem",
+            )),
+            ..HttpServerConfig::default()
+        };
+        assert!(tls.is_tls_enabled());
+        assert_eq!(tls.validate().is_ok(), cfg!(feature = "tls"));
+        assert!(HttpServerConfig::default().validate().is_ok());
     }
 
     #[test]

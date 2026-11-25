@@ -16,9 +16,19 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tempfile::TempDir;
 
 use super::{ClientTls, TrustChoice, build_client_tls, read_certs};
-use crate::crypto::{CryptoProfile, PqcMode};
+use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
+use crate::tls::TlsError;
+use crate::tls::profile::Posture;
 use crate::tls::test_pki::{Leaf, TestCa, pump};
-use crate::tls::{TlsError, posture_provider};
+
+/// The strong posture with the default settings.
+fn strong() -> Posture {
+    Posture::new(
+        CryptoProfile::Strong,
+        &TlsProfiles::default(),
+        KeyShare::Profile,
+    )
+}
 
 /// What building a client and running its handshake came to.
 #[derive(Debug, PartialEq, Eq)]
@@ -82,8 +92,8 @@ impl Pki {
 /// A server presenting `leaf`, asking for a client certificate from
 /// `client_ca` when one is given.
 fn server_config(leaf: &Leaf, client_ca: Option<&TestCa>) -> Arc<ServerConfig> {
-    let builder = ServerConfig::builder_with_provider(posture_provider(PqcMode::Prefer))
-        .with_safe_default_protocol_versions()
+    let builder = ServerConfig::builder_with_provider(strong().provider())
+        .with_protocol_versions(strong().versions())
         .unwrap();
     let builder = match client_ca {
         Some(ca) => {
@@ -91,12 +101,10 @@ fn server_config(leaf: &Leaf, client_ca: Option<&TestCa>) -> Arc<ServerConfig> {
             roots
                 .add(CertificateDer::from_pem_slice(ca.pem().as_bytes()).unwrap())
                 .unwrap();
-            let verifier = WebPkiClientVerifier::builder_with_provider(
-                Arc::new(roots),
-                posture_provider(PqcMode::Prefer),
-            )
-            .build()
-            .unwrap();
+            let verifier =
+                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), strong().provider())
+                    .build()
+                    .unwrap();
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
@@ -111,10 +119,11 @@ fn server_config(leaf: &Leaf, client_ca: Option<&TestCa>) -> Arc<ServerConfig> {
     )
 }
 
-/// Build a client from `tls` on `profile` and run its handshake against
-/// `server`.
-fn connect(profile: CryptoProfile, tls: &ClientTls, server: Arc<ServerConfig>) -> Outcome {
-    let config = match build_client_tls(profile, tls) {
+/// Build a client from `tls`, on the default profile settings, and run its
+/// handshake against `server`.
+fn connect(tls: &ClientTls, server: Arc<ServerConfig>) -> Outcome {
+    let tls = tls.clone().with_profiles(TlsProfiles::default());
+    let config = match build_client_tls(&tls) {
         Ok(config) => config,
         Err(TlsError::EmptyTrustStore) => return Outcome::Refused,
         Err(e) => return Outcome::BuildFails(e.to_string()),
@@ -213,7 +222,7 @@ fn each_trust_choice_trusts_what_it_names_and_nothing_else() {
         ),
     ];
     for (name, tls, leaf, expected) in cases {
-        let got = connect(CryptoProfile::Prod, &tls, server_config(leaf, None));
+        let got = connect(&tls, server_config(leaf, None));
         assert!(
             is(&expected, &got),
             "{name}: expected {expected:?}, got {got:?}"
@@ -277,7 +286,7 @@ fn mutual_tls_presents_the_identity_under_every_trust_choice() {
         ];
         for (name, tls, expected) in cases {
             let server = server_config(&pki.server_a, Some(&pki.ca_a));
-            let got = connect(CryptoProfile::Prod, &tls, server);
+            let got = connect(&tls, server);
             assert!(
                 is(&expected, &got),
                 "{trust} {name}: expected {expected:?}, got {got:?}"
@@ -286,8 +295,8 @@ fn mutual_tls_presents_the_identity_under_every_trust_choice() {
     }
 }
 
-/// The profile reaches the built config: HighSec negotiates TLS 1.3 and the
-/// hybrid group under every trust choice.
+/// The profile reaches the built config under every trust choice: against a
+/// strong server, cnsa2 agrees AES-256 and P-384, its one group in common.
 #[test]
 fn the_profile_applies_under_every_trust_choice() {
     let pki = Pki::new();
@@ -296,8 +305,11 @@ fn the_profile_applies_under_every_trust_choice() {
         TrustChoice::Platform,
         TrustChoice::Bundle,
     ] {
-        let tls = ClientTls::new(trust).with_ca(pki.path("ca_a.pem"));
-        let config = build_client_tls(CryptoProfile::HighSec, &tls).unwrap();
+        let tls = ClientTls::new(trust)
+            .with_ca(pki.path("ca_a.pem"))
+            .with_profile(CryptoProfile::Cnsa2)
+            .with_profiles(TlsProfiles::default());
+        let config = build_client_tls(&tls).unwrap();
         let mut client =
             ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap();
         let mut server = ServerConnection::new(server_config(&pki.server_a, None)).unwrap();
@@ -308,8 +320,13 @@ fn the_profile_applies_under_every_trust_choice() {
             "{trust}"
         );
         assert_eq!(
+            client.negotiated_cipher_suite().map(|s| s.suite()),
+            Some(rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+            "{trust}"
+        );
+        assert_eq!(
             client.negotiated_key_exchange_group().map(|g| g.name()),
-            Some(rustls::NamedGroup::X25519MLKEM768),
+            Some(rustls::NamedGroup::secp384r1),
             "{trust}"
         );
     }
@@ -360,7 +377,7 @@ fn a_key_pin_accepts_its_key_and_refuses_a_rekeyed_leaf() {
             ),
         ];
         for (name, tls, leaf, expected) in cases {
-            let got = connect(CryptoProfile::Prod, &tls, server_config(leaf, None));
+            let got = connect(&tls, server_config(leaf, None));
             assert!(
                 is(&expected, &got),
                 "{trust} {name}: expected {expected:?}, got {got:?}"
@@ -405,7 +422,6 @@ fn a_bundle_file_yields_its_certificates_and_skips_the_rest() {
             leaf.cert_pem
         ),
     );
-    let (bytes, certs) = read_certs(&path).unwrap();
+    let certs = read_certs(&path).unwrap();
     assert_eq!(certs.len(), 2, "the CA and the leaf, not the key");
-    assert_eq!(bytes, std::fs::read(&path).unwrap());
 }

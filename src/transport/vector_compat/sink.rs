@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use super::convert::json_to_event_wrapper;
 use super::proto::vector;
-use super::tls::VectorCompatTls;
 use crate::compression::{Accepts, Codec, Compression};
+use crate::tls::ClientTlsConfig;
 use crate::transport::error::{TransportError, TransportResult};
 use crate::transport::grpc::GrpcConfig;
 use crate::transport::tonic_channel::{self, lazy_channel};
@@ -80,13 +80,15 @@ impl VectorCompatClient {
     ///
     /// # Errors
     ///
-    /// Returns error if the endpoint URI is invalid.
+    /// Returns error if the endpoint URI is invalid, or `https://`, which
+    /// [`connect_lazy_tls`](Self::connect_lazy_tls) dials.
     pub fn connect_lazy_within(endpoint: &str, send_timeout_ms: u64) -> TransportResult<Self> {
         Self::connect_lazy_inner(endpoint, send_timeout_ms, None)
     }
 
     /// [`connect_lazy_within`](Self::connect_lazy_within) over TLS, with the
-    /// trust, server name and client identity in `tls`.
+    /// profile, trust, server name, client identity and key pins in `tls`,
+    /// the section every transport reads.
     ///
     /// The endpoint must be `https://`. Every file `tls` names is read here, so
     /// a missing or wrong one fails the call and not the first RPC. A server
@@ -101,16 +103,17 @@ impl VectorCompatClient {
     pub fn connect_lazy_tls(
         endpoint: &str,
         send_timeout_ms: u64,
-        tls: &VectorCompatTls,
+        tls: &ClientTlsConfig,
     ) -> TransportResult<Self> {
         super::tls::require_https(endpoint)?;
+        let tls = super::tls::channel_tls(endpoint, tls)?;
         Self::connect_lazy_inner(endpoint, send_timeout_ms, Some(tls))
     }
 
     fn connect_lazy_inner(
         endpoint: &str,
         send_timeout_ms: u64,
-        tls: Option<&VectorCompatTls>,
+        tls: Option<tonic_channel::ChannelTls>,
     ) -> TransportResult<Self> {
         // Bound the response decode size. `usize::MAX` contradicts the never-OOM
         // doctrine -- even a (trusted) Vector server response should not be able
@@ -118,14 +121,14 @@ impl VectorCompatClient {
         // response and matches the generous end of the transport size envelope.
         const MAX_DECODE_BYTES: usize = 64 * 1024 * 1024;
 
-        let mut ep = tonic::transport::Channel::from_shared(endpoint.to_string())
-            .map_err(|e| TransportError::Config(format!("invalid Vector endpoint: {e}")))?;
-        if let Some(tls) = tls {
-            ep = ep
-                .tls_config(tls.client_config()?)
-                .map_err(|e| super::tls::tonic_error(&e))?;
-        }
-        let channel = lazy_channel(ep, send_timeout_ms, crate::transport::ProxyDialer::direct());
+        let ep = tonic_channel::endpoint(endpoint, None, tls.is_some())
+            .map_err(|e| TransportError::Config(format!("Vector endpoint: {e}")))?;
+        let channel = lazy_channel(
+            ep,
+            send_timeout_ms,
+            crate::transport::ProxyDialer::direct(),
+            tls,
+        );
 
         let mut client = vector::vector_client::VectorClient::new(channel)
             .max_decoding_message_size(MAX_DECODE_BYTES);
@@ -567,39 +570,34 @@ mod tests {
     /// tonic gives it.
     #[tokio::test]
     async fn a_push_that_never_reached_a_source_is_not_a_refusal() {
-        let (addr, _accepts) = silent_listener().await;
-        let client = VectorCompatClient::connect_lazy_within(&format!("https://{addr}"), 5_000)
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let client = VectorCompatClient::connect_lazy_within(&format!("http://{closed}"), 5_000)
             .expect("client");
         let status = tokio::time::timeout(
             Duration::from_secs(2),
             client.send_events_status(&[serde_json::json!({ "seq": 1 })]),
         )
         .await
-        .expect("the TLS refusal is immediate")
-        .expect_err("no TLS on this client");
+        .expect("the refused connect is immediate")
+        .expect_err("nothing listens");
         assert!(
             !VectorCompatClient::is_permanent_rejection(&status),
             "{status:?}"
         );
     }
 
-    /// The client carries no TLS, so tonic refuses an `https` endpoint once the
-    /// TCP connect completes, before any RPC is sent: the send fails at once.
+    /// A client with no TLS refuses an `https` endpoint when it is built,
+    /// before anything is dialled.
     #[tokio::test]
     async fn an_https_endpoint_is_refused() {
-        let (addr, _accepts) = silent_listener().await;
-        let client = VectorCompatClient::connect_lazy_within(&format!("https://{addr}"), 5_000)
-            .expect("client");
-
-        let sent = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.send_events(&[serde_json::json!({ "seq": 1 })]),
-        )
-        .await;
-
+        let built = VectorCompatClient::connect_lazy_within("https://127.0.0.1:9", 5_000);
         assert!(
-            matches!(sent, Ok(Err(TransportError::Send(_)))),
-            "got {sent:?}"
+            matches!(&built, Err(TransportError::Config(m)) if m.contains("needs TLS")),
+            "got {:?}",
+            built.err()
         );
     }
 

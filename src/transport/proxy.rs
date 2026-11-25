@@ -605,13 +605,14 @@ fn bracketed(host: &str) -> String {
     }
 }
 
-/// tonic's connector: each dial goes through [`ProxyDialer`], and tonic runs
-/// its TLS over the stream.
+/// tonic's connector: each dial goes through [`ProxyDialer`], and the channel
+/// runs its TLS over the stream.
 #[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 #[derive(Clone)]
 pub(crate) struct Connector {
     dialer: ProxyDialer,
     direct: hyper_util::client::legacy::connect::HttpConnector,
+    tls: bool,
 }
 
 #[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
@@ -621,7 +622,18 @@ impl Connector {
         dialer: ProxyDialer,
         direct: hyper_util::client::legacy::connect::HttpConnector,
     ) -> Self {
-        Self { dialer, direct }
+        Self {
+            dialer,
+            direct,
+            tls: false,
+        }
+    }
+
+    /// Route every dial as a TLS one, whatever its URI's scheme, for a channel
+    /// that runs TLS over an `http://` dial URI.
+    pub(crate) fn for_tls(mut self) -> Self {
+        self.tls = true;
+        self
     }
 }
 
@@ -641,7 +653,7 @@ impl Service<http::Uri> for Connector {
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
-        let scheme = if uri.scheme_str() == Some("https") {
+        let scheme = if self.tls || uri.scheme_str() == Some("https") {
             Scheme::Tls
         } else {
             Scheme::Plain

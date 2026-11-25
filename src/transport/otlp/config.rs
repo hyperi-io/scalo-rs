@@ -96,10 +96,11 @@ pub struct OtlpConfig {
     /// `OTEL_RESOURCE_ATTRIBUTES`.
     pub resource_attributes: BTreeMap<String, String>,
 
-    /// Client TLS for an `https://` endpoint, in the [`ClientTlsConfig`] keys.
-    /// Without it an `https://` endpoint is verified against the OS root
-    /// store. With it, the endpoint must be `https://`. gRPC takes `native` or
-    /// `bundle` trust.
+    /// Client TLS for an `https://` endpoint, the [`ClientTlsConfig`] every
+    /// transport reads. Without it an `https://` endpoint takes the defaults:
+    /// `strong`, the OS root store. With it, the endpoint must be `https://`.
+    /// `server_name` is taken under `grpc` only: under `http` the endpoint's
+    /// host is the name checked.
     pub tls: Option<ClientTlsConfig>,
 
     /// `none` (default), `system` (the machine's proxy) or a proxy URL, as the
@@ -200,17 +201,28 @@ impl OtlpConfig {
     /// # Errors
     ///
     /// `TransportError::Config` for a scheme other than `http` or `https`, a
-    /// `tls` section beside an `http://` URL, or half a client identity.
+    /// `tls` section beside an `http://` URL, half a client identity, a
+    /// `server_name` under `http`, or refused profile settings.
     pub(super) fn client_tls(&self, url: &str) -> TransportResult<Option<ClientTls>> {
         let scheme = url
             .split_once("://")
             .map(|(scheme, _)| scheme.to_ascii_lowercase());
         match (scheme.as_deref(), &self.tls) {
-            (Some("https"), Some(tls)) => tls
+            (Some("https"), Some(tls))
+                if tls.server_name.is_some() && self.protocol == OtlpProtocol::Http =>
+            {
+                Err(TransportError::Config(
+                    "OTLP TLS: tls.server_name is taken under grpc only: under http the \
+                     endpoint's host is the name checked"
+                        .to_string(),
+                ))
+            }
+            (Some("https"), section) => section
+                .clone()
+                .unwrap_or_default()
                 .client_tls()
                 .map(Some)
                 .map_err(|e| TransportError::Config(format!("OTLP {e}"))),
-            (Some("https"), None) => Ok(Some(ClientTls::default())),
             (Some("http"), None) => Ok(None),
             (Some("http"), Some(_)) => Err(TransportError::Config(
                 "OTLP: a tls section needs an https:// endpoint".to_string(),
@@ -282,7 +294,7 @@ mod tests {
              x-tenant: blue\n    timeout_ms: 2500\n    compression: {codec: none}\n    \
              max_retry_delay_ms: 60000\n    service_name: from-yaml\n    \
              resource_attributes:\n      team: data\n    tls:\n      trust: bundle\n      \
-             ca_path: /etc/tls/ca.pem\n      client_cert_path: /etc/tls/client.pem\n      \
+             ca_paths: [/etc/tls/ca.pem]\n      client_cert_path: /etc/tls/client.pem\n      \
              client_key_path: /etc/tls/yaml.key\n    proxy: http://proxy.example:3128\n    \
              connect_to: 10.0.0.5:4317\n    \
              filters_out:\n      \
@@ -340,7 +352,7 @@ mod tests {
             config.tls,
             Some(ClientTlsConfig {
                 trust: TrustChoice::Bundle,
-                ca_path: Some(PathBuf::from("/etc/tls/ca.pem")),
+                ca_paths: vec![PathBuf::from("/etc/tls/ca.pem")],
                 client_cert_path: Some(PathBuf::from("/etc/tls/client.pem")),
                 client_key_path: Some(PathBuf::from("/etc/tls/env.key")),
                 ..ClientTlsConfig::default()
@@ -371,11 +383,13 @@ mod tests {
         type Want = Result<(&'static str, &'static str, Option<ClientTls>), &'static str>;
         let tls = |trust, cert: Option<&str>, key: Option<&str>| ClientTlsConfig {
             trust,
-            ca_path: Some(PathBuf::from("ca.pem")),
+            ca_paths: vec![PathBuf::from("ca.pem")],
             client_cert_path: cert.map(PathBuf::from),
             client_key_path: key.map(PathBuf::from),
             ..ClientTlsConfig::default()
         };
+        // A section's profile settings are read from the cascade, here unset.
+        let resolved = |tls: ClientTls| tls.with_profiles(crate::tls::TlsProfiles::default());
         // (case, config, logs and metrics URLs and client TLS, or the error text)
         let cases: Vec<(&str, OtlpConfig, Want)> = vec![
             (
@@ -419,7 +433,7 @@ mod tests {
                 Ok((
                     "https://collector:4317",
                     "https://collector:4317",
-                    Some(ClientTls::default()),
+                    Some(resolved(ClientTls::default())),
                 )),
             ),
             (
@@ -431,8 +445,21 @@ mod tests {
                 Ok((
                     "https://collector:4318/v1/logs",
                     "https://collector:4318/v1/metrics",
-                    Some(ClientTls::pinned("ca.pem").with_identity("c.pem", "k.pem")),
+                    Some(resolved(
+                        ClientTls::pinned("ca.pem").with_identity("c.pem", "k.pem"),
+                    )),
                 )),
+            ),
+            (
+                "a server name under http",
+                OtlpConfig {
+                    tls: Some(ClientTlsConfig {
+                        server_name: Some("other.example".to_string()),
+                        ..ClientTlsConfig::default()
+                    }),
+                    ..OtlpConfig::http("https://collector:4318")
+                },
+                Err("server_name is taken under grpc only"),
             ),
             (
                 "half an identity",
@@ -479,7 +506,7 @@ mod tests {
                 Ok((
                     "https://gateway.example/otlp/v1/logs",
                     "https://gateway.example/otlp/v1/metrics",
-                    Some(ClientTls::default()),
+                    Some(resolved(ClientTls::default())),
                 )),
             ),
             ("blank", OtlpConfig::grpc("  "), Err("endpoint is empty")),

@@ -863,7 +863,10 @@ async fn https_goes_through_a_connect_proxy() {
     for (name, proxy) in rows {
         let config = HttpTransportConfig {
             proxy: ProxyConfig::Url(secret(&proxy)),
-            tls_ca_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            tls: crate::tls::ClientTlsConfig {
+                ca_paths: vec![ca_file.path().to_path_buf()],
+                ..crate::tls::ClientTlsConfig::default()
+            },
             ..HttpTransportConfig::sender(&endpoint)
         };
         let result = sender(&config).await.send("ingest", "{}".into()).await;
@@ -895,13 +898,13 @@ async fn a_tls_refusal_holds_the_batch_once_no_endpoint_takes_it() {
             vec![Untrusted],
             false,
             Got::Hold,
-            "invalid peer certificate",
+            "does not chain to a trusted CA",
         ),
         (
             vec![Untrusted, Untrusted],
             false,
             Got::Hold,
-            "invalid peer certificate",
+            "does not chain to a trusted CA",
         ),
         (vec![Untrusted, Trusted], false, Got::Ok, ""),
         (vec![Untrusted, Down], false, Got::Backpressured, ""),
@@ -909,7 +912,7 @@ async fn a_tls_refusal_holds_the_batch_once_no_endpoint_takes_it() {
             vec![Trusted],
             true,
             Got::Hold,
-            "ApplicationVerificationFailure",
+            "matches no configured pin_sha256",
         ),
     ];
     for (ends, pinned, want, named) in rows {
@@ -935,12 +938,15 @@ async fn a_tls_refusal_holds_the_batch_once_no_endpoint_takes_it() {
                     auth: None,
                 })
                 .collect(),
-            tls_trust: Some(crate::tls::TrustChoice::Bundle),
-            tls_ca_path: Some(ca_file.path().to_string_lossy().into_owned()),
-            tls_pin_sha256: if pinned {
-                vec!["00".repeat(32).parse().unwrap()]
-            } else {
-                Vec::new()
+            tls: crate::tls::ClientTlsConfig {
+                trust: crate::tls::TrustChoice::Bundle,
+                ca_paths: vec![ca_file.path().to_path_buf()],
+                pin_sha256: if pinned {
+                    vec!["00".repeat(32).parse().unwrap()]
+                } else {
+                    Vec::new()
+                },
+                ..crate::tls::ClientTlsConfig::default()
             },
             ..HttpTransportConfig::sender(&urls[0])
         };
@@ -961,6 +967,40 @@ async fn a_tls_refusal_holds_the_batch_once_no_endpoint_takes_it() {
         target.seen().len(),
         1,
         "only the trusted endpoint is reached"
+    );
+}
+
+/// The `tls` section reaches the handshake: a cnsa2 client against a cnsa2
+/// server agrees ML-KEM-1024 and AES-256, where the default strong client
+/// would agree P-384.
+#[tokio::test]
+async fn the_tls_section_reaches_the_handshake() {
+    use crate::tls::test_pki::{Agreed, Front, TestCa, server_tls};
+
+    let target = Server::status(200).await;
+    let ca = TestCa::new("http handshake ca");
+    let (server, _files) =
+        server_tls(&ca, crate::crypto::CryptoProfile::Cnsa2, &[b"http/1.1"]).await;
+    let front = Front::start(server, target.addr).await;
+    let ca_file = tempfile::NamedTempFile::new().unwrap();
+    tokio::fs::write(ca_file.path(), ca.pem()).await.unwrap();
+    let config = HttpTransportConfig {
+        tls: crate::tls::ClientTlsConfig {
+            profile: crate::crypto::CryptoProfile::Cnsa2,
+            trust: crate::tls::TrustChoice::Bundle,
+            ca_paths: vec![ca_file.path().to_path_buf()],
+            ..crate::tls::ClientTlsConfig::default()
+        },
+        ..HttpTransportConfig::sender(&format!("https://localhost:{}", front.addr.port()))
+    };
+    let result = sender(&config).await.send("ingest", "{}".into()).await;
+    assert_eq!(got(&result), Got::Ok, "{result:?}");
+    assert_eq!(
+        front.agreed(),
+        [Agreed::tls13(
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::NamedGroup::MLKEM1024
+        )]
     );
 }
 

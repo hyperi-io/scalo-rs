@@ -635,9 +635,12 @@ mod tests {
             transport_type: TransportType::Memory,
             ..TransportConfig::default()
         };
-        let sender = crate::transport::RoutedSender::from_route_configs(table, Some(fallback))
-            .await
-            .unwrap();
+        let sender = Box::pin(crate::transport::RoutedSender::from_route_configs(
+            table,
+            Some(fallback),
+        ))
+        .await
+        .unwrap();
         assert_eq!(sender.delivery_guarantee(), DeliveryGuarantee::Written);
         assert!(
             sender

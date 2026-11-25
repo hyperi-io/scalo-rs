@@ -84,6 +84,9 @@ pub struct OtlpTransport {
     /// Whether the proxy is refusing CONNECT, which lasts until an export goes through.
     refusals: crate::transport::proxy::Refusals,
     filter_engine: TransportFilterEngine,
+    /// The TLS posture of an `https://` collector, which names a handshake
+    /// failure. `None` in plain text.
+    posture: Option<crate::tls::Posture>,
 }
 
 /// The client for the configured protocol and what every request carries.
@@ -229,6 +232,11 @@ impl OtlpTransport {
         let parsed = reqwest::Url::parse(&url)
             .map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
         let tls = config.client_tls(&url)?;
+        let posture = tls
+            .as_ref()
+            .map(crate::tls::ClientTls::posture)
+            .transpose()
+            .map_err(|e| config_error(e.to_string()))?;
         let connect_to = config.connect_to()?;
         let wire = match config.protocol {
             OtlpProtocol::Grpc => grpc_wire(config, &url, tls.as_ref(), connect_to)?,
@@ -274,7 +282,17 @@ impl OtlpTransport {
             lifecycle,
             refusals,
             filter_engine,
+            posture,
         })
+    }
+
+    /// Why the TLS handshake behind `error` failed, named on this transport's
+    /// profile. `None` when no TLS error is in it.
+    fn tls_failure(&self, error: &(dyn std::error::Error + 'static)) -> Option<String> {
+        match self.posture {
+            Some(posture) => crate::tls::describe_failure(error, posture),
+            None => crate::tls::rustls_error(error).map(ToString::to_string),
+        }
     }
 
     /// Send the records no outbound filter takes out as one export request,
@@ -368,7 +386,9 @@ impl OtlpTransport {
                     Ok(refused) => accepted(refused, counted),
                     Err(status) => match crate::transport::proxy::refusal(&status) {
                         Some(refused) => self.refusals.hold(refused, "otlp"),
-                        None => grpc_failure(&status, self.max_retry_delay),
+                        None => {
+                            grpc_failure(&status, self.max_retry_delay, self.tls_failure(&status))
+                        }
                     },
                 }
             }
@@ -419,7 +439,7 @@ impl OtlpTransport {
                     // A refused certificate, name or key pin is the config's to fix. Refused,
                     // reset and timed-out connections clear when the collector is back.
                     Err(e) => {
-                        if let Some(tls) = crate::tls::rustls_error(&e) {
+                        if let Some(tls) = self.tls_failure(&e) {
                             return SendResult::Fatal(TransportError::Config(format!(
                                 "OTLP HTTP: TLS with the collector failed: {tls}"
                             )));
@@ -607,26 +627,32 @@ fn grpc_wire(
             "a gRPC transport is built inside a Tokio runtime".to_string(),
         ));
     }
-    let tls = tls
-        .map(crate::tls::tonic_client_tls)
+    let channel_tls = tls
+        .map(|tls| {
+            let rustls = crate::tls::build_client_tls(tls).map_err(|e| e.to_string())?;
+            let name = match &tls.server_name {
+                Some(name) => name.clone(),
+                None => super::tonic_channel::origin_host(url)?,
+            };
+            super::tonic_channel::ChannelTls::new(&rustls, &name)
+        })
         .transpose()
-        .map_err(|e| config_error(e.to_string()))?;
-    let endpoint = if let Some(to) = connect_to {
-        let parsed =
-            reqwest::Url::parse(url).map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
-        to.tonic_endpoint(&parsed, tls).map_err(config_error)?
-    } else {
-        let endpoint = tonic::transport::Endpoint::from_shared(url.to_string())
-            .map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
-        match tls {
-            Some(tls) => endpoint
-                .tls_config(tls)
-                .map_err(|e| config_error(format!("TLS: {e}")))?,
-            None => endpoint,
-        }
-    };
-    let channel =
-        super::tonic_channel::lazy_channel(endpoint, config.timeout_ms, config.proxy.dialer()?);
+        .map_err(config_error)?;
+    let dial = connect_to
+        .map(|to| {
+            let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid endpoint: {e}"))?;
+            to.dial_url(&parsed)
+        })
+        .transpose()
+        .map_err(config_error)?;
+    let endpoint = super::tonic_channel::endpoint(url, dial.as_deref(), channel_tls.is_some())
+        .map_err(config_error)?;
+    let channel = super::tonic_channel::lazy_channel(
+        endpoint,
+        config.timeout_ms,
+        config.proxy.dialer()?,
+        channel_tls,
+    );
     let mut logs = LogsServiceClient::new(channel.clone());
     let mut metrics = MetricsServiceClient::new(channel);
     for &accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
@@ -672,8 +698,7 @@ fn http_wire(
         .connect_timeout(Duration::from_millis(config.timeout_ms))
         .redirect(reqwest::redirect::Policy::none());
     if let Some(tls) = tls {
-        let tls = crate::tls::build_client_tls(crate::crypto::CryptoProfile::default(), tls)
-            .map_err(|e| config_error(e.to_string()))?;
+        let tls = crate::tls::build_client_tls(tls).map_err(|e| config_error(e.to_string()))?;
         builder = builder.use_preconfigured_tls((*tls).clone());
     }
     let mut host = None;
@@ -777,10 +802,14 @@ fn accepted(refused: Option<Refused>, counted: Counted) -> SendResult {
 /// only with `RetryInfo`, as the OTLP specification has it: without one it is
 /// most often a request over the collector's size limit, which the same
 /// request meets every time.
-fn grpc_failure(status: &tonic::Status, max_retry_delay: Duration) -> SendResult {
+fn grpc_failure(
+    status: &tonic::Status,
+    max_retry_delay: Duration,
+    tls: Option<String>,
+) -> SendResult {
     use tonic::Code;
 
-    if let Some(tls) = crate::tls::rustls_error(status) {
+    if let Some(tls) = tls {
         return SendResult::Fatal(TransportError::Config(format!(
             "OTLP gRPC: TLS with the collector failed: {tls}"
         )));

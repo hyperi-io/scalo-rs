@@ -80,7 +80,7 @@ register_framing("counted", Arc::new(Counted))?;
 | any other 3xx or 4xx | `Fatal(Config)` | keeps them until the endpoint or its credential is fixed |
 
 - A refused, reset or timed-out connection is `Backpressured`. A request that can't be built (a key that makes a bad URL) is `Reject`.
-- A failed TLS handshake (an untrusted or misnamed certificate, a key off `tls_pin_sha256`, a client certificate the endpoint turns away) is not retried. When no other endpoint takes the body or is worth a retry, the answer is `Fatal(Config)` naming the rustls error.
+- A failed TLS handshake (an untrusted or misnamed certificate, a key off `tls.pin_sha256`, a client certificate the endpoint turns away, no version, suite or group in common) is not retried. When no other endpoint takes the body or is worth a retry, the answer is `Fatal(Config)` naming the `TlsFailure`.
 - `Retry-After` is taken in its delta-seconds form, capped at `max_retry_after_ms`. A date, or a `max_retry_after_ms` of 0, leaves the caller's own schedule in charge.
 - A listed 202 counts as stored. Left out of the list, it is sent again: accepted is not stored.
 

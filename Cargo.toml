@@ -167,8 +167,9 @@ transport = ["tokio", "serde_json", "rmpv", "regex", "memchr", "sonic-rs", "park
 transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
 # Kafka config and token types with no librdkafka.
-transport-kafka-config = ["transport"]
-transport-kafka = ["transport-kafka-config", "concurrency", "rdkafka", "regex", "tokio-util"]
+transport-kafka-config = ["transport", "base64"]
+# `rustls-native-certs` reads the OS store into ssl.ca.pem for `trust: native` beside CA files.
+transport-kafka = ["transport-kafka-config", "concurrency", "rdkafka", "regex", "tokio-util", "dep:rustls-native-certs"]
 # Kafka fixtures for consumer test suites. Needs a Docker daemon at test time.
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 # Shaped senders and delivery approaches for tests and benches: src/transport/test_support/mod.rs
@@ -194,7 +195,7 @@ secrets-aws = ["secrets", "aws-config", "aws-sdk-secretsmanager"]
 secrets-all = ["secrets-vault", "secrets-aws"]
 
 # docs/api/tls.md
-tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:webpki-roots", "dep:tokio-rustls", "dep:arc-swap", "dep:sha2", "base64", "tokio", "tracing"]
+tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:arc-swap", "dep:sha2", "base64", "tokio", "tracing"]
 
 # Can leak secrets: not in `full`, off in every shipping build.
 dangerous-diagnostics = []
@@ -272,7 +273,6 @@ rustls-native-certs = { version = ">=0.8.5, <0.9", optional = true }
 # The OS verifier behind `TrustChoice::Platform`, already in the graph through reqwest.
 rustls-platform-verifier = { version = ">=0.7.1, <0.8", optional = true }
 rustls-pki-types = { version = ">=1.16.0, <2", features = ["std"], optional = true }
-webpki-roots = { version = ">=1.0.12, <2", optional = true }
 # The provider comes from the rustls entry above.
 tokio-rustls = { version = ">=0.26.6, <0.27", default-features = false, features = ["logging", "tls12"], optional = true }
 
@@ -286,8 +286,8 @@ jiff = { version = ">=1.0.3, <2", optional = true }
 rmpv = { version = ">=1.3.1, <2", optional = true }
 
 # tonic-prost is used by the code build.rs generates, which cargo-machete does not see.
-# `tls-aws-lc` matches crate::tls's explicit provider.
-tonic = { version = ">=0.14.9, <0.15", features = ["tls-aws-lc", "tls-native-roots"], optional = true }
+# No tonic TLS feature: gRPC clients run crate::tls over each stream (src/transport/tonic_channel.rs).
+tonic = { version = ">=0.14.9, <0.15", optional = true }
 tonic-prost = { version = ">=0.14.9, <0.15", optional = true }
 # RetryInfo from a gRPC status, for transport-otlp. Released with tonic.
 tonic-types = { version = ">=0.14.9, <0.15", optional = true }

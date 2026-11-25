@@ -7,8 +7,8 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! The Vector client over TLS to a source that is the real
-//! [`VectorCompatService`] behind tonic's TLS server, with a certificate from a
-//! throwaway CA. Needs the `tls` feature for the test CA.
+//! [`VectorCompatService`] behind scalo's own `ServerTls`, with a certificate
+//! from a throwaway CA. Needs the `tls` feature for the test CA.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -17,19 +17,19 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use super::VectorCompatClient;
 use super::proto::vector::vector_server::VectorServer;
 use super::source::VectorCompatService;
-use super::tls::VectorCompatTls;
-use crate::tls::test_pki::TestCa;
+use crate::crypto::CryptoProfile;
+use crate::tls::test_pki::{Agreed, Front, TestCa, server_tls_with};
+use crate::tls::{ClientAuth, ClientTlsConfig, TrustChoice};
 use crate::transport::grpc::GrpcToken;
 use crate::transport::types::Message;
 
 /// A running source, stopped when it drops.
 struct Source {
-    addr: SocketAddr,
+    front: Front,
     events: mpsc::Receiver<Message<GrpcToken>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -42,28 +42,19 @@ impl Drop for Source {
 
 impl Source {
     fn endpoint(&self) -> String {
-        format!("https://127.0.0.1:{}", self.addr.port())
+        format!("https://127.0.0.1:{}", self.front.addr.port())
     }
 }
 
-/// A source with a certificate from `ca`, asking for a client certificate from
-/// the same CA when `ask_for_client`.
-async fn source(ca: &TestCa, ask_for_client: bool) -> Source {
-    crate::tls::install_default_provider();
-    let leaf = ca.server("vector-source");
-    let mut tls =
-        ServerTlsConfig::new().identity(Identity::from_pem(&leaf.cert_pem, &leaf.key_pem));
-    if ask_for_client {
-        tls = tls.client_ca_root(Certificate::from_pem(ca.pem()));
-    }
+/// A source on `profile` with a certificate from `ca`, asking for a client
+/// certificate from the same CA when `ask_for_client`.
+async fn source_on(ca: &TestCa, profile: CryptoProfile, ask_for_client: bool) -> Source {
     let (sender, events) = mpsc::channel(16);
     let service = VectorCompatService::new(sender, Arc::new(AtomicU64::new(0)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .tls_config(tls)
-            .unwrap()
             .add_service(
                 VectorServer::new(service)
                     .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
@@ -72,7 +63,22 @@ async fn source(ca: &TestCa, ask_for_client: bool) -> Source {
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await;
     });
-    Source { addr, events, task }
+    let client_auth = if ask_for_client {
+        ClientAuth::Required
+    } else {
+        ClientAuth::None
+    };
+    let (tls, _files) = server_tls_with(ca, profile, &[b"h2"], client_auth).await;
+    let front = Front::start(tls, addr).await;
+    Source {
+        front,
+        events,
+        task,
+    }
+}
+
+async fn source(ca: &TestCa, ask_for_client: bool) -> Source {
+    source_on(ca, CryptoProfile::Strong, ask_for_client).await
 }
 
 /// Push one event and say whether the source took it. An accepted push reaches
@@ -89,7 +95,7 @@ async fn push(client: &VectorCompatClient, source: &mut Source, seq: u32) -> boo
     sent
 }
 
-fn client(source: &Source, tls: &VectorCompatTls) -> VectorCompatClient {
+fn client(source: &Source, tls: &ClientTlsConfig) -> VectorCompatClient {
     VectorCompatClient::connect_lazy_tls(&source.endpoint(), 5000, tls).expect("the client builds")
 }
 
@@ -107,6 +113,16 @@ fn ca_file(ca: &TestCa) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+/// Trust `ca_paths` under `trust`, checking the name `localhost`.
+fn trusting(trust: TrustChoice, ca_paths: Vec<PathBuf>) -> ClientTlsConfig {
+    ClientTlsConfig {
+        trust,
+        ca_paths,
+        server_name: Some("localhost".to_string()),
+        ..ClientTlsConfig::default()
+    }
+}
+
 /// A private CA trusted by file verifies the source, whatever the OS store
 /// holds, and a push and a health check go through TLS.
 #[tokio::test]
@@ -114,16 +130,15 @@ async fn a_private_ca_verifies_the_source() {
     let ca = TestCa::new("vector-ca");
     let mut source = source(&ca, false).await;
     let (_dir, ca_path) = ca_file(&ca);
-    let tls = VectorCompatTls::private_ca(&ca_path).with_domain("localhost");
-    let client = client(&source, &tls);
+    let client = client(&source, &trusting(TrustChoice::Bundle, vec![ca_path]));
 
     assert!(push(&client, &mut source, 1).await, "a push through TLS");
     assert!(client.health_check().await.expect("a health check"));
 }
 
 /// Without a root for the source's CA the handshake fails and nothing is
-/// queued, so verification is on. A pin to another CA fails the same way, and
-/// the right CA beside the OS store is trusted when `exclusive` is off.
+/// queued, so verification is on. A bundle of another CA fails the same way,
+/// and the right CA beside the OS store is trusted under `native`.
 #[tokio::test]
 async fn a_source_from_an_untrusted_ca_is_not_trusted() {
     let ca = TestCa::new("vector-ca");
@@ -131,16 +146,13 @@ async fn a_source_from_an_untrusted_ca_is_not_trusted() {
     let (_dir, ca_path) = ca_file(&ca);
     let (_other_dir, other_path) = ca_file(&TestCa::new("another-ca"));
 
-    let os_store_only = VectorCompatTls::default().with_domain("localhost");
+    let os_store_only = trusting(TrustChoice::Native, Vec::new());
     assert!(!push(&client(&source, &os_store_only), &mut source, 1).await);
 
-    let pinned_elsewhere = VectorCompatTls::private_ca(&other_path).with_domain("localhost");
+    let pinned_elsewhere = trusting(TrustChoice::Bundle, vec![other_path.clone()]);
     assert!(!push(&client(&source, &pinned_elsewhere), &mut source, 2).await);
 
-    let beside = VectorCompatTls {
-        extra_roots: vec![other_path, ca_path],
-        ..VectorCompatTls::default().with_domain("localhost")
-    };
+    let beside = trusting(TrustChoice::Native, vec![other_path, ca_path]);
     assert!(push(&client(&source, &beside), &mut source, 3).await);
 }
 
@@ -150,7 +162,10 @@ async fn the_name_in_the_certificate_must_match() {
     let ca = TestCa::new("vector-ca");
     let mut source = source(&ca, false).await;
     let (_dir, ca_path) = ca_file(&ca);
-    let wrong = VectorCompatTls::private_ca(&ca_path).with_domain("not-the-source.test");
+    let wrong = ClientTlsConfig {
+        server_name: Some("not-the-source.test".to_string()),
+        ..trusting(TrustChoice::Bundle, vec![ca_path])
+    };
     assert!(!push(&client(&source, &wrong), &mut source, 1).await);
 }
 
@@ -165,11 +180,37 @@ async fn a_client_certificate_reaches_a_source_that_asks_for_one() {
     let cert = write(dir.path(), "agent.pem", &agent.cert_pem);
     let key = write(dir.path(), "agent.key", &agent.key_pem);
 
-    let without = VectorCompatTls::private_ca(&ca_path).with_domain("localhost");
+    let without = trusting(TrustChoice::Bundle, vec![ca_path]);
     assert!(!push(&client(&source, &without), &mut source, 1).await);
 
-    let with = without.with_client_identity(&cert, &key);
+    let with = ClientTlsConfig {
+        client_cert_path: Some(cert),
+        client_key_path: Some(key),
+        ..without
+    };
     assert!(push(&client(&source, &with), &mut source, 2).await);
+}
+
+/// The `tls` section reaches the handshake: a cnsa2 client against a cnsa2
+/// source agrees ML-KEM-1024 and AES-256, where the default strong client
+/// would agree P-384.
+#[tokio::test]
+async fn the_tls_section_reaches_the_handshake() {
+    let ca = TestCa::new("vector-ca");
+    let mut source = source_on(&ca, CryptoProfile::Cnsa2, false).await;
+    let (_dir, ca_path) = ca_file(&ca);
+    let cnsa2 = ClientTlsConfig {
+        profile: CryptoProfile::Cnsa2,
+        ..trusting(TrustChoice::Bundle, vec![ca_path])
+    };
+    assert!(push(&client(&source, &cnsa2), &mut source, 1).await);
+    assert_eq!(
+        source.front.agreed(),
+        [Agreed::tls13(
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+            rustls::NamedGroup::MLKEM1024
+        )]
+    );
 }
 
 /// The OS store is the default trust: pointed at the CA the way
@@ -184,7 +225,7 @@ fn the_os_store_is_trusted_by_default() {
     temp_env::with_var("SSL_CERT_FILE", Some(&ca_path), || {
         runtime.block_on(async {
             let mut source = source(&ca, false).await;
-            let tls = VectorCompatTls::default().with_domain("localhost");
+            let tls = trusting(TrustChoice::Native, Vec::new());
             assert!(push(&client(&source, &tls), &mut source, 1).await);
         });
     });
@@ -209,18 +250,16 @@ fn an_empty_os_store_leaves_extra_roots_trusted() {
         runtime.block_on(async {
             let mut source = source(&ca, false).await;
 
-            let os_store_alone = VectorCompatTls::default().with_domain("localhost");
-            let refused = VectorCompatClient::connect_lazy_tls(&source.endpoint(), 5000, &os_store_alone);
+            let os_store_alone = trusting(TrustChoice::Native, Vec::new());
+            let refused =
+                VectorCompatClient::connect_lazy_tls(&source.endpoint(), 5000, &os_store_alone);
             assert!(
                 matches!(&refused, Err(crate::transport::TransportError::Config(m)) if m.contains("OS root store is empty")),
                 "{:?}",
                 refused.err()
             );
 
-            let beside = VectorCompatTls {
-                extra_roots: vec![ca_path],
-                ..os_store_alone
-            };
+            let beside = trusting(TrustChoice::Native, vec![ca_path]);
             assert!(push(&client(&source, &beside), &mut source, 1).await);
         });
     });

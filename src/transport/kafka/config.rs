@@ -1233,29 +1233,20 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub sasl_password: Option<crate::SensitiveString>,
 
-    // --- TLS Configuration ---
-    //
-    // Kafka TLS is configured by FILE PATH because librdkafka (the C library)
-    // owns the TLS stack and reads PEM files directly -- it does not accept a
-    // Rust rustls `ClientConfig`, so the unified `crate::tls` module does not
-    // apply here. The mapping from the unified `TlsTrust` vocabulary is:
-    //   TlsTrust.extra_roots (private CA, single bundle ok) -> ssl_ca_location
-    //   client cert / key (mTLS)                             -> ssl_certificate_location / ssl_key_location
-    //   native/webpki roots                                  -> omit ssl_ca_location: the client builders set ssl.ca.location=probe
-    //   exclusive private-CA pin                             -> set ssl_ca_location to the private CA only
-    /// SSL CA certificate file path (private-CA bundle -- maps to
-    /// `TlsTrust.extra_roots` -- a single combined root+intermediate PEM is
-    /// accepted).
+    /// Client TLS for `ssl` and `sasl_ssl`: the
+    /// [`ClientTlsConfig`](crate::tls_config::ClientTlsConfig) every transport
+    /// reads, mapped onto librdkafka's properties, which owns the TLS stack.
+    ///
+    /// `profile` sets the TLS 1.2 cipher list, and cnsa2 its groups and
+    /// signature schemes too. The version floor goes through the file
+    /// `OPENSSL_CONF` names, one per process (`docs/tls-profiles.md`).
+    /// `trust: native` with CA files trusts the OS store and the files,
+    /// `bundle` the files alone, and `platform` is the Windows certificate
+    /// store, taken on Windows only. Pins, `server_name` and a classical
+    /// `key_share` are refused: librdkafka checks the broker's chain and name
+    /// itself.
     #[serde(default)]
-    pub ssl_ca_location: Option<String>,
-
-    /// SSL client certificate file path (mTLS).
-    #[serde(default)]
-    pub ssl_certificate_location: Option<String>,
-
-    /// SSL client key file path (mTLS).
-    #[serde(default)]
-    pub ssl_key_location: Option<String>,
+    pub tls: crate::tls_config::ClientTlsConfig,
 
     /// Skip SSL certificate verification.
     ///
@@ -1445,9 +1436,7 @@ impl fmt::Debug for KafkaConfig {
             .field("sasl_mechanism", &self.sasl_mechanism)
             .field("sasl_username", &self.sasl_username)
             .field("sasl_password", &self.sasl_password)
-            .field("ssl_ca_location", &self.ssl_ca_location)
-            .field("ssl_certificate_location", &self.ssl_certificate_location)
-            .field("ssl_key_location", &self.ssl_key_location)
+            .field("tls", &self.tls)
             .field("ssl_skip_verify", &self.ssl_skip_verify)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
             .field("allow_auto_create_topics", &self.allow_auto_create_topics)
@@ -1569,9 +1558,7 @@ impl Default for KafkaConfig {
             sasl_mechanism: None,
             sasl_username: None,
             sasl_password: None,
-            ssl_ca_location: None,
-            ssl_certificate_location: None,
-            ssl_key_location: None,
+            tls: crate::tls_config::ClientTlsConfig::default(),
             ssl_skip_verify: false,
             allow_insecure_transport: false,
             allow_auto_create_topics: false,
@@ -1772,7 +1759,8 @@ impl KafkaConfig {
         self
     }
 
-    /// Add TLS configuration.
+    /// Turn TLS on, trusting only the CA file at `ca_location` when one is
+    /// given, and the OS store otherwise.
     #[must_use]
     pub fn with_tls(mut self, ca_location: Option<&str>) -> Self {
         if self.security_protocol == "plaintext" {
@@ -1780,16 +1768,73 @@ impl KafkaConfig {
         } else if self.security_protocol == "sasl_plaintext" {
             self.security_protocol = "sasl_ssl".to_string();
         }
-        self.ssl_ca_location = ca_location.map(String::from);
+        if let Some(ca) = ca_location {
+            self.tls.trust = crate::tls_config::TrustChoice::Bundle;
+            self.tls.ca_paths = vec![ca.into()];
+        } else {
+            self.tls.trust = crate::tls_config::TrustChoice::Native;
+            self.tls.ca_paths.clear();
+        }
         self
     }
 
     /// Add client certificate for mutual TLS.
     #[must_use]
     pub fn with_client_cert(mut self, cert_location: &str, key_location: &str) -> Self {
-        self.ssl_certificate_location = Some(cert_location.to_string());
-        self.ssl_key_location = Some(key_location.to_string());
+        self.tls.client_cert_path = Some(cert_location.into());
+        self.tls.client_key_path = Some(key_location.into());
         self
+    }
+
+    /// Refuse a `tls` section librdkafka cannot honour.
+    ///
+    /// # Errors
+    ///
+    /// A pin, a `server_name`, a classical `key_share`, `platform` trust off
+    /// Windows or beside CA files, `bundle` with no CA file, or half a client
+    /// identity.
+    fn validate_tls(&self) -> Result<(), String> {
+        use crate::crypto::KeyShare;
+        use crate::tls_config::TrustChoice;
+
+        let tls = &self.tls;
+        let refuse = |what: &str| Err(format!("kafka: tls.{what}"));
+        if !tls.pin_sha256.is_empty() {
+            return refuse(
+                "pin_sha256 is not taken: librdkafka checks the broker's chain and name, \
+                 not a key pin",
+            );
+        }
+        if tls.server_name.is_some() {
+            return refuse("server_name is not taken: librdkafka checks each broker's own name");
+        }
+        if tls.key_share == KeyShare::Classical {
+            return refuse(
+                "key_share classical is not taken: librdkafka sends its OpenSSL's own key share",
+            );
+        }
+        match (tls.trust, tls.ca_paths.is_empty()) {
+            (TrustChoice::Platform, _) if !cfg!(windows) => {
+                return refuse(
+                    "trust platform is Windows only for Kafka: use native, which reads the OS \
+                     store, or bundle",
+                );
+            }
+            (TrustChoice::Platform, false) => {
+                return refuse(
+                    "trust platform reads the Windows certificate store alone and takes no \
+                     ca_paths: use native for the store and the files",
+                );
+            }
+            (TrustChoice::Bundle, true) => {
+                return refuse("trust bundle needs a CA file in ca_paths");
+            }
+            _ => {}
+        }
+        tls.identity_paths()
+            .map_err(|e| format!("kafka: tls: {e}"))?;
+        crate::crypto::TlsProfiles::from_cascade().map_err(|e| format!("kafka: {e}"))?;
+        Ok(())
     }
 
     /// Skip SSL certificate verification.
@@ -1905,13 +1950,16 @@ impl KafkaConfig {
     /// values match in any letter case, and values are trimmed.
     ///
     /// NOTE: `ssl_skip_verify` is slated for removal at GA -- supply the broker
-    /// CA via `ssl_ca_location` (private-CA trust) instead.
+    /// CA via `tls.ca_paths` (private-CA trust) instead.
     ///
     /// # Errors
     ///
     /// Returns `Err` (in ANY environment) when the SASL mechanism is `PLAIN`
     /// but the transport is not `sasl_ssl` -- a PLAIN password must never cross
-    /// a plaintext transport. Additionally, when `is_production`, returns `Err`
+    /// a plaintext transport, or the `tls` section holds a key librdkafka
+    /// cannot honour (a pin, `server_name`, a classical `key_share`,
+    /// `platform` off Windows, `bundle` with no CA file, half an identity).
+    /// Additionally, when `is_production`, returns `Err`
     /// if `ssl_skip_verify` is set, a raw map turns certificate or hostname
     /// verification off, an unencrypted transport (`plaintext`/`sasl_plaintext`) is
     /// configured without the explicit `allow_insecure_transport` opt-in, a raw
@@ -1952,13 +2000,14 @@ impl KafkaConfig {
                 .check(compression)
                 .map_err(|e| format!("kafka: {e}"))?;
         }
+        self.validate_tls()?;
         if !is_production {
             return Ok(());
         }
         if self.ssl_skip_verify {
             return Err(
                 "kafka: ssl_skip_verify (TLS verification disabled) is not permitted \
-                 in production -- configure ssl_ca_location for private-CA trust instead"
+                 in production -- configure tls.ca_paths for private-CA trust instead"
                     .to_string(),
             );
         }
@@ -1967,7 +2016,7 @@ impl KafkaConfig {
         {
             return Err(format!(
                 "kafka: {unverified} disables TLS certificate verification, which is not \
-                 permitted in production -- configure ssl_ca_location for private-CA trust \
+                 permitted in production -- configure tls.ca_paths for private-CA trust \
                  instead"
             ));
         }
@@ -2212,8 +2261,10 @@ impl KafkaConfig {
             config.sasl_password = Some(crate::SensitiveString::from(val));
         }
 
+        // One CA file, trusted alone, as librdkafka's ssl.ca.location does.
         if let Some(val) = prefixed("SSL_CA_LOCATION", &["CA_CERT", "SSL_CA"]).get() {
-            config.ssl_ca_location = Some(val);
+            config.tls.trust = crate::tls_config::TrustChoice::Bundle;
+            config.tls.ca_paths = vec![val.into()];
         }
 
         if let Some(val) = prefixed("SSL_SKIP_VERIFY", &["SSL_INSECURE", "INSECURE"]).get_bool() {
