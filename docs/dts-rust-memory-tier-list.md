@@ -441,7 +441,7 @@ flowchart LR
 
 - `OnceLock` / `LazyLock` -- `[sync]` -- init shared immutable state once,
   read with no lock after. In std now.
-  - *When to use:* set-once immutable state -- a compiled regex/CEL, a static
+  - *When to use:* set-once immutable state -- a compiled regex/[CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md), a static
     table, an HTTP client.
   - *Situational:* `LazyLock` for lazy-on-first-touch, `OnceLock` when you own
     the init point. Drop `once_cell`. Needs to reload at runtime? Wrong tool --

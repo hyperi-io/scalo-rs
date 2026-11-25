@@ -59,7 +59,7 @@ Pillars are singletons. Modules in higher layers call into them via macros
 | `governor` | `governor` | `UnifiedPressure` self-regulation gate - latches a hard memory signal with weighted soft signals under hysteresis, driving inbound backpressure |
 | `concurrency` | `concurrency` | `BackgroundSink`, `PeriodicWorker`, `ActorHandle` - fire-and-forget, timer, command-queue primitives |
 | `strmatch` | `strmatch` | 4-tier string matcher: `Byte`, `Literal`, `LiteralSet`, `Regex` |
-| `expression` | `expression` | CEL evaluator (used by transport filters) |
+| `expression` | `expression` | [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) evaluator (used by transport filters) |
 
 ### L3 - Transport and I/O
 

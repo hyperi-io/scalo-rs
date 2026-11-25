@@ -1,6 +1,6 @@
 # Rules
 
-`scalo::rules` (feature `rules`) sets target fields on a record from an ordered rule set. For each target in the order the set lists them, the first row in declared order that matches the record and resolves a value sets it. A row tests the record with a native test or a CEL Fast condition, and takes its value as a literal, a copy of a field, or a field mapped through a bounded lookup table.
+`scalo::rules` (feature `rules`) sets target fields on a record from an ordered rule set. For each target in the order the set lists them, the first row in declared order that matches the record and resolves a value sets it. A row tests the record with a native test or a [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) Fast condition, and takes its value as a literal, a copy of a field, or a field mapped through a bounded lookup table.
 
 Targets are set in their listed order, each by the first row that matches and resolves a value, and a clamp then checks the clamped target's final value against an allowed set.
 

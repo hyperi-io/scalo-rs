@@ -5,7 +5,7 @@ the way out of every transport -- Kafka, gRPC, Memory, File, Pipe,
 HTTP -- before they reach app code. It's embedded in every
 backend, a no-op check when no rules are configured, and tiered so the
 common case (field-presence or equality on a top-level field) runs
-without invoking the CEL engine at all.
+without invoking the [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) engine at all.
 
 ---
 
