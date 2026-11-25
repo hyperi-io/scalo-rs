@@ -3,6 +3,15 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.39](https://github.com/hyperi-io/scalo-rs/compare/v2.14.38...v2.14.39) (2026-11-25)
+
+### Bug Fixes
+
+* **metrics:** edge app process gauges and Windows and macOS fallbacks ([dba1f24](https://github.com/hyperi-io/scalo-rs/commit/dba1f24e1a1e31b55c5af840419e0b2a140ea83d))
+* **spool:** batch spills and acknowledge after disk sync ([147c7fd](https://github.com/hyperi-io/scalo-rs/commit/147c7fdbde113482c684ee9f5adc364ed59faa88))
+* **spool:** repair the yaque queue and tag each record ([a2dd345](https://github.com/hyperi-io/scalo-rs/commit/a2dd345a199f73fddb842a01ea21f6b21d783b00))
+* **transport:** send metrics over OTLP transport ([e960176](https://github.com/hyperi-io/scalo-rs/commit/e960176cb4e0a2d30ddbe2c8cef447c44c17b201))
+
 ## [2.14.38](https://github.com/hyperi-io/scalo-rs/compare/v2.14.37...v2.14.38) (2026-11-24)
 
 ### Bug Fixes
