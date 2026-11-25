@@ -99,6 +99,24 @@ pub(crate) fn channel(base: &Path, options: Options) -> io::Result<(Sender, Rece
 /// Waits between lock attempts, about a quarter second in all.
 const LOCK_RETRY_MS: [u64; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
+/// The inner error of the `WouldBlock` [`channel`] returns when another open
+/// holds a half of the queue.
+#[derive(Debug)]
+pub(crate) struct Held {
+    /// The pid the held lock file names. `None` when it can't be read, as on
+    /// Windows, where the lock covers reads too.
+    pub(crate) pid: Option<u32>,
+    message: String,
+}
+
+impl std::fmt::Display for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Held {}
+
 /// A process spawned anywhere in this one holds a copy of every open file
 /// until it execs, so a lock just released can read as held for that long.
 fn lock(base: &Path, name: &str, side: &str) -> io::Result<FileGuard> {
@@ -110,12 +128,21 @@ fn lock(base: &Path, name: &str, side: &str) -> io::Result<FileGuard> {
         std::thread::sleep(std::time::Duration::from_millis(wait));
     }
     FileGuard::try_lock(&path)?.ok_or_else(|| {
+        let pid: Option<u32> = std::fs::read_to_string(&path).ok().and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("pid="))
+                .and_then(|pid| pid.trim().parse().ok())
+        });
         io::Error::new(
             io::ErrorKind::WouldBlock,
-            format!(
-                "queue {} {side} side is held by another open",
-                base.display()
-            ),
+            Held {
+                pid,
+                message: format!(
+                    "queue {} {side} side is held by another open{}",
+                    base.display(),
+                    crate::spool_codec::owner_pid(pid)
+                ),
+            },
         )
     })
 }
@@ -797,13 +824,22 @@ mod tests {
         );
     }
 
-    /// A second open of a queue another open holds is refused as `WouldBlock`.
+    /// A second open of a queue another open holds is refused as `WouldBlock`
+    /// around a [`Held`] naming the owner's pid.
     #[test]
     fn a_second_open_is_refused() {
         let (_dir, path) = test_queue_dir();
         let first = channel(&path, options(512)).unwrap();
         let err = channel(&path, options(512)).err().expect("held");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        let held = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Held>())
+            .expect("the refusal wraps a Held");
+        // Windows locks reads of a held lock file too, so only unix reads the pid.
+        if cfg!(unix) {
+            assert_eq!(held.pid, Some(std::process::id()), "{err}");
+        }
         drop(first);
         channel(&path, options(512)).expect("released");
     }

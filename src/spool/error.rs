@@ -18,6 +18,15 @@ pub enum SpoolError {
     #[error("failed to open spool at {path}: {message}")]
     Open { path: String, message: String },
 
+    /// Another live open, in this process or another, holds the queue. It
+    /// opens once that owner drops it. `pid` is the one its lock file names,
+    /// `None` where the lock file can't be read (Windows).
+    #[error(
+        "spool at {path} is locked by a live owner{}, refusing a second open of the same path",
+        crate::spool_codec::owner_pid(*pid)
+    )]
+    Locked { path: String, pid: Option<u32> },
+
     /// Queue file operation error.
     #[error("spool queue error: {0}")]
     Queue(String),

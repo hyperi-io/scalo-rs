@@ -24,7 +24,7 @@ mod version;
 
 #[cfg(feature = "tiered-sink")]
 pub(crate) use queue::Taken;
-pub(crate) use queue::{Options, Receiver, SHAPE_BYTES, Sender, Shape, channel, segments};
+pub(crate) use queue::{Held, Options, Receiver, SHAPE_BYTES, Sender, Shape, channel, segments};
 pub(crate) use state::{QueueState, RECV_METADATA, write_position};
 pub(crate) use sync::Shared;
 
