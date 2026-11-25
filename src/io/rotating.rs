@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use jiff::tz::TimeZone;
-use jiff::{SignedDuration, Timestamp};
+use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use tracing::{debug, warn};
 
 use super::config::{FileMode, FileWriterConfig, RotationPeriod};
@@ -365,16 +365,15 @@ fn rotated_files(live: &Path) -> io::Result<Vec<Rotated>> {
     Ok(found)
 }
 
-fn stamp(at: Timestamp) -> String {
-    at.to_zoned_datetime(TimeZone::system())
-        .strftime(STAMP_FORMAT)
-        .to_string()
+/// The [`STAMP_FORMAT`] suffix for `at`, in its zone.
+fn stamp(at: &ZonedDateTime) -> String {
+    at.strftime(STAMP_FORMAT).to_string()
 }
 
 /// Renames the live file to its rotated name and returns that name. The
 /// caller has dropped its handle.
 pub(super) fn rename_live(live: &Path) -> io::Result<PathBuf> {
-    let now = stamp(Timestamp::now());
+    let now = stamp(&ZonedDateTime::now());
     let existing = rotated_files(live)?;
     let mut number = existing
         .first()
@@ -428,7 +427,7 @@ pub(super) fn retain(live: &Path, config: &FileWriterConfig, label: &str) {
             24 * i64::from(config.max_age_days),
         ))
         .ok()
-        .map(stamp)
+        .map(|at| stamp(&at.to_zoned_datetime(TimeZone::system())))
         .filter(|s| s.len() == STAMP_LEN);
     let max_files = config
         .write
@@ -589,6 +588,23 @@ mod tests {
                 want,
                 "{rotation:?} {last:?} -> {now:?}"
             );
+        }
+    }
+
+    #[test]
+    fn stamp_is_the_civil_time_to_the_second() {
+        for (instant, want) in [
+            ("2026-03-02T14:00:00+00:00[UTC]", "20260302T140000"),
+            (
+                "2026-03-02T14:00:00.999999999+00:00[UTC]",
+                "20260302T140000",
+            ),
+            ("2026-12-31T23:59:59+10:00[+10:00]", "20261231T235959"),
+            ("2026-01-01T00:00:00-05:00[-05:00]", "20260101T000000"),
+            ("2026-07-04T09:05:03+05:30[+05:30]", "20260704T090503"),
+        ] {
+            let at: ZonedDateTime = instant.parse().unwrap();
+            assert_eq!(stamp(&at), want, "{instant}");
         }
     }
 }

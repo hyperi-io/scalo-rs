@@ -868,6 +868,7 @@ mod tests {
         let now: jiff::Timestamp = "2026-11-23T12:00:00Z".parse().unwrap();
         for (published, age) in [
             ("2026-11-24T12:00:00Z", Some("just released")),
+            ("2026-11-23T13:00:00Z", Some("released today")),
             ("2026-11-23T12:00:00Z", Some("released today")),
             ("2026-11-22T11:00:00Z", Some("released 1 day ago")),
             ("2026-11-13T12:00:00Z", Some("released 10 days ago")),
