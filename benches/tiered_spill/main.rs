@@ -88,7 +88,10 @@ impl Gate {
         if !self.open.load(Ordering::Acquire) {
             return SendResult::Backpressured;
         }
-        let mut taken = self.taken.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut taken = self
+            .taken
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         taken.extend(records.iter().filter_map(seq_of));
         SendResult::Ok
     }
@@ -98,9 +101,22 @@ impl Gate {
 /// from a fixed seed, so a rerun writes the same bytes.
 fn envelope(seq: u64, size: usize) -> Vec<u8> {
     const WORDS: [&str; 16] = [
-        "GET", "POST", "/api/v1/events", "200", "404", "user=alice", "user=bob", "latency_ms=12",
-        "src=10.1.2.3", "dst=10.4.5.6", "proto=tcp", "action=allow", "action=deny", "bytes=512",
-        "session", "closed",
+        "GET",
+        "POST",
+        "/api/v1/events",
+        "200",
+        "404",
+        "user=alice",
+        "user=bob",
+        "latency_ms=12",
+        "src=10.1.2.3",
+        "dst=10.4.5.6",
+        "proto=tcp",
+        "action=allow",
+        "action=deny",
+        "bytes=512",
+        "session",
+        "closed",
     ];
     let mut state = seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut message = String::new();
@@ -275,7 +291,9 @@ async fn cell(dir: &Path, size: usize, batch_bytes: Option<u64>, codec: Codec, r
         .and_then(|v| v.trim().parse::<f64>().ok())
         .unwrap_or(f64::NAN);
     let release_p99 = percentile(
-        &mut released.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        &mut released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
         0.99,
     );
     let mib = input as f64 / f64::from(1 << 20);
@@ -306,8 +324,7 @@ fn matrix(root: &Path) {
         for batch in batches {
             for codec in [Codec::Zstd, Codec::None] {
                 for run in 0..RUNS {
-                    let dir =
-                        root.join(format!("{size}-{}-{codec}-{run}", batch.unwrap_or(0_u64)));
+                    let dir = root.join(format!("{size}-{}-{codec}-{run}", batch.unwrap_or(0_u64)));
                     let status = Command::new(std::env::current_exe().expect("this binary"))
                         .args(["cell", &dir.display().to_string(), &size.to_string()])
                         .arg(batch.map_or_else(|| "record".to_string(), |b| b.to_string()))
@@ -439,12 +456,20 @@ fn kill(root: &Path) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--bench").collect();
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--bench")
+        .collect();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("a runtime");
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["matrix", root] => matrix(Path::new(root)),
         ["kill", root] => kill(Path::new(root)),
         ["cell", dir, size, batch, codec, run] => {

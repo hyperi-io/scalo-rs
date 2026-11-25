@@ -81,17 +81,23 @@ impl Spill {
     }
 }
 
+/// The bytes an encoded record takes in an entry's body: its 4-byte length,
+/// then the record.
+fn framed_len(encoded: &[u8]) -> usize {
+    4 + encoded.len()
+}
+
 /// The spool bytes a record holds reserved until its entry is written: its
 /// framed bytes and a whole entry's overhead, which the write then corrects
 /// to what the entry took.
-fn reserved(framed: &[u8]) -> u64 {
-    framed.len() as u64 + ENTRY_OVERHEAD
+fn reserved(encoded: &[u8]) -> u64 {
+    framed_len(encoded) as u64 + ENTRY_OVERHEAD
 }
 
 /// One caller's records waiting for the spill, in the order it gave them.
 struct Waiting {
     id: u64,
-    /// Each record framed for an entry's body.
+    /// Each record, encoded.
     records: Vec<Vec<u8>>,
     /// Records already in written entries.
     written: usize,
@@ -194,7 +200,7 @@ impl Writer {
             &self.count,
             &self.bytes,
             unwritten.len() as u64,
-            unwritten.iter().map(|framed| reserved(framed)).sum(),
+            unwritten.iter().map(|encoded| reserved(encoded)).sum(),
         );
     }
 
@@ -202,8 +208,8 @@ impl Writer {
     fn next_bytes(&self) -> usize {
         let mut bytes = 0;
         for waiting in self.waiting.lock().iter() {
-            for framed in &waiting.records[waiting.written..] {
-                bytes += framed.len();
+            for encoded in &waiting.records[waiting.written..] {
+                bytes += framed_len(encoded);
                 if bytes >= self.max_bytes {
                     return bytes;
                 }
@@ -222,14 +228,15 @@ impl Writer {
             let (mut records, mut bytes) = (0_usize, 0_usize);
             while let Some(front) = waiting.front() {
                 let mut take = 0;
-                for framed in &front.records[front.written..] {
+                for encoded in &front.records[front.written..] {
+                    let framed = framed_len(encoded);
                     if records > 0
-                        && (records >= self.max_records || bytes + framed.len() > self.max_bytes)
+                        && (records >= self.max_records || bytes + framed > self.max_bytes)
                     {
                         break;
                     }
                     records += 1;
-                    bytes += framed.len();
+                    bytes += framed;
                     take += 1;
                 }
                 let whole = front.written + take == front.records.len();
@@ -284,9 +291,9 @@ impl Writer {
         let mut estimate = 0_u64;
         let mut records = 0_u32;
         for (waiting, take) in plan.iter() {
-            for framed in &waiting.records[waiting.written..waiting.written + take] {
-                raw.extend_from_slice(framed);
-                estimate += reserved(framed);
+            for encoded in &waiting.records[waiting.written..waiting.written + take] {
+                drainer::frame(encoded, &mut raw);
+                estimate += reserved(encoded);
                 records += 1;
             }
         }
@@ -1008,17 +1015,9 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
         // The whole record (payload, key, headers, dedup key) is encoded only
         // here, on the cold path, so a drained replay keeps its routing.
-        let framed: Vec<Vec<u8>> = records
-            .iter()
-            .map(|record| {
-                let encoded = record.encode();
-                let mut framed = Vec::with_capacity(4 + encoded.len());
-                drainer::frame(&encoded, &mut framed);
-                framed
-            })
-            .collect();
-        let count = framed.len() as u64;
-        let estimate: u64 = framed.iter().map(|framed| reserved(framed)).sum();
+        let encoded: Vec<Vec<u8>> = records.iter().map(Record::encode).collect();
+        let count = encoded.len() as u64;
+        let estimate: u64 = encoded.iter().map(|encoded| reserved(encoded)).sum();
 
         if let Some(max_items) = self.config.max_spool_items {
             let max_items_u64 = max_items as u64;
@@ -1065,7 +1064,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         let acks = piece
             .take()
             .map(|piece| BatchFinalizer::new(move |status| piece.report(status)));
-        match self.spill_records(framed, acks).await {
+        match self.spill_records(encoded, acks).await {
             Ok(()) => {}
             // A full disk backpressures exactly as a full spool does. An
             // acknowledged spill's piece already reported Errored, so its
@@ -1119,7 +1118,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         }
     }
 
-    /// Queues `framed` records, already reserved, for the spill, and waits
+    /// Queues `encoded` records, already reserved, for the spill, and waits
     /// until a round writes them, leading the rounds while it holds the spill
     /// lock. Compression and the write run on the blocking pool for a round
     /// of [`INLINE_WRITE_BYTES`] or more, or one that starts a segment file.
@@ -1129,10 +1128,10 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     /// The write's error, the records not yet written given back.
     async fn spill_records(
         &self,
-        framed: Vec<Vec<u8>>,
+        encoded: Vec<Vec<u8>>,
         acks: Option<BatchFinalizer>,
     ) -> std::io::Result<()> {
-        let (id, mut written) = self.writer.enqueue(framed, acks);
+        let (id, mut written) = self.writer.enqueue(encoded, acks);
         let _queued = Queued {
             writer: &self.writer,
             id,
