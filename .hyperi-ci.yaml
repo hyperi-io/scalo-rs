@@ -48,6 +48,13 @@ test:
     # Every feature, `testcontainers` included, so the real-broker tests run on
     # the Test job's Docker-capable runner.
     features: all
+    # Windows and macOS lint every feature but Kafka's librdkafka and testcontainers' Docker.
+    windows:
+      features: &off_linux "auth,cli,cli-service,compression,compression-snappy,concurrency,config,config-reload,config-schema,dangerous-diagnostics,deployment,deployment-smoke,deployment-test-support,directory-config,directory-config-git,dlq,dlq-http,expression,geoip-download,governor,health,http,http-server,io,lifecycle,logger,memory,metrics,metrics-core,metrics-process,otel,otel-metrics,otel-tracing,output-file,rules,runtime,scaling,secrets,secrets-all,secrets-aws,secrets-vault,service-metrics,shutdown,sink-stack,spool,strmatch,tiered-sink,tls,top,transport,transport-file,transport-grpc,transport-grpc-vector-compat,transport-http,transport-kafka-config,transport-memory,transport-otlp,transport-pipe,transport-proxy,transport-proxy-test-support,transport-syslog,transport-test-support,transport-trace,version-check,worker,worker-batch,worker-msgpack,worker-pool,yaml"
+      mode: clippy
+    macos:
+      features: *off_linux
+      mode: clippy
   # A release runs the full tier: every real-broker and OpenBao test and the
   # docker builds. tests/TESTING.md says which tests are which.
   full:
@@ -58,7 +65,15 @@ build:
   - native
   rust:
     features: all
-    targets: []
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+      - x86_64-pc-windows-msvc
+      - aarch64-apple-darwin
+    windows:
+      features: *off_linux
+    macos:
+      features: *off_linux
     # The test compile's link stalled a free runner on memory at 3 cargo jobs (#548).
     free_memory_per_job_gib: 6
 release:
