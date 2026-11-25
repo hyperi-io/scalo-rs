@@ -70,6 +70,8 @@ pub(crate) struct Shared {
     segment: AtomicU64,
     end: AtomicU64,
     disk: AtomicU64,
+    /// Bytes of segment files deleted since the queue opened.
+    freed: AtomicU64,
     /// The sender's open segment.
     open: Mutex<Option<(u64, Arc<File>)>>,
     /// The segment open at the last sync, `None` before the first.
@@ -194,6 +196,12 @@ impl Shared {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 Some(held.saturating_sub(bytes))
             });
+        self.freed.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Bytes of segment files deleted since the queue opened. It only grows.
+    pub(crate) fn freed(&self) -> u64 {
+        self.freed.load(Ordering::Relaxed)
     }
 }
 

@@ -90,7 +90,7 @@ Permission, full-disk, read-only and quota errors are returned under either poli
 
 ### Full disk
 
-A push the disk has no room for (`StorageFull`, a quota, or a file size limit) is cut back, writes nothing, and returns `Err(SpoolError::DiskFull)`. The caller backs off as it does at `max_size_bytes`. Pushes are then refused without touching the disk until a retry is due, the wait doubling from 100 ms to 5 s, and the first push that fits ends the wait. The spool waits on the space it already holds: popping deletes consumed segments. While the disk is full the `spool_disk` health component is Degraded. `spool_disk_full_refused_bytes_total` counts the refused bytes, and `spool_disk_full_wait_milliseconds_total` the time spent waiting.
+A push the disk has no room for (`StorageFull`, a quota, or a file size limit) is cut back, writes nothing, and returns `Err(SpoolError::DiskFull)`. The caller backs off as it does at `max_size_bytes`. Pushes are then refused without touching the disk until a retry is due, the wait doubling from 100 ms to 5 s, or until a pop deletes a consumed segment. The first push that fits ends the wait. While the disk is full the `spool_disk` health component is Degraded. `spool_disk_full_refused_bytes_total` counts the refused bytes, and `spool_disk_full_wait_milliseconds_total` the time spent waiting.
 
 ### Disk use
 

@@ -508,13 +508,15 @@ const FULL_DISK_RETRY: Backoff = Backoff::new(Duration::from_millis(100), Durati
 
 /// Tracks a store's disk filling up. While the disk is full, writes are
 /// refused without touching it until the next retry, which the backoff
-/// spaces out. The queue's failed write is already cut back, so nothing torn
-/// is left, and the drain frees space by deleting consumed segments.
+/// spaces out, or until the queue deletes a consumed segment. The queue's
+/// failed write is already cut back, so nothing torn is left.
 pub(crate) struct FullDisk {
     store: &'static str,
     failures: u32,
     since: Option<Instant>,
     retry_at: Option<Instant>,
+    /// The queue's freed bytes when last asked.
+    freed: u64,
     flag: Arc<AtomicBool>,
 }
 
@@ -525,6 +527,7 @@ impl FullDisk {
             failures: 0,
             since: None,
             retry_at: None,
+            freed: 0,
             flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -535,8 +538,13 @@ impl FullDisk {
         Arc::clone(&self.flag)
     }
 
-    /// Whether a write may be tried now.
-    pub(crate) fn admits(&self, now: Instant) -> bool {
+    /// Whether a write may be tried now: the backoff has run out, or the
+    /// queue has deleted segment bytes since, `freed` being its running total.
+    pub(crate) fn admits(&mut self, now: Instant, freed: u64) -> bool {
+        if freed != self.freed {
+            self.freed = freed;
+            self.retry_at = None;
+        }
         self.retry_at.is_none_or(|at| now >= at)
     }
 
@@ -1132,7 +1140,11 @@ mod tests {
                 "{level} is in {all:?}"
             );
         }
-        assert_eq!(all.last().map(PathBuf::as_path), Some(Path::new("/")));
+        // `/` on unix, a drive's root such as `\\?\C:\` on Windows.
+        assert!(
+            all.last().is_some_and(|root| root.parent().is_none()),
+            "ends at the root: {all:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1152,17 +1164,23 @@ mod tests {
     fn a_full_disk_backs_off_and_recovers() {
         let mut full = FullDisk::new("test");
         let now = Instant::now();
-        assert!(full.admits(now));
+        assert!(full.admits(now, 0));
         full.failed(now, 10, &full_error());
         assert!(full.flag().load(Ordering::Relaxed), "health flag set");
-        assert!(!full.admits(now), "refused inside the backoff");
+        assert!(!full.admits(now, 0), "refused inside the backoff");
         assert!(
-            full.admits(now + Duration::from_secs(6)),
+            full.admits(now + Duration::from_secs(6), 0),
             "retried after it"
+        );
+        full.failed(now, 10, &full_error());
+        assert!(full.admits(now, 4096), "retried once a segment is deleted");
+        assert!(
+            full.flag().load(Ordering::Relaxed),
+            "still full until a write goes through"
         );
         full.wrote(now + Duration::from_secs(6));
         assert!(!full.flag().load(Ordering::Relaxed));
-        assert!(full.admits(now));
+        assert!(full.admits(now, 4096));
         for kind in [
             io::ErrorKind::StorageFull,
             io::ErrorKind::QuotaExceeded,

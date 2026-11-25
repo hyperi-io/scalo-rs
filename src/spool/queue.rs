@@ -253,11 +253,11 @@ impl Spool {
         }
 
         let now = Instant::now();
-        if !self.full.admits(now) {
+        let queue = live(&mut self.queue)?;
+        if !self.full.admits(now, queue.sender.freed()) {
             self.full.refused(4 + written);
             return Err(SpoolError::DiskFull(spool_codec::full_error().to_string()));
         }
-        let queue = live(&mut self.queue)?;
         match queue.sender.send(&prefix, body) {
             Ok(()) => self.full.wrote(now),
             Err(e) if spool_codec::is_full(&e) => {

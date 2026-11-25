@@ -153,6 +153,11 @@ impl Sender {
         self.shared.disk_bytes()
     }
 
+    /// Bytes of segment files the queue has deleted since it opened.
+    pub(crate) fn freed(&self) -> u64 {
+        self.shared.freed()
+    }
+
     /// Ends the open segment when the receiver has read to its end and it
     /// holds a sixteenth of a segment or more, so the receiver can delete it
     /// and the queue stops holding the disk. `Ok(true)` when it did.

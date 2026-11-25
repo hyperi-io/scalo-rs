@@ -43,13 +43,13 @@ impl Spill {
     fn write(&mut self, prefix: &[u8], body: &[u8]) -> std::io::Result<()> {
         let now = Instant::now();
         let written = 4 + prefix.len() + body.len();
-        if !self.full.admits(now) {
-            self.full.refused(written);
-            return Err(spool_codec::full_error());
-        }
         let sender = self.sender.as_mut().ok_or_else(|| {
             std::io::Error::other("the spill is closed after a failed quarantine")
         })?;
+        if !self.full.admits(now, sender.freed()) {
+            self.full.refused(written);
+            return Err(spool_codec::full_error());
+        }
         match sender.send(prefix, body) {
             Ok(()) => {
                 self.full.wrote(now);
@@ -2141,6 +2141,62 @@ mod tests {
                 .shutdown()
                 .await;
         }
+    }
+
+    /// A send the full disk refused goes through as soon as the drain deletes a
+    /// segment, while the full-disk backoff still has seconds to run, and well
+    /// inside `when_full_wait_ms`. StrictFifo keeps it off the hot path while
+    /// the spool holds records.
+    #[tokio::test]
+    async fn a_send_the_full_disk_refused_goes_through_once_the_drain_frees_a_segment() {
+        let dir = tempdir().unwrap();
+        let sink = TestSink::new();
+        sink.set_available(false);
+        let mut config = TieredSinkConfig::new(dir.path().join("spill"));
+        config.circuit_failure_threshold = 1;
+        config.circuit_reset_timeout_ms = 50;
+        config.drain_interval_ms = 10;
+        config.ordering = OrderingMode::StrictFifo;
+        config.drain_strategy = crate::tiered_sink::DrainStrategy::RateLimited { msgs_per_sec: 10 };
+        config.segment_bytes = 64;
+        config.when_full_wait_ms = 1500;
+        let tiered = Arc::new(TieredSink::new(sink, config).await.unwrap());
+        for i in 0..40 {
+            tiered
+                .send(&rec(format!("r{i:02}").as_bytes()))
+                .await
+                .unwrap();
+        }
+        // The disk filled: the backoff now refuses writes for seconds.
+        {
+            let mut spill = tiered.spill.lock().await;
+            for _ in 0..8 {
+                spill
+                    .full
+                    .failed(Instant::now(), 0, &spool_codec::full_error());
+            }
+        }
+
+        let started = Instant::now();
+        let blocked = {
+            let tiered = Arc::clone(&tiered);
+            tokio::spawn(async move { tiered.send(&rec(b"late")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tiered.inner().set_available(true);
+        let sent = blocked.await.unwrap();
+        let waited = started.elapsed();
+        assert!(sent.is_ok(), "{sent:?} after {waited:?}");
+        assert!(waited < Duration::from_millis(1000), "took {waited:?}");
+        assert!(
+            tiered.spool_len().await > 0,
+            "sent while the spool still held records"
+        );
+        Arc::try_unwrap(tiered)
+            .map_err(|_| "outstanding Arc refs")
+            .unwrap()
+            .shutdown()
+            .await;
     }
 
     /// `spool_state` and the age gauge report the oldest spilled record from
