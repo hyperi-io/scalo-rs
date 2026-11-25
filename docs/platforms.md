@@ -18,6 +18,8 @@ Linux is scalo's core platform: the DFE services run there, and every feature do
 | `proxy: system` | the proxy environment variables | those, then the System Configuration proxies | those, then the WinHTTP machine proxy |
 | Managed config layer | none | MDM managed preferences | Group Policy in the registry |
 
+On Windows `process_virtual_memory_bytes` is the private commit (sysinfo's `PrivateUsage`), not the address space Linux and macOS report, so don't chart it against resident memory across OSes.
+
 Two defaults are Linux paths, so set them on macOS and Windows: `DEFAULT_SPOOL_ROOT` (`/var/spool/scalo`), which the DLQ file and output paths start from, and `geoip_download.data_dir` (`/var/lib/geoip`).
 
 Container metrics and the Kubernetes and container detection in `env::Environment` read Linux paths, so off Linux they find nothing and bare metal. `deployment` writes Linux container artefacts and builds on any OS. macOS builds librdkafka from source for `transport-kafka` ([deployment/native-deps.md](deployment/native-deps.md)).
