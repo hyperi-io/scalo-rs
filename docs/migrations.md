@@ -6,6 +6,14 @@ release and the target before bumping.
 
 ---
 
+## 2.14.40
+
+### A spool held by a live owner is refused with its own variant
+
+`Spool::open` returns `SpoolError::Locked { path, pid }` and `TieredSink::new` returns `TieredSinkError::SpoolLocked { path, pid }` where both returned `Open` / `SpoolOpen` before. `pid` is the one the lock file names, `None` where it can't be read. The message still says "locked by a live owner".
+
+**Consumer adjustment** -- a `match` on either enum adds the arm. A caller that matched the message text to wait out an old owner matches the variant instead.
+
 ## 2.14.38
 
 ### The spool and the tiered sink sync on a timer, hold OS locks, and cap the disk (BEHAVIOUR CHANGE)

@@ -79,8 +79,8 @@ impl Spool {
     ///
     /// # Errors
     ///
-    /// Returns [`SpoolError::Open`] if the queue is locked by a live owner, or
-    /// cannot be opened and was not quarantined (see
+    /// Returns [`SpoolError::Locked`] if the queue is locked by a live owner,
+    /// [`SpoolError::Open`] if it cannot be opened and was not quarantined (see
     /// [`CorruptionPolicy`]), and [`SpoolError::Compression`] for a
     /// `compression_level` zstd does not take.
     pub async fn open(config: SpoolConfig) -> Result<Self> {
@@ -623,9 +623,15 @@ fn open_queue(
     policy: CorruptionPolicy,
     options: yaque::Options,
 ) -> Result<(Sender, Receiver)> {
-    spool_codec::open_queue(path, policy, options).map_err(|e| SpoolError::Open {
-        path: path.display().to_string(),
-        message: e.to_string(),
+    spool_codec::open_queue(path, policy, options).map_err(|e| match e {
+        spool_codec::OpenError::Locked { pid, .. } => SpoolError::Locked {
+            path: path.display().to_string(),
+            pid,
+        },
+        spool_codec::OpenError::Failed(message) => SpoolError::Open {
+            path: path.display().to_string(),
+            message,
+        },
     })
 }
 
@@ -703,6 +709,28 @@ mod tests {
             ),
             "the reopened spool counts the record it already holds"
         );
+    }
+
+    /// A second open of a held spool is `Locked`, naming the owner's pid where
+    /// the lock file can be read, and opens once the first is dropped.
+    #[tokio::test]
+    async fn a_second_open_of_a_held_spool_is_locked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("held");
+        let first = Spool::create(&path).await.unwrap();
+        match Spool::create(&path).await {
+            Err(SpoolError::Locked { path: named, pid }) => {
+                assert_eq!(named, path.display().to_string());
+                // Windows locks reads of a held lock file too, so only unix reads the pid.
+                if cfg!(unix) {
+                    assert_eq!(pid, Some(std::process::id()), "names the live owner");
+                }
+            }
+            Err(e) => panic!("expected Locked, got {e}"),
+            Ok(_) => panic!("a second open of a held spool must be refused"),
+        }
+        drop(first);
+        Spool::create(&path).await.expect("opens once released");
     }
 
     #[tokio::test]
@@ -1086,7 +1114,7 @@ mod tests {
         assert!(
             matches!(
                 Spool::open(config.clone()).await,
-                Err(SpoolError::Open { .. })
+                Err(SpoolError::Locked { .. })
             ),
             "a second open of the recovered queue is refused"
         );

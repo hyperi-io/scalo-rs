@@ -447,8 +447,9 @@ impl<S: TransportSender + 'static> TieredSink<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`TieredSinkError::SpoolOpen`] if the spill cache is locked by a
-    /// live owner, or cannot be opened and was not quarantined (see
+    /// Returns [`TieredSinkError::SpoolLocked`] if the spill cache is locked by
+    /// a live owner, [`TieredSinkError::SpoolOpen`] if it cannot be opened and
+    /// was not quarantined (see
     /// `TieredSinkConfig::on_corruption`), and [`TieredSinkError::Codec`] for a
     /// `compression` the spill does not take.
     pub async fn new(sink: S, config: TieredSinkConfig) -> Result<Self> {
@@ -490,7 +491,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
         }
 
         let (sender, receiver, initial_count, initial_bytes, options, segment_reserve, front_ms) =
-            open_spill(&config).await.map_err(spool_open_err)?;
+            open_spill(&config).await?;
 
         let sink = Arc::new(sink);
         let cell: QueueCell = Arc::new(parking_lot::Mutex::new(Some(sender.shared())));
@@ -1364,8 +1365,9 @@ type OpenedSpill = (Sender, yaque::Receiver, u64, u64, yaque::Options, u64, u64)
 /// Opens the spill's queue on the blocking pool, and counts what it holds:
 /// its entries, the bytes they take on disk, the options it opened with, the
 /// bytes of `max_spool_bytes` held back for one segment of read records, and
-/// when its front entry was written.
-async fn open_spill(config: &TieredSinkConfig) -> std::result::Result<OpenedSpill, String> {
+/// when its front entry was written. A live owner is `SpoolLocked`, any
+/// other failure `SpoolOpen`.
+async fn open_spill(config: &TieredSinkConfig) -> Result<OpenedSpill> {
     // A segment's read records stay on disk until it goes, so that much of
     // the cap is held back, and the segment shrinks to a quarter of the cap.
     let segment_bytes = match config.max_spool_bytes {
@@ -1385,9 +1387,8 @@ async fn open_spill(config: &TieredSinkConfig) -> std::result::Result<OpenedSpil
     // Walks the segments' headers and may cut a torn tail, so it runs off the runtime.
     let path = config.spool_path.clone();
     let policy = config.on_corruption;
-    tokio::task::spawn_blocking(move || {
-        let (sender, mut receiver) =
-            spool_codec::open_queue(&path, policy, options).map_err(|e| e.to_string())?;
+    let opened = tokio::task::spawn_blocking(move || {
+        let (sender, mut receiver) = spool_codec::open_queue(&path, policy, options)?;
         let queued = receiver.queued().unwrap_or_default();
         let front_ms = drainer::front_written_ms(&mut receiver);
         // The cap counts each entry's 4-byte header, as the disk does.
@@ -1402,7 +1403,16 @@ async fn open_spill(config: &TieredSinkConfig) -> std::result::Result<OpenedSpil
         ))
     })
     .await
-    .map_err(|e| format!("spool open task failed: {e}"))?
+    .unwrap_or_else(|e| {
+        Err(spool_codec::OpenError::Failed(format!(
+            "spool open task failed: {e}"
+        )))
+    });
+    let path = config.spool_path.display().to_string();
+    opened.map_err(|e| match e {
+        spool_codec::OpenError::Locked { pid, .. } => TieredSinkError::SpoolLocked { path, pid },
+        spool_codec::OpenError::Failed(message) => TieredSinkError::SpoolOpen { path, message },
+    })
 }
 
 /// Check available disk space using `statvfs`.
@@ -3695,10 +3705,13 @@ mod tests {
 
         // While the child lives, the OS lock it holds refuses a second open.
         let refused = TieredSink::new(TestSink::new(), spilling_config(&spool)).await;
-        assert!(
-            matches!(refused, Err(TieredSinkError::SpoolOpen { .. })),
-            "a spool a live process holds must refuse the open"
-        );
+        let Err(TieredSinkError::SpoolLocked { pid, .. }) = refused else {
+            panic!("a spool a live process holds must refuse the open as SpoolLocked");
+        };
+        // Windows locks reads of a held lock file too, so only unix reads the pid.
+        if cfg!(unix) {
+            assert_eq!(pid, Some(child_pid), "names the live owner");
+        }
         assert!(
             entries_with_prefix(&spool, "corrupt-").is_empty(),
             "nothing quarantined"
@@ -3796,10 +3809,13 @@ mod tests {
 
         let second = TieredSink::new(TestSink::new(), spilling_config(&spool)).await;
         match second {
-            Err(TieredSinkError::SpoolOpen { message, .. }) => {
-                assert!(message.contains("locked"), "names the lock: {message}");
+            Err(TieredSinkError::SpoolLocked { pid, .. }) => {
+                // Windows locks reads of a held lock file too, so only unix reads the pid.
+                if cfg!(unix) {
+                    assert_eq!(pid, Some(std::process::id()), "names the live owner");
+                }
             }
-            Err(e) => panic!("expected SpoolOpen, got {e}"),
+            Err(e) => panic!("expected SpoolLocked, got {e}"),
             Ok(_) => panic!("a second open of a live spool must be refused"),
         }
         assert!(

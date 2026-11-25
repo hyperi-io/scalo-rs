@@ -71,7 +71,7 @@ A segment takes entries until it passes `segment_bytes` (16 MiB), then an end ma
 
 ### Locks after a hard kill
 
-The sending and receiving halves each hold an operating-system lock on a file in the queue directory, `send.lock` and `recv.lock` (`flock` on Linux and macOS, `LockFileEx` on Windows). The OS drops a lock with the process that held it, so a kill -9 leaves no lock behind and a restart opens the queue at once. The files stay and are reused. A queue another open holds, in this process or another, is refused with `Open` / `SpoolOpen`, and is never quarantined.
+The sending and receiving halves each hold an operating-system lock on a file in the queue directory, `send.lock` and `recv.lock` (`flock` on Linux and macOS, `LockFileEx` on Windows). The OS drops a lock with the process that held it, so a kill -9 leaves no lock behind and a restart opens the queue at once. The files stay and are reused. A queue another open holds, in this process or another, is refused with `SpoolError::Locked` / `TieredSinkError::SpoolLocked`, and is never quarantined. Each carries the path and the pid the lock file names, `None` where the file can't be read (Windows locks reads too). A caller that waits out an old owner, as on a reload, matches the variant and retries.
 
 Two sinks or spools on one path in one process, or two processes sharing one volume, therefore fail at start instead of writing one queue twice. Give each its own path. A lock on a network filesystem holds only as far as that filesystem's locking does, so two pods sharing a `ReadWriteMany` volume must not share a spool path.
 
@@ -266,7 +266,7 @@ arrives). `pop_front` is the try-style alternative that returns
 | `close().await` | Stop the timed sync after one last sync |
 | `with_memory_guard(guard)` | Reserve each record's length before reading it (`memory` feature) |
 | `config() -> &SpoolConfig` | Active config |
-| `SpoolError` | `Open / Queue / Compression / Decompression / Io / MaxItemsReached / MaxSizeReached / Corrupted / DiskFull` |
+| `SpoolError` | `Open / Locked / Queue / Compression / Decompression / Io / MaxItemsReached / MaxSizeReached / Corrupted / DiskFull` |
 
 ---
 

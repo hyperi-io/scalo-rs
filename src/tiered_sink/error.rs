@@ -18,6 +18,15 @@ pub enum TieredSinkError {
     #[error("failed to open spool at {path}: {message}")]
     SpoolOpen { path: String, message: String },
 
+    /// Another live sink, in this process or another, holds the spool. It
+    /// opens once that owner drops it. `pid` is the one its lock file names,
+    /// `None` where the lock file can't be read (Windows).
+    #[error(
+        "spool at {path} is locked by a live owner{}, refusing a second open of the same path",
+        crate::spool_codec::owner_pid(*pid)
+    )]
+    SpoolLocked { path: String, pid: Option<u32> },
+
     /// Spool operation failed.
     #[error("spool error: {0}")]
     Spool(String),

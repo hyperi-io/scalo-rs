@@ -383,8 +383,8 @@ impl QuarantineTrigger {
 #[derive(Debug)]
 pub(crate) enum OpenError {
     /// A live process holds the queue. A second handle would put two writers
-    /// and two readers on one queue.
-    Locked(String),
+    /// and two readers on one queue. `pid` is the one its lock file names.
+    Locked { pid: Option<u32>, message: String },
     /// The queue would not open, and was not (or could not be) replaced.
     Failed(String),
 }
@@ -392,13 +392,18 @@ pub(crate) enum OpenError {
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Locked(m) => write!(
+            Self::Locked { message, .. } => write!(
                 f,
-                "spool is locked by a live owner, refusing a second open of the same path: {m}"
+                "spool is locked by a live owner, refusing a second open of the same path: {message}"
             ),
             Self::Failed(m) => f.write_str(m),
         }
     }
+}
+
+/// ` (pid N)` for a known lock owner, empty otherwise.
+pub(crate) fn owner_pid(pid: Option<u32>) -> String {
+    pid.map_or_else(String::new, |pid| format!(" (pid {pid})"))
 }
 
 /// Open the queue at `path` for sending and receiving.
@@ -437,7 +442,14 @@ pub(crate) fn open_queue(
         Err(e) => e,
     };
     if open_err.kind() == io::ErrorKind::WouldBlock {
-        return Err(OpenError::Locked(open_err.to_string()));
+        let pid = open_err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<yaque::Held>())
+            .and_then(|held| held.pid);
+        return Err(OpenError::Locked {
+            pid,
+            message: open_err.to_string(),
+        });
     }
     // A queue in another format is not damage: its records wait for the release that wrote them.
     if is_environmental(open_err.kind())
