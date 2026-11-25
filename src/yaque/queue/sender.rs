@@ -48,7 +48,7 @@ impl Sender {
         shared.add_disk(disk);
         let newest = numbers.last().copied().unwrap_or(0);
         let path = segment_filename(base, newest);
-        let found = match scan(&path, 0, options.whole) {
+        let found = match scan(&path, 0, options.whole, None) {
             Ok(found) => Some(found),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
@@ -122,7 +122,7 @@ impl Sender {
         if self.torn {
             self.cut_back()?;
         }
-        if self.state.position >= self.segment_bytes {
+        if self.state.position >= self.segment_bytes || self.wants_new_segment() {
             self.roll()?;
         }
         self.append(&mut [
@@ -145,7 +145,26 @@ impl Sender {
     /// Whether the next send starts a segment, creating a file.
     #[cfg(feature = "tiered-sink")]
     pub(crate) fn rolls_next(&self) -> bool {
-        self.torn || self.state.position >= self.segment_bytes
+        self.torn || self.state.position >= self.segment_bytes || self.wants_new_segment()
+    }
+
+    /// The end of the last whole entry written.
+    #[cfg(feature = "tiered-sink")]
+    pub(crate) fn position(&self) -> QueueState {
+        self.state
+    }
+
+    /// Whether a failed sync asked for a new segment, and this one holds an
+    /// entry for it to leave behind.
+    fn wants_new_segment(&self) -> bool {
+        if !self.shared.roll_requested() {
+            return false;
+        }
+        if self.state.position == 0 {
+            self.shared.rolled();
+            return false;
+        }
+        true
     }
 
     /// Bytes the queue's segment files hold.
@@ -187,6 +206,7 @@ impl Sender {
         self.shared.set_open(next.segment, Arc::clone(&file));
         self.file = file;
         self.state = next;
+        self.shared.rolled();
         self.shared.publish(next.segment, 0);
         Ok(())
     }

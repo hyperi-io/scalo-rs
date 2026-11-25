@@ -63,6 +63,7 @@
 //! tiered.send(&record).await?;
 //! ```
 
+mod acks;
 mod circuit;
 mod config;
 mod drainer;

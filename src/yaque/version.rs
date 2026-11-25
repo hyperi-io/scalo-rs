@@ -14,12 +14,26 @@ use super::queue::{scan, segment_filename, segments};
 use super::state::{Persistence, QueueState, RECV_METADATA};
 
 /// The version stamped in `version/contents`. It names the on-disk format, so
-/// it never follows scalo's release. 0.7 puts a codec tag, a CRC32C and the
-/// write time in front of every entry.
-pub(crate) const QUEUE_FORMAT_VERSION: &str = "0.7.0";
+/// it never follows scalo's release. 0.8 adds a record count and a decoded
+/// length to 0.7's codec tag, CRC32C and write time in front of every entry.
+pub(crate) const QUEUE_FORMAT_VERSION: &str = "0.8.0";
 
-/// The stamped versions a queue may carry and still open.
-pub(crate) const QUEUE_FORMAT_ACCEPTS: &str = "0.7.*";
+/// The stamped versions a queue may carry and open as is.
+pub(crate) const QUEUE_FORMAT_ACCEPTS: &str = "0.8.*";
+
+/// The format before, which this one reads and restamps before writing its
+/// own entries. Each entry marks which of the two wrote it.
+pub(crate) const PREVIOUS_FORMAT_ACCEPTS: &str = "0.7.*";
+
+/// Whether `stamp` names this format or the one before.
+fn readable(stamp: &str) -> bool {
+    Version::parse(stamp.trim()).is_ok_and(|named| {
+        [QUEUE_FORMAT_ACCEPTS, PREVIOUS_FORMAT_ACCEPTS]
+            .into_iter()
+            .filter_map(|accepts| VersionReq::parse(accepts).ok())
+            .any(|accepted| accepted.matches(&named))
+    })
+}
 
 /// Refuses a queue stamped in another format while a lock file names an owner
 /// of the earlier one, reading only, so a refused open changes no file. That
@@ -35,11 +49,7 @@ pub(crate) fn refuse_earlier_owner(base: &Path) -> io::Result<()> {
     };
     let file = base.join("version").join("contents");
     let stamp = std::fs::read_to_string(&file).unwrap_or_default();
-    let ours = Version::parse(stamp.trim())
-        .ok()
-        .zip(VersionReq::parse(QUEUE_FORMAT_ACCEPTS).ok())
-        .is_some_and(|(named, accepted)| accepted.matches(&named));
-    if ours {
+    if readable(&stamp) {
         return Ok(());
     }
     Err(io::Error::new(
@@ -67,14 +77,17 @@ fn earlier_owner(base: &Path) -> Option<String> {
 }
 
 /// Stamps the format into a queue that has none, or checks the one it has.
-/// A queue in an earlier format that holds no unread entry is cleared and
-/// stamped, since nothing in it is lost. The caller holds the queue's locks,
-/// so no other open races the stamp, and has run [`refuse_earlier_owner`].
+/// A queue in the format before is restamped, synced, before this build
+/// writes an entry, so a build of that format refuses it rather than misread
+/// the newer entries. A queue in an older format that holds no unread entry
+/// is cleared and stamped, since nothing in it is lost. The caller holds the
+/// queue's locks, so no other open races the stamp, and has run
+/// [`refuse_earlier_owner`].
 ///
 /// # Errors
 ///
 /// `InvalidData` naming the file when it holds no version. `Unsupported` for a
-/// later format, and for an earlier one that still holds entries. Otherwise
+/// later format, and for an older one that still holds entries. Otherwise
 /// the read's, removal's or write's error.
 pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
     let dir = base.join("version");
@@ -101,6 +114,16 @@ pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
     let accepted = VersionReq::parse(QUEUE_FORMAT_ACCEPTS)
         .map_err(|e| invalid(format!("cannot be checked: {e}")))?;
     if accepted.matches(&named) {
+        return Ok(());
+    }
+    if readable(&text) {
+        stamp_synced(&file)?;
+        tracing::info!(
+            path = %base.display(),
+            from = %named,
+            to = QUEUE_FORMAT_VERSION,
+            "opened a spool written in the format before: its entries read as they are, and new ones are written in this format"
+        );
         return Ok(());
     }
     let current = Version::parse(QUEUE_FORMAT_VERSION)
@@ -140,6 +163,13 @@ pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
     }
 }
 
+/// Writes this format's stamp to `file` and flushes it to disk.
+fn stamp_synced(file: &Path) -> io::Result<()> {
+    let mut stamp = std::fs::File::create(file)?;
+    io::Write::write_all(&mut stamp, format!("{QUEUE_FORMAT_VERSION}\n").as_bytes())?;
+    stamp.sync_all()
+}
+
 /// The unread entries and their bytes from the saved read position, walking
 /// only the headers, which this format shares with the earlier one. `None`
 /// when a header is damaged, since nothing past it can be counted.
@@ -168,7 +198,7 @@ fn unread(base: &Path) -> io::Result<Option<(u64, u64)>> {
         } else {
             0
         };
-        let found = scan(&segment_filename(base, number), start, None)?;
+        let found = scan(&segment_filename(base, number), start, None, None)?;
         if found.damaged {
             return Ok(None);
         }
@@ -211,19 +241,20 @@ fn segment_bytes(base: &Path) -> io::Result<u64> {
 mod tests {
     use super::*;
 
-    /// A fresh queue is stamped with a version it accepts, and an empty one
-    /// stamped in an earlier format is restamped. A later format is
-    /// `Unsupported` and a stamp that is no version `InvalidData`, each naming
-    /// the file, never a panic.
+    /// A fresh queue is stamped with a version it accepts, one in the format
+    /// before is restamped, and an empty one stamped in an older format is
+    /// restamped. A later format is `Unsupported` and a stamp that is no
+    /// version `InvalidData`, each naming the file, never a panic.
     #[test]
     fn a_stamp_is_written_once_and_checked_after() {
         use io::ErrorKind::{InvalidData, Unsupported};
-        let rows: [(&str, Option<&[u8]>, Option<io::ErrorKind>); 7] = [
+        let rows: [(&str, Option<&[u8]>, Option<io::ErrorKind>); 8] = [
             ("fresh", None, None),
-            ("this format", Some(b"0.7.0\n"), None),
-            ("the format before, empty", Some(b"0.6.6\n"), None),
+            ("this format", Some(b"0.8.0\n"), None),
+            ("the format before", Some(b"0.7.0\n"), None),
+            ("two formats back, empty", Some(b"0.6.6\n"), None),
             ("an older format, empty", Some(b"0.5.2\n"), None),
-            ("a later format", Some(b"0.8.0\n"), Some(Unsupported)),
+            ("a later format", Some(b"0.9.0\n"), Some(Unsupported)),
             ("not a version", Some(b"not a version"), Some(InvalidData)),
             ("only whitespace", Some(b"\n"), Some(InvalidData)),
         ];
@@ -336,7 +367,7 @@ mod tests {
             ),
             case(
                 "a later format",
-                "0.8.0",
+                "0.9.0",
                 &two,
                 end,
                 None,

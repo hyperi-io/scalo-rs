@@ -8,7 +8,8 @@
 
 //! Background drain task for spooled messages.
 
-use crate::spool_codec::{Decoders, QueueCell, StoreMetrics, written_ms};
+use crate::spool_codec::{Decoders, QueueCell, StoreMetrics, Unreadable, written_ms};
+use crate::tiered_sink::acks::Acks;
 use crate::tiered_sink::tiered::Spill;
 use crate::tiered_sink::{CircuitBreaker, DrainStrategy};
 use crate::transport::{Record, SendResult, TransportSender};
@@ -213,17 +214,12 @@ async fn settle(result: DrainResult, drainer: &mut Drainer, circuit: &CircuitBre
     }
 }
 
-/// Take one entry of `bytes` off the spool counters, stopping at
-/// zero: a count already short of what is on disk must not wrap to
-/// `u64::MAX`, which keeps StrictFifo's hot path shut and refuses every spill.
-pub(crate) fn release(count: &AtomicU64, total: &AtomicU64, bytes: u64) {
-    release_many(count, total, 1, bytes);
-}
-
-/// [`release`] for `entries` committed together, holding `bytes` between them.
-fn release_many(count: &AtomicU64, total: &AtomicU64, entries: u64, bytes: u64) {
+/// Take `records` holding `bytes` off the spool counters, stopping at zero: a
+/// count already short of what is on disk must not wrap to `u64::MAX`, which
+/// keeps StrictFifo's hot path shut and refuses every spill.
+pub(crate) fn release_many(count: &AtomicU64, total: &AtomicU64, records: u64, bytes: u64) {
     let _ = count.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
-        Some(n.saturating_sub(entries))
+        Some(n.saturating_sub(records))
     });
     let _ = total.try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
         Some(n.saturating_sub(bytes))
@@ -441,25 +437,54 @@ pub(crate) struct DrainBatch {
     pub(crate) max_bytes: u64,
 }
 
-/// Why a spooled entry did not decode.
-enum Unreadable {
-    /// It failed its CRC, so it is dropped.
-    Corrupt(crate::spool_codec::CorruptionError),
-    /// It does not decompress or decode under its own codec, so it is kept.
-    WrongCodec(String),
-}
-
-/// Unframe, decompress into `scratch` under the entry's own codec, and decode one spooled entry.
+/// Unframe one spooled entry, decompress it into `scratch` under its own
+/// codec, and decode its records: each framed by a 4-byte little-endian
+/// length, or one bare record in an entry of the format before. Over
+/// `previous_cap` decoded bytes, an entry of the format before is damaged.
 fn decode_entry(
     raw: &[u8],
     decoders: &mut Decoders,
     scratch: &mut Vec<u8>,
-) -> Result<Record, Unreadable> {
-    let entry = crate::spool_codec::unframe(raw).map_err(Unreadable::Corrupt)?;
-    decoders
-        .decode_into(&entry, scratch)
-        .map_err(Unreadable::WrongCodec)?;
-    Record::decode(scratch).map_err(|e| Unreadable::WrongCodec(e.to_string()))
+    previous_cap: usize,
+) -> Result<Vec<Record>, Unreadable> {
+    let entry = crate::spool_codec::unframe(raw).map_err(Unreadable::Damaged)?;
+    decoders.decode_into(&entry, scratch, previous_cap)?;
+    let unreadable = |e: crate::transport::RecordCodecError| Unreadable::Codec(e.to_string());
+    let Some(counted) = entry.counted else {
+        return Ok(vec![Record::decode(scratch).map_err(unreadable)?]);
+    };
+    let mut records = Vec::with_capacity(usize::try_from(counted.records).unwrap_or(0).min(4096));
+    let mut rest = scratch.as_slice();
+    while let Some((len, after)) = rest.split_first_chunk::<4>() {
+        let len = usize::try_from(u32::from_le_bytes(*len)).unwrap_or(usize::MAX);
+        let Some((record, after)) = after.split_at_checked(len) else {
+            return Err(Unreadable::Codec(format!(
+                "a record of {len} bytes runs past its entry's end"
+            )));
+        };
+        records.push(Record::decode(record).map_err(unreadable)?);
+        rest = after;
+    }
+    if !rest.is_empty() || records.len() != usize::try_from(counted.records).unwrap_or(0) {
+        return Err(Unreadable::Codec(format!(
+            "the entry holds {} records and {} stray bytes, not the {} its prefix names",
+            records.len(),
+            rest.len(),
+            counted.records
+        )));
+    }
+    Ok(records)
+}
+
+/// Frames `encoded` records as one entry's body: each record's 4-byte
+/// little-endian length, then the record.
+pub(crate) fn frame(encoded: &[u8], body: &mut Vec<u8>) {
+    body.extend_from_slice(
+        &u32::try_from(encoded.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    body.extend_from_slice(encoded);
 }
 
 /// The spill the drain reads from, and what it touches when the queue changes.
@@ -473,6 +498,10 @@ pub(crate) struct DrainQueue {
     pub(crate) metrics: Arc<StoreMetrics>,
     #[cfg(feature = "memory")]
     pub(crate) memory: Arc<std::sync::OnceLock<Arc<crate::memory::MemoryGuard>>>,
+    /// Pieces waiting on spilled entries: a commit reports those it passes.
+    pub(crate) acks: Arc<Acks>,
+    /// The most an entry of the format before may decode to.
+    pub(crate) previous_cap: usize,
 }
 
 /// The spool's entry and byte counters, shared with the sink.
@@ -539,8 +568,9 @@ impl DrainQueue {
     }
 
     /// Commits the first `entries` read and returns the rest, on the blocking
-    /// pool: a commit can delete segments and save the position. Returns when
-    /// the entry left at the front was written, 0 for none.
+    /// pool: a commit can delete segments and save the position. Reports the
+    /// pieces waiting on the committed entries delivered, since the sink took
+    /// them. Returns when the entry left at the front was written, 0 for none.
     async fn commit(&self, entries: usize) -> u64 {
         let receiver = Arc::clone(&self.receiver);
         let guard = self.guard();
@@ -548,14 +578,19 @@ impl DrainQueue {
             receiver.lock().as_mut().map(|receiver| {
                 let kept = receiver.taken().get(entries).map(|raw| written_ms(raw));
                 receiver.commit(entries, guard.as_deref());
+                let at = receiver.position();
                 let front = kept.unwrap_or_else(|| front_written_ms(receiver));
-                (receiver.disk_bytes(), front)
+                (receiver.disk_bytes(), front, at)
             })
         })
         .await;
         self.metrics.reserved(0, false);
         match committed {
-            Ok(Some((disk, front))) => {
+            Ok(Some((disk, front, at))) => {
+                if entries > 0 {
+                    self.acks
+                        .report_through(at, crate::transport::DeliveryStatus::Delivered);
+                }
                 self.metrics.disk(disk);
                 front
             }
@@ -605,6 +640,7 @@ impl DrainQueue {
         let cell = Arc::clone(&self.cell);
         let path = self.path.clone();
         let options = self.options;
+        let acks = Arc::clone(&self.acks);
         let reopened = tokio::task::spawn_blocking(move || {
             let mut spill = spill.blocking_lock();
             let mut receiver = receiver.lock();
@@ -612,8 +648,10 @@ impl DrainQueue {
             spill.sender = None;
             *receiver = None;
             *cell.lock() = None;
-            let (sender, fresh) = crate::spool_codec::quarantine_damaged(&path, &reason, options)
-                .map_err(|e| e.to_string())?;
+            let quarantined = crate::spool_codec::quarantine_damaged(&path, &reason, options);
+            // Their entries went aside with the queue, so their sources deliver again.
+            acks.fail_all();
+            let (sender, fresh) = quarantined.map_err(|e| e.to_string())?;
             *cell.lock() = Some(sender.shared());
             spill.sender = Some(sender);
             *receiver = Some(fresh);
@@ -634,9 +672,11 @@ impl DrainQueue {
     }
 }
 
-/// Take up to `cap` entries within `batch.max_bytes`, send the readable ones in
-/// one `send_batch` under `send_timeout`, and commit every entry only when the
-/// sink takes them. Any other answer returns the whole batch to the queue.
+/// Take up to `cap` records' worth of entries within `batch.max_bytes`, send
+/// the readable records in one `send_batch` under `send_timeout`, and commit
+/// every entry only when the sink takes them. Any other answer returns the
+/// whole batch to the queue. With a `cursor`, take the head entry and send
+/// only its next record, committing the entry after its last.
 #[allow(clippy::too_many_arguments)]
 async fn drain_once<S: TransportSender>(
     sink: &S,
@@ -648,14 +688,15 @@ async fn drain_once<S: TransportSender>(
     send_timeout: Duration,
     counters: &Counters,
     dead_letters: &DeadLetters,
-) -> Vec<DrainResult> {
+    cursor: Option<&mut usize>,
+) -> (Vec<DrainResult>, usize) {
     let taken = match queue.read(cap, batch.max_bytes).await {
-        Ok(taken) if taken.entries == 0 => return vec![DrainResult::Empty],
+        Ok(taken) if taken.entries == 0 => return (vec![DrainResult::Empty], 0),
         Ok(taken) => taken.entries,
         Err(e) if crate::spool_codec::is_damaged_header(&e) => {
-            return vec![DrainResult::Damaged(e.to_string())];
+            return (vec![DrainResult::Damaged(e.to_string())], 0);
         }
-        Err(e) => return vec![DrainResult::IoError(e.to_string())],
+        Err(e) => return (vec![DrainResult::IoError(e.to_string())], 0),
     };
     let (outcome, commit) = deliver(
         sink,
@@ -666,14 +707,17 @@ async fn drain_once<S: TransportSender>(
         send_timeout,
         counters,
         dead_letters,
+        cursor,
     )
     .await;
     counters.front(queue.commit(commit).await);
-    outcome
+    (outcome, commit)
 }
 
 /// Decode, send and dead-letter the `taken` entries the receiver holds. Returns
-/// the outcome and how many entries to commit, the rest going back to the queue.
+/// the outcome and how many entries to commit, the rest going back to the
+/// queue. With a `cursor`, only the head entry's next record goes, and the
+/// entry commits once the cursor passes its last.
 #[allow(clippy::too_many_arguments)]
 async fn deliver<S: TransportSender>(
     sink: &S,
@@ -684,30 +728,39 @@ async fn deliver<S: TransportSender>(
     send_timeout: Duration,
     counters: &Counters,
     dead_letters: &DeadLetters,
+    cursor: Option<&mut usize>,
 ) -> (Vec<DrainResult>, usize) {
     let mut read_back = Vec::with_capacity(taken);
     let mut unreadable = Vec::new();
     let mut wrong_codec = None;
-    let mut stored = 0_u64;
+    // What the entries take on disk, each 4-byte header included, and the
+    // records they count for in the spool.
+    let (mut stored, mut held) = (0_u64, 0_u64);
+    let mut head_records = 0;
     {
         let receiver = queue.receiver.lock();
         let Some(receiver) = receiver.as_ref() else {
             return (vec![DrainResult::Empty], 0);
         };
         for (index, raw) in receiver.taken().iter().enumerate() {
-            match decode_entry(raw, decoders, scratch) {
-                Ok(record) => read_back.push(record),
-                Err(Unreadable::Corrupt(e)) => {
+            match decode_entry(raw, decoders, scratch, queue.previous_cap) {
+                Ok(records) => {
+                    if index == 0 {
+                        head_records = records.len();
+                    }
+                    read_back.extend(records);
+                }
+                Err(Unreadable::Damaged(e)) => {
                     queue.metrics.damaged(&e);
                     unreadable.push(DrainResult::Corrupt);
                 }
-                Err(Unreadable::WrongCodec(e)) => {
+                Err(Unreadable::Codec(e)) => {
                     wrong_codec = Some((index, e));
                     break;
                 }
             }
-            // What the entry takes on disk, its 4-byte header included.
             stored += 4 + raw.len() as u64;
+            held += crate::spool_codec::shape(raw).records;
         }
     }
     // Only the entries before one the codec cannot read are taken. The rest
@@ -717,6 +770,9 @@ async fn deliver<S: TransportSender>(
         Some((0, error)) => return (vec![DrainResult::Held(error)], 0),
         Some((index, _)) => index,
     };
+    if let Some(at) = cursor.as_deref() {
+        read_back = read_back.into_iter().skip(*at).take(1).collect();
+    }
     let mut records = Vec::with_capacity(read_back.len());
     let mut dead = Vec::new();
     for record in read_back {
@@ -782,7 +838,6 @@ async fn deliver<S: TransportSender>(
     {
         return (vec![DrainResult::DeadLetterUnwritten], 0);
     }
-    release_many(&counters.count, &counters.bytes, take as u64, stored);
     let mut results = unreadable;
     if dead_lettered > 0 {
         results.push(DrainResult::DeadLettered(dead_lettered));
@@ -790,6 +845,15 @@ async fn deliver<S: TransportSender>(
     if delivered > 0 {
         results.push(DrainResult::Success(delivered));
     }
+    // A record of the head entry is settled. The entry commits after its last.
+    if let Some(at) = cursor {
+        *at += 1;
+        if *at < head_records {
+            return (results, 0);
+        }
+        *at = 0;
+    }
+    release_many(&counters.count, &counters.bytes, held, stored);
     (results, take)
 }
 
@@ -825,8 +889,10 @@ pub async fn drain_loop<S: TransportSender + 'static>(
 ) {
     let mut drainer = Drainer::new(strategy);
     let mut decoders = Decoders::default();
-    // Entries still to send one at a time after a refused batch.
+    // Entries still to send a record at a time after a refused batch, and the
+    // records of the head one already settled.
     let mut isolate = 0_usize;
+    let mut cursor = 0_usize;
     // Decompressed entries land here, reused across passes.
     let mut scratch = Vec::new();
     let mut read_failing = false;
@@ -880,13 +946,13 @@ pub async fn drain_loop<S: TransportSender + 'static>(
         };
 
         // A second's worth at the current rate, so a rate-limited drain stays smooth.
-        let cap = if isolate > 0 {
-            isolate -= 1;
+        let isolating = isolate > 0;
+        let cap = if isolating {
             1
         } else {
             per_pass(batch.max_records, drainer.current_rate())
         };
-        let results = drain_once(
+        let (results, committed) = drain_once(
             sink.as_ref(),
             &queue,
             cap,
@@ -896,8 +962,12 @@ pub async fn drain_loop<S: TransportSender + 'static>(
             send_timeout,
             &counters,
             &dead_letters,
+            isolating.then_some(&mut cursor),
         )
         .await;
+        if isolating && committed > 0 {
+            isolate -= 1;
+        }
 
         let mut took = 0_usize;
         let mut progressed = false;
@@ -916,10 +986,13 @@ pub async fn drain_loop<S: TransportSender + 'static>(
                 }
                 DrainResult::Isolate(entries) => {
                     isolate = *entries;
+                    cursor = 0;
                     pause = Duration::ZERO;
                 }
                 DrainResult::Damaged(reason) => {
                     queue.quarantine(reason.clone(), &counters).await;
+                    isolate = 0;
+                    cursor = 0;
                     progressed = true;
                 }
                 DrainResult::Empty => {

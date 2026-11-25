@@ -10,10 +10,11 @@
 //! and the `TieredSink` cold path so the integrity + recovery behaviour is
 //! defined once.
 //!
-//! - **Framing** ([`prefix`] / [`unframe`]): each entry's codec, write time
-//!   and CRC32C in front of its body. The queue parity-checks only the length
-//!   header, so the checksum is what turns a torn write or bit-rot in the body
-//!   into a [`CorruptionError`].
+//! - **Framing** ([`prefix`] / [`unframe`]): each entry's codec, write time,
+//!   record count, decoded length and CRC32C in front of its body. The queue
+//!   parity-checks only the length header, so the checksum is what turns a
+//!   torn write or bit-rot in the body into a [`CorruptionError`]. An entry the
+//!   format before wrote, with no count or length, still reads as one record.
 //! - **Open** ([`open_queue`]): refuses a queue another open holds, replays a
 //!   receive position a crash left unusable, and quarantines a queue that will
 //!   not open under [`CorruptionPolicy::Quarantine`].
@@ -78,11 +79,33 @@ impl std::fmt::Display for CorruptionError {
     }
 }
 
-/// Bytes in front of each entry's body: a tag, a CRC32C and the write time.
-pub(crate) const PREFIX_LEN: usize = 13;
+/// Bytes in front of each entry's body: a tag, a CRC32C, the write time, the
+/// record count and the decoded length.
+pub(crate) const PREFIX_LEN: usize = 21;
+
+/// Bytes in front of an entry of the format before: a tag, a CRC32C and the
+/// write time.
+pub(crate) const PREVIOUS_PREFIX_LEN: usize = 13;
 
 /// The tag bit set on an entry that carries its CRC.
 const CHECKED: u8 = 0x80;
+
+/// The tag bit set on an entry that carries its record count and decoded
+/// length. The format before never sets it.
+const COUNTED: u8 = 0x40;
+
+/// The most an entry of the format before may decode to, which names no
+/// decoded length: the default drain cap.
+pub(crate) const PREVIOUS_DECODE_CAP: usize = 4 << 20;
+
+const _: () = assert!(PREFIX_LEN <= crate::yaque::SHAPE_BYTES);
+
+/// The records an entry holds, and the bytes its body decodes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Counted {
+    pub(crate) records: u32,
+    pub(crate) decoded: u32,
+}
 
 /// Milliseconds since the Unix epoch, 0 for a clock set before it.
 pub(crate) fn now_ms() -> u64 {
@@ -93,19 +116,52 @@ pub(crate) fn now_ms() -> u64 {
         })
 }
 
-/// The prefix of an entry whose `body` was compressed with `codec` at
-/// `written_ms`: the codec's tag, then with `crc` a CRC32C over the tag, the
-/// time and the body, then the time, both little endian.
+/// The prefix of an entry whose `body` holds `counted` and was compressed with
+/// `codec` at `written_ms`: the codec's tag, then with `crc` a CRC32C over the
+/// tag, the rest of the prefix and the body, then the time, the record count
+/// and the decoded length, each little endian.
 #[must_use]
-pub(crate) fn prefix(codec: Codec, crc: bool, written_ms: u64, body: &[u8]) -> [u8; PREFIX_LEN] {
-    tagged(codec.tag(), crc, written_ms, body)
+pub(crate) fn prefix(
+    codec: Codec,
+    crc: bool,
+    written_ms: u64,
+    counted: Counted,
+    body: &[u8],
+) -> [u8; PREFIX_LEN] {
+    tagged(codec.tag(), crc, written_ms, counted, body)
 }
 
 /// [`prefix`] for any codec tag, known to this build or not.
 #[must_use]
-pub(crate) fn tagged(tag: u8, crc: bool, written_ms: u64, body: &[u8]) -> [u8; PREFIX_LEN] {
+pub(crate) fn tagged(
+    tag: u8,
+    crc: bool,
+    written_ms: u64,
+    counted: Counted,
+    body: &[u8],
+) -> [u8; PREFIX_LEN] {
     let mut prefix = [0; PREFIX_LEN];
-    prefix[0] = tag | if crc { CHECKED } else { 0 };
+    prefix[0] = tag | COUNTED | if crc { CHECKED } else { 0 };
+    prefix[5..13].copy_from_slice(&written_ms.to_le_bytes());
+    prefix[13..17].copy_from_slice(&counted.records.to_le_bytes());
+    prefix[17..21].copy_from_slice(&counted.decoded.to_le_bytes());
+    if crc {
+        let sum = checksum(prefix[0], &prefix[5..], body);
+        prefix[1..5].copy_from_slice(&sum.to_le_bytes());
+    }
+    prefix
+}
+
+/// The prefix the format before wrote: a tag, a CRC32C and the write time.
+#[cfg(test)]
+pub(crate) fn previous_prefix(
+    codec: Codec,
+    crc: bool,
+    written_ms: u64,
+    body: &[u8],
+) -> [u8; PREVIOUS_PREFIX_LEN] {
+    let mut prefix = [0; PREVIOUS_PREFIX_LEN];
+    prefix[0] = codec.tag() | if crc { CHECKED } else { 0 };
     prefix[5..].copy_from_slice(&written_ms.to_le_bytes());
     if crc {
         let sum = checksum(prefix[0], &prefix[5..], body);
@@ -114,8 +170,44 @@ pub(crate) fn tagged(tag: u8, crc: bool, written_ms: u64, body: &[u8]) -> [u8; P
     prefix
 }
 
-fn checksum(tag: u8, time: &[u8], body: &[u8]) -> u32 {
-    crc32c::crc32c_append(crc32c::crc32c_append(crc32c::crc32c(&[tag]), time), body)
+fn checksum(tag: u8, rest: &[u8], body: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc32c::crc32c_append(crc32c::crc32c(&[tag]), rest), body)
+}
+
+/// What an entry's leading bytes say about it, read without its CRC so the
+/// queue can count and reserve before reading the body: one record of unknown
+/// decoded length for an entry of the format before.
+pub(crate) fn shape(leading: &[u8]) -> crate::yaque::Shape {
+    match leading {
+        [
+            tag,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            r0,
+            r1,
+            r2,
+            r3,
+            d0,
+            d1,
+            d2,
+            d3,
+            ..,
+        ] if tag & COUNTED != 0 => crate::yaque::Shape {
+            records: u64::from(u32::from_le_bytes([*r0, *r1, *r2, *r3]).max(1)),
+            decoded: Some(u64::from(u32::from_le_bytes([*d0, *d1, *d2, *d3]))),
+        },
+        _ => crate::yaque::Shape::ONE,
+    }
 }
 
 /// A stored entry, its prefix read and its CRC checked.
@@ -123,14 +215,28 @@ fn checksum(tag: u8, time: &[u8], body: &[u8]) -> u32 {
 pub(crate) struct Entry<'a> {
     /// The codec its body was compressed with, or the tag of one this build does not know.
     pub(crate) codec: Result<Codec, u8>,
+    /// Its record count and decoded length, `None` for an entry of the format
+    /// before, which holds one record and names no length.
+    pub(crate) counted: Option<Counted>,
     pub(crate) body: &'a [u8],
+}
+
+/// Why a stored entry did not decode.
+#[derive(Debug)]
+pub(crate) enum Unreadable {
+    /// It failed its CRC, or decodes to more or fewer bytes than its prefix
+    /// names. Dropped and counted.
+    Damaged(CorruptionError),
+    /// It names a codec this build lacks, or does not decompress or decode
+    /// under its own. Kept.
+    Codec(String),
 }
 
 /// When an entry was written, in milliseconds since the Unix epoch, read from
 /// its prefix without checking the CRC. 0 for one too short to hold it.
 #[cfg(feature = "tiered-sink")]
 pub(crate) fn written_ms(raw: &[u8]) -> u64 {
-    raw.get(5..PREFIX_LEN)
+    raw.get(5..PREVIOUS_PREFIX_LEN)
         .and_then(|time| time.try_into().ok())
         .map_or(0, u64::from_le_bytes)
 }
@@ -141,25 +247,39 @@ pub(crate) fn written_ms(raw: &[u8]) -> u64 {
 /// [`CorruptionError`] when the entry is shorter than its prefix or fails its
 /// CRC, so damaged bytes are never handed on.
 pub(crate) fn unframe(raw: &[u8]) -> Result<Entry<'_>, CorruptionError> {
-    let Some((&[tag, c0, c1, c2, c3, ref time @ ..], body)) = raw.split_first_chunk::<PREFIX_LEN>()
-    else {
+    let wanted = match raw.first() {
+        Some(tag) if tag & COUNTED != 0 => PREFIX_LEN,
+        _ => PREVIOUS_PREFIX_LEN,
+    };
+    let Some((prefix, body)) = raw.split_at_checked(wanted) else {
         return Err(CorruptionError(format!(
-            "entry of {} bytes is shorter than its {PREFIX_LEN}-byte prefix",
+            "entry of {} bytes is shorter than its {wanted}-byte prefix",
             raw.len()
         )));
     };
+    let &[tag, c0, c1, c2, c3, ref rest @ ..] = prefix else {
+        return Err(CorruptionError("entry prefix is cut short".into()));
+    };
     if tag & CHECKED != 0 {
         let expected = u32::from_le_bytes([c0, c1, c2, c3]);
-        let actual = checksum(tag, time, body);
+        let actual = checksum(tag, rest, body);
         if expected != actual {
             return Err(CorruptionError(format!(
                 "CRC32C mismatch (stored {expected:08x}, computed {actual:08x})"
             )));
         }
     }
-    let codec_tag = tag & !CHECKED;
+    let counted = match rest {
+        [_, _, _, _, _, _, _, _, r0, r1, r2, r3, d0, d1, d2, d3] => Some(Counted {
+            records: u32::from_le_bytes([*r0, *r1, *r2, *r3]),
+            decoded: u32::from_le_bytes([*d0, *d1, *d2, *d3]),
+        }),
+        _ => None,
+    };
+    let codec_tag = tag & !(CHECKED | COUNTED);
     Ok(Entry {
         codec: Codec::from_tag(codec_tag).ok_or(codec_tag),
+        counted,
         body,
     })
 }
@@ -177,32 +297,63 @@ pub(crate) struct Decoders {
 }
 
 impl Decoders {
-    /// Replaces `out` with `entry`'s body decompressed under its own codec.
+    /// Replaces `out` with `entry`'s body decompressed under its own codec,
+    /// to exactly the length its prefix names, or to at most `previous_cap`
+    /// bytes for an entry of the format before.
     ///
     /// # Errors
-    /// A codec this build does not know or lacks, or a body that does not
-    /// decompress under it.
+    /// [`Unreadable::Codec`] for a codec this build does not know or lacks, or
+    /// a body that does not decompress under it. [`Unreadable::Damaged`] for a
+    /// body that decodes past its cap or short of its named length.
     pub(crate) fn decode_into(
         &mut self,
         entry: &Entry<'_>,
         out: &mut Vec<u8>,
-    ) -> Result<(), String> {
+        previous_cap: usize,
+    ) -> Result<(), Unreadable> {
         let codec = entry.codec.map_err(|tag| {
-            format!("the entry names codec tag {tag}, which this build does not know")
+            Unreadable::Codec(format!(
+                "the entry names codec tag {tag}, which this build does not know"
+            ))
         })?;
         let slot = &mut self.engines[usize::from(codec.tag())];
         if slot.is_none() {
             *slot = Some(
                 crate::compression::Compressor::new(crate::compression::Compression::new(codec))
-                    .map_err(|e| format!("the entry's codec {codec} cannot run here: {e}"))?,
+                    .map_err(|e| {
+                        Unreadable::Codec(format!("the entry's codec {codec} cannot run here: {e}"))
+                    })?,
             );
         }
         let Some(engine) = slot.as_mut() else {
-            return Err(format!("no {codec} decoder"));
+            return Err(Unreadable::Codec(format!("no {codec} decoder")));
         };
-        engine
-            .decompress_into(entry.body, out, usize::MAX)
-            .map_err(|e| format!("the entry does not decompress under its codec {codec}: {e}"))
+        let named = entry
+            .counted
+            .map(|counted| usize::try_from(counted.decoded).unwrap_or(usize::MAX));
+        let cap = named.unwrap_or(previous_cap);
+        match engine.decompress_into(entry.body, out, cap) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::FileTooLarge => {
+                return Err(Unreadable::Damaged(CorruptionError(format!(
+                    "the entry decodes past its {cap}-byte cap"
+                ))));
+            }
+            Err(e) => {
+                return Err(Unreadable::Codec(format!(
+                    "the entry does not decompress under its codec {codec}: {e}"
+                )));
+            }
+        }
+        match named {
+            Some(named) if named != out.len() => {
+                Err(Unreadable::Damaged(CorruptionError(format!(
+                    "the entry decodes to {} bytes, not the {named} its prefix names",
+                    out.len()
+                ))))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -392,16 +543,26 @@ fn recv_position_is_usable(path: &Path, saved: &[u8], segments: &[u64]) -> bool 
 }
 
 /// Flush a directory's entries to stable storage, so a file created or renamed
-/// in it survives a power loss. Windows has no directory sync: there the
-/// segment's own flush is the last step, and this does nothing.
+/// in it survives a power loss. Windows opens the directory for write with
+/// backup semantics, the only way it hands out a directory handle, and
+/// `sync_all` is `FlushFileBuffers` on it.
 #[cfg_attr(
-    not(unix),
-    allow(clippy::unnecessary_wraps, reason = "only the unix flush can fail")
+    not(any(unix, windows)),
+    allow(clippy::unnecessary_wraps, reason = "only the unix and Windows flushes can fail")
 )]
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(path)?.sync_all()?;
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)?
+            .sync_all()?;
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = path;
     Ok(())
 }
@@ -717,10 +878,37 @@ impl StoreMetrics {
 /// The open queue's shared half, swapped when a quarantine opens a fresh one.
 pub(crate) type QueueCell = Arc<parking_lot::Mutex<Option<Arc<yaque::Shared>>>>;
 
+/// What waits on a store's syncs: pieces of work that report once a sync
+/// covers the entry holding them.
+pub(crate) trait Waiters: Send + Sync {
+    /// The sender's published end, read under the lock a writer holds from
+    /// its write to registering the entry's waiters, so every waiter at or
+    /// below it is registered.
+    fn end(&self, shared: &yaque::Shared) -> Option<QueueState>;
+
+    /// Reports every waiter at or below `end`: durable when `synced`, failed
+    /// when the sync that covered it failed.
+    fn settle(&self, end: QueueState, synced: bool);
+}
+
+/// What one sync did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Synced {
+    /// Flushed what was written up to the end it read.
+    Flushed,
+    /// Nothing was written since the last sync settled the same end, so
+    /// nothing was flushed.
+    Unchanged,
+}
+
 /// Syncs the queue in `cell` to stable storage on the blocking pool: the
 /// segments written since the last sync, the directory when a segment was
-/// created since, and the receiver's committed position. Records how long it
-/// took in `spool_sync_seconds`.
+/// created since, and the receiver's committed position. A sync with nothing
+/// written since the last does no flush. Records how long a flush took in
+/// `spool_sync_seconds`, and settles `waiters` against the end it covered. A
+/// failed flush is not retried: its waiters fail, and the sender starts a new
+/// segment, since a flush retried on the same file can report clean with the
+/// data gone.
 ///
 /// # Errors
 /// A sync's or the position save's [`io::Error`], or the blocking task's
@@ -729,32 +917,65 @@ pub(crate) async fn sync_queue(
     path: PathBuf,
     store: &'static str,
     cell: QueueCell,
-) -> io::Result<()> {
+    waiters: Option<Arc<dyn Waiters>>,
+) -> io::Result<Synced> {
     let Some(shared) = cell.lock().clone() else {
-        return Ok(());
+        return Ok(Synced::Unchanged);
     };
     tokio::task::spawn_blocking(move || {
+        let end = match &waiters {
+            Some(waiters) => waiters.end(&shared),
+            None => shared.published(),
+        };
         let started = Instant::now();
-        let synced = sync_now(&path, &shared);
-        #[cfg(feature = "metrics")]
-        ::metrics::histogram!("spool_sync_seconds", "store" => store)
-            .record(started.elapsed().as_secs_f64());
+        let synced = sync_now(&path, &shared, end);
+        if matches!(synced, Ok(Synced::Flushed) | Err(_)) {
+            #[cfg(feature = "metrics")]
+            ::metrics::histogram!("spool_sync_seconds", "store" => store)
+                .record(started.elapsed().as_secs_f64());
+        }
         let _ = (started, store);
+        if synced.is_err() {
+            shared.request_roll();
+        }
+        if let (Some(waiters), Some(end)) = (waiters, end) {
+            waiters.settle(end, synced.is_ok());
+        }
         synced
     })
     .await
     .map_err(io::Error::other)?
 }
 
-fn sync_now(path: &Path, shared: &yaque::Shared) -> io::Result<()> {
-    let open = shared
-        .open_segment()
-        .ok_or_else(|| io::Error::other("the spool has no open segment"))?;
-    // A segment deleted under the open handle would sync to a file no restart finds.
-    std::fs::metadata(path.join(format!("{}.q", open.0)))?;
-    let segment = sync_segments(path, shared.synced(), open)?;
-    shared.mark_synced(segment);
-    shared.save_position()
+/// Flushes the queue up to `end`, read before the open segment so a roll
+/// between the two cannot mark an unflushed entry durable. An end the last
+/// sync settled is not flushed again, and a failure there is reported again.
+fn sync_now(path: &Path, shared: &yaque::Shared, end: Option<QueueState>) -> io::Result<Synced> {
+    match (end, shared.settled()) {
+        (Some(end), Some((settled, flushed))) if end == settled => {
+            if !flushed {
+                return Err(io::Error::other(
+                    "the spool's last sync failed and nothing was spilled since; the next spill \
+                     starts a new segment",
+                ));
+            }
+            shared.save_position()?;
+            return Ok(Synced::Unchanged);
+        }
+        _ => {}
+    }
+    let flushed = (|| {
+        let open = shared
+            .open_segment()
+            .ok_or_else(|| io::Error::other("the spool has no open segment"))?;
+        // A segment deleted under the open handle would sync to a file no restart finds.
+        std::fs::metadata(path.join(format!("{}.q", open.0)))?;
+        let segment = sync_segments(path, shared.synced(), open)?;
+        shared.mark_synced(segment);
+        shared.save_position()
+    })();
+    shared.settle(end, flushed.is_ok());
+    flushed.map(|()| Synced::Flushed)
 }
 
 /// Syncs a queue every interval, and once more at shutdown, so a power loss
@@ -763,13 +984,20 @@ pub(crate) struct SyncTicker {
     pub(crate) path: PathBuf,
     pub(crate) store: &'static str,
     pub(crate) cell: QueueCell,
+    pub(crate) waiters: Option<Arc<dyn Waiters>>,
 }
 
 impl crate::concurrency::PeriodicTask for SyncTicker {
     async fn tick(&mut self) -> Result<(), crate::concurrency::TickError> {
-        sync_queue(self.path.clone(), self.store, Arc::clone(&self.cell))
-            .await
-            .map_err(|e| crate::concurrency::TickError::Generic(Box::new(e)))
+        sync_queue(
+            self.path.clone(),
+            self.store,
+            Arc::clone(&self.cell),
+            self.waiters.clone(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| crate::concurrency::TickError::Generic(Box::new(e)))
     }
 
     async fn shutdown(&mut self) -> Result<(), crate::concurrency::TickError> {
@@ -918,8 +1146,15 @@ pub(crate) fn age(written_ms: u64) -> Option<Duration> {
 mod tests {
     use super::*;
 
-    /// An entry reads back with its codec and time, and a flip of any byte
-    /// its CRC covers is caught. Without the CRC only the length is checked.
+    const SEVEN: Counted = Counted {
+        records: 7,
+        decoded: 17,
+    };
+
+    /// An entry reads back with its codec, time, count and decoded length, and
+    /// a flip of any byte its CRC covers is caught. Without the CRC only the
+    /// length is checked. An entry of the format before reads as one record
+    /// that names no length.
     #[test]
     fn framing_round_trips_and_catches_damage() {
         let body = b"the payload bytes";
@@ -928,13 +1163,26 @@ mod tests {
             (Codec::Lz4, true),
             (Codec::None, false),
         ] {
-            let framed = [&prefix(codec, crc, 1_700_000_000_123, body)[..], body].concat();
+            let framed = [
+                &prefix(codec, crc, 1_700_000_000_123, SEVEN, body)[..],
+                body,
+            ]
+            .concat();
             let entry = unframe(&framed).unwrap();
             assert_eq!(entry.codec, Ok(codec), "{codec}");
+            assert_eq!(entry.counted, Some(SEVEN), "{codec}");
+            assert_eq!(
+                shape(&framed),
+                crate::yaque::Shape {
+                    records: 7,
+                    decoded: Some(17)
+                },
+                "{codec}"
+            );
             #[cfg(feature = "tiered-sink")]
             assert_eq!(written_ms(&framed), 1_700_000_000_123, "{codec}");
             assert_eq!(entry.body, body, "{codec}");
-            for at in [0, 1, 6, PREFIX_LEN, framed.len() - 1] {
+            for at in [0, 1, 6, 14, 18, PREFIX_LEN, framed.len() - 1] {
                 let mut damaged = framed.clone();
                 damaged[at] ^= 0x01;
                 // Bit 0 of the tag turns zstd into none and lz4 into gzip, the CRC catches it.
@@ -944,9 +1192,35 @@ mod tests {
                     "{codec}: byte {at} flipped"
                 );
             }
+
+            let before = [
+                &previous_prefix(codec, crc, 1_700_000_000_123, body)[..],
+                body,
+            ]
+            .concat();
+            let entry = unframe(&before).unwrap();
+            assert_eq!(
+                (entry.codec, entry.counted, entry.body),
+                (Ok(codec), None, &body[..]),
+                "{codec}: the format before"
+            );
+            assert_eq!(shape(&before), crate::yaque::Shape::ONE, "{codec}");
+            #[cfg(feature = "tiered-sink")]
+            assert_eq!(written_ms(&before), 1_700_000_000_123, "{codec}");
+            let mut damaged = before.clone();
+            damaged[PREVIOUS_PREFIX_LEN] ^= 0x01;
+            assert_eq!(
+                unframe(&damaged).is_err(),
+                crc,
+                "{codec}: the format before"
+            );
         }
         assert!(unframe(&[1, 2]).is_err(), "too short for the prefix");
-        let unknown = [&tagged(0x0F, true, 1, body)[..], body].concat();
+        assert!(
+            unframe(&[COUNTED; PREVIOUS_PREFIX_LEN + 2]).is_err(),
+            "a counted entry too short for its prefix"
+        );
+        let unknown = [&tagged(0x0F, true, 1, SEVEN, body)[..], body].concat();
         assert_eq!(
             unframe(&unknown).unwrap().codec,
             Err(0x0F),
@@ -954,23 +1228,72 @@ mod tests {
         );
     }
 
+    fn packed(codec: Codec, record: &[u8]) -> Vec<u8> {
+        let mut packed = Vec::new();
+        crate::compression::Compressor::new(crate::compression::Compression::new(codec))
+            .unwrap()
+            .compress_into(record, &mut packed)
+            .unwrap();
+        packed
+    }
+
     /// Each entry decodes under the codec it names, whatever the one before it used.
     #[test]
     fn each_entry_decodes_under_its_own_codec() {
         let record = b"a record that compresses a record that compresses".repeat(4);
+        let counted = Counted {
+            records: 1,
+            decoded: u32::try_from(record.len()).unwrap(),
+        };
         let mut decoders = Decoders::default();
         for codec in [Codec::Zstd, Codec::None, Codec::Lz4, Codec::Zstd] {
-            let mut packed = Vec::new();
-            crate::compression::Compressor::new(crate::compression::Compression::new(codec))
-                .unwrap()
-                .compress_into(&record, &mut packed)
-                .unwrap();
-            let framed = [&prefix(codec, true, 1, &packed)[..], &packed].concat();
+            let packed = packed(codec, &record);
+            let framed = [&prefix(codec, true, 1, counted, &packed)[..], &packed].concat();
             let mut out = Vec::new();
             decoders
-                .decode_into(&unframe(&framed).unwrap(), &mut out)
+                .decode_into(&unframe(&framed).unwrap(), &mut out, PREVIOUS_DECODE_CAP)
                 .unwrap();
             assert_eq!(out, record, "{codec}");
+        }
+    }
+
+    /// A decode is held to the length the prefix names, and an entry of the
+    /// format before to the cap it is given: more, or fewer, is damage, never
+    /// a codec it cannot read.
+    #[test]
+    fn a_decode_is_held_to_its_named_length_or_the_cap() {
+        let record = vec![b'x'; 10_000];
+        let mut decoders = Decoders::default();
+        for codec in [Codec::Zstd, Codec::None] {
+            let packed = packed(codec, &record);
+            for (case, named, cap, damaged) in [
+                ("named exactly", Some(10_000), 1, false),
+                ("named short", Some(9_999), usize::MAX, true),
+                ("named long", Some(10_001), usize::MAX, true),
+                ("before, under the cap", None, 10_000, false),
+                ("before, past the cap", None, 9_999, true),
+            ] {
+                let framed = match named {
+                    Some(decoded) => {
+                        let counted = Counted {
+                            records: 1,
+                            decoded,
+                        };
+                        [&prefix(codec, true, 1, counted, &packed)[..], &packed].concat()
+                    }
+                    None => [&previous_prefix(codec, true, 1, &packed)[..], &packed].concat(),
+                };
+                let mut out = Vec::new();
+                let decoded = decoders.decode_into(&unframe(&framed).unwrap(), &mut out, cap);
+                assert_eq!(
+                    matches!(decoded, Err(Unreadable::Damaged(_))),
+                    damaged,
+                    "{codec} {case}: {decoded:?}"
+                );
+                if !damaged {
+                    assert_eq!(out, record, "{codec} {case}");
+                }
+            }
         }
     }
 
@@ -1089,6 +1412,7 @@ mod tests {
             recycle_bytes: 1 << 16,
             whole: None,
             damaged_tail: None,
+            shape: None,
             store: "test",
         }
     }
@@ -1113,6 +1437,53 @@ mod tests {
         let again = sync_segments(&path, Some(1), open(&sender)).unwrap();
         assert_eq!(again, 2);
         assert_eq!(sync_segments(&path, Some(2), open(&sender)).unwrap(), 2);
+    }
+
+    /// A sync with nothing written since the last flushes nothing, and one
+    /// after a write flushes again. A failed flush is not retried on the same
+    /// end, only reported again, and a new segment flushes.
+    #[test]
+    fn a_sync_flushes_only_what_was_written_since_and_never_retries_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue");
+        let options = yaque::Options {
+            segment_bytes: 1 << 20,
+            ..options()
+        };
+        let (mut sender, _receiver) = open_queue(&path, CorruptionPolicy::Fail, options).unwrap();
+        let shared = sender.shared();
+        let sync = |shared: &yaque::Shared| sync_now(&path, shared, shared.published());
+        assert_eq!(sync(&shared).unwrap(), Synced::Flushed, "the first sync");
+        assert_eq!(sync(&shared).unwrap(), Synced::Unchanged, "nothing written");
+        sender.send(&[], b"one").unwrap();
+        assert_eq!(sync(&shared).unwrap(), Synced::Flushed, "after a write");
+        assert_eq!(sync(&shared).unwrap(), Synced::Unchanged);
+
+        sender.send(&[], b"two").unwrap();
+        std::fs::remove_file(path.join("0.q")).unwrap();
+        let failed = sync(&shared).unwrap_err();
+        assert_eq!(
+            failed.kind(),
+            io::ErrorKind::NotFound,
+            "gone from under its handle"
+        );
+        let again = sync(&shared).unwrap_err();
+        assert!(
+            again.to_string().contains("last sync failed"),
+            "reported again, not flushed again: {again}"
+        );
+        shared.request_roll();
+        sender.send(&[], b"three").unwrap();
+        assert_eq!(
+            sender.shared().open_segment().map(|(segment, _)| segment),
+            Some(1),
+            "the next write starts a new segment"
+        );
+        assert_eq!(
+            sync(&shared).unwrap(),
+            Synced::Flushed,
+            "the new segment flushes"
+        );
     }
 
     /// The first sync flushes each directory up to the root, and later syncs
@@ -1149,6 +1520,18 @@ mod tests {
             all.last().is_some_and(|root| root.parent().is_none()),
             "ends at the root: {all:?}"
         );
+    }
+
+    /// A directory flushes on every platform with one: Linux and macOS by
+    /// `fsync` on the directory, Windows by `FlushFileBuffers` on a handle
+    /// opened with backup semantics.
+    #[test]
+    fn a_directory_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("0.q"), b"segment").unwrap();
+        sync_directory(dir.path()).expect("the directory flushes");
+        #[cfg(any(unix, windows))]
+        assert!(sync_directory(&dir.path().join("absent")).is_err());
     }
 
     #[cfg(unix)]

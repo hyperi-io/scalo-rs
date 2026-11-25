@@ -100,7 +100,7 @@ http-server = ["axum", "tower", "tower-http", "tokio", "tracing"]
 compression = ["zstd", "lz4_flex", "dep:flate2", "tonic?/gzip", "tonic?/zstd"]
 compression-snappy = ["compression", "snap"]
 
-spool = ["compression", "concurrency", "parking_lot", "dep:futures-util", "dep:semver", "dep:crc32c", "dep:jiff", "tokio", "tracing"]
+spool = ["compression", "concurrency", "parking_lot", "dep:futures-util", "dep:semver", "dep:crc32c", "dep:jiff", "tokio", "tracing", "dep:windows", "windows/Win32_Storage_FileSystem"]
 tiered-sink = ["transport", "concurrency", "compression", "dep:windows", "windows/Win32_Storage_FileSystem", "parking_lot", "dep:futures-util", "dep:semver", "tokio", "tokio-util", "libc", "tracing", "dep:crc32c", "dep:jiff"]
 
 # docs/pipeline/sink-stack.md

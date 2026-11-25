@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 /// offset in it, as two big-endian u64.
 pub(crate) const RECV_METADATA: &str = "recv-metadata";
 
-/// A position in the queue: a segment and a byte offset in it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A position in the queue: a segment and a byte offset in it, ordered as
+/// the queue is written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct QueueState {
     pub(crate) segment: u64,
     pub(crate) position: u64,

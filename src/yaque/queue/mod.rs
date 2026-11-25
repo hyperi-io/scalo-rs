@@ -37,8 +37,36 @@ pub(crate) struct Options {
     /// Keeps the newest segment's bytes from a damaged header on, given the
     /// segment and the header's offset, before the open cuts them off.
     pub(crate) damaged_tail: Option<fn(&Path, u64) -> io::Result<()>>,
+    /// Reads an entry's records and decoded length from its first
+    /// [`SHAPE_BYTES`] bytes. Without it each entry is one record.
+    pub(crate) shape: Option<fn(&[u8]) -> Shape>,
     /// The `store` label on the queue's metrics.
     pub(crate) store: &'static str,
+}
+
+/// The most leading bytes of an entry a [`Shape`] is read from.
+pub(crate) const SHAPE_BYTES: usize = 32;
+
+/// What a store's own prefix says about one entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shape {
+    /// The records it holds.
+    pub(crate) records: u64,
+    /// The bytes its body decodes to, when the prefix names them.
+    pub(crate) decoded: Option<u64>,
+}
+
+impl Shape {
+    /// One record of unknown decoded length.
+    pub(crate) const ONE: Self = Self {
+        records: 1,
+        decoded: None,
+    };
+
+    /// The shape `read` gives `leading`, or one record without a reader.
+    fn of(read: Option<fn(&[u8]) -> Self>, leading: &[u8]) -> Self {
+        read.map_or(Self::ONE, |read| read(leading))
+    }
 }
 
 /// The name of a segment file in the queue directory.
@@ -126,6 +154,8 @@ pub(crate) fn segments(base: &Path) -> io::Result<Vec<u64>> {
 pub(crate) struct Scan {
     /// Whole entries after the start offset.
     pub(crate) entries: u64,
+    /// The records they hold, by their shape.
+    pub(crate) records: u64,
     /// Their payload bytes.
     pub(crate) bytes: u64,
     /// The offset after the last whole entry, or after the end-of-segment marker.
@@ -143,14 +173,20 @@ pub(crate) struct Scan {
 const SCAN_BUFFER: usize = 64 * 1024;
 
 /// Walks the headers of the segment at `path` from `from`. Payloads are
-/// skipped, except the last when `whole` checks it. The walk stops at the
+/// skipped past their first [`SHAPE_BYTES`] when `shape` counts records, and
+/// read whole only for the last when `whole` checks it. The walk stops at the
 /// end-of-segment marker, at an entry the file does not hold in full, and at
 /// a header that fails its parity check, which it reports as `damaged`.
 ///
 /// # Errors
 ///
 /// The open's or a read's error.
-pub(crate) fn scan(path: &Path, from: u64, whole: Option<fn(&[u8]) -> bool>) -> io::Result<Scan> {
+pub(crate) fn scan(
+    path: &Path,
+    from: u64,
+    whole: Option<fn(&[u8]) -> bool>,
+    shape: Option<fn(&[u8]) -> Shape>,
+) -> io::Result<Scan> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     let mut found = Scan {
@@ -184,22 +220,45 @@ pub(crate) fn scan(path: &Path, from: u64, whole: Option<fn(&[u8]) -> bool>) -> 
         if next > len {
             break;
         }
-        if next == len
+        let records = if next == len
             && let Some(whole) = whole
         {
             let mut last = vec![0_u8; usize::try_from(payload).unwrap_or(usize::MAX)];
-            reader.read_exact(&mut last)?;
+            if direct {
+                reader.get_mut().read_exact(&mut last)?;
+            } else {
+                reader.read_exact(&mut last)?;
+            }
             if !whole(&last) {
                 break;
             }
-        } else if payload > SCAN_BUFFER as u64 {
-            reader.seek(SeekFrom::Start(next))?;
-            direct = true;
+            Shape::of(shape, &last).records
         } else {
-            reader.seek_relative(i64::try_from(payload).unwrap_or(i64::MAX))?;
-            direct = false;
-        }
+            let mut leading = [0_u8; SHAPE_BYTES];
+            let peek = if shape.is_some() {
+                usize::try_from(payload)
+                    .unwrap_or(usize::MAX)
+                    .min(SHAPE_BYTES)
+            } else {
+                0
+            };
+            if direct {
+                reader.get_mut().read_exact(&mut leading[..peek])?;
+            } else {
+                reader.read_exact(&mut leading[..peek])?;
+            }
+            let rest = payload - peek as u64;
+            if rest > SCAN_BUFFER as u64 {
+                reader.seek(SeekFrom::Start(next))?;
+                direct = true;
+            } else {
+                reader.seek_relative(i64::try_from(rest).unwrap_or(i64::MAX))?;
+                direct = false;
+            }
+            Shape::of(shape, &leading[..peek]).records
+        };
         found.entries += 1;
+        found.records += records;
         found.bytes += payload;
         found.end = next;
     }
@@ -219,6 +278,7 @@ mod tests {
             recycle_bytes: 1 << 20,
             whole: None,
             damaged_tail: None,
+            shape: None,
             store: "test",
         }
     }
@@ -251,21 +311,61 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("0.q");
             std::fs::write(&path, file).unwrap();
-            let found = scan(&path, 0, None).unwrap();
+            let found = scan(&path, 0, None, None).unwrap();
             assert_eq!(found.entries, 3, "{name}");
+            assert_eq!(found.records, 3, "{name}: one record each without a shape");
+            let counted = scan(&path, 0, None, Some(first_byte_records)).unwrap();
+            assert_eq!(
+                counted.records,
+                u64::from(b'a') + 7 + u64::from(b'b'),
+                "{name}: each entry's shape, the long one read past the buffer"
+            );
+            assert_eq!(counted.end, want_end, "{name}");
             assert_eq!(found.bytes, bytes, "{name}");
             assert_eq!(found.end, want_end, "{name}");
             assert_eq!(found.sealed, sealed, "{name}");
             assert_eq!(found.damaged, damaged_header, "{name}");
             assert_eq!(found.len, file.len() as u64, "{name}");
-            let from = scan(&path, entry(b"a").len() as u64, None).unwrap();
+            let from = scan(&path, entry(b"a").len() as u64, None, None).unwrap();
             assert_eq!(from.entries, 2, "{name}: walked from the second entry");
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0.q");
         std::fs::write(&path, &whole).unwrap();
-        let refused = scan(&path, 0, Some(|last: &[u8]| last != b"bc")).unwrap();
+        let refused = scan(&path, 0, Some(|last: &[u8]| last != b"bc"), None).unwrap();
         assert_eq!(refused.entries, 2, "the last entry fails its check");
+    }
+
+    /// A test shape: the entry's first byte is its record count.
+    pub(super) fn first_byte_records(leading: &[u8]) -> Shape {
+        Shape {
+            records: leading.first().map_or(1, |n| u64::from(*n)),
+            decoded: None,
+        }
+    }
+
+    /// A read holds to its record cap after the first entry, and takes the
+    /// first whatever it holds.
+    #[test]
+    fn a_read_holds_to_its_record_cap() {
+        let (_dir, path) = test_queue_dir();
+        let options = Options {
+            shape: Some(first_byte_records),
+            ..options(1 << 20)
+        };
+        let (mut sender, mut receiver) = channel(&path, options).unwrap();
+        for count in [3_u8, 3, 3] {
+            sender.send(&[count], b"entry").unwrap();
+        }
+        for (cap, want) in [(1, 1), (5, 1), (6, 2), (100, 3)] {
+            assert_eq!(
+                receiver.read(cap, u64::MAX, None).unwrap().entries,
+                want,
+                "{cap}"
+            );
+            receiver.commit(0, None);
+        }
+        assert_eq!(receiver.queued().unwrap().records, 9);
     }
 
     #[test]
