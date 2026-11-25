@@ -9,7 +9,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "spool")]
 use std::task::Context;
 
@@ -76,6 +76,10 @@ pub(crate) struct Shared {
     open: Mutex<Option<(u64, Arc<File>)>>,
     /// The segment open at the last sync, `None` before the first.
     synced: Mutex<Option<u64>>,
+    /// The published end the last sync settled, and whether its flush held.
+    settled: Mutex<Option<(QueueState, bool)>>,
+    /// Set by a failed sync, so the sender writes on in a new segment.
+    roll: AtomicBool,
     position: Mutex<Position>,
 }
 
@@ -107,6 +111,45 @@ impl Shared {
     pub(crate) fn mark_synced(&self, segment: u64) {
         let mut synced = self.synced.lock();
         *synced = Some(synced.map_or(segment, |was| was.max(segment)));
+    }
+
+    /// The published end the last sync settled and whether its flush held,
+    /// `None` before the first.
+    pub(crate) fn settled(&self) -> Option<(QueueState, bool)> {
+        *self.settled.lock()
+    }
+
+    /// Records the published end a sync settled, and whether its flush held.
+    pub(crate) fn settle(&self, end: Option<QueueState>, flushed: bool) {
+        *self.settled.lock() = end.map(|end| (end, flushed));
+    }
+
+    /// Asks the sender to start a new segment before its next write.
+    pub(crate) fn request_roll(&self) {
+        self.roll.store(true, Ordering::Release);
+    }
+
+    /// Whether a new segment was asked for.
+    pub(crate) fn roll_requested(&self) -> bool {
+        self.roll.load(Ordering::Acquire)
+    }
+
+    /// Clears the ask, once the sender starts a new segment.
+    pub(crate) fn rolled(&self) {
+        self.roll.store(false, Ordering::Release);
+    }
+
+    /// The end of the last whole entry the sender published, read as one
+    /// pair. `None` when the sender kept moving segments under the reads.
+    pub(crate) fn published(&self) -> Option<QueueState> {
+        for _ in 0..4 {
+            let segment = self.segment.load(Ordering::Acquire);
+            let position = self.end.load(Ordering::Acquire);
+            if self.segment.load(Ordering::Acquire) == segment {
+                return Some(QueueState { segment, position });
+            }
+        }
+        None
     }
 
     /// Where the receiver saves its position, the position it opened at, and
@@ -280,12 +323,18 @@ impl Follower {
     /// The next 4 bytes, without consuming them. The caller has checked that
     /// they lie before the end.
     pub(crate) fn peek4(&mut self, end: u64) -> io::Result<[u8; 4]> {
-        while self.filled - self.start < 4 {
+        let mut word = [0_u8; 4];
+        word.copy_from_slice(self.peek(4, end)?);
+        Ok(word)
+    }
+
+    /// The next `n` bytes, without consuming them. The caller has checked
+    /// that they lie before the end, and `n` fits the buffer.
+    pub(crate) fn peek(&mut self, n: usize, end: u64) -> io::Result<&[u8]> {
+        while self.filled - self.start < n {
             self.refill(end)?;
         }
-        let mut word = [0_u8; 4];
-        word.copy_from_slice(&self.buf[self.start..self.start + 4]);
-        Ok(word)
+        Ok(&self.buf[self.start..self.start + n])
     }
 
     /// Skips `n` buffered bytes, which [`peek4`](Self::peek4) returned.

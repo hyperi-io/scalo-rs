@@ -12,17 +12,28 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use super::{Options, scan, segment_filename, segments};
+use super::{Options, SHAPE_BYTES, Shape, scan, segment_filename, segments};
 use crate::yaque::header::{EOF, Header};
 use crate::yaque::state::{Persistence, QueueState};
 use crate::yaque::sync::{FileGuard, Follower, Limit, Shared};
 use crate::yaque::{MemoryGuard, count};
 
-/// The receiver saves its committed position after this many entries...
-const SAVE_EVERY_ENTRIES: usize = 250;
+/// The receiver saves its committed position after this many records, an
+/// entry counting as the records its shape names...
+const SAVE_EVERY_RECORDS: u64 = 250;
 /// ...or this long after the last save, whichever comes first. A crash
 /// replays at most what was committed since.
 const SAVE_EVERY: Duration = Duration::from_millis(350);
+
+/// What is queued after the committed position.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Queued {
+    pub(crate) entries: u64,
+    /// The records the entries hold, by their shape.
+    pub(crate) records: u64,
+    /// Their payload bytes.
+    pub(crate) bytes: u64,
+}
 
 /// What one [`Receiver::read`] took.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -41,13 +52,16 @@ pub(crate) struct Receiver {
     state: QueueState,
     /// Where the open transaction started.
     committed: QueueState,
-    /// The open transaction's entries, and the position after each.
+    /// The open transaction's entries, the position after each, and the
+    /// records each holds.
     taken: Vec<Vec<u8>>,
     ends: Vec<QueueState>,
+    records: Vec<u64>,
     /// Bytes the open transaction reserved with the memory guard.
     reserved: u64,
     spare: Spare,
-    entries_since_save: usize,
+    shape: Option<fn(&[u8]) -> Shape>,
+    records_since_save: u64,
     saved_at: Instant,
     shared: Arc<Shared>,
     store: &'static str,
@@ -76,13 +90,15 @@ impl Receiver {
             committed: state,
             taken: Vec::new(),
             ends: Vec::new(),
+            records: Vec::new(),
             reserved: 0,
             spare: Spare {
                 buffers: Vec::new(),
                 held: 0,
                 cap: options.recycle_bytes,
             },
-            entries_since_save: 0,
+            shape: options.shape,
+            records_since_save: 0,
             saved_at: Instant::now(),
             shared,
             store: options.store,
@@ -90,14 +106,15 @@ impl Receiver {
         })
     }
 
-    /// The entries and payload bytes queued after the committed position,
-    /// read from the segments' headers.
+    /// The entries, records and payload bytes queued after the committed
+    /// position, read from the segments' headers and each entry's leading
+    /// bytes.
     ///
     /// # Errors
     ///
     /// A directory or segment read's error.
-    pub(crate) fn queued(&self) -> io::Result<(u64, u64)> {
-        let (mut entries, mut bytes) = (0, 0);
+    pub(crate) fn queued(&self) -> io::Result<Queued> {
+        let mut queued = Queued::default();
         for number in segments(&self.base)? {
             if number < self.committed.segment {
                 continue;
@@ -107,25 +124,32 @@ impl Receiver {
             } else {
                 0
             };
-            match scan(&segment_filename(&self.base, number), from, None) {
+            match scan(
+                &segment_filename(&self.base, number),
+                from,
+                None,
+                self.shape,
+            ) {
                 Ok(found) => {
-                    entries += found.entries;
-                    bytes += found.bytes;
+                    queued.entries += found.entries;
+                    queued.records += found.records;
+                    queued.bytes += found.bytes;
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
-        Ok((entries, bytes))
+        Ok(queued)
     }
 
-    /// Reads up to `max_entries` whole entries into the open transaction,
-    /// holding to `max_bytes` of payload after the first. Never waits: an
-    /// empty queue reads none.
+    /// Reads whole entries into the open transaction while they hold up to
+    /// `max_records` records and `max_bytes` of payload, taking the first
+    /// whatever it holds. Never waits: an empty queue reads none.
     ///
-    /// With a memory guard, each entry's length is reserved before its buffer
-    /// is filled. A refusal stops the read after the first entry, never before
-    /// it, so a pressed process drains in smaller reads and still drains.
+    /// With a memory guard, each entry's decoded length, or its stored length
+    /// where it names none, is reserved before its buffer is filled. A refusal
+    /// stops the read after the first entry, never before it, so a pressed
+    /// process drains in smaller reads and still drains.
     ///
     /// # Errors
     ///
@@ -133,17 +157,20 @@ impl Receiver {
     /// the read stops there and the next one meets it.
     pub(crate) fn read(
         &mut self,
-        max_entries: usize,
+        max_records: usize,
         max_bytes: u64,
         guard: Option<&MemoryGuard>,
     ) -> io::Result<Taken> {
         let mut taken = Taken::default();
         let mut bytes = 0;
-        while taken.entries < max_entries {
-            match self.next(bytes, max_bytes, guard) {
-                Ok(Next::Entry(len)) => {
+        let mut records = 0_u64;
+        let max_records = u64::try_from(max_records).unwrap_or(u64::MAX);
+        while records < max_records {
+            match self.next(bytes, max_bytes, records, max_records, guard) {
+                Ok(Next::Entry(len, held)) => {
                     taken.entries += 1;
                     bytes += len;
+                    records += held;
                 }
                 Ok(Next::Empty) => break,
                 Ok(Next::HeldBack) => {
@@ -167,6 +194,12 @@ impl Receiver {
         &self.taken
     }
 
+    /// Where each of the open transaction's entries ends, oldest first.
+    #[cfg(feature = "tiered-sink")]
+    pub(crate) fn ends(&self) -> &[QueueState] {
+        &self.ends
+    }
+
     /// Bytes the open transaction holds reserved with the memory guard.
     pub(crate) fn reserved_bytes(&self) -> u64 {
         self.reserved
@@ -186,6 +219,7 @@ impl Receiver {
             Some(last) => self.ends[last],
             None => self.committed,
         };
+        let records: u64 = self.records[..entries].iter().sum();
         if let Some(guard) = guard
             && self.reserved > 0
         {
@@ -196,6 +230,7 @@ impl Receiver {
             self.spare.put(buffer);
         }
         self.ends.clear();
+        self.records.clear();
         if target != self.state {
             self.go_to(target);
         }
@@ -205,10 +240,10 @@ impl Receiver {
         if entries == 0 {
             return;
         }
-        self.entries_since_save += entries;
+        self.records_since_save += records;
         let crossed = target.segment > from;
         if crossed
-            || self.entries_since_save >= SAVE_EVERY_ENTRIES
+            || self.records_since_save >= SAVE_EVERY_RECORDS
             || self.saved_at.elapsed() >= SAVE_EVERY
         {
             self.save();
@@ -268,6 +303,8 @@ impl Receiver {
         &mut self,
         bytes: u64,
         max_bytes: u64,
+        records: u64,
+        max_records: u64,
         guard: Option<&MemoryGuard>,
     ) -> io::Result<Next> {
         loop {
@@ -298,11 +335,21 @@ impl Receiver {
                 self.end_of_segment(true);
                 continue;
             }
-            if !self.taken.is_empty() && bytes + len > max_bytes {
+            let shape = match self.shape {
+                Some(read) => {
+                    let peek = usize::try_from(len).unwrap_or(usize::MAX).min(SHAPE_BYTES);
+                    read(&self.follower.peek(4 + peek, end)?[4..])
+                }
+                None => Shape::ONE,
+            };
+            if !self.taken.is_empty()
+                && (bytes + len > max_bytes || records + shape.records > max_records)
+            {
                 return Ok(Next::Empty);
             }
+            let reserve = shape.decoded.map_or(len, |decoded| decoded.max(len));
             let reserved = match guard {
-                Some(guard) => guard.try_reserve(len),
+                Some(guard) => guard.try_reserve(reserve),
                 None => false,
             };
             if guard.is_some() && !reserved && !self.taken.is_empty() {
@@ -312,18 +359,19 @@ impl Receiver {
             self.follower.consume(4);
             if let Err(e) = self.follower.read_into(&mut buffer) {
                 if let (Some(guard), true) = (guard, reserved) {
-                    guard.release(len);
+                    guard.release(reserve);
                 }
                 self.spare.put(buffer);
                 return Err(e);
             }
             if reserved {
-                self.reserved += len;
+                self.reserved += reserve;
             }
             self.state.position += 4 + len;
             self.taken.push(buffer);
             self.ends.push(self.state);
-            return Ok(Next::Entry(len));
+            self.records.push(shape.records);
+            return Ok(Next::Entry(len, shape.records));
         }
     }
 
@@ -370,7 +418,7 @@ impl Receiver {
     pub(crate) fn save(&mut self) {
         match self.shared.save_position() {
             Ok(()) => {
-                self.entries_since_save = 0;
+                self.records_since_save = 0;
                 self.saved_at = Instant::now();
             }
             Err(e) => {
@@ -431,7 +479,8 @@ fn start_at(saved: QueueState, shared: &Shared) -> QueueState {
 }
 
 enum Next {
-    Entry(u64),
+    /// An entry of this many payload bytes, holding this many records.
+    Entry(u64, u64),
     Empty,
     HeldBack,
 }
@@ -468,6 +517,54 @@ impl Spare {
         if capacity > 0 && self.held + capacity <= self.cap {
             self.held += capacity;
             self.buffers.push(buffer);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::yaque::queue::channel;
+
+    /// The position is saved once the records committed reach 250, counting
+    /// each entry as the records its shape names, not as one. The timed save
+    /// is pushed out of the test's reach.
+    #[test]
+    fn the_position_save_counts_records() {
+        for (shape, saved) in [
+            (None, false),
+            (
+                Some(super::super::tests::first_byte_records as fn(&[u8]) -> Shape),
+                true,
+            ),
+        ] {
+            let (_dir, path) = crate::yaque::test_queue_dir();
+            let options = Options {
+                segment_bytes: 1 << 20,
+                read_buffer_bytes: 4096,
+                recycle_bytes: 1 << 16,
+                whole: None,
+                damaged_tail: None,
+                shape,
+                store: "test",
+            };
+            let (mut sender, mut receiver) = channel(&path, options).unwrap();
+            receiver.saved_at = Instant::now() + Duration::from_secs(3600);
+            for _ in 0..3 {
+                sender.send(&[100], b"an entry of 100 records").unwrap();
+            }
+            assert_eq!(receiver.read(1000, u64::MAX, None).unwrap().entries, 3);
+            receiver.commit(3, None);
+            let on_disk = std::fs::read(path.join(crate::yaque::RECV_METADATA))
+                .ok()
+                .and_then(|saved| saved.get(8..16).and_then(|at| at.try_into().ok()))
+                .map(u64::from_be_bytes);
+            assert_eq!(
+                on_disk == Some(receiver.position().position),
+                saved,
+                "shape {}: saved at {on_disk:?}",
+                shape.is_some()
+            );
         }
     }
 }

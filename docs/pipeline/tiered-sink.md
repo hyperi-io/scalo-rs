@@ -45,7 +45,7 @@ flowchart LR
 
 *Figure 1. L4 Detail -- Tiered sink delivery. Green ends return `Ok`, orange ends `Err`, and the plain end `Ok` for a record it dropped.* Up: [Pipeline](README.md).
 
-The hot send is one `send_batch`, bounded by `send_timeout_ms`, made when the breaker admits it and, under `StrictFifo`, the spool is empty. Not delivered covers a breaker refusal, `Backpressured` and a timeout. Spool writes encode and compress (zstd, LZ4 or snappy) and append to the spill queue with one write, and a background drain sends the spool on once the breaker admits. A spill under 64 KiB is written on the calling task, where it takes microseconds. A larger one, or one that starts a segment file, is written on tokio's blocking pool.
+The hot send is one `send_batch`, bounded by `send_timeout_ms`, made when the breaker admits it and, under `StrictFifo`, the spool is empty. `send` sends one record, `send_batch` a slice of them. Not delivered covers a breaker refusal, `Backpressured` and a timeout. Spills are batched into entries ([Batched spills](#batched-spills)), compressed (zstd, LZ4 or snappy) and appended to the spill queue with one write each, and a background drain sends the spool on once the breaker admits.
 
 A `disk_capacity_poller` watches the spool filesystem when
 `disk_aware` is configured -- if usage crosses the threshold the
@@ -120,9 +120,9 @@ re-tries the primary sink at a rate controlled by `DrainStrategy`:
 | `RateLimited { msgs_per_sec }` | Fixed rate |
 | `Greedy` | Drain as fast as possible -- risks overwhelming a recovering sink |
 
-Each pass takes up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends them in one `send_batch` under one `send_timeout_ms`. Records the sender names in `dead_letter_reason` are taken out first. Every entry is committed only when the sink answers `Ok` and the DLQ holds the dead letters. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal`, and a `FilteredDlq`, names no record, so the batch is kept and its entries are sent one at a time, which dead-letters only the record the sink rejects. An entry that fails its CRC is dropped, counted in `spool_damaged_entries_total` with one warn, and the rest of its batch is sent. One in a codec this build lacks, or that does not decompress or decode, holds the drain ([Changing the codec](#changing-the-codec)).
+Each pass takes whole entries up to `drain_batch_max_records` (500) records and `drain_batch_max_bytes` (4 MiB, counted as stored after compression and framing), no more than a second's worth at the strategy's current rate, and sends their records in one `send_batch` under one `send_timeout_ms`. It counts an entry's records from its prefix before decoding it, and always takes the first entry whole. Records the sender names in `dead_letter_reason` are taken out first. Every entry is committed only when the sink answers `Ok` and the DLQ holds the dead letters. `Backpressured`, a timeout, or `Fatal(Config)`/`Fatal(Closed)` rolls the whole batch back, so a retry can deliver part of it twice, never lose it. Any other `Fatal`, and a `FilteredDlq`, names no record, so the batch is kept and its records are sent one at a time, which dead-letters only the record the sink rejects. A cursor in memory walks each entry's records and commits the entry after its last, so a kill part way replays the entry whole. An entry that fails its CRC, or decodes to a length other than its prefix names, is dropped, counted in `spool_damaged_entries_total` with one warn, and the rest of its batch is sent. One in a codec this build lacks, or that does not decompress or decode, holds the drain ([Changing the codec](#changing-the-codec)).
 
-A pass reads on tokio's blocking pool and commits there too, since a commit can delete a segment file and save the read position. No lock is held across the send. With `with_memory_guard(guard)`, each record's length is reserved before it is read and released when the pass commits or returns its records. A refused reservation ends the pass's read early, after its first record and never before it, so a pressed process drains in smaller batches and still drains. A record whose 4-byte header fails its parity check leaves nothing after it to find, so the spill is quarantined and a fresh one opened. A spool that counts records its drain does not find for 50 passes in a row sets `tiered_sink_drain_stalled` and degrades readiness.
+A pass reads on tokio's blocking pool and commits there too, since a commit can delete a segment file and save the read position. No lock is held across the send. With `with_memory_guard(guard)`, each entry's decoded length is reserved before it is read and released when the pass commits or returns its records. A refused reservation ends the pass's read early, after its first record and never before it, so a pressed process drains in smaller batches and still drains. A record whose 4-byte header fails its parity check leaves nothing after it to find, so the spill is quarantined and a fresh one opened. A spool that counts records its drain does not find for 50 passes in a row sets `tiered_sink_drain_stalled` and degrades readiness.
 
 A pass that takes records starts the next after the strategy's pause for that many records, so the strategy sets the rate. `drain_interval_ms` (100 ms) is added after a pass that found the spool empty or the sink down. Shutdown cuts either wait short.
 
@@ -162,7 +162,42 @@ Crossing the `disk_aware` threshold returns `Err(TieredSinkError::DiskUnavailabl
 
 The spill's two halves hold OS locks on their lock files, so a killed process holds nothing and `TieredSink::new` opens its spill at once, and a `spool_path` another live sink holds is refused: each sink needs a path of its own. A spill cache that will not open is quarantined into a `corrupt-*` subdirectory of `spool_path`, never by renaming the path. One written in an earlier spool format is cleared and stamped once drained, and refused with `SpoolOpen` while it holds records, with nothing moved ([spool.md](spool.md#quarantine)). A receive position a power loss left unusable is not that case: the sink replays from the first segment instead, so some consumed records come again.
 
-A spill survives the process being killed once `send` returns. It survives a power loss or a node crash once a sync has run. The timed sync runs every `sync_interval_ms` (500 ms, 0 turns it off) on tokio's blocking pool: it flushes the open segment, the directory only when a segment was created since the last sync, and saves the read position. So a power loss loses at most about one interval of spilled records, and a process kill loses none. `shutdown()` runs a last sync. `TieredSink::sync().await` syncs at once, so a caller that accepts records in batches can sync once per batch, and `sync_on_spill: true` syncs inside every spilling `send`, at a disk sync per spilled record on the path that runs when the sink is down. The first sync also flushes every directory up to the root, since opening creates any that are missing. Windows has no directory sync, so there the segment's own flush is the last step. A sync that fails returns `TieredSinkError::Spool` with the record already spilled, so a retry can deliver it twice. See [spool.md](spool.md#locks-after-a-hard-kill).
+A spill survives the process being killed once `send` returns. It survives a power loss or a node crash once a sync has run. The timed sync runs every `sync_interval_ms` (500 ms, 0 turns it off) on tokio's blocking pool: it flushes the open segment, the directory only when a segment was created since the last sync, and saves the read position. So a power loss loses at most about one interval of spilled records, and a process kill loses none. `shutdown()` runs a last sync. `TieredSink::sync().await` syncs at once, so a caller that accepts records in batches can sync once per batch, and `sync_on_spill: true` syncs inside every spilling `send`, at a disk sync per spilled record on the path that runs when the sink is down. The first sync also flushes every directory up to the root, since opening creates any that are missing. Windows flushes a directory through `FlushFileBuffers` on a handle opened with backup semantics ([spool.md](spool.md#durability-and-recovery)). A sync that fails returns `TieredSinkError::Spool` with the record already spilled, so a retry can deliver it twice. See [spool.md](spool.md#locks-after-a-hard-kill).
+
+---
+
+## Batched spills
+
+Spills waiting on the spill lock, from one `send_batch` or from concurrent sends, are written together as one entry: a group commit. Its holder takes the waiting spills oldest first, up to the caps, compresses their records as one body and appends it with one write. A batch over the caps takes several entries.
+
+| Key | Default | Bound |
+| --- | --- | --- |
+| `spill_batch_max_records` | 500 | `drain_batch_max_records` |
+| `spill_batch_max_bytes` | 256 KiB, encoded | `drain_batch_max_bytes`, and 32 MiB, so an entry that does not compress fits the 64 MiB a queue entry holds |
+| `spill_batch_linger_ms` | 0 | none |
+
+`new` lowers a cap past its bound with one warn, and never refuses to start. The body frames each record by its 4-byte little-endian length, and the prefix names the record count and decoded length ([spool.md](spool.md#storage-layout)). A round of 64 KiB encoded or more, or one starting a segment file, compresses and writes on tokio's blocking pool. Under that it runs on the calling task, where it takes microseconds. With `with_memory_guard`, a round counts its encoded and compressed bytes with the guard until the write returns.
+
+The knobs trade CPU for disk. zstd 3 on one 200 B record saves about a tenth for six times the CPU ([spool.md](spool.md#why-zstd-level-3)). A batch of them compresses nearer the ratio of 16 KiB records, which the bench decides. Bigger batches cost memory per write, lose more to one failed CRC, and replay more after a kill. A linger above 0 lets more spills join an entry, and every `send` that spills waits it out.
+
+## Durable acknowledgements
+
+`send_acked(&record, piece)` and `send_batch_acked(&records, piece)` take a `PieceFinalizer` ([acknowledgements.md](acknowledgements.md)) and report it once the records are safe. One piece covers a batch, and reports once every entry it spilled into is safe. A piece per record adds a waiter per record to every sync.
+
+| Outcome | The piece reports |
+| --- | --- |
+| The sink took it on the hot path | `Delivered`, at once |
+| Spilled | `Delivered` once a sync covers its entry, or the drain delivers it |
+| Spilled, settled by the drain before a sync | The worst of its records: `Delivered`, `Rejected` for a dead letter the DLQ holds, `Dropped` for one with no DLQ, `Errored` for an entry that failed its CRC |
+| Shed by `when_full: drop_newest` | `Dropped` |
+| Written to the DLQ by `when_full: dlq` | `Rejected` |
+| Any `Err`, a full spool or disk, a failed sync, a quarantine of its entry | `Errored` |
+
+A sync reads the end the sender published, flushes, then releases every piece at or below that end. A writer registers its entry's pieces under the same lock it writes under, so no piece the sync covered is missed. A failed flush reports its pieces `Errored` and is not tried again on the same end, and the next spill starts a new segment. A sync with nothing spilled since the last flushes nothing.
+
+So a spilled piece waits up to `sync_interval_ms` (500 ms) plus the flush. A push source answers its sender 100 ms before its hold deadline, so the interval stays well below that. With `sync_interval_ms: 0` and `sync_on_spill: false` no sync runs on its own: an acked send reports `Errored` at once, naming both keys, and `new` warns.
+
+An `Err` reports `Errored`, `DeadLetter` included, so screen records with `inner().dead_letter_reason` first, or the source delivers a dead letter again on every retry. `confirms_delivery()` gives `SinkConfirmation::Local`, or `None` over a sender that confirms nothing, for `.sink_confirms(..)`.
 
 ---
 
@@ -199,6 +234,9 @@ tiered_sink:
   drain_interval_ms: 100
   drain_batch_max_records: 500
   drain_batch_max_bytes: 4194304   # 4 MiB, as stored
+  spill_batch_max_records: 500     # most records one spilled entry holds
+  spill_batch_max_bytes: 262144    # 256 KiB, encoded
+  spill_batch_linger_ms: 0         # how long a spill waits for others to join it
   disk_aware:
     max_usage_percent: 0.8
     poll_interval_secs: 5
@@ -218,7 +256,7 @@ Emitted through the `metrics` crate, and only when scalo is built with the `metr
 | Metric | Type | Labels | What it reports |
 | --- | --- | --- | --- |
 | `spool_hot_path_total` | counter | none | Records the sink took directly, answering `Ok` within `send_timeout_ms` |
-| `spool_cold_path_total` | counter | none | `send` calls that ended on the spool path without error. Includes records shed by `drop_newest`, since `send` returns `Ok` for them |
+| `spool_cold_path_total` | counter | none | Records that ended on the spool path without error. Includes records shed by `drop_newest`, since `send` returns `Ok` for them |
 | `spool_circuit_trips_total` | counter | none | Hot-path sends that failed against the breaker (`Backpressured`, or past `send_timeout_ms`). One per failed send, not per Closed-to-Open change. Drain failures are not counted |
 | `spool_circuit_state` | gauge | none | Breaker state at the last `send`: `0` closed, `1` half-open, `2` open. Half-open shows once the reset timeout has passed, before a probe goes out. An idle sink keeps its last value |
 | `tiered_sink_overflow_total` | counter | `policy` | Records a full spool did not take: `drop_newest` sheds them, `dlq` writes them to the DLQ. `block` returns `SpoolFull` and does not count |
@@ -233,7 +271,7 @@ Emitted through the `metrics` crate, and only when scalo is built with the `metr
 | `spool_disk_bytes` | gauge | `store` | Bytes the spill's segment files hold |
 | `spool_disk_full_refused_bytes_total` | counter | `store` | Bytes refused while the disk was full |
 | `spool_disk_full_wait_milliseconds_total` | counter | `store` | Time spent waiting for the disk to have room |
-| `spool_sync_seconds` | histogram | `store` | Time one sync took, timed, explicit or `sync_on_spill` |
+| `spool_sync_seconds` | histogram | `store` | Time one sync's flush took, timed, explicit or `sync_on_spill`. A sync with nothing spilled since the last flushes nothing and records nothing |
 | `spool_memory_reserved_bytes` | gauge | `store` | Bytes the drain's read holds reserved with the memory guard |
 | `spool_drain_cut_short_total` | counter | `store` | Drain reads the memory guard stopped after their first record |
 | `spool_position_save_failures_total` | counter | `store` | Read-position saves that failed. A restart then replays more |
@@ -271,9 +309,12 @@ No metric counts a `SpoolFull`, `DiskUnavailable` or `DeadLetter` error, which g
 | ------ | --------- |
 | `TieredSink::new(sender, config)` | Construct, open spool, spawn drain task. `S` is any `TransportSender`, and the sink calls its `send_batch` with one record and acts on the `SendResult` |
 | `send(&Record) -> Result<()>` | Hot path, else spool. Errors go back to the caller, which routes the record (usually to the DLQ) |
+| `send_batch(&[Record])` | `send` for a batch: one hot `send_batch`, else one spill. A record the sender names fails the batch before anything is sent |
+| `send_acked(&Record, PieceFinalizer)` / `send_batch_acked(&[Record], PieceFinalizer)` | As `send` and `send_batch`, reporting the piece once the records are safe ([Durable acknowledgements](#durable-acknowledgements)) |
+| `confirms_delivery()` | `SinkConfirmation::Local`, or `None` over a sender that confirms nothing |
 | `with_dlq(Arc<Dlq>)` | The DLQ the drain writes records it cannot deliver to, and `when_full: dlq` the records a full spool cannot take (`dlq` feature) |
 | `with_memory_guard(Arc<MemoryGuard>)` | Reserve each spilled record's length before the drain reads it (`memory` feature) |
-| `sync()` | Sync every spill so far to disk, on tokio's blocking pool |
+| `sync()` | Sync every spill so far to disk, on tokio's blocking pool, releasing the acked pieces it covers |
 | `spool_len() / spool_is_empty() / spool_bytes()` | Spool depth introspection |
 | `spool_state() -> SpoolState` | Records spilled, their bytes as stored, and the oldest's age as of the drain's last pass (`None` when empty). Reads counters, never the disk |
 | `circuit_state()` | Current `CircuitState` |
@@ -307,5 +348,6 @@ Drop cancels the same token, so both background tasks exit even if the consumer 
 - [`../../src/tiered_sink/circuit.rs`](../../src/tiered_sink/circuit.rs)
 - [`../../src/tiered_sink/error.rs`](../../src/tiered_sink/error.rs)
 - [`../../src/tiered_sink/drainer.rs`](../../src/tiered_sink/drainer.rs)
+- [`../../src/tiered_sink/acks.rs`](../../src/tiered_sink/acks.rs) -- pieces waiting on a sync or the drain
 - [../compression.md](../compression.md) -- the `compression` key and its codecs
 - [`../../src/tiered_sink/config.rs`](../../src/tiered_sink/config.rs)

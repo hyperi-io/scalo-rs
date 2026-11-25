@@ -134,6 +134,16 @@ An app's own listener, such as an HTTP endpoint that must answer only once its r
 - `ticket.piece()` for each destination send
 - `ticket.outcome().await` for the answer
 
+A `TieredSink` takes a piece with `send_acked(&record, piece)` or `send_batch_acked(&records, piece)`, and reports it once the records are safe: `Delivered` at once on the hot path, and for a spill once a sync covers its entry on disk or the drain delivers it. A full spool or disk, a failed sync and a quarantine report `Errored`, so the source holds and delivers again. One piece covers a batch however many entries it spills into. [tiered-sink.md](tiered-sink.md#durable-acknowledgements) has the full table.
+
+```rust
+let ack = SourceAck::new(&receiver, batch.commit_tokens);
+tiered.send_batch_acked(&batch.records, ack.piece()).await?;
+ack.release().await?; // commits once the spill is synced
+```
+
+The release waits up to `sync_interval_ms` (500 ms) plus the flush. Declare the sink with `.sink_confirms(tiered.confirms_delivery())`, which reports `at_least_once_local`. An `Err` reports `Errored`, a `DeadLetter` included, so screen with `inner().dead_letter_reason` first.
+
 ---
 
 ## Source

@@ -93,6 +93,25 @@ pub struct TieredSinkConfig {
     #[serde(default = "default_drain_batch_max_bytes")]
     pub drain_batch_max_bytes: u64,
 
+    /// Most records one spilled entry holds. Spills waiting on the spill
+    /// lock, from one `send_batch` or concurrent sends, are written as one
+    /// entry up to this. Default 500, held to `drain_batch_max_records`.
+    #[serde(default = "default_spill_batch_max_records")]
+    pub spill_batch_max_records: usize,
+
+    /// Most encoded bytes, before compression, one spilled entry holds.
+    /// Default 256 KiB, held to `drain_batch_max_bytes`. Larger entries
+    /// compress small records better, for more memory per write, a larger
+    /// loss when one fails its CRC, and more to replay after a kill.
+    #[serde(default = "default_spill_batch_max_bytes")]
+    pub spill_batch_max_bytes: u64,
+
+    /// Milliseconds the spill lock's holder waits for more spills before it
+    /// writes. Default 0: a spill waits for nothing it does not have to, and
+    /// each `send` waits out its linger.
+    #[serde(default)]
+    pub spill_batch_linger_ms: u64,
+
     /// Disk-aware capacity management. When configured, a background poller
     /// checks available disk space and stops spooling if the filesystem
     /// exceeds the configured usage threshold.
@@ -126,7 +145,10 @@ pub struct TieredSinkConfig {
     #[serde(default)]
     pub sync_on_spill: bool,
 
-    /// Milliseconds between timed syncs of the spill to disk. 0 turns them off. Default 500.
+    /// Milliseconds between timed syncs of the spill to disk. 0 turns them
+    /// off. Default 500. Each sync releases the acknowledged spills it
+    /// covers, so this is also the longest a spilled piece waits, plus the
+    /// flush. With 0 and `sync_on_spill` false, `send_acked` reports Errored.
     #[serde(default = "default_sync_interval_ms")]
     pub sync_interval_ms: u64,
 
@@ -186,6 +208,14 @@ fn default_drain_batch_max_bytes() -> u64 {
     4 * 1024 * 1024
 }
 
+fn default_spill_batch_max_records() -> usize {
+    500
+}
+
+fn default_spill_batch_max_bytes() -> u64 {
+    256 * 1024
+}
+
 fn default_sync_interval_ms() -> u64 {
     crate::spool_codec::DEFAULT_SYNC_INTERVAL_MS
 }
@@ -217,6 +247,9 @@ impl TieredSinkConfig {
             drain_interval_ms: default_drain_interval_ms(),
             drain_batch_max_records: default_drain_batch_max_records(),
             drain_batch_max_bytes: default_drain_batch_max_bytes(),
+            spill_batch_max_records: default_spill_batch_max_records(),
+            spill_batch_max_bytes: default_spill_batch_max_bytes(),
+            spill_batch_linger_ms: 0,
             disk_aware: None,
             crc: true,
             on_corruption: CorruptionPolicy::Quarantine,

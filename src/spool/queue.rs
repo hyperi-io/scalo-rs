@@ -16,7 +16,7 @@ use crate::compression::{Codec, Compression, Compressor};
 use crate::concurrency::PeriodicWorker;
 use crate::spool::{CorruptionPolicy, Result, SpoolConfig, SpoolError};
 use crate::spool_codec::{
-    self, CorruptionError, Decoders, FullDisk, QueueCell, StoreMetrics, SyncTicker,
+    self, CorruptionError, Decoders, FullDisk, QueueCell, StoreMetrics, SyncTicker, Unreadable,
 };
 use crate::yaque::{self, MemoryGuard, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
@@ -70,14 +70,6 @@ fn live(queue: &mut Option<Queue>) -> Result<&mut Queue> {
     })
 }
 
-/// Why a stored record did not decode.
-enum Unreadable {
-    /// Its CRC did not match.
-    Damaged(CorruptionError),
-    /// It did not decompress.
-    Codec(String),
-}
-
 impl Spool {
     /// Open the queue at the configured path, creating it if absent.
     ///
@@ -105,8 +97,8 @@ impl Spool {
         let options = options(&config);
         let (sender, receiver, len, bytes) = tokio::task::spawn_blocking(move || {
             let (sender, receiver) = open_queue(&path, policy, options)?;
-            let (len, bytes) = receiver.queued().unwrap_or((0, 0));
-            Ok::<_, SpoolError>((sender, receiver, len, bytes))
+            let queued = receiver.queued().unwrap_or_default();
+            Ok::<_, SpoolError>((sender, receiver, queued.entries, queued.bytes))
         })
         .await
         .map_err(|e| SpoolError::Open {
@@ -121,6 +113,7 @@ impl Spool {
                 path: config.path.clone(),
                 store: STORE,
                 cell: Arc::clone(&cell),
+                waiters: None,
             },
             Duration::from_millis(config.sync_interval_ms),
             shutdown.clone(),
@@ -238,10 +231,23 @@ impl Spool {
             data
         };
         let compressing = started.elapsed();
+        let decoded = u32::try_from(data.len()).map_err(|_| {
+            SpoolError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "a record of {} bytes is past what a spool entry names",
+                    data.len()
+                ),
+            ))
+        })?;
         let prefix = spool_codec::prefix(
             self.compressor.compression().codec,
             self.config.crc,
             spool_codec::now_ms(),
+            spool_codec::Counted {
+                records: 1,
+                decoded,
+            },
             body,
         );
         let written = prefix.len() + body.len();
@@ -295,9 +301,15 @@ impl Spool {
     /// spool.
     pub async fn sync(&mut self) -> Result<()> {
         live(&mut self.queue)?;
-        spool_codec::sync_queue(self.config.path.clone(), STORE, Arc::clone(&self.cell))
-            .await
-            .map_err(SpoolError::Io)
+        spool_codec::sync_queue(
+            self.config.path.clone(),
+            STORE,
+            Arc::clone(&self.cell),
+            None,
+        )
+        .await
+        .map(|_| ())
+        .map_err(SpoolError::Io)
     }
 
     /// Take one record of `written` bytes off the counts.
@@ -381,8 +393,7 @@ impl Spool {
         let entry =
             spool_codec::unframe(&queue.receiver.taken()[0]).map_err(Unreadable::Damaged)?;
         self.decoders
-            .decode_into(&entry, out)
-            .map_err(Unreadable::Codec)
+            .decode_into(&entry, out, spool_codec::PREVIOUS_DECODE_CAP)
     }
 
     /// Drops the record that failed its CRC, counting it. Under `Fail` the
@@ -601,6 +612,7 @@ fn options(config: &SpoolConfig) -> yaque::Options {
         recycle_bytes: config.read_buffer_bytes,
         whole: Some(spool_codec::whole),
         damaged_tail: Some(spool_codec::keep_damaged_tail),
+        shape: Some(spool_codec::shape),
         store: STORE,
     }
 }
@@ -953,6 +965,49 @@ mod tests {
                 .any(|e| e.file_name().to_string_lossy().starts_with("corrupt-"));
             assert!(!quarantined, "{policy:?}: nothing quarantined");
         }
+    }
+
+    /// A spool in the format before opens, restamped: its records read back,
+    /// one past the 4 MiB drain cap included, then the ones pushed after them.
+    #[tokio::test]
+    async fn a_spool_of_the_format_before_reads_on() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("before");
+        let large = vec![b'l'; 5 << 20];
+        {
+            let options = yaque::Options {
+                shape: None,
+                ..options(&SpoolConfig::new(&path))
+            };
+            let (mut sender, _receiver) = yaque::channel(&path, options).unwrap();
+            for (codec, record) in [
+                (Codec::None, &b"before-0"[..]),
+                (Codec::Zstd, &large[..]),
+                (Codec::Zstd, b"before-1"),
+            ] {
+                let mut body = Vec::new();
+                Compressor::new(Compression::new(codec))
+                    .unwrap()
+                    .compress_into(record, &mut body)
+                    .unwrap();
+                let prefix = spool_codec::previous_prefix(codec, true, 1, &body);
+                sender.send(&prefix, &body).unwrap();
+            }
+        }
+        let stamp = path.join("version").join("contents");
+        std::fs::write(&stamp, "0.7.0\n").unwrap();
+
+        let mut spool = Spool::open(SpoolConfig::with_compression(&path))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&stamp).unwrap().trim(), "0.8.0");
+        assert_eq!(spool.len(), 3);
+        spool.push(b"after").await.unwrap();
+        let mut read = Vec::new();
+        while let Some(record) = spool.pop_front().await.unwrap() {
+            read.push(record);
+        }
+        assert_eq!(read, [&b"before-0"[..], &large[..], b"before-1", b"after"]);
     }
 
     /// A damaged header in the newest segment keeps every record before it.
