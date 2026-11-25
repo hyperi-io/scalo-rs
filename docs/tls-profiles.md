@@ -1,6 +1,6 @@
 # TLS profiles
 
-Every TLS client and server in scalo names a profile, and the profile sets the protocol versions, cipher suites, key-exchange groups and signature schemes. A connection never builds its own cipher or curve list. There are three profiles, and `strong` is the default.
+Every TLS client and server scalo builds names a profile, and the profile sets the protocol versions, cipher suites, key-exchange groups and signature schemes. A connection never builds its own cipher or curve list. There are three profiles, and `strong` is the default. Clients inside other libraries keep those libraries' TLS: Vault through `vaultrs`, AWS Secrets Manager through the AWS SDK, and the OpenTelemetry exporters.
 
 ```yaml
 transport:
@@ -66,7 +66,7 @@ ClickHouse's server takes only P-256 by default and its `ecdhCurve` names no hyb
 
 ## TLS 1.2 and the key share
 
-Every TLS 1.2 handshake logs a warning and counts `tls_tls12_handshakes_total{role, profile}`, on clients and servers. A client that meets a TLS 1.2-only peer on a profile without `allow_tls12` fails with:
+Every TLS 1.2 handshake logs a warning and counts `tls_tls12_handshakes_total{role, profile}`, on clients and servers, Kafka's excepted (below). A client that meets a TLS 1.2-only peer on a profile without `allow_tls12` fails with:
 
 ```text
 peer supports only TLS 1.2: enable allow_tls12 on profile strong
@@ -82,7 +82,9 @@ FIPS 140-3 is a build mode, not a profile. No scalo build has it yet: rustls 0.2
 
 librdkafka owns its TLS stack on OpenSSL, so for Kafka the profile becomes OpenSSL lists: `ssl.cipher.suites` gets the profile's TLS 1.2 suites, and `cnsa2` also sets `ssl.curves.list` and `ssl.sigalgs.list`. The other profiles leave groups to OpenSSL, because an OpenSSL before 3.5 refuses a list that names an ML-KEM group. A raw `librdkafka_overrides` key wins over all of these.
 
-librdkafka has no setting for a version floor, so it goes through OpenSSL's own config. Before the first Kafka TLS client, scalo writes `MinProtocol` (TLSv1.3, or TLSv1.2 with `allow_tls12`) into the file `OPENSSL_CONF` names, when that file is missing or one scalo wrote, and OpenSSL reads it once, at its first TLS context. That makes it one Kafka floor per process: every Kafka client takes the first one's, and a later client on another profile logs a warning. An operator's own file is left alone. Set `OPENSSL_CONF` to a writable path in the deployment, or call `scalo::transport::kafka::set_openssl_conf()` first thing in `main`, before the runtime starts. With it unset, the first Kafka TLS client warns that the 1.3 floor is not enforced, and a TLS 1.2 broker is reached on the profile's TLS 1.2 suites.
+librdkafka has no setting for a version floor, and `ssl.cipher.suites` reaches TLS 1.2 only, so both go through OpenSSL's own config. Before the first Kafka TLS client, scalo writes `MinProtocol` (TLSv1.3, or TLSv1.2 with `allow_tls12`) and the profile's TLS 1.3 `Ciphersuites` into the file `OPENSSL_CONF` names, when that file is missing or one scalo wrote. OpenSSL reads it once, at its first TLS context, so every Kafka client in a process takes the first one's settings, and a later client on another profile logs a warning. An operator's own file is left alone.
+
+The file sets OpenSSL's system default, so it reaches every OpenSSL user in the process, and any child process that inherits `OPENSSL_CONF`, not Kafka alone. Set `OPENSSL_CONF` to a writable path in the deployment, or call `scalo::transport::kafka::set_openssl_conf()` first thing in `main`, before the runtime starts. With it unset, the first Kafka TLS client warns that the 1.3 floor is not enforced, and a TLS 1.2 broker is reached on the profile's TLS 1.2 suites. librdkafka does not report the version a broker agrees, so Kafka's TLS 1.2 handshakes are not counted: a Kafka profile with `allow_tls12` logs one warning at start instead.
 
 ## Failures
 

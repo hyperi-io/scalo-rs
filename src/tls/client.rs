@@ -26,7 +26,7 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use super::TlsError;
 use super::pin;
-use super::profile::Posture;
+use super::profile::ProfileSettings;
 use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
 use crate::tls_config::{ClientTlsConfig, SpkiPin, TrustChoice};
 
@@ -49,7 +49,7 @@ pub struct ClientIdentity {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ClientTls {
-    /// The profile the posture comes from.
+    /// The profile the versions, suites and groups come from.
     pub profile: CryptoProfile,
     /// Per-profile settings. `None` reads the `tls.profiles` cascade section
     /// when the config is built.
@@ -148,12 +148,16 @@ impl ClientTls {
     ///
     /// [`TlsError::Profiles`] when the settings come from a cascade section
     /// that does not parse or is refused.
-    pub fn posture(&self) -> Result<Posture, TlsError> {
+    pub fn profile_settings(&self) -> Result<ProfileSettings, TlsError> {
         let profiles = match self.profiles {
             Some(profiles) => profiles,
             None => TlsProfiles::from_cascade().map_err(TlsError::Profiles)?,
         };
-        Ok(Posture::new(self.profile, &profiles, self.key_share))
+        Ok(ProfileSettings::new(
+            self.profile,
+            &profiles,
+            self.key_share,
+        ))
     }
 }
 
@@ -199,10 +203,10 @@ impl ClientTlsConfig {
 /// [`TlsError::Build`] when the OS verifier cannot start or the key does not
 /// match the certificate.
 pub fn build_client_tls(tls: &ClientTls) -> Result<Arc<ClientConfig>, TlsError> {
-    let posture = tls.posture()?;
-    let provider = posture.provider();
+    let settings = tls.profile_settings()?;
+    let provider = settings.provider();
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_protocol_versions(posture.versions())
+        .with_protocol_versions(settings.versions())
         .map_err(|e| TlsError::Build(e.to_string()))?;
     let verifier: Arc<dyn ServerCertVerifier> = match tls.trust {
         TrustChoice::Native => {
@@ -224,8 +228,8 @@ pub fn build_client_tls(tls: &ClientTls) -> Result<Arc<ClientConfig>, TlsError> 
         None => builder.with_no_client_auth(),
     };
     tracing::info!(
-        profile = posture.profile.as_str(),
-        allow_tls12 = posture.allow_tls12,
+        profile = settings.profile.as_str(),
+        allow_tls12 = settings.allow_tls12,
         trust = %tls.trust,
         ca_files = tls.ca_paths.len(),
         mutual_tls = tls.identity.is_some(),

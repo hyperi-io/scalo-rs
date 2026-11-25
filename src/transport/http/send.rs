@@ -301,18 +301,18 @@ pub(super) struct Sender {
     success: Vec<StatusCode>,
     max_retry_after: Duration,
     send_timeout: Duration,
-    /// The TLS posture `builder` carries, which names a handshake failure.
-    posture: crate::tls::Posture,
+    /// The profile settings `builder` carries, which name a handshake failure.
+    settings: crate::tls::ProfileSettings,
 }
 
 impl Sender {
-    /// Finish `builder`, which carries TLS on `posture` and timeouts, for
+    /// Finish `builder`, which carries TLS on `settings` and timeouts, for
     /// posting to `endpoint` and then `config.failover`.
     pub(super) fn new(
         config: &HttpTransportConfig,
         endpoint: &str,
         builder: reqwest::ClientBuilder,
-        posture: crate::tls::Posture,
+        settings: crate::tls::ProfileSettings,
     ) -> TransportResult<Self> {
         let targets = std::iter::once((endpoint, None))
             .chain(
@@ -381,7 +381,7 @@ impl Sender {
             success,
             max_retry_after: Duration::from_millis(config.max_retry_after_ms),
             send_timeout: Duration::from_millis(config.send_timeout_ms),
-            posture,
+            settings,
         })
     }
 
@@ -501,7 +501,7 @@ impl Sender {
                 Err(e) => {
                     let held = e.is_redirect();
                     let timed_out = e.is_timeout();
-                    let tls = crate::tls::describe_failure(&e, self.posture);
+                    let tls = crate::tls::describe_failure(&e, self.settings);
                     let detail = describe(e);
                     tracing::warn!(endpoint = %shown, records, error = %detail, "HTTP request failed");
                     HttpTransport::count_send_error();

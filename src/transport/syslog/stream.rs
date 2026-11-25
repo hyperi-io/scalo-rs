@@ -60,7 +60,7 @@ pub(super) struct ConnectorTls {
     pub(super) config: Arc<rustls::ClientConfig>,
     pub(super) server_name: ServerName<'static>,
     /// Names a handshake failure.
-    pub(super) posture: crate::tls::Posture,
+    pub(super) settings: crate::tls::ProfileSettings,
 }
 
 impl Connector {
@@ -108,7 +108,7 @@ impl Connector {
                     TlsConnector::from(Arc::clone(&tls.config))
                         .connect(tls.server_name.clone(), tcp)
                         .await
-                        .map_err(|e| classify_handshake(e, tls.posture))?,
+                        .map_err(|e| classify_handshake(e, tls.settings))?,
                 ),
             };
             Ok(stream)
@@ -124,9 +124,9 @@ impl Connector {
 }
 
 /// A rustls failure (refused certificate, name or key pin, nothing in common)
-/// is a trust error, named on `posture`.
-fn classify_handshake(e: io::Error, posture: crate::tls::Posture) -> ConnectError {
-    match crate::tls::describe_failure(&e, posture) {
+/// is a trust error, named on `settings`.
+fn classify_handshake(e: io::Error, settings: crate::tls::ProfileSettings) -> ConnectError {
+    match crate::tls::describe_failure(&e, settings) {
         Some(reason) => ConnectError::Trust(reason),
         None => ConnectError::Unreachable(e),
     }

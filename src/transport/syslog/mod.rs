@@ -117,11 +117,11 @@ impl SyslogTransport {
             })?;
             let fail = |e: crate::tls::TlsError| TransportError::Config(format!("syslog: {e}"));
             let client = section.client_tls().map_err(fail)?;
-            let posture = client.posture().map_err(fail)?;
+            let settings = client.profile_settings().map_err(fail)?;
             Some(stream::ConnectorTls {
                 config: crate::tls::build_client_tls(&client).map_err(fail)?,
                 server_name,
-                posture,
+                settings,
             })
         } else {
             None

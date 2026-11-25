@@ -508,8 +508,15 @@ async fn do_version_check(
         instance_id: config.send_instance_id.then(|| resolve_instance_id(config)),
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
+    let mut builder = reqwest::Client::builder().timeout(config.timeout);
+    if crate::tls::is_https(&config.api_url) {
+        let tls = crate::tls::ClientTlsConfig::default()
+            .client_tls()
+            .and_then(|tls| crate::tls::build_client_tls(&tls))
+            .map_err(|e| VersionCheckError::Http(e.to_string()))?;
+        builder = builder.use_preconfigured_tls((*tls).clone());
+    }
+    let client = builder
         .build()
         .map_err(|e| VersionCheckError::Http(e.to_string()))?;
 

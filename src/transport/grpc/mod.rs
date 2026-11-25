@@ -379,9 +379,9 @@ pub struct GrpcTransport {
 #[derive(Clone)]
 struct Wire {
     client: proto::transport_client::TransportClient<tonic::transport::Channel>,
-    /// The TLS posture of an `https://` endpoint, which names a handshake
+    /// The TLS settings of an `https://` endpoint, which names a handshake
     /// failure. `None` in plain text.
-    posture: Option<crate::tls::Posture>,
+    settings: Option<crate::tls::ProfileSettings>,
     send_timeout_ms: u64,
     /// Whether the proxy is refusing CONNECT, shared with the transport's readiness.
     refusals: Refusals,
@@ -419,12 +419,12 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// The channel TLS for `endpoint` and its posture: the `tls` section, or the
+/// The channel TLS for `endpoint` and its settings: the `tls` section, or the
 /// defaults when there is none, for `https://`, and `None` for `http://`.
 fn build_grpc_client_tls(
     config: &GrpcConfig,
     endpoint: &str,
-) -> TransportResult<Option<(ChannelTls, crate::tls::Posture)>> {
+) -> TransportResult<Option<(ChannelTls, crate::tls::ProfileSettings)>> {
     let fail = |e: &dyn std::fmt::Display| TransportError::Config(format!("gRPC {e}"));
     let https = endpoint
         .get(..8)
@@ -435,14 +435,14 @@ fn build_grpc_client_tls(
         (true, section) => section.clone().unwrap_or_default(),
     };
     let tls = section.client_tls().map_err(|e| fail(&e))?;
-    let posture = tls.posture().map_err(|e| fail(&e))?;
+    let settings = tls.profile_settings().map_err(|e| fail(&e))?;
     let rustls = crate::tls::build_client_tls(&tls).map_err(|e| fail(&e))?;
     let name = match &tls.server_name {
         Some(name) => name.clone(),
         None => super::tonic_channel::origin_host(endpoint).map_err(|e| fail(&e))?,
     };
     let channel = ChannelTls::new(&rustls, &name).map_err(|e| fail(&e))?;
-    Ok(Some((channel, posture)))
+    Ok(Some((channel, settings)))
 }
 
 /// Builds a [`GrpcTransport`] with the settings [`GrpcConfig`] does not
@@ -604,18 +604,18 @@ fn native_server(
 }
 
 /// The lazily connected client for `endpoint`, with the configured TLS,
-/// deadlines and compression, and the TLS posture when it is `https://`.
+/// deadlines and compression, and the TLS settings when it is `https://`.
 fn build_client(
     config: &GrpcConfig,
     endpoint: &str,
 ) -> TransportResult<(
     proto::transport_client::TransportClient<tonic::transport::Channel>,
-    Option<crate::tls::Posture>,
+    Option<crate::tls::ProfileSettings>,
 )> {
     let tls = build_grpc_client_tls(config, endpoint)?;
     let ep = super::tonic_channel::endpoint(endpoint, None, tls.is_some())
         .map_err(TransportError::Config)?;
-    let (tls, posture) = tls.unzip();
+    let (tls, settings) = tls.unzip();
     let channel =
         super::tonic_channel::lazy_channel(ep, config.send_timeout_ms, config.proxy.dialer()?, tls);
 
@@ -630,7 +630,7 @@ fn build_client(
     if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
         client = client.send_compressed(encoding);
     }
-    Ok((client, posture))
+    Ok((client, settings))
 }
 
 impl GrpcTransport {
@@ -1007,18 +1007,18 @@ fn redelivery_reason(status: &tonic::Status) -> Option<&'static str> {
 
 /// The send result for a failed RPC: backpressure while the server is down or
 /// busy or the proxy refused the tunnel, so the caller retries rather than drops,
-/// and `Fatal(Config)` when the TLS handshake failed on `posture`, which no
+/// and `Fatal(Config)` when the TLS handshake failed on `settings`, which no
 /// retry fixes.
 fn failed_rpc_result(
     status: &tonic::Status,
     refusals: &Refusals,
-    posture: Option<crate::tls::Posture>,
+    settings: Option<crate::tls::ProfileSettings>,
 ) -> SendResult {
     if let Some(refused) = crate::transport::proxy::refusal(status) {
         return refusals.hold(refused, "grpc");
     }
-    let tls = match posture {
-        Some(posture) => crate::tls::describe_failure(status, posture),
+    let tls = match settings {
+        Some(settings) => crate::tls::describe_failure(status, settings),
         None => crate::tls::rustls_error(status).map(ToString::to_string),
     };
     if let Some(tls) = tls {
@@ -1063,7 +1063,7 @@ impl TransportSender for GrpcTransport {
         let Some(Wire {
             client,
             refusals,
-            posture,
+            settings,
             ..
         }) = &self.wire
         else {
@@ -1116,7 +1116,7 @@ impl TransportSender for GrpcTransport {
                 self.max_message_size,
                 status.message(),
             ),
-            Err(status) => failed_rpc_result(&status, refusals, *posture),
+            Err(status) => failed_rpc_result(&status, refusals, *settings),
         };
 
         #[cfg(feature = "metrics")]
@@ -1410,15 +1410,15 @@ fn coalescer(
 
 impl Wire {
     fn new(
-        (client, posture): (
+        (client, settings): (
             proto::transport_client::TransportClient<tonic::transport::Channel>,
-            Option<crate::tls::Posture>,
+            Option<crate::tls::ProfileSettings>,
         ),
         send_timeout_ms: u64,
     ) -> Self {
         Self {
             client,
-            posture,
+            settings,
             send_timeout_ms,
             refusals: Refusals::default(),
             #[cfg(feature = "metrics")]
@@ -1509,7 +1509,7 @@ impl Wire {
             }
             Err(status) => {
                 code = Some(status.code());
-                failed_rpc_result(&status, &self.refusals, self.posture)
+                failed_rpc_result(&status, &self.refusals, self.settings)
             }
         };
 

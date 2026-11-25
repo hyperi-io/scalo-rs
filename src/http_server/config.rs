@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::tls_config::Removed;
+
 /// HTTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -77,6 +79,21 @@ pub struct HttpServerConfig {
     /// to fit under K8s `terminationGracePeriodSeconds`.
     #[serde(default = "default_shutdown_timeout_ms")]
     pub shutdown_timeout_ms: u64,
+
+    /// Removed: `tls.cert_file`.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, deserialize_with = "removed_tls_cert_path")]
+    pub tls_cert_path: Removed,
+
+    /// Removed: `tls.key_file`.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, deserialize_with = "removed_tls_key_path")]
+    pub tls_key_path: Removed,
+}
+
+crate::tls_config::removed_keys! {
+    removed_tls_cert_path: "tls_cert_path" => "tls.cert_file";
+    removed_tls_key_path: "tls_key_path" => "tls.key_file";
 }
 
 fn default_request_timeout_ms() -> u64 {
@@ -117,6 +134,8 @@ impl Default for HttpServerConfig {
             enable_http2: true,
             tls: None,
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
+            tls_cert_path: Removed,
+            tls_key_path: Removed,
         }
     }
 }
@@ -211,6 +230,23 @@ mod tests {
         assert!(tls.is_tls_enabled());
         assert_eq!(tls.validate().is_ok(), cfg!(feature = "tls"));
         assert!(HttpServerConfig::default().validate().is_ok());
+    }
+
+    /// A removed TLS key fails the load, naming its replacement, where the
+    /// server would start on plain HTTP with the key dropped.
+    #[cfg(all(feature = "yaml", feature = "figment"))]
+    #[test]
+    fn a_removed_tls_key_fails_the_load() {
+        crate::tls_config::assert_removed::<HttpServerConfig>(&[
+            (
+                r#"{"bind_address": "0.0.0.0:8443", "tls_cert_path": "/c.pem"}"#,
+                "tls.cert_file",
+            ),
+            (
+                r#"{"bind_address": "0.0.0.0:8443", "tls_key_path": "/k.pem"}"#,
+                "tls.key_file",
+            ),
+        ]);
     }
 
     #[test]

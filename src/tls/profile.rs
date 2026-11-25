@@ -8,8 +8,10 @@
 
 //! Each [`CryptoProfile`] as a rustls provider over aws-lc-rs.
 //!
-//! The lists are taken from rustls's own constants and never from rustls's
-//! defaults, so a rustls release that changes its defaults changes no profile.
+//! Suites and groups are named from rustls's constants, never its defaults, so
+//! a rustls release that changes its defaults changes no suite or group. cnsa2
+//! names its signature schemes too. strong and commercial verify aws-lc-rs's
+//! full signature set, which a rustls release can change.
 
 use std::sync::{Arc, LazyLock};
 
@@ -23,7 +25,7 @@ use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
 
 /// A profile with its cascade settings applied: what one config is built on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Posture {
+pub struct ProfileSettings {
     /// The profile.
     pub profile: CryptoProfile,
     /// Whether TLS 1.2 is offered beside TLS 1.3.
@@ -32,7 +34,7 @@ pub struct Posture {
     pub key_share: KeyShare,
 }
 
-impl Posture {
+impl ProfileSettings {
     /// `profile` with its `profiles` settings, sending `key_share` first.
     #[must_use]
     pub fn new(profile: CryptoProfile, profiles: &TlsProfiles, key_share: KeyShare) -> Self {
@@ -129,7 +131,7 @@ impl Posture {
         }
     }
 
-    /// The aws-lc-rs provider holding this posture's suites, groups and
+    /// The aws-lc-rs provider holding these settings' suites, groups and
     /// signatures.
     #[must_use]
     pub fn provider(self) -> Arc<CryptoProvider> {
@@ -215,8 +217,12 @@ static CNSA2_SIGNATURES: LazyLock<WebPkiSupportedAlgorithms> =
 mod tests {
     use super::*;
 
-    fn posture(profile: CryptoProfile, allow_tls12: bool, key_share: KeyShare) -> Posture {
-        Posture::new(
+    fn profile_settings(
+        profile: CryptoProfile,
+        allow_tls12: bool,
+        key_share: KeyShare,
+    ) -> ProfileSettings {
+        ProfileSettings::new(
             profile,
             &TlsProfiles::default().with_tls12(CryptoProfile::Strong, allow_tls12),
             key_share,
@@ -230,7 +236,7 @@ mod tests {
         use rustls::CipherSuite as C;
         use rustls::NamedGroup as G;
 
-        let names = |p: Posture| {
+        let names = |p: ProfileSettings| {
             let suites: Vec<C> = p.cipher_suites().iter().map(|s| s.suite()).collect();
             let groups: Vec<G> = p.kx_groups().iter().map(|g| g.name()).collect();
             (suites, groups)
@@ -247,16 +253,16 @@ mod tests {
             G::X25519,
             G::secp256r1,
         ];
-        let cases: Vec<(&str, Posture, Vec<C>, Vec<G>)> = vec![
+        let cases: Vec<(&str, ProfileSettings, Vec<C>, Vec<G>)> = vec![
             (
                 "strong",
-                posture(CryptoProfile::Strong, false, KeyShare::Profile),
+                profile_settings(CryptoProfile::Strong, false, KeyShare::Profile),
                 strong13.clone(),
                 strong_groups.clone(),
             ),
             (
                 "strong with allow_tls12",
-                posture(CryptoProfile::Strong, true, KeyShare::Profile),
+                profile_settings(CryptoProfile::Strong, true, KeyShare::Profile),
                 [
                     strong13.as_slice(),
                     &[
@@ -269,7 +275,7 @@ mod tests {
             ),
             (
                 "strong, classical share first",
-                posture(CryptoProfile::Strong, false, KeyShare::Classical),
+                profile_settings(CryptoProfile::Strong, false, KeyShare::Classical),
                 strong13,
                 vec![
                     G::secp384r1,
@@ -281,7 +287,7 @@ mod tests {
             ),
             (
                 "commercial",
-                posture(CryptoProfile::Commercial, false, KeyShare::Profile),
+                profile_settings(CryptoProfile::Commercial, false, KeyShare::Profile),
                 vec![
                     C::TLS13_AES_128_GCM_SHA256,
                     C::TLS13_AES_256_GCM_SHA384,
@@ -297,7 +303,7 @@ mod tests {
             ),
             (
                 "cnsa2",
-                posture(CryptoProfile::Cnsa2, false, KeyShare::Profile),
+                profile_settings(CryptoProfile::Cnsa2, false, KeyShare::Profile),
                 vec![C::TLS13_AES_256_GCM_SHA384],
                 vec![G::MLKEM1024, G::secp384r1],
             ),
@@ -306,12 +312,13 @@ mod tests {
             assert_eq!(names(p), (suites, groups), "{name}");
         }
 
-        let cnsa2: Vec<SignatureScheme> = posture(CryptoProfile::Cnsa2, false, KeyShare::Profile)
-            .signatures()
-            .mapping
-            .iter()
-            .map(|(scheme, _)| *scheme)
-            .collect();
+        let cnsa2: Vec<SignatureScheme> =
+            profile_settings(CryptoProfile::Cnsa2, false, KeyShare::Profile)
+                .signatures()
+                .mapping
+                .iter()
+                .map(|(scheme, _)| *scheme)
+                .collect();
         assert_eq!(
             cnsa2,
             [
@@ -320,14 +327,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            posture(CryptoProfile::Cnsa2, false, KeyShare::Profile)
+            profile_settings(CryptoProfile::Cnsa2, false, KeyShare::Profile)
                 .signatures()
                 .all
                 .len(),
             2,
             "cnsa2 verifies ECDSA P-384 with SHA-384 and ML-DSA-87 certificates only"
         );
-        let strong = posture(CryptoProfile::Strong, false, KeyShare::Profile).signatures();
+        let strong = profile_settings(CryptoProfile::Strong, false, KeyShare::Profile).signatures();
         assert!(
             strong
                 .mapping
@@ -341,7 +348,7 @@ mod tests {
     #[test]
     fn cnsa2_has_no_tls12() {
         let profiles = TlsProfiles::default().with_tls12(CryptoProfile::Cnsa2, true);
-        let p = Posture::new(CryptoProfile::Cnsa2, &profiles, KeyShare::Profile);
+        let p = ProfileSettings::new(CryptoProfile::Cnsa2, &profiles, KeyShare::Profile);
         assert!(!p.allow_tls12);
         assert_eq!(p.versions().len(), 1);
     }

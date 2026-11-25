@@ -42,6 +42,12 @@ pub struct HttpClientConfig {
     /// Custom User-Agent header. Default: None (uses reqwest default).
     #[serde(default)]
     pub user_agent: Option<String>,
+
+    /// Client TLS for `https://` calls, the
+    /// [`ClientTlsConfig`](crate::tls::ClientTlsConfig) every client reads.
+    /// The URL's host is the name checked, so `server_name` is refused.
+    #[serde(default)]
+    pub tls: crate::tls::ClientTlsConfig,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -70,6 +76,7 @@ impl Default for HttpClientConfig {
             max_retry_interval_ms: default_max_retry_interval_ms(),
             retry_non_idempotent: false,
             user_agent: None,
+            tls: crate::tls::ClientTlsConfig::default(),
         }
     }
 }

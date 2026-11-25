@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/crypto.rs
-// Purpose:   TLS profiles: the named crypto postures every TLS client and server selects
+// Purpose:   TLS profiles, which every TLS client and server selects by name
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -36,7 +36,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A named TLS posture. `strong` is the default.
+/// A named TLS profile. `strong` is the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -46,7 +46,7 @@ pub enum CryptoProfile {
     #[default]
     Strong,
     /// TLS 1.3 and 1.2, every ECDHE AEAD suite, hybrid post-quantum key
-    /// exchange first: the cheapest posture that is still current.
+    /// exchange first: the cheapest profile that is still current.
     Commercial,
     /// TLS 1.3 only, AES-256-GCM, ML-KEM-1024 then P-384, ECDSA P-384 and
     /// ML-DSA-87 signatures. The CNSA 2.0 shape.

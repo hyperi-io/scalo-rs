@@ -50,10 +50,7 @@ pub(super) fn config_error(message: String) -> TransportError {
 ///
 /// `TransportError::Config` for any other scheme.
 pub(super) fn require_https(endpoint: &str) -> TransportResult<()> {
-    if endpoint
-        .get(..8)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-    {
+    if crate::tls::is_https(endpoint) {
         Ok(())
     } else {
         Err(config_error(

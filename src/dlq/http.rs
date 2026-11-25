@@ -31,6 +31,11 @@ pub struct HttpDlqConfig {
 
     /// Request timeout in seconds.
     pub timeout_secs: u64,
+
+    /// Client TLS for an `https://` endpoint, the
+    /// [`ClientTlsConfig`](crate::tls::ClientTlsConfig) every client reads.
+    /// The endpoint's host is the name checked, so `server_name` is refused.
+    pub tls: crate::tls::ClientTlsConfig,
 }
 
 impl Default for HttpDlqConfig {
@@ -39,6 +44,7 @@ impl Default for HttpDlqConfig {
             enabled: false,
             endpoint: String::new(),
             timeout_secs: 30,
+            tls: crate::tls::ClientTlsConfig::default(),
         }
     }
 }
@@ -62,8 +68,24 @@ impl HttpDlqInner {
             return Err(DlqError::BackendError("HTTP DLQ endpoint is empty".into()));
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.timeout_secs))
+        let refused =
+            |e: &dyn std::fmt::Display| DlqError::BackendError(format!("HTTP DLQ TLS: {e}"));
+        let mut builder =
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(config.timeout_secs));
+        if crate::tls::is_https(&config.endpoint) {
+            if config.tls.server_name.is_some() {
+                return Err(refused(
+                    &"tls.server_name is not taken: the endpoint's host is the name checked",
+                ));
+            }
+            let tls = config
+                .tls
+                .client_tls()
+                .and_then(|tls| crate::tls::build_client_tls(&tls))
+                .map_err(|e| refused(&e))?;
+            builder = builder.use_preconfigured_tls((*tls).clone());
+        }
+        let client = builder
             .build()
             .map_err(|e| DlqError::BackendError(format!("failed to build HTTP DLQ client: {e}")))?;
 
@@ -108,6 +130,40 @@ impl HttpDlqInner {
 mod tests {
     use super::*;
 
+    /// An `https://` endpoint builds its TLS from the `tls` section, so a
+    /// mistake in it fails the build, and an `http://` one builds none.
+    #[test]
+    fn only_an_https_endpoint_builds_tls_from_the_section() {
+        let no_roots = crate::tls::ClientTlsConfig {
+            trust: crate::tls::TrustChoice::Bundle,
+            ..crate::tls::ClientTlsConfig::default()
+        };
+        let named = crate::tls::ClientTlsConfig {
+            server_name: Some("other.example".to_string()),
+            ..crate::tls::ClientTlsConfig::default()
+        };
+        let cases = [
+            ("http://127.0.0.1:9/dlq", no_roots.clone(), None),
+            ("https://127.0.0.1:9/dlq", no_roots, Some("no trusted root")),
+            ("https://127.0.0.1:9/dlq", named, Some("server_name")),
+        ];
+        for (endpoint, tls, refused) in cases {
+            let built = HttpDlqInner::new(&HttpDlqConfig {
+                enabled: true,
+                endpoint: endpoint.to_string(),
+                tls,
+                ..HttpDlqConfig::default()
+            });
+            match (refused, built) {
+                (None, Ok(_)) => {}
+                (Some(want), Err(DlqError::BackendError(message))) => {
+                    assert!(message.contains(want), "{endpoint}: {message}");
+                }
+                (_, other) => panic!("{endpoint}: {:?}", other.err()),
+            }
+        }
+    }
+
     /// The body is each entry's JSON followed by one newline, sent as NDJSON.
     #[tokio::test]
     async fn send_batch_posts_one_json_line_per_entry() {
@@ -147,6 +203,7 @@ mod tests {
             enabled: true,
             endpoint: format!("http://{address}/dlq"),
             timeout_secs: 5,
+            ..HttpDlqConfig::default()
         })
         .unwrap();
         let entries = [

@@ -69,6 +69,7 @@ use super::types::PayloadFormat;
 use super::types::SendResult;
 use super::work_batch::WorkBatch;
 use crate::compression::{Accepts, Codec, Compression};
+use crate::tls_config::Removed;
 use serde::{Deserialize, Serialize};
 #[cfg(any(feature = "http-server", feature = "governor"))]
 use std::sync::Arc;
@@ -271,6 +272,47 @@ pub struct HttpTransportConfig {
     /// [`ClientTlsConfig`]: crate::tls::ClientTlsConfig
     #[serde(default)]
     pub tls: crate::tls::ClientTlsConfig,
+
+    /// Removed: `tls.ca_paths`.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, deserialize_with = "removed_tls_ca_path")]
+    pub tls_ca_path: Removed,
+
+    /// Removed: `tls.trust`.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, deserialize_with = "removed_tls_trust")]
+    pub tls_trust: Removed,
+
+    /// Removed: `tls.client_cert_path`.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_tls_client_cert_path"
+    )]
+    pub tls_client_cert_path: Removed,
+
+    /// Removed: `tls.client_key_path`.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_tls_client_key_path"
+    )]
+    pub tls_client_key_path: Removed,
+
+    /// Removed: `tls.pin_sha256`.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, deserialize_with = "removed_tls_pin_sha256")]
+    pub tls_pin_sha256: Removed,
+}
+
+crate::tls_config::removed_keys! {
+    removed_tls_ca_path: "tls_ca_path" => "tls.ca_paths";
+    removed_tls_trust: "tls_trust" => "tls.trust";
+    removed_tls_client_cert_path: "tls_client_cert_path" => "tls.client_cert_path";
+    removed_tls_client_key_path: "tls_client_key_path" => "tls.client_key_path";
+    removed_tls_pin_sha256: "tls_pin_sha256" => "tls.pin_sha256";
 }
 
 impl Default for HttpTransportConfig {
@@ -298,6 +340,11 @@ impl Default for HttpTransportConfig {
             max_body_bytes: default_max_body_bytes(),
             max_in_flight_bytes: default_max_in_flight_bytes(),
             tls: crate::tls::ClientTlsConfig::default(),
+            tls_ca_path: Removed,
+            tls_trust: Removed,
+            tls_client_cert_path: Removed,
+            tls_client_key_path: Removed,
+            tls_pin_sha256: Removed,
         }
     }
 }
@@ -328,7 +375,7 @@ impl std::fmt::Debug for HttpTransportConfig {
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_in_flight_bytes", &self.max_in_flight_bytes)
             .field("tls", &self.tls)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -473,17 +520,22 @@ impl HttpTransport {
         let sender = match config.endpoint.as_deref() {
             Some(endpoint) => {
                 let tls = config.client_tls()?;
-                let posture = tls
-                    .posture()
+                let settings = tls
+                    .profile_settings()
                     .map_err(|e| TransportError::Config(format!("HTTP client {e}")))?;
-                let tls_cfg = crate::tls::build_client_tls(&tls)
-                    .map_err(|e| TransportError::Config(format!("HTTP client {e}")))?;
-                client_builder = client_builder.use_preconfigured_tls((*tls_cfg).clone());
+                // Plain endpoints need no root store, which a scratch image may lack.
+                let mut urls = std::iter::once(endpoint)
+                    .chain(config.failover.iter().map(|failover| failover.url.as_str()));
+                if urls.any(crate::tls::is_https) {
+                    let tls_cfg = crate::tls::build_client_tls(&tls)
+                        .map_err(|e| TransportError::Config(format!("HTTP client {e}")))?;
+                    client_builder = client_builder.use_preconfigured_tls((*tls_cfg).clone());
+                }
                 Some(send::Sender::new(
                     config,
                     endpoint,
                     client_builder,
-                    posture,
+                    settings,
                 )?)
             }
             None => None,
@@ -1241,8 +1293,79 @@ mod tests {
                 ],
                 server_name: None,
                 key_share: KeyShare::Classical,
+                ..ClientTlsConfig::default()
             }
         );
+    }
+
+    /// A sink with only `http://` endpoints builds no TLS, so it starts where
+    /// no root store can be read, and an `https://` endpoint, failover
+    /// included, still needs one.
+    #[tokio::test]
+    async fn only_an_https_endpoint_builds_tls() {
+        let no_roots = crate::tls::ClientTlsConfig {
+            trust: crate::tls::TrustChoice::Bundle,
+            ..crate::tls::ClientTlsConfig::default()
+        };
+        let config = |endpoint: &str, failover: &[&str]| HttpTransportConfig {
+            endpoint: Some(endpoint.to_string()),
+            failover: failover
+                .iter()
+                .map(|url| HttpEndpoint {
+                    url: (*url).to_string(),
+                    auth: None,
+                })
+                .collect(),
+            tls: no_roots.clone(),
+            ..HttpTransportConfig::default()
+        };
+        let cases = [
+            (
+                "plain",
+                config("http://127.0.0.1:9", &["http://127.0.0.1:10"]),
+                None,
+            ),
+            (
+                "https",
+                config("HTTPS://127.0.0.1:9", &[]),
+                Some("no trusted root"),
+            ),
+            (
+                "https failover",
+                config("http://127.0.0.1:9", &["https://127.0.0.1:10"]),
+                Some("no trusted root"),
+            ),
+        ];
+        for (name, config, refused) in cases {
+            let built = HttpTransport::new(&config).await;
+            match (refused, built) {
+                (None, Ok(_)) => {}
+                (Some(want), Err(TransportError::Config(message))) => {
+                    assert!(message.contains(want), "{name}: {message}");
+                }
+                (_, other) => panic!("{name}: {:?}", other.err()),
+            }
+        }
+    }
+
+    /// A removed TLS key fails the load, naming its replacement, where the
+    /// sink would send with the key dropped.
+    #[cfg(all(feature = "yaml", feature = "figment"))]
+    #[test]
+    fn a_removed_tls_key_fails_the_load() {
+        crate::tls_config::assert_removed::<HttpTransportConfig>(&[
+            (r#"{"tls_ca_path": "/ca.pem"}"#, "tls.ca_paths"),
+            (r#"{"tls_trust": "bundle"}"#, "tls.trust"),
+            (
+                r#"{"tls_client_cert_path": "/c.pem"}"#,
+                "tls.client_cert_path",
+            ),
+            (
+                r#"{"tls_client_key_path": "/k.pem"}"#,
+                "tls.client_key_path",
+            ),
+            (r#"{"tls_pin_sha256": ["x"]}"#, "tls.pin_sha256"),
+        ]);
     }
 
     /// The `tls` section refuses what HTTP cannot honour, and a key the
@@ -1268,7 +1391,7 @@ mod tests {
             (
                 "the old one-file ca_path key",
                 serde_json::json!({"tls": {"ca_path": "ca.pem"}}),
-                "unknown field `ca_path`",
+                "`ca_path` is removed: set ca_paths",
             ),
             (
                 "the fips profile",

@@ -255,7 +255,7 @@ mod tests {
             .unwrap();
         let (front, ca) = tls_front(server.local_addr().unwrap(), alpn).await;
         let ca_file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(ca_file.path(), ca).unwrap();
+        tokio::fs::write(ca_file.path(), ca).await.unwrap();
         (server, front, ca_file)
     }
 
@@ -319,7 +319,9 @@ mod tests {
             }
         });
         let ca = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(ca.path(), crate::tls::test_pki::TestCa::new("ca").pem()).unwrap();
+        tokio::fs::write(ca.path(), crate::tls::test_pki::TestCa::new("ca").pem())
+            .await
+            .unwrap();
         let started = Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(5),

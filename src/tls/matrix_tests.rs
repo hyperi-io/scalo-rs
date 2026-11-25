@@ -24,7 +24,7 @@ type Outcome = Result<Agreed, Option<TlsFailure>>;
 
 /// Run `client`'s handshake against `server` in memory.
 fn handshake(client: &ClientTls, server: Arc<rustls::ServerConfig>) -> Outcome {
-    let posture = client.posture().unwrap();
+    let settings = client.profile_settings().unwrap();
     let config = build_client_tls(client).unwrap();
     let mut client =
         ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap();
@@ -40,7 +40,7 @@ fn handshake(client: &ClientTls, server: Arc<rustls::ServerConfig>) -> Outcome {
             let mut rd: &[u8] = &sink;
             while !rd.is_empty() && client.read_tls(&mut rd).is_ok() {}
             let seen = client.process_new_packets().err().unwrap_or(e);
-            Err(TlsFailure::of(&seen, posture))
+            Err(TlsFailure::of(&seen, settings))
         }
     }
 }
@@ -61,7 +61,7 @@ async fn every_client_profile_against_every_server_profile() {
     let ca = TestCa::new("matrix ca");
     let dir = tempfile::tempdir().unwrap();
     let ca_file = dir.path().join("ca.pem");
-    std::fs::write(&ca_file, ca.pem()).unwrap();
+    tokio::fs::write(&ca_file, ca.pem()).await.unwrap();
 
     let hybrid = |suite| Ok(Agreed::tls13(suite, G::X25519MLKEM768));
     let p384 = || Ok(Agreed::tls13(C::TLS13_AES_256_GCM_SHA384, G::secp384r1));
@@ -102,7 +102,7 @@ async fn cnsa2_refuses_a_p256_server_naming_the_next_profile() {
     let ca = TestCa::new("p256 ca");
     let dir = tempfile::tempdir().unwrap();
     let ca_file = dir.path().join("ca.pem");
-    std::fs::write(&ca_file, ca.pem()).unwrap();
+    tokio::fs::write(&ca_file, ca.pem()).await.unwrap();
     let leaf = ca.server_p256("p256");
     let server = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::aws_lc_rs::default_provider().into(),
@@ -145,7 +145,7 @@ async fn a_tls12_peer_is_refused_by_default_and_agreed_with_allow_tls12() {
     let ca = TestCa::new("tls12 ca");
     let dir = tempfile::tempdir().unwrap();
     let ca_file = dir.path().join("ca.pem");
-    std::fs::write(&ca_file, ca.pem()).unwrap();
+    tokio::fs::write(&ca_file, ca.pem()).await.unwrap();
     let leaf = ca.server("tls12");
     let server = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::aws_lc_rs::default_provider().into(),
@@ -189,7 +189,7 @@ async fn a_strong_server_takes_tls12_only_with_allow_tls12() {
     let ca = TestCa::new("server tls12 ca");
     let dir = tempfile::tempdir().unwrap();
     let ca_file = dir.path().join("ca.pem");
-    std::fs::write(&ca_file, ca.pem()).unwrap();
+    tokio::fs::write(&ca_file, ca.pem()).await.unwrap();
     let commercial_tls12 = || {
         let mut roots = rustls::RootCertStore::empty();
         roots.add_parsable_certificates(super::client::read_certs(&ca_file).unwrap());
@@ -206,8 +206,8 @@ async fn a_strong_server_takes_tls12_only_with_allow_tls12() {
 
     let leaf = ca.server("strong server");
     let (cert, key) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
-    std::fs::write(&cert, &leaf.cert_pem).unwrap();
-    std::fs::write(&key, &leaf.key_pem).unwrap();
+    tokio::fs::write(&cert, &leaf.cert_pem).await.unwrap();
+    tokio::fs::write(&key, &leaf.key_pem).await.unwrap();
     let config = super::ServerTlsConfig {
         reload_interval_secs: 0,
         ..super::ServerTlsConfig::from_files(cert, key)

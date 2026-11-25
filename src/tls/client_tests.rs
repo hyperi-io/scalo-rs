@@ -18,12 +18,12 @@ use tempfile::TempDir;
 use super::{ClientTls, TrustChoice, build_client_tls, read_certs};
 use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
 use crate::tls::TlsError;
-use crate::tls::profile::Posture;
+use crate::tls::profile::ProfileSettings;
 use crate::tls::test_pki::{Leaf, TestCa, pump};
 
-/// The strong posture with the default settings.
-fn strong() -> Posture {
-    Posture::new(
+/// The strong profile on the default settings.
+fn strong() -> ProfileSettings {
+    ProfileSettings::new(
         CryptoProfile::Strong,
         &TlsProfiles::default(),
         KeyShare::Profile,

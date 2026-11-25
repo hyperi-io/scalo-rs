@@ -23,7 +23,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-use super::profile::Posture;
+use super::profile::ProfileSettings;
 use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
 
 /// A fresh ECDSA P-384 key, the key every profile verifies, cnsa2 included.
@@ -124,13 +124,13 @@ pub(crate) fn connector(ca_pem: &str, identity: Option<&Leaf>, alpn: &[&[u8]]) -
     for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
         roots.add(cert.unwrap()).unwrap();
     }
-    let posture = Posture::new(
+    let settings = ProfileSettings::new(
         CryptoProfile::Strong,
         &TlsProfiles::default(),
         KeyShare::Profile,
     );
-    let builder = ClientConfig::builder_with_provider(posture.provider())
-        .with_protocol_versions(posture.versions())
+    let builder = ClientConfig::builder_with_provider(settings.provider())
+        .with_protocol_versions(settings.versions())
         .unwrap()
         .with_root_certificates(roots);
     let mut config = match identity {
@@ -312,9 +312,9 @@ pub(crate) async fn server_tls_with(
         dir.path().join("key.pem"),
         dir.path().join("ca.pem"),
     );
-    std::fs::write(&cert, &leaf.cert_pem).unwrap();
-    std::fs::write(&key, &leaf.key_pem).unwrap();
-    std::fs::write(&ca_file, ca.pem()).unwrap();
+    tokio::fs::write(&cert, &leaf.cert_pem).await.unwrap();
+    tokio::fs::write(&key, &leaf.key_pem).await.unwrap();
+    tokio::fs::write(&ca_file, ca.pem()).await.unwrap();
     let config = super::ServerTlsConfig {
         profile,
         client_auth,
@@ -336,11 +336,23 @@ pub(crate) async fn server_tls_with(
 
 /// A TLS listener on localhost in front of `upstream`: each connection's
 /// handshake runs on `tls` and is noted, then its plain bytes are relayed.
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-syslog",
+    feature = "transport-otlp",
+    feature = "transport-grpc"
+))]
 pub(crate) struct Front {
     pub addr: SocketAddr,
     agreed: Arc<std::sync::Mutex<Vec<Agreed>>>,
 }
 
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-syslog",
+    feature = "transport-otlp",
+    feature = "transport-grpc"
+))]
 impl Front {
     pub(crate) async fn start(tls: super::ServerTls, upstream: SocketAddr) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -370,6 +382,46 @@ impl Front {
     pub(crate) fn agreed(&self) -> Vec<Agreed> {
         self.agreed.lock().unwrap().clone()
     }
+}
+
+/// An HTTPS server on localhost that offers TLS 1.2 only, on a certificate
+/// from `ca`, and answers every request 200 with an empty body.
+#[cfg(feature = "http")]
+pub(crate) async fn tls12_https_server(ca: &TestCa) -> SocketAddr {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let leaf = ca.server("tls12 https");
+    let config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS12])
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![leaf.der.clone()],
+        PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
 }
 
 /// Connect to `addr` and run the client handshake for `localhost`.

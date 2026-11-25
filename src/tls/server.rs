@@ -43,7 +43,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
 
 use super::TlsError;
-use super::profile::Posture;
+use super::profile::ProfileSettings;
 use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
 use crate::tls_config::{ClientAuth, ServerTlsConfig};
 
@@ -144,7 +144,7 @@ pub struct ServerTls {
 struct Inner {
     config: ServerTlsConfig,
     options: ServerTlsOptions,
-    posture: Posture,
+    settings: ProfileSettings,
     provider: Arc<CryptoProvider>,
     resolver: Arc<CertResolver>,
     server_config: ArcSwap<ServerConfig>,
@@ -162,7 +162,7 @@ impl fmt::Debug for ServerTls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerTls")
             .field("config", &self.inner.config)
-            .field("posture", &self.inner.posture)
+            .field("settings", &self.inner.settings)
             .finish_non_exhaustive()
     }
 }
@@ -202,17 +202,18 @@ impl ServerTls {
             Some(profiles) => profiles,
             None => TlsProfiles::from_cascade().map_err(TlsError::Profiles)?,
         };
-        let posture = Posture::new(config.profile, &profiles, KeyShare::Profile);
+        let settings = ProfileSettings::new(config.profile, &profiles, KeyShare::Profile);
         let material = sources.read().await?;
-        let provider = posture.provider();
+        let provider = settings.provider();
 
         let key = certified_key(&material.cert, &material.key, &provider)?;
         let resolver = Arc::new(CertResolver::new(key));
         let verifier = client_verifier(config.client_auth, material.ca.as_deref(), &provider)?;
-        let server_config = build_server_config(&options, posture, &provider, verifier, &resolver)?;
+        let server_config =
+            build_server_config(&options, settings, &provider, verifier, &resolver)?;
         tracing::info!(
-            profile = posture.profile.as_str(),
-            allow_tls12 = posture.allow_tls12,
+            profile = settings.profile.as_str(),
+            allow_tls12 = settings.allow_tls12,
             client_auth = %config.client_auth,
             "TLS server config built"
         );
@@ -221,7 +222,7 @@ impl ServerTls {
             inner: Arc::new(Inner {
                 config: config.clone(),
                 options,
-                posture,
+                settings,
                 provider,
                 resolver,
                 server_config: ArcSwap::from_pointee(server_config),
@@ -246,8 +247,8 @@ impl ServerTls {
     /// The profile, with its settings, every config from this `ServerTls` is
     /// built on.
     #[must_use]
-    pub fn posture(&self) -> Posture {
-        self.inner.posture
+    pub fn profile_settings(&self) -> ProfileSettings {
+        self.inner.settings
     }
 
     /// The certificate resolver every config from this `ServerTls` uses.
@@ -295,7 +296,7 @@ impl ServerTls {
                 record_handshake(
                     connection.protocol_version(),
                     connection.negotiated_key_exchange_group().map(|g| g.name()),
-                    self.inner.posture.profile,
+                    self.inner.settings.profile,
                 );
                 Ok(stream)
             }
@@ -414,7 +415,7 @@ impl Inner {
             )?;
             Some(build_server_config(
                 &self.options,
-                self.posture,
+                self.settings,
                 &self.provider,
                 verifier,
                 &self.resolver,
@@ -678,14 +679,14 @@ fn client_verifier(
 
 fn build_server_config(
     options: &ServerTlsOptions,
-    posture: Posture,
+    settings: ProfileSettings,
     provider: &Arc<CryptoProvider>,
     verifier: Arc<dyn ClientCertVerifier>,
     resolver: &Arc<CertResolver>,
 ) -> Result<ServerConfig, TlsError> {
     let resolver: Arc<dyn ResolvesServerCert> = Arc::clone(resolver) as _;
     let mut config = ServerConfig::builder_with_provider(Arc::clone(provider))
-        .with_protocol_versions(posture.versions())
+        .with_protocol_versions(settings.versions())
         .map_err(|e| TlsError::Build(e.to_string()))?
         .with_client_cert_verifier(verifier)
         .with_cert_resolver(resolver);

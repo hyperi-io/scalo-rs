@@ -84,9 +84,9 @@ pub struct OtlpTransport {
     /// Whether the proxy is refusing CONNECT, which lasts until an export goes through.
     refusals: crate::transport::proxy::Refusals,
     filter_engine: TransportFilterEngine,
-    /// The TLS posture of an `https://` collector, which names a handshake
+    /// The TLS settings of an `https://` collector, which names a handshake
     /// failure. `None` in plain text.
-    posture: Option<crate::tls::Posture>,
+    settings: Option<crate::tls::ProfileSettings>,
 }
 
 /// The client for the configured protocol and what every request carries.
@@ -232,9 +232,9 @@ impl OtlpTransport {
         let parsed = reqwest::Url::parse(&url)
             .map_err(|e| config_error(format!("invalid endpoint: {e}")))?;
         let tls = config.client_tls(&url)?;
-        let posture = tls
+        let settings = tls
             .as_ref()
-            .map(crate::tls::ClientTls::posture)
+            .map(crate::tls::ClientTls::profile_settings)
             .transpose()
             .map_err(|e| config_error(e.to_string()))?;
         let connect_to = config.connect_to()?;
@@ -282,15 +282,15 @@ impl OtlpTransport {
             lifecycle,
             refusals,
             filter_engine,
-            posture,
+            settings,
         })
     }
 
     /// Why the TLS handshake behind `error` failed, named on this transport's
     /// profile. `None` when no TLS error is in it.
     fn tls_failure(&self, error: &(dyn std::error::Error + 'static)) -> Option<String> {
-        match self.posture {
-            Some(posture) => crate::tls::describe_failure(error, posture),
+        match self.settings {
+            Some(settings) => crate::tls::describe_failure(error, settings),
             None => crate::tls::rustls_error(error).map(ToString::to_string),
         }
     }

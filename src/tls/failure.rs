@@ -14,7 +14,7 @@
 //! never sees the server's offer, only the alert it sent, so a refusal of
 //! every suite and group is worded from that alert.
 
-use super::profile::Posture;
+use super::profile::ProfileSettings;
 use crate::tls_config::{TlsFailure, Whose};
 
 /// The error the key pin check fails a chain with, found by [`TlsFailure`].
@@ -24,26 +24,29 @@ pub(crate) struct PinMismatch;
 
 impl TlsFailure {
     /// The failure behind the rustls error in `error` or its causes, for a
-    /// connection on `posture`. `None` when there is none, or the error is
+    /// connection on `settings`. `None` when there is none, or the error is
     /// not one of these.
     #[must_use]
-    pub fn find(error: &(dyn std::error::Error + 'static), posture: Posture) -> Option<Self> {
-        super::rustls_error(error).and_then(|tls| Self::of(tls, posture))
+    pub fn find(
+        error: &(dyn std::error::Error + 'static),
+        settings: ProfileSettings,
+    ) -> Option<Self> {
+        super::rustls_error(error).and_then(|tls| Self::of(tls, settings))
     }
 
-    /// The failure `error` is, for a connection on `posture`.
+    /// The failure `error` is, for a connection on `settings`.
     #[must_use]
-    pub fn of(error: &rustls::Error, posture: Posture) -> Option<Self> {
+    pub fn of(error: &rustls::Error, settings: ProfileSettings) -> Option<Self> {
         use rustls::{AlertDescription as A, CertificateError as C, PeerIncompatible as P};
 
-        let profile = posture.profile;
+        let profile = settings.profile;
         let no_shared = || Self::NoSharedParameters {
             profile,
             wider: profile.wider(),
         };
         let version = || Self::VersionMismatch {
             profile,
-            tls12_offered: posture.allow_tls12,
+            tls12_offered: settings.allow_tls12,
         };
         Some(match error {
             rustls::Error::InvalidCertificate(certificate) => match certificate {
@@ -101,7 +104,8 @@ mod tests {
 
         use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
 
-        let posture = |profile| Posture::new(profile, &TlsProfiles::default(), KeyShare::Profile);
+        let settings =
+            |profile| ProfileSettings::new(profile, &TlsProfiles::default(), KeyShare::Profile);
         let strong = CryptoProfile::Strong;
         let cases: Vec<(E, Option<TlsFailure>)> = vec![
             (
@@ -151,17 +155,17 @@ mod tests {
         ];
         for (error, want) in cases {
             let name = format!("{error:?}");
-            assert_eq!(TlsFailure::of(&error, posture(strong)), want, "{name}");
+            assert_eq!(TlsFailure::of(&error, settings(strong)), want, "{name}");
             let wrapped = std::io::Error::new(std::io::ErrorKind::InvalidData, error);
             assert_eq!(
-                TlsFailure::find(&wrapped, posture(strong)),
+                TlsFailure::find(&wrapped, settings(strong)),
                 want,
                 "{name} in an io::Error"
             );
         }
 
         let message = |error: E, profile| {
-            TlsFailure::of(&error, posture(profile))
+            TlsFailure::of(&error, settings(profile))
                 .unwrap()
                 .to_string()
         };

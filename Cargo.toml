@@ -81,8 +81,8 @@ service-metrics = ["metrics"]
 directory-config = ["yaml", "serde_json/preserve_order", "tokio", "tracing"]
 directory-config-git = ["directory-config", "git2"]
 
-# `base64` encodes Basic auth for the signer, and `bytes` holds the body across retries.
-http = ["reqwest", "serde_json", "dep:backon", "tokio", "base64", "bytes"]
+# `base64` encodes Basic auth for the signer, `bytes` holds the body across retries, and `tls` builds the client TLS from a profile.
+http = ["reqwest", "serde_json", "dep:backon", "tokio", "base64", "bytes", "tls"]
 
 # reqwest gates its `query` and `form` encoders, so this feature alone pays for them. docs/api/auth.md
 auth = [
@@ -134,7 +134,7 @@ io = ["parking_lot", "dep:jiff", "compression", "tracing", "tokio"]
 # `wide` compiles parse_guard, which caps the depth of an original filed under `_json`.
 dlq = ["io", "concurrency", "base64", "serde_json", "serde_json/raw_value", "tokio", "tokio-util", "tracing", "dep:wide"]
 dlq-kafka = ["dlq", "transport-kafka"]
-dlq-http = ["dlq", "reqwest"]
+dlq-http = ["dlq", "reqwest", "tls"]
 
 output-file = ["io", "serde_json", "tracing"]
 
@@ -156,7 +156,7 @@ testcontainers = ["transport-kafka-test-support", "transport-proxy-test-support"
 # docs/reflectable-config-shape.md
 config-schema = ["dep:schemars", "serde_json", "deployment"]
 
-version-check = ["reqwest", "tokio", "serde_json", "tracing", "dep:jiff", "dirs", "dep:uuid"]
+version-check = ["reqwest", "tokio", "serde_json", "tracing", "dep:jiff", "dirs", "dep:uuid", "tls"]
 
 # `reqwest/query` sits here, not on `http`, so only this feature pays for `serde_urlencoded`.
 geoip-download = ["http", "reqwest/query", "dep:flate2", "dep:tar", "tokio", "dep:jiff", "tracing"]

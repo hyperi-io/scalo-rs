@@ -37,6 +37,27 @@ use crate::crypto::CryptoProfile;
 #[cfg(any(feature = "tls", feature = "transport-kafka-config"))]
 use crate::crypto::KeyShare;
 
+/// A removed config key. Any value for it fails the load, naming the key that
+/// replaced it, so a config written for the old shape can't load with its TLS
+/// settings dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Removed;
+
+/// One private deserialiser per removed key, each failing with the key's
+/// replacement: `name: "old_key" => "what to set";`.
+macro_rules! removed_keys {
+    ($($name:ident: $old:literal => $new:literal;)*) => {$(
+        fn $name<'de, D: serde::Deserializer<'de>>(
+            _: D,
+        ) -> Result<$crate::tls_config::Removed, D::Error> {
+            Err(serde::de::Error::custom(concat!(
+                "`", $old, "` is removed: set ", $new, " (docs/migrations.md)"
+            )))
+        }
+    )*};
+}
+pub(crate) use removed_keys;
+
 /// One path or a list of them.
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -247,6 +268,16 @@ pub struct ClientTlsConfig {
     /// `profile` (default) sends the profile's first group, a post-quantum
     /// one. `classical` sends a classical share first.
     pub key_share: KeyShare,
+    /// Removed: `ca_paths`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_ca_path")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub ca_path: Removed,
+}
+
+#[cfg(any(feature = "tls", feature = "transport-kafka-config"))]
+crate::tls_config::removed_keys! {
+    removed_ca_path: "ca_path" => "ca_paths, one path or a list";
 }
 
 #[cfg(any(feature = "tls", feature = "transport-kafka-config"))]
@@ -447,6 +478,16 @@ pub struct ServerTlsConfig {
     /// How long a client has to finish its handshake, in milliseconds.
     /// Default 10,000.
     pub handshake_timeout_ms: u64,
+    /// Removed: `ca_files`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_ca_file")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub ca_file: Removed,
+}
+
+#[cfg(any(feature = "tls", feature = "http-server"))]
+crate::tls_config::removed_keys! {
+    removed_ca_file: "ca_file" => "ca_files, one path or a list";
 }
 
 #[cfg(any(feature = "tls", feature = "http-server"))]
@@ -463,6 +504,7 @@ impl Default for ServerTlsConfig {
             client_auth: ClientAuth::None,
             reload_interval_secs: 30,
             handshake_timeout_ms: 10_000,
+            ca_file: Removed,
         }
     }
 }
@@ -483,7 +525,7 @@ impl std::fmt::Debug for ServerTlsConfig {
             .field("client_auth", &self.client_auth)
             .field("reload_interval_secs", &self.reload_interval_secs)
             .field("handshake_timeout_ms", &self.handshake_timeout_ms)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -500,11 +542,51 @@ impl ServerTlsConfig {
     }
 }
 
+/// Each `(document, replacement)` row fails to load into `T`, through the
+/// YAML parser and through figment, with an error naming the replacement.
+/// Each document is a JSON object, which is YAML too.
+#[cfg(all(test, feature = "yaml", feature = "figment"))]
+pub(crate) fn assert_removed<T: serde::de::DeserializeOwned>(rows: &[(&str, &str)]) {
+    for (document, replacement) in rows {
+        let errors = [
+            crate::yaml::from_str::<T>(document, "removed", crate::yaml::Profile::Config)
+                .err()
+                .map(|e| e.to_string()),
+            figment::Figment::from(
+                <figment::providers::Json as figment::providers::Format>::string(document),
+            )
+            .extract::<T>()
+            .err()
+            .map(|e| e.to_string()),
+        ];
+        for (reader, error) in ["yaml", "figment"].iter().zip(errors) {
+            let Some(error) = error else {
+                panic!("{reader} loaded {document}");
+            };
+            assert!(
+                error.contains("is removed") && error.contains(replacement),
+                "{reader}, {document}: {error}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde::de::value::{Error, StrDeserializer};
 
     use super::*;
+
+    /// A removed key in a `tls` section fails the load, naming its
+    /// replacement, where it was dropped.
+    #[cfg(all(feature = "yaml", feature = "figment"))]
+    #[test]
+    fn a_removed_tls_key_fails_the_load() {
+        #[cfg(any(feature = "tls", feature = "transport-kafka-config"))]
+        assert_removed::<ClientTlsConfig>(&[(r#"{"ca_path": "/ca.pem"}"#, "ca_paths")]);
+        #[cfg(any(feature = "tls", feature = "http-server"))]
+        assert_removed::<ServerTlsConfig>(&[(r#"{"ca_file": "/ca.pem"}"#, "ca_files")]);
+    }
 
     /// Base64 and hex of the same 32 bytes read as one pin, which prints as
     /// base64. Any other text fails to parse, from text and from config.

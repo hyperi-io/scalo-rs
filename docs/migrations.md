@@ -10,7 +10,7 @@ release and the target before bumping.
 
 ### One TLS section on named profiles (API, CONFIG and BEHAVIOUR CHANGE)
 
-Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `ServerTlsConfig`, each with a `profile`, `strong` by default and TLS 1.3 only. `tls.profiles.<name>.allow_tls12` turns TLS 1.2 on per profile ([tls-profiles.md](tls-profiles.md)). Unknown keys fail the load.
+Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `ServerTlsConfig`, each with a `profile`, `strong` by default and TLS 1.3 only. `tls.profiles.<name>.allow_tls12` turns TLS 1.2 on per profile ([tls-profiles.md](tls-profiles.md)). Each old key below fails the load with an error naming its new key, and an unknown key inside a `tls` section fails it too.
 
 | Old key | New key |
 | --- | --- |
@@ -25,7 +25,7 @@ Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `
 | server `tls.ca_file` | `tls.ca_files` |
 | `http_server.tls_{cert,key}_path` | `http_server.tls`, a server section |
 
-- HTTP with no `tls_*` key used reqwest's verifier, and now takes the section's defaults.
+- HTTP with no `tls_*` key used reqwest's verifier, and now takes the section's defaults. `HttpClient` (`http_client.tls`), the HTTP DLQ (`http.tls` in the DLQ section) and the version check build through the same path. `HttpClient` builds its TLS when it is created, so it needs a root store, or `trust: bundle` with CA files. An HTTP sink or DLQ with only `http://` endpoints builds none.
 - gRPC, OTLP-gRPC and Vector compat run scalo's rustls over each stream, take every trust choice and pins, and need ALPN `h2`. scalo enables no tonic TLS feature.
 - `tls_handshakes_total{key_exchange}` reads `post_quantum` for `hybrid`. `tls_tls12_handshakes_total{role, profile}` is new.
 - `CryptoProfile::{Prod, HighSec, DevTest}` become `Strong`, `Cnsa2` and nothing, beside `Commercial`. `PqcMode` and `TlsFloor` are gone. `profile: fips` fails at load.
@@ -35,7 +35,7 @@ Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `
 
 ### Kafka's TLS floor goes through OPENSSL_CONF (BEHAVIOUR CHANGE)
 
-librdkafka has no version property. Before its first TLS client scalo writes the profile's `MinProtocol` into the file `OPENSSL_CONF` names, if missing or scalo's, and OpenSSL reads it once per process, so all Kafka clients share one floor. Unset, the floor is not set and a warning says so.
+librdkafka has no version property, and `ssl.cipher.suites` reaches TLS 1.2 only. Before its first TLS client scalo writes the profile's `MinProtocol` and TLS 1.3 `Ciphersuites` into the file `OPENSSL_CONF` names, if missing or scalo's, and OpenSSL reads it once per process, so all Kafka clients share one floor. It is OpenSSL's system default, so every OpenSSL user in the process and any child that inherits the variable takes it too. Unset, the floor is not set and a warning says so.
 
 **Consumer adjustment** -- set `OPENSSL_CONF` to a writable path in the deployment, or call `scalo::transport::kafka::set_openssl_conf()` first in `main`.
 

@@ -8,14 +8,18 @@
 
 //! # TLS
 //!
-//! Every TLS client in scalo reads one config section, [`ClientTlsConfig`],
-//! and builds through [`build_client_tls`]: HTTP and OTLP over reqwest, gRPC,
-//! OTLP-gRPC and Vector compat over tonic, and syslog over its own stream.
-//! Every server reads [`ServerTlsConfig`] and builds through [`ServerTls`].
-//! Kafka maps the same section onto librdkafka's properties.
+//! Every TLS client scalo builds reads one config section, [`ClientTlsConfig`],
+//! and builds through [`build_client_tls`]: HTTP, OTLP, the HTTP DLQ,
+//! `HttpClient` and the version check over reqwest, gRPC, OTLP-gRPC and Vector
+//! compat over tonic, and syslog over its own stream. Every server reads
+//! [`ServerTlsConfig`] and builds through [`ServerTls`]. Kafka maps the same
+//! section onto librdkafka's properties. Clients inside other libraries keep
+//! those libraries' TLS: Vault through `vaultrs`, AWS Secrets Manager through
+//! the AWS SDK, and the OpenTelemetry exporters.
 //!
-//! The posture comes from the section's [`CryptoProfile`], with its settings
-//! from the `tls.profiles` cascade section: see [`crate::crypto`].
+//! Versions, suites, groups and signatures come from the section's
+//! [`CryptoProfile`], with its settings from the `tls.profiles` cascade
+//! section: see [`crate::crypto`].
 //!
 //! ## Client trust and identity
 //!
@@ -71,7 +75,7 @@ mod server;
 pub(crate) mod test_pki;
 
 pub use client::{ClientIdentity, ClientTls, build_client_tls};
-pub use profile::{Posture, is_post_quantum};
+pub use profile::{ProfileSettings, is_post_quantum};
 pub use server::{CertResolver, HandshakeError, Reloaded, ServerTls, ServerTlsOptions};
 
 pub use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
@@ -194,6 +198,18 @@ pub fn install_default_provider() -> bool {
     installed
 }
 
+/// Whether `url` is an `https://` URL, in any case.
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-grpc-vector-compat",
+    feature = "dlq-http",
+    feature = "version-check"
+))]
+pub(crate) fn is_https(url: &str) -> bool {
+    url.get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
 /// The rustls error in `error` or its causes: a certificate, name or key pin
 /// refused, or an alert from the peer, such as a client certificate it would
 /// not take.
@@ -219,7 +235,7 @@ pub(crate) fn rustls_error<'a>(
     None
 }
 
-/// The reason in `error` for a connection on `posture`, else the rustls error
+/// The reason in `error` for a connection on `settings`, else the rustls error
 /// itself, as text for a transport's error. `None` when `error` holds no
 /// rustls error.
 #[cfg(any(
@@ -230,32 +246,33 @@ pub(crate) fn rustls_error<'a>(
 ))]
 pub(crate) fn describe_failure(
     error: &(dyn std::error::Error + 'static),
-    posture: Posture,
+    settings: ProfileSettings,
 ) -> Option<String> {
     let tls = rustls_error(error)?;
     Some(
-        TlsFailure::of(tls, posture).map_or_else(|| tls.to_string(), |failure| failure.to_string()),
+        TlsFailure::of(tls, settings)
+            .map_or_else(|| tls.to_string(), |failure| failure.to_string()),
     )
 }
 
-/// Warn (via `tracing`) if a completed handshake negotiated below `posture`:
+/// Warn (via `tracing`) if a completed handshake negotiated below `settings`:
 /// a classical key exchange when the profile leads with a post-quantum group,
 /// or TLS 1.2. For a caller holding a rustls connection
 /// (`negotiated_key_exchange_group()` and `protocol_version()`).
 pub fn warn_if_downgraded(
-    posture: Posture,
+    settings: ProfileSettings,
     negotiated_version: Option<ProtocolVersion>,
     negotiated_group: Option<NamedGroup>,
     peer: &str,
 ) {
-    let leads_post_quantum = posture
+    let leads_post_quantum = settings
         .kx_groups()
         .first()
         .is_some_and(|group| is_post_quantum(group.name()));
     if leads_post_quantum && negotiated_group.is_some_and(|g| !is_post_quantum(g)) {
         tracing::warn!(
             peer,
-            profile = posture.profile.as_str(),
+            profile = settings.profile.as_str(),
             group = ?negotiated_group,
             "TLS negotiated a classical key exchange: the peer offers no post-quantum group"
         );
@@ -263,7 +280,7 @@ pub fn warn_if_downgraded(
     if negotiated_version == Some(ProtocolVersion::TLSv1_2) {
         tracing::warn!(
             peer,
-            profile = posture.profile.as_str(),
+            profile = settings.profile.as_str(),
             "TLS negotiated 1.2, below the preferred 1.3"
         );
     }

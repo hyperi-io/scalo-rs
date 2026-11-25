@@ -1248,6 +1248,36 @@ pub struct KafkaConfig {
     #[serde(default)]
     pub tls: crate::tls_config::ClientTlsConfig,
 
+    /// Removed: `tls.ca_paths` with `tls.trust: bundle`.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_ssl_ca_location"
+    )]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub ssl_ca_location: crate::tls_config::Removed,
+
+    /// Removed: `tls.client_cert_path`.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_ssl_certificate_location"
+    )]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub ssl_certificate_location: crate::tls_config::Removed,
+
+    /// Removed: `tls.client_key_path`.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_ssl_key_location"
+    )]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub ssl_key_location: crate::tls_config::Removed,
+
     /// Skip SSL certificate verification.
     ///
     /// Automatically enabled for `devtest` profile.
@@ -1459,7 +1489,7 @@ impl fmt::Debug for KafkaConfig {
             )
             .field("filters_in", &self.filters_in)
             .field("filters_out", &self.filters_out)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1535,6 +1565,12 @@ fn default_auth_refusal_grace_secs() -> u64 {
     120
 }
 
+crate::tls_config::removed_keys! {
+    removed_ssl_ca_location: "ssl_ca_location" => "tls.ca_paths with tls.trust: bundle";
+    removed_ssl_certificate_location: "ssl_certificate_location" => "tls.client_cert_path";
+    removed_ssl_key_location: "ssl_key_location" => "tls.client_key_path";
+}
+
 impl Default for KafkaConfig {
     fn default() -> Self {
         #[allow(deprecated)]
@@ -1559,6 +1595,9 @@ impl Default for KafkaConfig {
             sasl_username: None,
             sasl_password: None,
             tls: crate::tls_config::ClientTlsConfig::default(),
+            ssl_ca_location: crate::tls_config::Removed,
+            ssl_certificate_location: crate::tls_config::Removed,
+            ssl_key_location: crate::tls_config::Removed,
             ssl_skip_verify: false,
             allow_insecure_transport: false,
             allow_auto_create_topics: false,
@@ -2306,6 +2345,21 @@ impl KafkaConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A removed TLS key fails the load, naming its replacement, where the
+    /// client would connect with the key dropped.
+    #[cfg(all(feature = "yaml", feature = "figment"))]
+    #[test]
+    fn a_removed_tls_key_fails_the_load() {
+        crate::tls_config::assert_removed::<KafkaConfig>(&[
+            (r#"{"ssl_ca_location": "/ca.pem"}"#, "tls.ca_paths"),
+            (
+                r#"{"ssl_certificate_location": "/c.pem"}"#,
+                "tls.client_cert_path",
+            ),
+            (r#"{"ssl_key_location": "/k.pem"}"#, "tls.client_key_path"),
+        ]);
+    }
 
     /// A broker grants consumer groups by a fixed per-app prefix, so an
     /// internal client's group id has to start with whatever the app is

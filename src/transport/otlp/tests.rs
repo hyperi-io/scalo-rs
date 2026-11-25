@@ -1304,7 +1304,7 @@ async fn the_tls_section_reaches_the_handshake() {
 
     let ca = TestCa::new("otlp handshake ca");
     let ca_file = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(ca_file.path(), ca.pem()).unwrap();
+    tokio::fs::write(ca_file.path(), ca.pem()).await.unwrap();
     for (protocol, alpn) in [(GRPC, b"h2".as_slice()), (HTTP, b"http/1.1".as_slice())] {
         let seen = Shared::default();
         let collector = if protocol == GRPC {
