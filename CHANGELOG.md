@@ -24,7 +24,7 @@ hand. Release notes also appear on the GitHub Releases page, one per tag.
 ### Bug Fixes
 
 * **kafka:** one set of client profiles ([4d052c5](https://github.com/hyperi-io/scalo-rs/commit/4d052c5e445f6fe8d50d2815e394250a18dc0115))
-* **transport:** count screened [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) skips once ([#567](https://github.com/hyperi-io/scalo-rs/issues/567)) ([0f5f5ac](https://github.com/hyperi-io/scalo-rs/commit/0f5f5ac43476eb2ad9a58289b5067387f5365ff0))
+* **transport:** count screened CEL skips once ([#567](https://github.com/hyperi-io/scalo-rs/issues/567)) ([0f5f5ac](https://github.com/hyperi-io/scalo-rs/commit/0f5f5ac43476eb2ad9a58289b5067387f5365ff0))
 * **transport:** link zstd for gRPC only with compression ([#563](https://github.com/hyperi-io/scalo-rs/issues/563)) ([5cb8155](https://github.com/hyperi-io/scalo-rs/commit/5cb8155b1587c3cd2f28fc40cd3a4598ecbbf347))
 * **transport:** share send code across transports ([db3dffb](https://github.com/hyperi-io/scalo-rs/commit/db3dffb4c33d48bd379a099492c3fcabf852ae05))
 
