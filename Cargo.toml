@@ -495,6 +495,12 @@ path = "benches/delivery_path/main.rs"
 harness = false
 required-features = ["transport-test-support"]
 
+[[bench]]
+name = "tiered_spill"
+path = "benches/tiered_spill/main.rs"
+harness = false
+required-features = ["tiered-sink", "metrics"]
+
 # Memory backpressure operational-test harness (not a product binary).
 # Driven under a cgroup --memory limit by scripts/operational-mem-test.sh.
 [[example]]
