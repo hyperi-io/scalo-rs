@@ -912,6 +912,7 @@ async fn open_spill(config: &TieredSinkConfig) -> std::result::Result<OpenedSpil
         read_buffer_bytes: config.read_buffer_bytes,
         recycle_bytes: usize::try_from(config.drain_batch_max_bytes).unwrap_or(usize::MAX),
         whole: Some(spool_codec::whole),
+        damaged_tail: Some(spool_codec::keep_damaged_tail),
         store: STORE,
     };
     // Walks the segments' headers and may cut a torn tail, so it runs off the runtime.
@@ -1897,6 +1898,7 @@ mod tests {
                 read_buffer_bytes: 1024,
                 recycle_bytes: 1024,
                 whole: None,
+                damaged_tail: None,
                 store: STORE,
             };
             let (mut sender, _receiver) = yaque::channel(&path, options).unwrap();

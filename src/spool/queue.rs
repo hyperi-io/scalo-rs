@@ -600,6 +600,7 @@ fn options(config: &SpoolConfig) -> yaque::Options {
         read_buffer_bytes: config.read_buffer_bytes,
         recycle_bytes: config.read_buffer_bytes,
         whole: Some(spool_codec::whole),
+        damaged_tail: Some(spool_codec::keep_damaged_tail),
         store: STORE,
     }
 }
@@ -952,6 +953,50 @@ mod tests {
                 .any(|e| e.file_name().to_string_lossy().starts_with("corrupt-"));
             assert!(!quarantined, "{policy:?}: nothing quarantined");
         }
+    }
+
+    /// A damaged header in the newest segment keeps every record before it.
+    /// The open copies the segment from that header on into a `corrupt-*`
+    /// directory, cuts it off, and takes new records after it.
+    #[tokio::test]
+    async fn a_damaged_header_in_the_newest_segment_is_kept_aside_at_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("damaged-header");
+        let config = SpoolConfig::new(&path);
+        let records: Vec<Vec<u8>> = (0..10)
+            .map(|i| format!("record-{i}").into_bytes())
+            .collect();
+        let mut spool = Spool::open(config.clone()).await.unwrap();
+        for record in &records {
+            spool.push(record).await.unwrap();
+        }
+        drop(spool);
+        let entry = 4 + spool_codec::PREFIX_LEN + records[0].len();
+        let segment = path.join("0.q");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        // A parity bit of record 4's header.
+        bytes[4 * entry] ^= 0x04;
+        std::fs::write(&segment, &bytes).unwrap();
+
+        let mut spool = Spool::open(config).await.unwrap();
+        assert_eq!(spool.len(), 4);
+        for record in &records[..4] {
+            assert_eq!(spool.pop_front().await.unwrap().as_ref(), Some(record));
+        }
+        assert_eq!(spool.pop_front().await.unwrap(), None);
+        let kept: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("corrupt-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "one corrupt-* directory");
+        assert_eq!(
+            std::fs::read(kept[0].path().join("0.q")).unwrap(),
+            bytes[4 * entry..],
+            "the bytes from the damaged header on are kept"
+        );
+        spool.push(b"after").await.unwrap();
+        assert_eq!(spool.pop_front().await.unwrap(), Some(b"after".to_vec()));
     }
 
     /// A header damaged on disk quarantines the queue on read. The old

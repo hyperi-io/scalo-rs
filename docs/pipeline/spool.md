@@ -2,7 +2,7 @@
 
 Disk-backed async FIFO queue. Crash-safe, persistent, with optional zstd compression and bounded size, for any pipeline that needs durable store-and-forward. `TieredSink` does not use `Spool`: it runs its own queue for disk spillover and shares the locks, quarantine, sync and full-disk handling below.
 
-The queue started as yaque 0.6.6 (<https://github.com/tokahuke/yaque>, Apache-2.0), copied into scalo as the private module `src/yaque` because upstream looked abandoned: no release and no commit to its default branch since 2023-11. scalo has since replaced its locks, its wake-up and its read path, and put a codec tag, a CRC32C and the write time in front of every record (spool format 0.7). A spool written in an earlier format is refused at open: drain it with the release that wrote it, or remove it.
+The queue started as yaque 0.6.6 (<https://github.com/tokahuke/yaque>, Apache-2.0), copied into scalo as the private module `src/yaque` because upstream looked abandoned: no release and no commit to its default branch since 2023-11. scalo has since replaced its locks, its wake-up and its read path, and put a codec tag, a CRC32C and the write time in front of every record (spool format 0.7). A drained spool written in an earlier format is cleared and stamped 0.7 when it opens. One still holding records is refused ([Quarantine](#quarantine)).
 
 For most workloads you want `TieredSink` (transport + spool + circuit
 breaker + drain). Reach for `Spool` directly only when you're building
@@ -78,7 +78,9 @@ When a queue will not open, `on_corruption` decides (default `quarantine`). A qu
 
 A record's 4-byte header carries parity bits. One that fails them is damaged, and no record after it can be found, so a read that meets it quarantines the queue under either policy, counted as `trigger="damaged_header"`.
 
-A `version/contents` naming another spool format is refused with `Open` under either policy, and nothing moves: its records wait for the release that reads them.
+A `version/contents` naming an earlier spool format opens once the queue holds no unread record: the open counts them from the saved position by walking the headers, which 0.6 and 0.7 share, then deletes the segments and `recv-metadata`, stamps 0.7 and logs it at info. A queue that still holds records is refused with `Open` under either policy, naming how many and their bytes, and nothing moves. Drain it with the release that wrote it, or remove the directory, losing them. So is one whose header count stops at a damaged header, one with a later format, and one whose `send.lock` or `recv.lock` still names a 0.6 owner, which removes its lock files when it stops.
+
+A damaged header in the newest segment is met at open, where the sender looks for its end. The records before it stay. The segment from that header on is copied into a new `corrupt-*` subdirectory, synced, then cut off, counted as `trigger="damaged_header"` with one warn. The records after it are kept there for inspection, not replayed.
 
 ### Damaged records
 

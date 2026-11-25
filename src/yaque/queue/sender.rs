@@ -32,6 +32,8 @@ impl Sender {
     ///
     /// A torn entry at its end, left by a kill or a full disk, is cut off,
     /// and a segment already closed by its end marker is followed by a new one.
+    /// From a damaged header on, the bytes go to `options.damaged_tail` first,
+    /// since no entry past it can be found.
     pub(crate) fn open(
         base: &Path,
         options: Options,
@@ -64,12 +66,16 @@ impl Sender {
                 let end = found.map_or(0, |f| f.end);
                 let file = open_segment(base, newest)?;
                 if let Some(found) = found.filter(|f| f.len > f.end) {
-                    count("spool_torn_entries_cut_total", options.store);
-                    tracing::warn!(
-                        segment = %path.display(),
-                        torn_bytes = found.len - found.end,
-                        "cutting a torn entry off the end of the spool"
-                    );
+                    if let Some(keep) = options.damaged_tail.filter(|_| found.damaged) {
+                        keep(&path, end)?;
+                    } else {
+                        count("spool_torn_entries_cut_total", options.store);
+                        tracing::warn!(
+                            segment = %path.display(),
+                            torn_bytes = found.len - found.end,
+                            "cutting a torn entry off the end of the spool"
+                        );
+                    }
                     file.set_len(end)?;
                     shared.remove_disk(found.len - end);
                 }

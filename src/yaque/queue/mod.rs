@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use super::header::{EOF, Header};
 use super::sync::{FileGuard, Shared};
-use super::version::check_queue_version;
+use super::version::{check_queue_version, earlier_owner};
 
 /// What a queue opens with.
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +34,9 @@ pub(crate) struct Options {
     /// Checks the last entry of the newest segment at open. One that fails is
     /// cut off with the torn entries.
     pub(crate) whole: Option<fn(&[u8]) -> bool>,
+    /// Keeps the newest segment's bytes from a damaged header on, given the
+    /// segment and the header's offset, before the open cuts them off.
+    pub(crate) damaged_tail: Option<fn(&Path, u64) -> io::Result<()>>,
     /// The `store` label on the queue's metrics.
     pub(crate) store: &'static str,
 }
@@ -54,9 +57,11 @@ pub(crate) fn segment_filename(base: &Path, segment: u64) -> PathBuf {
 /// version stamp or segment name this build does not read, or the I/O error.
 pub(crate) fn channel(base: &Path, options: Options) -> io::Result<(Sender, Receiver)> {
     std::fs::create_dir_all(base)?;
+    // Read before the locks below rewrite the files.
+    let earlier = earlier_owner(base);
     let send_lock = lock(base, "send.lock", "sender")?;
     let recv_lock = lock(base, "recv.lock", "receiver")?;
-    check_queue_version(base)?;
+    check_queue_version(base, earlier.as_deref())?;
     let shared = Arc::new(Shared::default());
     let sender = Sender::open(base, options, Arc::clone(&shared), send_lock)?;
     let receiver = Receiver::open(base, options, shared, recv_lock)?;
@@ -127,6 +132,8 @@ pub(crate) struct Scan {
     pub(crate) end: u64,
     /// Whether an end-of-segment marker closes the segment.
     pub(crate) sealed: bool,
+    /// Whether the walk stopped at a header that fails its parity check.
+    pub(crate) damaged: bool,
     /// The file's length.
     pub(crate) len: u64,
 }
@@ -138,7 +145,7 @@ const SCAN_BUFFER: usize = 64 * 1024;
 /// Walks the headers of the segment at `path` from `from`. Payloads are
 /// skipped, except the last when `whole` checks it. The walk stops at the
 /// end-of-segment marker, at an entry the file does not hold in full, and at
-/// a header that fails its parity check.
+/// a header that fails its parity check, which it reports as `damaged`.
 ///
 /// # Errors
 ///
@@ -169,6 +176,7 @@ pub(crate) fn scan(path: &Path, from: u64, whole: Option<fn(&[u8]) -> bool>) -> 
             break;
         }
         let Ok(header) = Header::decode(header) else {
+            found.damaged = true;
             break;
         };
         let payload = u64::from(header.len());
@@ -210,6 +218,7 @@ mod tests {
             read_buffer_bytes: 1024,
             recycle_bytes: 1 << 20,
             whole: None,
+            damaged_tail: None,
             store: "test",
         }
     }
@@ -232,13 +241,13 @@ mod tests {
         let damaged = [whole.clone(), b"Asbt".to_vec(), entry(b"y")].concat();
         let end = whole.len() as u64;
         let bytes = 3 + long.len() as u64;
-        let rows: [(&str, &[u8], u64, bool); 4] = [
-            ("whole", &whole, end, false),
-            ("torn", &torn, end, false),
-            ("sealed", &sealed, end + 4, true),
-            ("damaged header", &damaged, end, false),
+        let rows: [(&str, &[u8], u64, bool, bool); 4] = [
+            ("whole", &whole, end, false, false),
+            ("torn", &torn, end, false, false),
+            ("sealed", &sealed, end + 4, true, false),
+            ("damaged header", &damaged, end, false, true),
         ];
-        for (name, file, want_end, sealed) in rows {
+        for (name, file, want_end, sealed, damaged_header) in rows {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("0.q");
             std::fs::write(&path, file).unwrap();
@@ -247,6 +256,7 @@ mod tests {
             assert_eq!(found.bytes, bytes, "{name}");
             assert_eq!(found.end, want_end, "{name}");
             assert_eq!(found.sealed, sealed, "{name}");
+            assert_eq!(found.damaged, damaged_header, "{name}");
             assert_eq!(found.len, file.len() as u64, "{name}");
             let from = scan(&path, entry(b"a").len() as u64, None).unwrap();
             assert_eq!(from.entries, 2, "{name}: walked from the second entry");

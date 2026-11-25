@@ -22,7 +22,7 @@ Under `when_full: block` a `send` the full spool refuses waits up to `when_full_
 
 Each record now opens with its codec, a CRC32C and its write time, and `crc` defaults to true. A record that fails its CRC is dropped and counted in `spool_damaged_entries_total{store}`, and under `on_corruption: fail` the `Spool` pop also returns `Corrupted` once. `trigger="crc_mismatch"` is gone. A codec change drains what was already spilled. `TieredSink::spool_state()` and `spool_oldest_age_seconds` report the oldest record's age.
 
-**Consumer adjustment** -- drain each spool before the upgrade, or remove its directory: one in format 0.6 is refused at open under either `on_corruption`.
+**Consumer adjustment** -- drain each spool before the upgrade. A drained 0.6 directory is cleared and stamped 0.7 at open. One still holding records is refused under either `on_corruption`, naming how many, until it is drained by the earlier release or removed.
 
 ### `SinkStackConfig::backoff()` returns `scalo::backoff::Backoff`, and retries wait +/-20% (API and BEHAVIOUR CHANGE)
 

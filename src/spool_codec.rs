@@ -815,9 +815,7 @@ pub(crate) fn quarantine(
             std::fs::rename(&src, dest.join(name))?;
         }
     }
-    #[cfg(feature = "metrics")]
-    ::metrics::counter!("spool_quarantined_total", "trigger" => trigger.label()).increment(1);
-    #[cfg(feature = "tracing")]
+    quarantined(trigger);
     tracing::warn!(
         path = %path.display(),
         quarantined = %dest.display(),
@@ -825,8 +823,51 @@ pub(crate) fn quarantine(
         cause,
         "spool could not be used; moved its files aside and started a fresh queue"
     );
-    let _ = (trigger.label(), cause);
     Ok(Some(dest))
+}
+
+/// Counts one quarantine in `spool_quarantined_total{trigger}`.
+fn quarantined(trigger: QuarantineTrigger) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!("spool_quarantined_total", "trigger" => trigger.label()).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = trigger;
+}
+
+/// Copies the newest segment's bytes from a damaged header at `from` to its
+/// end into a new `corrupt-*` subdirectory of its queue, synced, before the
+/// open cuts them off. No entry past the header can be found, so they are
+/// kept for inspection. Counted as `trigger="damaged_header"`, warned once.
+///
+/// # Errors
+/// The copy's, a sync's or the subdirectory create's [`io::Error`]. The open
+/// then fails, and cuts nothing.
+pub(crate) fn keep_damaged_tail(segment: &Path, from: u64) -> io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+    let (Some(base), Some(name)) = (segment.parent(), segment.file_name()) else {
+        return Err(io::Error::other(format!(
+            "{} names no segment in a queue directory",
+            segment.display()
+        )));
+    };
+    let dest = create_quarantine_dir(base)?;
+    let mut source = std::fs::File::open(segment)?;
+    source.seek(SeekFrom::Start(from))?;
+    let kept = dest.join(name);
+    let mut copy = std::fs::File::create(&kept)?;
+    let bytes = io::copy(&mut source, &mut copy)?;
+    copy.sync_all()?;
+    sync_directory(&dest)?;
+    sync_directory(base)?;
+    quarantined(QuarantineTrigger::DamagedHeader);
+    tracing::warn!(
+        segment = %segment.display(),
+        offset = from,
+        bytes,
+        quarantined = %kept.display(),
+        "a header in the newest spool segment is damaged; moved the segment from it aside"
+    );
+    Ok(())
 }
 
 /// The local-time `YYYYMMDD-HHMMSS-<nanos>` in a quarantine directory's name.
@@ -984,12 +1025,58 @@ mod tests {
         }
     }
 
+    /// The open counts a damaged tail it keeps aside as a quarantine, never
+    /// as a torn entry, and leaves the queue readable up to it.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_kept_damaged_tail_is_counted_as_a_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q");
+        let options = yaque::Options {
+            segment_bytes: 1 << 20,
+            damaged_tail: Some(keep_damaged_tail),
+            ..options()
+        };
+        {
+            let (mut sender, _receiver) = yaque::channel(&path, options).unwrap();
+            for record in [&b"kept"[..], b"damaged", b"after"] {
+                sender.send(&[], record).unwrap();
+            }
+        }
+        let segment = path.join("0.q");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes[4 + 4] ^= 0x04;
+        std::fs::write(&segment, &bytes).unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let rendered = ::metrics::with_local_recorder(&recorder, || {
+            let (_sender, mut receiver) = yaque::channel(&path, options).unwrap();
+            assert_eq!(receiver.read(10, u64::MAX, None).unwrap().entries, 1);
+            assert_eq!(receiver.taken()[0], b"kept");
+            recorder.handle().render()
+        });
+        assert!(
+            rendered.contains("spool_quarantined_total{trigger=\"damaged_header\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("spool_torn_entries_cut_total"),
+            "{rendered}"
+        );
+        assert_eq!(
+            std::fs::metadata(&segment).unwrap().len(),
+            8,
+            "cut after the first entry"
+        );
+    }
+
     fn options() -> yaque::Options {
         yaque::Options {
             segment_bytes: 16,
             read_buffer_bytes: 4096,
             recycle_bytes: 1 << 16,
             whole: None,
+            damaged_tail: None,
             store: "test",
         }
     }
