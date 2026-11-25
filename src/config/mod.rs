@@ -144,7 +144,10 @@ pub struct ConfigOptions {
     /// Environment variable prefix (e.g., "MYAPP" for MYAPP_DATABASE_HOST).
     pub env_prefix: String,
 
-    /// Override the detected app environment (dev, staging, prod).
+    /// The app's own default app environment (dev, staging, prod), below
+    /// `APP_ENV`, `ENVIRONMENT`, `ENV` and the cascade's `app_env` key. It
+    /// picks `settings.{env}.yaml` and is what `get_app_env` returns when none
+    /// of those names the environment.
     pub app_env: Option<String>,
 
     /// Application name for user-scoped config discovery.
@@ -230,6 +233,8 @@ struct SearchPaths<'a> {
 pub struct Config {
     figment: Figment,
     env_prefix: String,
+    /// `ConfigOptions::app_env`, when it holds a value.
+    app_env_default: Option<String>,
     /// The env layers' text, for a field that refuses a parsed env value.
     env_text: EnvText,
 }
@@ -258,12 +263,31 @@ impl Config {
         Self::build(opts, layer.as_ref())
     }
 
+    /// The `app_env` key of `files` with the managed policy and the prefixed
+    /// variables over it, as the finished cascade gives it.
+    fn app_env_key(
+        files: &Figment,
+        managed: Option<&ManagedLayer>,
+        env_prefix: &str,
+    ) -> Option<String> {
+        let mut probe = files.clone();
+        if let Some(layer) = managed {
+            probe = probe.merge(layer);
+        }
+        if !env_prefix.is_empty() {
+            probe = probe
+                .merge(Env::prefixed(&format!("{env_prefix}__")).split("__"))
+                .merge(Env::prefixed(&format!("{env_prefix}_")).split("__"));
+        }
+        let app_env: String = probe.extract_inner(crate::env::APP_ENV_KEY).ok()?;
+        crate::env::non_blank(&app_env)
+    }
+
     /// [`Config::new`] with the managed layer already read.
     fn build(opts: ConfigOptions, managed: Option<&ManagedLayer>) -> Result<Self, ConfigError> {
         for path in &opts.config_paths {
             Self::check_named_path(path)?;
         }
-        let app_env = opts.app_env.unwrap_or_else(get_app_env);
         let resolved_app_name = Self::resolve_app_name(opts.app_name.as_deref());
         let app_name_ref = resolved_app_name.as_deref();
 
@@ -295,7 +319,13 @@ impl Config {
             figment = figment.merge(YamlFile::new(path));
         }
 
-        // 4. settings.{env}.yaml
+        // 4. settings.{env}.yaml, for the environment `get_app_env` resolves
+        // once the cascade is set up.
+        let app_env_default = opts.app_env.as_deref().and_then(crate::env::non_blank);
+        let app_env = crate::env::app_env_from_vars()
+            .or_else(|| Self::app_env_key(&figment, managed, &opts.env_prefix))
+            .or_else(|| app_env_default.clone())
+            .unwrap_or_else(|| crate::env::DEFAULT_APP_ENV.to_string());
         let env_settings = format!("settings.{app_env}");
         for path in Self::find_config_files(&env_settings, &search) {
             figment = figment.merge(YamlFile::new(path));
@@ -329,8 +359,15 @@ impl Config {
         Ok(Self {
             figment,
             env_prefix: opts.env_prefix,
+            app_env_default,
             env_text,
         })
+    }
+
+    /// `ConfigOptions::app_env`, the app's own default app environment, when
+    /// it holds a value.
+    pub(crate) fn app_env_default(&self) -> Option<&str> {
+        self.app_env_default.as_deref()
     }
 
     /// Load `.env` files: `~/.env` (global defaults) then `project_dir/.env`
@@ -631,7 +668,16 @@ pub fn setup(opts: ConfigOptions) -> Result<(), ConfigError> {
     let config = Config::new(opts)?;
     CONFIG
         .set(config)
-        .map_err(|_| ConfigError::AlreadyInitialised)
+        .map_err(|_| ConfigError::AlreadyInitialised)?;
+    // Resolved once the cascade can name it, so a default posture is logged at load.
+    let _ = get_app_env();
+    Ok(())
+}
+
+/// The global configuration once [`setup`] has run, with no warning when it
+/// has not.
+pub(crate) fn loaded() -> Option<&'static Config> {
+    CONFIG.get()
 }
 
 /// Get the global configuration.
@@ -735,6 +781,82 @@ mod tests {
             })
             .unwrap();
             assert_eq!(config.get_string("host"), Some("testhost".to_string()));
+        });
+    }
+
+    /// `app_env` in the files, the managed policy or a prefixed variable picks
+    /// `settings.{env}.yaml` and names the environment, and the bare variables
+    /// win over it.
+    #[test]
+    fn app_env_picks_the_settings_file_below_the_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "app_env: staging\nmarker: base\n",
+        )
+        .unwrap();
+        for env in ["staging", "production"] {
+            std::fs::write(
+                dir.path().join(format!("settings.{env}.yaml")),
+                format!("marker: {env}\n"),
+            )
+            .unwrap();
+        }
+        let unset: [(&str, Option<&str>); 4] = [
+            ("APP_ENV", None),
+            ("ENVIRONMENT", None),
+            ("ENV", None),
+            ("APPENVTEST_APP_ENV", None),
+        ];
+        // (variable set, marker loaded and app_env the cascade gives)
+        let cases = [
+            (None, "staging", "staging"),
+            (Some(("APP_ENV", "production")), "production", "staging"),
+            (
+                Some(("APPENVTEST_APP_ENV", "production")),
+                "production",
+                "production",
+            ),
+            (Some(("ENV", "production")), "production", "staging"),
+        ];
+        for (var, marker, key) in cases {
+            let vars = unset.map(|(name, _)| {
+                (
+                    name,
+                    var.and_then(|(set, value)| (set == name).then_some(value)),
+                )
+            });
+            temp_env::with_vars(vars, || {
+                let config = Config::new(ConfigOptions {
+                    env_prefix: "APPENVTEST".into(),
+                    config_paths: vec![dir.path().to_path_buf()],
+                    search_standard_paths: false,
+                    load_dotenv: false,
+                    ..ConfigOptions::default()
+                })
+                .unwrap();
+                assert_eq!(
+                    config.get_string("marker").as_deref(),
+                    Some(marker),
+                    "{var:?}"
+                );
+                assert_eq!(
+                    config.get_string("app_env").as_deref(),
+                    Some(key),
+                    "{var:?}"
+                );
+            });
+        }
+        temp_env::with_vars(unset, || {
+            setup(ConfigOptions {
+                env_prefix: "APPENVTEST".into(),
+                config_paths: vec![dir.path().to_path_buf()],
+                search_standard_paths: false,
+                load_dotenv: false,
+                ..ConfigOptions::default()
+            })
+            .unwrap();
+            assert_eq!(get_app_env(), "staging", "the loaded cascade names it");
         });
     }
 

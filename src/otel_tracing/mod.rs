@@ -85,8 +85,9 @@ pub struct OtelTracingConfig {
     /// Set `false`, or blank the [`endpoint`](Self::endpoint), to export
     /// nothing. Either way the `tracing` logger is untouched.
     pub enabled: bool,
-    /// OTLP endpoint, `http://localhost:4317` by default. Left at that default,
-    /// it resolves to `http://localhost:4318` when the protocol is HTTP.
+    /// OTLP endpoint, `http://localhost` by default. An `http://` endpoint
+    /// naming no port takes 4317 under gRPC and 4318 under HTTP. A named port,
+    /// or `https://` naming none (443), is used as given.
     pub endpoint: String,
     /// Wire protocol.
     pub protocol: OtelTracingProtocol,
@@ -117,7 +118,7 @@ impl Default for OtelTracingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            endpoint: crate::otel_endpoint::DEFAULT_GRPC_ENDPOINT.into(),
+            endpoint: crate::otel_endpoint::DEFAULT_ENDPOINT.into(),
             protocol: OtelTracingProtocol::Grpc,
             service_name: String::new(),
             sample_ratio: 0.05,
@@ -176,17 +177,14 @@ fn resolve(config: &OtelTracingConfig) -> OtelTracingConfig {
             _ => OtelTracingProtocol::Grpc,
         };
     }
-    // Resolved after the protocol, as the default endpoint depends on it.
-    resolved.endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| {
-            crate::otel_endpoint::endpoint_for_protocol(
-                &config.endpoint,
-                resolved.protocol == OtelTracingProtocol::Http,
-            )
-            .to_string()
-        })
-        .trim()
-        .to_string();
+    // Resolved after the protocol, as the port an endpoint takes depends on it.
+    let endpoint =
+        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| config.endpoint.clone());
+    resolved.endpoint = crate::otel_endpoint::endpoint_for_protocol(
+        &endpoint,
+        resolved.protocol == OtelTracingProtocol::Http,
+    )
+    .into_owned();
     if let Ok(v) = std::env::var("OTEL_SERVICE_NAME") {
         resolved.service_name = v;
     }

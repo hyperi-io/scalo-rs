@@ -27,13 +27,14 @@ pub enum OtelProtocol {
 }
 
 impl OtelProtocol {
-    /// Default endpoint for this protocol.
+    /// Default endpoint for this protocol: `http://localhost` with its port.
     #[must_use]
-    pub fn default_endpoint(self) -> &'static str {
-        match self {
-            Self::Grpc => crate::otel_endpoint::DEFAULT_GRPC_ENDPOINT,
-            Self::Http => crate::otel_endpoint::DEFAULT_HTTP_ENDPOINT,
-        }
+    pub fn default_endpoint(self) -> String {
+        crate::otel_endpoint::endpoint_for_protocol(
+            crate::otel_endpoint::DEFAULT_ENDPOINT,
+            self == Self::Http,
+        )
+        .into_owned()
     }
 }
 
@@ -47,8 +48,9 @@ pub struct OtelMetricsConfig {
     /// nothing. Both routes leave the Prometheus scrape endpoint untouched.
     pub enabled: bool,
 
-    /// OTLP endpoint. Left at the gRPC default, it resolves to the HTTP default
-    /// when the protocol is HTTP.
+    /// OTLP endpoint, `http://localhost` by default. An `http://` endpoint
+    /// naming no port takes 4317 under gRPC and 4318 under HTTP. A named port,
+    /// or `https://` naming none (443), is used as given.
     ///
     /// Override via `OTEL_EXPORTER_OTLP_ENDPOINT` env var. An empty endpoint
     /// disables export -- it is the "off" value for an operator who cannot
@@ -85,19 +87,28 @@ pub struct OtelMetricsConfig {
     /// connection and never answers. Without it a black-holed collector holds
     /// the exporter open until the next interval and the attempts overlap.
     pub export_timeout_secs: u64,
+
+    /// Push through the OTLP transport that `transport.otlp` configures, on
+    /// its connection, TLS, proxy and headers, instead of
+    /// [`endpoint`](Self::endpoint), [`protocol`](Self::protocol),
+    /// [`headers`](Self::headers) and the export timeout, which are then
+    /// unused. Off by default. Needs scalo's `transport-otlp` feature: without
+    /// it push stays off.
+    pub via_transport: bool,
 }
 
 impl Default for OtelMetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            endpoint: OtelProtocol::Grpc.default_endpoint().to_string(),
+            endpoint: crate::otel_endpoint::DEFAULT_ENDPOINT.to_string(),
             protocol: OtelProtocol::default(),
             service_name: String::new(),
             headers: HashMap::new(),
             resource_attributes: HashMap::new(),
             export_interval_secs: 60,
             export_timeout_secs: 10,
+            via_transport: false,
         }
     }
 }
@@ -105,12 +116,22 @@ impl Default for OtelMetricsConfig {
 impl OtelMetricsConfig {
     /// Whether OTLP push should be wired up, after env-var resolution.
     ///
-    /// False when [`enabled`](Self::enabled) is off, the effective endpoint is
-    /// blank, or there is no Tokio runtime to export on. Callers install the
-    /// Prometheus recorder alone.
+    /// False when [`enabled`](Self::enabled) is off, there is nowhere to push
+    /// (a blank effective endpoint, or [`via_transport`](Self::via_transport)
+    /// without the `transport-otlp` feature), or there is no Tokio runtime to
+    /// export on. Callers install the Prometheus recorder alone.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.enabled && !resolved_endpoint(&self.endpoint).is_empty() && runtime_available()
+        self.enabled && self.has_destination() && runtime_available()
+    }
+
+    /// Whether there is somewhere to push: the transport, or a non-blank endpoint.
+    fn has_destination(&self) -> bool {
+        if self.via_transport {
+            cfg!(feature = "transport-otlp")
+        } else {
+            !resolved_endpoint(&self.endpoint).is_empty()
+        }
     }
 }
 
@@ -118,7 +139,9 @@ impl OtelMetricsConfig {
 pub(crate) fn inactive_reason(config: &OtelMetricsConfig) -> &'static str {
     if !config.enabled {
         "metrics.otel.enabled = false"
-    } else if resolved_endpoint(&config.endpoint).is_empty() {
+    } else if config.via_transport && !config.has_destination() {
+        "metrics.otel.via_transport needs scalo's transport-otlp feature"
+    } else if !config.has_destination() {
         "endpoint is blank"
     } else if !runtime_available() {
         "no Tokio runtime on this thread"

@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/transport/otlp/tests.rs
-// Purpose:   The OTLP transport against a local collector stub per protocol
+// Purpose:   The OTLP transport's logs and metrics against a local collector per protocol
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -16,6 +16,12 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
 };
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::{
+    MetricsService, MetricsServiceServer,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use prost::Message as _;
@@ -52,15 +58,27 @@ enum Answer {
 #[derive(Debug, Default)]
 struct Seen {
     requests: Vec<ExportLogsServiceRequest>,
+    metrics: Vec<ExportMetricsServiceRequest>,
     tenant: Vec<Option<String>>,
     gzip: Vec<bool>,
+    /// The `Host` header of each HTTP export.
+    host: Vec<Option<String>>,
 }
 
 type Shared = Arc<Mutex<Seen>>;
 
-fn note(seen: &Shared, request: ExportLogsServiceRequest, tenant: Option<&str>, gzip: bool) {
+/// An export request the stub collector received.
+enum Received {
+    Logs(ExportLogsServiceRequest),
+    Metrics(ExportMetricsServiceRequest),
+}
+
+fn note(seen: &Shared, request: Received, tenant: Option<&str>, gzip: bool) {
     let mut seen = seen.lock().unwrap();
-    seen.requests.push(request);
+    match request {
+        Received::Logs(request) => seen.requests.push(request),
+        Received::Metrics(request) => seen.metrics.push(request),
+    }
     seen.tenant.push(tenant.map(str::to_string));
     seen.gzip.push(gzip);
 }
@@ -74,25 +92,45 @@ fn partial(rejected: i64) -> ExportLogsServiceResponse {
     }
 }
 
+fn metrics_partial(rejected: i64) -> ExportMetricsServiceResponse {
+    ExportMetricsServiceResponse {
+        partial_success: Some(ExportMetricsPartialSuccess {
+            rejected_data_points: rejected,
+            error_message: "two were bad".to_string(),
+        }),
+    }
+}
+
 struct GrpcCollector {
     answer: Answer,
     seen: Shared,
 }
 
-#[tonic::async_trait]
-impl LogsService for GrpcCollector {
-    async fn export(
+impl GrpcCollector {
+    /// Note `request` and give the configured answer, `partial` building a
+    /// partial success.
+    async fn take<T, R: Default>(
         &self,
-        request: tonic::Request<ExportLogsServiceRequest>,
-    ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+        request: tonic::Request<T>,
+        received: impl FnOnce(T) -> Received,
+        partial: impl FnOnce(i64) -> R,
+    ) -> Result<tonic::Response<R>, tonic::Status> {
         let metadata = request.metadata();
-        let tenant = metadata.get("x-tenant").and_then(|v| v.to_str().ok());
+        let tenant = metadata
+            .get("x-tenant")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let gzip = metadata
             .get("grpc-encoding")
             .is_some_and(|v| v.to_str().ok() == Some("gzip"));
-        note(&self.seen, request.get_ref().clone(), tenant, gzip);
+        note(
+            &self.seen,
+            received(request.into_inner()),
+            tenant.as_deref(),
+            gzip,
+        );
         match self.answer {
-            Answer::Accept => Ok(tonic::Response::new(ExportLogsServiceResponse::default())),
+            Answer::Accept => Ok(tonic::Response::new(R::default())),
             Answer::Partial(rejected) => Ok(tonic::Response::new(partial(rejected))),
             Answer::Grpc(code, Some(delay)) => Err(tonic::Status::with_error_details(
                 code,
@@ -106,12 +144,37 @@ impl LogsService for GrpcCollector {
     }
 }
 
-/// A gRPC collector on localhost, with TLS asking for a client certificate
-/// from `ca` when there is one.
+#[tonic::async_trait]
+impl LogsService for GrpcCollector {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportLogsServiceRequest>,
+    ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+        self.take(request, Received::Logs, partial).await
+    }
+}
+
+#[tonic::async_trait]
+impl MetricsService for GrpcCollector {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+        self.take(request, Received::Metrics, metrics_partial).await
+    }
+}
+
+/// A gRPC collector on localhost taking logs and metrics, with TLS asking for
+/// a client certificate from `ca` when there is one.
 async fn grpc_collector(answer: Answer, seen: Shared, ca: Option<&TestCa>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let service = LogsServiceServer::new(GrpcCollector { answer, seen })
+    let logs = LogsServiceServer::new(GrpcCollector {
+        answer,
+        seen: Arc::clone(&seen),
+    })
+    .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+    let metrics = MetricsServiceServer::new(GrpcCollector { answer, seen })
         .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
     let mut server = tonic::transport::Server::builder();
     if let Some(ca) = ca {
@@ -126,16 +189,21 @@ async fn grpc_collector(answer: Answer, seen: Shared, ca: Option<&TestCa>) -> So
         server = server.tls_config(tls).unwrap();
     }
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
-    tokio::spawn(server.add_service(service).serve_with_incoming(incoming));
+    tokio::spawn(
+        server
+            .add_service(logs)
+            .add_service(metrics)
+            .serve_with_incoming(incoming),
+    );
     addr
 }
 
-/// An HTTP collector on localhost taking `POST /v1/logs`.
+/// An HTTP collector on localhost taking `POST /v1/logs` and `POST /v1/metrics`.
 async fn http_collector(answer: Answer, seen: Shared) -> SocketAddr {
     use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
     use axum::response::{IntoResponse, Response};
 
-    let handler = move |headers: HeaderMap, body: axum::body::Bytes| {
+    let handler = move |metrics: bool, headers: HeaderMap, body: axum::body::Bytes| {
         let seen = Arc::clone(&seen);
         async move {
             let gzip =
@@ -153,13 +221,24 @@ async fn http_collector(answer: Answer, seen: Shared) -> SocketAddr {
                 Some(&HeaderValue::from_static("application/x-protobuf"))
             );
             let tenant = headers.get("x-tenant").and_then(|v| v.to_str().ok());
-            let request = ExportLogsServiceRequest::decode(&body[..]).unwrap();
+            let request = if metrics {
+                Received::Metrics(ExportMetricsServiceRequest::decode(&body[..]).unwrap())
+            } else {
+                Received::Logs(ExportLogsServiceRequest::decode(&body[..]).unwrap())
+            };
             note(&seen, request, tenant, gzip);
+            let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+            seen.lock().unwrap().host.push(host.map(str::to_string));
             let protobuf = [(header::CONTENT_TYPE, "application/x-protobuf")];
             match answer {
                 Answer::Accept => StatusCode::OK.into_response(),
                 Answer::Partial(rejected) => {
-                    (StatusCode::OK, protobuf, partial(rejected).encode_to_vec()).into_response()
+                    let body = if metrics {
+                        metrics_partial(rejected).encode_to_vec()
+                    } else {
+                        partial(rejected).encode_to_vec()
+                    };
+                    (StatusCode::OK, protobuf, body).into_response()
                 }
                 Answer::Http(code, retry_after) => {
                     let status = tonic_types::Status {
@@ -180,7 +259,20 @@ async fn http_collector(answer: Answer, seen: Shared) -> SocketAddr {
             }
         }
     };
-    let app = axum::Router::new().route("/v1/logs", axum::routing::post(handler));
+    let logs = handler.clone();
+    let app = axum::Router::new()
+        .route(
+            "/v1/logs",
+            axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                logs(false, headers, body)
+            }),
+        )
+        .route(
+            "/v1/metrics",
+            axum::routing::post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                handler(true, headers, body)
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
@@ -774,6 +866,31 @@ async fn a_bad_setting_fails_the_build_and_a_closed_transport_refuses() {
             },
             "",
         ),
+        (
+            "connect_to that is not an address",
+            OtlpConfig {
+                connect_to: Some("collector-2:4317".to_string()),
+                ..OtlpConfig::default()
+            },
+            "is not an IP address or IP:port",
+        ),
+        (
+            "connect_to beside a proxy",
+            OtlpConfig {
+                connect_to: Some("10.0.0.5".to_string()),
+                proxy: crate::transport::ProxyConfig::System,
+                ..OtlpConfig::default()
+            },
+            "connect_to cannot be set with a proxy",
+        ),
+        (
+            "connect_to with an endpoint naming no host",
+            OtlpConfig {
+                connect_to: Some("10.0.0.5".to_string()),
+                ..OtlpConfig::http("http://192.168.1.9:4318")
+            },
+            "needs an endpoint that names its host",
+        ),
     ];
     for (name, config, text) in refused {
         let error = super::OtlpTransport::new(&config)
@@ -824,12 +941,303 @@ async fn a_bad_setting_fails_the_build_and_a_closed_transport_refuses() {
     );
 }
 
-/// Both protocols export through a real Squid's CONNECT tunnel, gRPC in plain
-/// text and HTTP with TLS inside it. The target name resolves only inside
-/// Squid, so an export that arrives went through it.
+/// Metrics an SDK collected, as its reader hands them to an exporter: a
+/// counter at 3 and a gauge at 7, under a resource naming `stub-test`.
+fn collected_metrics() -> opentelemetry_sdk::metrics::data::ResourceMetrics {
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(PeriodicReader::builder(exporter.clone()).build())
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name("stub-test")
+                .build(),
+        )
+        .build();
+    let meter = provider.meter("otlp-test");
+    meter.u64_counter("requests_total").build().add(3, &[]);
+    meter.f64_gauge("queue_depth").build().record(7.0, &[]);
+    provider.force_flush().unwrap();
+    exporter.get_finished_metrics().unwrap().remove(0)
+}
+
+/// Check the metric export carries the meter provider's resource, not the
+/// transport's, and the counter and gauge values.
+fn check_metrics(case: &str, request: &ExportMetricsServiceRequest) {
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as Number;
+
+    let resource = &request.resource_metrics[0];
+    let service = resource
+        .resource
+        .as_ref()
+        .and_then(|r| r.attributes.iter().find(|kv| kv.key == "service.name"))
+        .and_then(|kv| kv.value.clone())
+        .and_then(|v| v.value);
+    assert_eq!(
+        service,
+        Some(Value::StringValue("stub-test".to_string())),
+        "{case}: resource"
+    );
+    let mut values: Vec<(String, Option<Number>)> = resource
+        .scope_metrics
+        .iter()
+        .flat_map(|scope| &scope.metrics)
+        .map(|metric| {
+            let point = match &metric.data {
+                Some(Data::Sum(sum)) => sum.data_points.first(),
+                Some(Data::Gauge(gauge)) => gauge.data_points.first(),
+                other => panic!("{case}: {other:?}"),
+            };
+            (metric.name.clone(), point.and_then(|p| p.value))
+        })
+        .collect();
+    values.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        values,
+        vec![
+            ("queue_depth".to_string(), Some(Number::AsDouble(7.0))),
+            ("requests_total".to_string(), Some(Number::AsInt(3))),
+        ],
+        "{case}: metrics"
+    );
+}
+
+/// (case, protocol, answer, gzip, text of the export's error, `None` for `Ok`)
+type MetricCase = (
+    &'static str,
+    OtlpProtocol,
+    Answer,
+    bool,
+    Option<&'static str>,
+);
+
+const METRIC_CASES: &[MetricCase] = &[
+    ("grpc accepted", GRPC, Answer::Accept, false, None),
+    ("grpc gzip", GRPC, Answer::Accept, true, None),
+    (
+        "grpc partial success",
+        GRPC,
+        Answer::Partial(2),
+        false,
+        Some("rejected 2 data points: two were bad"),
+    ),
+    (
+        "grpc unavailable",
+        GRPC,
+        Answer::Grpc(Code::Unavailable, None),
+        false,
+        Some("unavailable or did not answer in time"),
+    ),
+    (
+        "grpc unavailable with RetryInfo",
+        GRPC,
+        Answer::Grpc(Code::Unavailable, SECS_7),
+        false,
+        Some("asked for a wait of 7s"),
+    ),
+    (
+        "grpc unauthenticated",
+        GRPC,
+        Answer::Grpc(Code::Unauthenticated, None),
+        false,
+        Some("Unauthenticated: collector says no"),
+    ),
+    (
+        "grpc collector down",
+        GRPC,
+        Answer::Down,
+        false,
+        Some("unavailable or did not answer in time"),
+    ),
+    ("http accepted", HTTP, Answer::Accept, false, None),
+    ("http gzip", HTTP, Answer::Accept, true, None),
+    (
+        "http partial success",
+        HTTP,
+        Answer::Partial(2),
+        false,
+        Some("rejected 2 data points: two were bad"),
+    ),
+    (
+        "http 503 with Retry-After",
+        HTTP,
+        Answer::Http(503, Some("7")),
+        false,
+        Some("asked for a wait of 7s"),
+    ),
+    (
+        "http 400",
+        HTTP,
+        Answer::Http(400, None),
+        false,
+        Some("400 Bad Request: bad record"),
+    ),
+    (
+        "http collector down",
+        HTTP,
+        Answer::Down,
+        false,
+        Some("unavailable or did not answer in time"),
+    ),
+];
+
+/// Metrics go over the transport's own client to the collector that takes its
+/// logs, on each protocol, and each answer maps onto the export's result. A
+/// closed transport and a shut-down exporter refuse.
+#[tokio::test]
+async fn metrics_go_through_the_transport_to_its_collector() {
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter as _;
+
+    let collected = collected_metrics();
+    let ca = TestCa::new("otlp metrics test CA");
+    let pinned = ca.server("otlp collector");
+    for &(name, protocol, answer, gzip, error) in METRIC_CASES {
+        let seen = Shared::default();
+        let mut config = OtlpConfig {
+            endpoint: endpoint(&case(name, protocol, answer, ""), &seen, &ca, &pinned).await,
+            protocol,
+            service_name: Some("the-transport-resource".to_string()),
+            headers: [("x-tenant".to_string(), "blue".into())]
+                .into_iter()
+                .collect(),
+            ..OtlpConfig::default()
+        };
+        if gzip {
+            config.compression = Compression::new(Codec::Gzip);
+        }
+        let transport = Arc::new(super::OtlpTransport::new(&config).unwrap());
+        let logs_sent = usize::from(error.is_none());
+        if error.is_none() {
+            let logs = transport.send_batch(&block()).await;
+            assert!(logs.is_ok(), "{name}: logs {logs:?}");
+        }
+        let exporter = super::OtlpMetricExporter::new(Arc::clone(&transport)).unwrap();
+        let result = exporter.export(&collected).await;
+        match error {
+            None => assert!(result.is_ok(), "{name}: {result:?}"),
+            Some(text) => assert!(
+                result.as_ref().is_err_and(|e| e.to_string().contains(text)),
+                "{name}: {result:?}"
+            ),
+        }
+        if matches!(answer, Answer::Down) {
+            continue;
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.metrics.len(), 1, "{name}: one metric export");
+        assert_eq!(
+            seen.requests.len(),
+            logs_sent,
+            "{name}: logs, same collector"
+        );
+        assert!(
+            seen.tenant.iter().all(|t| t.as_deref() == Some("blue")),
+            "{name}: header {:?}",
+            seen.tenant
+        );
+        assert!(seen.gzip.iter().all(|&g| g == gzip), "{name}: compression");
+        check_metrics(name, &seen.metrics[0]);
+    }
+
+    let seen = Shared::default();
+    let addr = grpc_collector(Answer::Accept, Arc::clone(&seen), None).await;
+    let transport =
+        Arc::new(super::OtlpTransport::new(&OtlpConfig::grpc(&format!("http://{addr}"))).unwrap());
+    let exporter = super::OtlpMetricExporter::new(Arc::clone(&transport)).unwrap();
+    transport.close().await.unwrap();
+    let closed = exporter.export(&collected).await;
+    assert!(
+        closed
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("transport closed")),
+        "{closed:?}"
+    );
+    exporter.shutdown().unwrap();
+    assert!(matches!(
+        exporter.export(&collected).await,
+        Err(opentelemetry_sdk::error::OTelSdkError::AlreadyShutdown)
+    ));
+    assert_eq!(seen.lock().unwrap().metrics, Vec::new());
+}
+
+/// `connect_to` dials the collector while the endpoint names a host that
+/// does not resolve and a port nothing listens on: both protocols, in plain
+/// text and with mutual TLS checked against the endpoint's host name. HTTP
+/// sends the endpoint's host and port as `Host`.
+#[tokio::test]
+async fn connect_to_dials_the_address_and_keeps_the_endpoint_name() {
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter as _;
+
+    let ca = TestCa::new("otlp connect_to test CA");
+    let files = client_files(&ca);
+    let pinned = ca.server("otlp collector");
+    let collected = collected_metrics();
+    for (protocol, tls) in [
+        (GRPC, Tls::Off),
+        (GRPC, Tls::WithIdentity),
+        (HTTP, Tls::Off),
+        (HTTP, Tls::WithIdentity),
+    ] {
+        let name = format!("{protocol:?} {tls:?}");
+        let seen = Shared::default();
+        let probe = Case {
+            tls,
+            ..case("connect_to", protocol, Answer::Accept, "Ok")
+        };
+        let collector = reqwest::Url::parse(&endpoint(&probe, &seen, &ca, &pinned).await).unwrap();
+        let mut config = OtlpConfig {
+            // target.test resolves nowhere, and the test certificate names it.
+            endpoint: format!("{}://target.test:1", collector.scheme()),
+            protocol,
+            connect_to: Some(format!("127.0.0.1:{}", collector.port().unwrap())),
+            ..OtlpConfig::default()
+        };
+        if tls != Tls::Off {
+            config.tls = Some(ClientTlsConfig {
+                trust: TrustChoice::Bundle,
+                ca_path: Some(files.ca.clone()),
+                client_cert_path: Some(files.cert.clone()),
+                client_key_path: Some(files.key.clone()),
+                ..ClientTlsConfig::default()
+            });
+        }
+        let transport = Arc::new(super::OtlpTransport::new(&config).unwrap());
+        let logs = transport.send_batch(&block()).await;
+        assert!(logs.is_ok(), "{name}: logs {logs:?}");
+        let exporter = super::OtlpMetricExporter::new(Arc::clone(&transport)).unwrap();
+        let metrics = exporter.export(&collected).await;
+        assert!(metrics.is_ok(), "{name}: metrics {metrics:?}");
+        // The mutual TLS collector for HTTP notes nothing.
+        if (protocol, tls) == (HTTP, Tls::WithIdentity) {
+            continue;
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            (seen.requests.len(), seen.metrics.len()),
+            (1, 1),
+            "{name}: one logs and one metrics export"
+        );
+        if protocol == HTTP {
+            assert_eq!(
+                seen.host,
+                vec![Some("target.test:1".to_string()); 2],
+                "{name}: Host"
+            );
+        }
+    }
+}
+
+/// Both protocols export logs and metrics through a real Squid's CONNECT
+/// tunnel, gRPC in plain text and HTTP with TLS inside it. The target name
+/// resolves only inside Squid, so an export that arrives went through it.
 #[cfg(all(feature = "transport-proxy-test-support", unix))]
 #[tokio::test]
 async fn exports_go_through_a_connect_proxy() {
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter as _;
+
     use crate::sensitive::SensitiveString;
     use crate::transport::proxy::squid::{Squid, TARGET_HOST};
     use crate::transport::proxy::test_front::{plain_front, tls_front};
@@ -872,15 +1280,16 @@ async fn exports_go_through_a_connect_proxy() {
             matches!(result, SendResult::Ok),
             "{protocol:?}: got {result:?}"
         );
+        let exporter = super::OtlpMetricExporter::new(Arc::new(transport)).unwrap();
+        let metrics = exporter.export(&collected_metrics()).await;
+        assert!(metrics.is_ok(), "{protocol:?}: metrics {metrics:?}");
     }
-    assert_eq!(
-        grpc_seen.lock().unwrap().requests.len(),
-        1,
-        "one gRPC export"
-    );
-    assert_eq!(
-        http_seen.lock().unwrap().requests.len(),
-        1,
-        "one HTTP export"
-    );
+    for (protocol, seen) in [("gRPC", grpc_seen), ("HTTP", http_seen)] {
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            (seen.requests.len(), seen.metrics.len()),
+            (1, 1),
+            "one {protocol} logs export and one metrics export"
+        );
+    }
 }

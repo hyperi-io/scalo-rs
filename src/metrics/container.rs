@@ -48,10 +48,12 @@ impl ContainerMetrics {
     fn register_metrics() {
         metrics::describe_gauge!(
             "container_memory_limit_bytes",
+            metrics::Unit::Bytes,
             "Container memory limit in bytes"
         );
         metrics::describe_gauge!(
             "container_memory_usage_bytes",
+            metrics::Unit::Bytes,
             "Container memory usage in bytes"
         );
         metrics::describe_gauge!("container_cpu_limit_cores", "Container CPU limit in cores");

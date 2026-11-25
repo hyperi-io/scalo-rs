@@ -9,10 +9,12 @@
 //! OpenTelemetry metrics setup.
 //!
 //! Configures an OTel `SdkMeterProvider` with an OTLP periodic exporter
-//! via the `metrics-exporter-opentelemetry` crate. When both the `metrics`
+//! via the `metrics-exporter-opentelemetry` crate: opentelemetry-otlp's, or
+//! with `transport-otlp` the OTLP transport's. When both the `metrics`
 //! (Prometheus) and `otel-metrics` features are enabled, a `Fanout` recorder
 //! sends each measurement to both backends.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -24,6 +26,8 @@ use metrics::{
 };
 use metrics_util::{KeyHasher, MetricKind};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+use opentelemetry_sdk::metrics::{Instrument, Stream};
 
 use super::MetricsError;
 use super::otel_types::{OtelMetricsConfig, OtelProtocol};
@@ -37,7 +41,66 @@ pub(crate) struct SteadyRecorder<R> {
     histograms: Handles<Histogram>,
     /// Each name's first unit and description, held while a handle is built so the inner describe and register run as a pair.
     described: Mutex<HashMap<(MetricKind, KeyName), Described>>,
+    /// Each built name's OTLP unit, which [`unit_view`] gives its stream.
+    units: OtlpUnits,
     inner: R,
+}
+
+/// Each instrument name's OTLP unit.
+pub(crate) type OtlpUnits = Arc<Mutex<HashMap<String, Cow<'static, str>>>>;
+
+/// A view giving each instrument named in `units` that unit, in place of the
+/// facade label the exporter gives it (`B` where OTLP wants `By`).
+pub(crate) fn unit_view(
+    units: OtlpUnits,
+) -> impl Fn(&Instrument) -> Option<Stream> + Send + Sync + 'static {
+    move |instrument| {
+        let unit = units
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(instrument.name())?
+            .clone();
+        Stream::builder().with_unit(unit).build().ok()
+    }
+}
+
+/// A name's OTLP unit, the UCUM code the OpenTelemetry semantic conventions
+/// use, and its description. With no facade unit, a description opening with a
+/// `{annotation}` such as `{packet}` gives that as the unit and loses it.
+fn otlp_unit(
+    unit: Option<Unit>,
+    description: Option<&SharedString>,
+) -> (Cow<'static, str>, Option<SharedString>) {
+    if unit.is_none()
+        && let Some(text) = description
+        && let Some(rest) = text.trim_start().strip_prefix('{')
+        && let Some((annotation, rest)) = rest.split_once('}')
+    {
+        return (
+            Cow::Owned(format!("{{{annotation}}}")),
+            Some(SharedString::from(rest.trim().to_string())),
+        );
+    }
+    let ucum = match unit {
+        None | Some(Unit::Count) => "1",
+        Some(Unit::Percent) => "%",
+        Some(Unit::Seconds) => "s",
+        Some(Unit::Milliseconds) => "ms",
+        Some(Unit::Microseconds) => "us",
+        Some(Unit::Nanoseconds) => "ns",
+        Some(Unit::Tebibytes) => "TiBy",
+        Some(Unit::Gibibytes) => "GiBy",
+        Some(Unit::Mebibytes) => "MiBy",
+        Some(Unit::Kibibytes) => "KiBy",
+        Some(Unit::Bytes) => "By",
+        Some(Unit::TerabitsPerSecond) => "Tbit/s",
+        Some(Unit::GigabitsPerSecond) => "Gbit/s",
+        Some(Unit::MegabitsPerSecond) => "Mbit/s",
+        Some(Unit::KilobitsPerSecond) => "kbit/s",
+        Some(Unit::BitsPerSecond) => "bit/s",
+        Some(Unit::CountPerSecond) => "1/s",
+    };
+    (Cow::Borrowed(ucum), description.cloned())
 }
 
 /// One kind's handles. A lookup never waits on a handle being built.
@@ -75,12 +138,19 @@ impl GaugeFn for SerialGauge {
 }
 
 impl<R> SteadyRecorder<R> {
+    #[cfg(test)]
     pub(crate) fn new(inner: R) -> Self {
+        Self::with_units(inner, OtlpUnits::default())
+    }
+
+    /// A recorder noting each built name's OTLP unit in `units`.
+    pub(crate) fn with_units(inner: R, units: OtlpUnits) -> Self {
         Self {
             counters: Handles::default(),
             gauges: Handles::default(),
             histograms: Handles::default(),
             described: Mutex::default(),
+            units,
             inner,
         }
     }
@@ -120,8 +190,16 @@ impl<R> SteadyRecorder<R> {
         }
         let first = described.entry((kind, key.name_shared())).or_default();
         first.built = true;
-        if let Some(text) = &first.description {
-            describe(key.name_shared(), first.unit, text.clone());
+        let (unit, text) = otlp_unit(first.unit, first.description.as_ref());
+        // Noted before the build, which runs the view that reads it.
+        self.units
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.name().to_string(), unit);
+        // The view gives the unit: the exporter's own label for microseconds is
+        // not ASCII, and an instrument built with it records nothing.
+        if let Some(text) = text {
+            describe(key.name_shared(), None, text);
         }
         let handle = register();
         handles.insert(key.clone(), handle.clone());
@@ -206,12 +284,12 @@ fn resolve_config(config: &OtelMetricsConfig) -> ResolvedOtelConfig {
         })
         .unwrap_or(config.protocol);
 
-    // Resolved after the protocol, as the default endpoint depends on it.
-    let endpoint =
-        super::otel_types::resolved_endpoint(crate::otel_endpoint::endpoint_for_protocol(
-            &config.endpoint,
-            protocol == OtelProtocol::Http,
-        ));
+    // Resolved after the protocol, as the port an endpoint takes depends on it.
+    let endpoint = crate::otel_endpoint::endpoint_for_protocol(
+        &super::otel_types::resolved_endpoint(&config.endpoint),
+        protocol == OtelProtocol::Http,
+    )
+    .into_owned();
 
     let export_interval = std::env::var("OTEL_METRIC_EXPORT_INTERVAL")
         .ok()
@@ -316,58 +394,87 @@ fn resource(resolved: &ResolvedOtelConfig) -> opentelemetry_sdk::Resource {
     builder.build()
 }
 
+/// The OTel recorder and the meter provider it records into.
+type OtelRecorder = (
+    SteadyRecorder<metrics_exporter_opentelemetry::Recorder>,
+    opentelemetry_sdk::metrics::SdkMeterProvider,
+);
+
 /// Build the OTel recorder (without installing it globally).
 ///
 /// Uses `metrics-exporter-opentelemetry` to create a `metrics::Recorder`
-/// backed by an OTel `SdkMeterProvider` with an OTLP periodic exporter.
+/// backed by an OTel `SdkMeterProvider` with an OTLP periodic exporter. With
+/// [`via_transport`](OtelMetricsConfig::via_transport) the exporter sends
+/// through `transport`, or one built from `transport.otlp` when none is given.
+/// The resource is the same either way.
 ///
 /// The recorder is returned but NOT installed -- the caller decides whether
 /// to install it directly or compose it with Prometheus via Fanout.
 pub(crate) fn build_otel_recorder(
     scope_name: &str,
     config: &OtelMetricsConfig,
-) -> Result<
-    (
-        SteadyRecorder<metrics_exporter_opentelemetry::Recorder>,
-        opentelemetry_sdk::metrics::SdkMeterProvider,
-    ),
-    MetricsError,
-> {
+    #[cfg(feature = "transport-otlp")] transport: Option<Arc<crate::transport::OtlpTransport>>,
+) -> Result<OtelRecorder, MetricsError> {
     let resolved = resolve_config(config);
+    let resource = resource(&resolved);
+    let interval = resolved.export_interval;
+
+    #[cfg(feature = "transport-otlp")]
+    if config.via_transport {
+        let transport = match transport {
+            Some(transport) => transport,
+            None => crate::transport::OtlpConfig::from_cascade()
+                .and_then(|otlp| crate::transport::OtlpTransport::new(&otlp))
+                .map(Arc::new)
+                .map_err(|e| MetricsError::BuildError(format!("transport.otlp: {e}")))?,
+        };
+        let exporter = crate::transport::OtlpMetricExporter::new(transport)
+            .map_err(|e| MetricsError::BuildError(format!("OTLP metric exporter: {e}")))?;
+        tracing::info!(
+            exporter = ?exporter,
+            export_interval_secs = interval.as_secs(),
+            "OTLP metric push enabled through the OTLP transport"
+        );
+        return Ok(periodic_recorder(scope_name, exporter, interval, resource));
+    }
 
     let exporter = build_otlp_exporter(&resolved)?;
+    tracing::info!(
+        endpoint = %resolved.endpoint,
+        protocol = ?resolved.protocol,
+        export_interval_secs = interval.as_secs(),
+        export_timeout_secs = resolved.export_timeout.as_secs(),
+        "OTLP metric push enabled"
+    );
+    Ok(periodic_recorder(scope_name, exporter, interval, resource))
+}
+
+/// A recorder whose provider reads into `exporter` every `interval`, under
+/// `resource`.
+fn periodic_recorder<E: PushMetricExporter>(
+    scope_name: &str,
+    exporter: E,
+    interval: Duration,
+    resource: opentelemetry_sdk::Resource,
+) -> OtelRecorder {
     // Backoff starts at one export interval so the first retry is the next
     // scheduled tick, then doubles while the collector stays unreachable.
-    let exporter =
-        crate::otel_backoff::GatedMetricExporter::new(exporter, resolved.export_interval);
+    let exporter = crate::otel_backoff::GatedMetricExporter::new(exporter, interval);
     let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
-        .with_interval(resolved.export_interval)
+        .with_interval(interval)
         .build();
-
-    let resource = resource(&resolved);
-
-    // Use with_meter_provider to attach our OTLP reader to the internal provider
-    let reader_for_closure = reader;
-    let resource_for_closure = resource;
-
+    let units = OtlpUnits::default();
+    let view = unit_view(Arc::clone(&units));
     // build() returns (SdkMeterProvider, Recorder) -- provider first
     let (provider, recorder) =
         metrics_exporter_opentelemetry::Recorder::builder(scope_name.to_string())
             .with_meter_provider(move |mpb| {
-                mpb.with_reader(reader_for_closure)
-                    .with_resource(resource_for_closure)
+                mpb.with_reader(reader)
+                    .with_resource(resource)
+                    .with_view(view)
             })
             .build();
-
-    tracing::info!(
-        endpoint = %resolved.endpoint,
-        protocol = ?resolved.protocol,
-        export_interval_secs = resolved.export_interval.as_secs(),
-        export_timeout_secs = resolved.export_timeout.as_secs(),
-        "OTLP metric push enabled"
-    );
-
-    Ok((SteadyRecorder::new(recorder), provider))
+    (SteadyRecorder::with_units(recorder, units), provider)
 }
 
 #[cfg(test)]
@@ -402,18 +509,23 @@ mod tests {
         }
     }
 
-    /// An exporter recorder whose provider flushes to the returned in-memory exporter.
+    /// An exporter recorder whose provider, with the unit view a pushing one
+    /// has, flushes to the returned in-memory exporter, and the units the view
+    /// reads.
     fn otel() -> (
         SdkMeterProvider,
         InMemoryMetricExporter,
         metrics_exporter_opentelemetry::Recorder,
+        OtlpUnits,
     ) {
         let exporter = InMemoryMetricExporter::default();
         let reader = PeriodicReader::builder(exporter.clone()).build();
+        let units = OtlpUnits::default();
+        let view = unit_view(Arc::clone(&units));
         let (provider, recorder) = metrics_exporter_opentelemetry::Recorder::builder("test")
-            .with_meter_provider(move |builder| builder.with_reader(reader))
+            .with_meter_provider(move |builder| builder.with_reader(reader).with_view(view))
             .build();
-        (provider, exporter, recorder)
+        (provider, exporter, recorder, units)
     }
 
     /// Every metric the provider exports on a flush, sorted.
@@ -445,10 +557,10 @@ mod tests {
 
     /// Describe each kind once with a unit, record through three registrations as `metrics::gauge!` does and once under a label, and list what is exported.
     fn exported_streams(
-        wrap: impl FnOnce(metrics_exporter_opentelemetry::Recorder) -> Box<dyn Recorder>,
+        wrap: impl FnOnce(metrics_exporter_opentelemetry::Recorder, OtlpUnits) -> Box<dyn Recorder>,
     ) -> Vec<Exported> {
-        let (provider, exporter, recorder) = otel();
-        let recorder = wrap(recorder);
+        let (provider, exporter, recorder, units) = otel();
+        let recorder = wrap(recorder, units);
 
         recorder.describe_gauge(GAUGE.into(), Some(Unit::Percent), "described".into());
         recorder.describe_counter(COUNTER.into(), Some(Unit::Bytes), "described".into());
@@ -478,7 +590,9 @@ mod tests {
 
     #[test]
     fn each_metric_exports_one_stream_however_often_it_registers() {
-        let found = exported_streams(|recorder| Box::new(SteadyRecorder::new(recorder)));
+        let found = exported_streams(|recorder, units| {
+            Box::new(SteadyRecorder::with_units(recorder, units))
+        });
 
         let described = |name: &str, unit: &str| {
             (
@@ -491,7 +605,7 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                described(COUNTER, "B"),
+                described(COUNTER, "By"),
                 described(GAUGE, "%"),
                 described(HISTOGRAM, "s"),
             ]
@@ -514,13 +628,13 @@ mod tests {
                 "described after first use",
                 &[],
                 Some((Unit::Seconds, "late")),
-                ("", ""),
+                ("1", ""),
             ),
-            ("never described", &[], None, ("", "")),
+            ("never described", &[], None, ("1", "")),
         ];
         for (name, before, after, (unit, description)) in cases {
-            let (provider, exporter, bare) = otel();
-            let recorder = SteadyRecorder::new(bare);
+            let (provider, exporter, bare, units) = otel();
+            let recorder = SteadyRecorder::with_units(bare, units);
             for (first_unit, text) in before {
                 recorder.describe_histogram(HISTOGRAM.into(), Some(*first_unit), (*text).into());
             }
@@ -705,8 +819,8 @@ mod tests {
 
     #[test]
     fn a_gauge_moved_up_and_down_reads_its_running_value() {
-        let (provider, exporter, bare) = otel();
-        let recorder = SteadyRecorder::new(bare);
+        let (provider, exporter, bare, units) = otel();
+        let recorder = SteadyRecorder::with_units(bare, units);
         let key = Key::from_name(GAUGE);
 
         // A connection gauge: two opens and one close, each through its own registration
@@ -736,10 +850,165 @@ mod tests {
         assert_eq!(values, vec![1.0]);
     }
 
+    /// Each facade unit exports as the UCUM code the semantic conventions use,
+    /// a `{annotation}` opening an undescribed unit's text becomes the unit,
+    /// a gauge exports as a gauge, and the process gauges carry their units.
+    #[test]
+    fn each_facade_unit_exports_as_its_ucum_code() {
+        let (provider, exporter, bare, units) = otel();
+        let recorder = SteadyRecorder::with_units(bare, units);
+
+        // (name, kind, facade unit, describe text or none, exported unit and description)
+        let cases: [(&str, MetricKind, Option<Unit>, Option<&str>, (&str, &str)); 8] = [
+            (
+                "sent_bytes",
+                MetricKind::Counter,
+                Some(Unit::Bytes),
+                Some("Sent"),
+                ("By", "Sent"),
+            ),
+            (
+                "events",
+                MetricKind::Counter,
+                Some(Unit::Count),
+                Some("Events"),
+                ("1", "Events"),
+            ),
+            ("undescribed", MetricKind::Counter, None, None, ("1", "")),
+            (
+                "wait",
+                MetricKind::Histogram,
+                Some(Unit::Seconds),
+                Some("Wait"),
+                ("s", "Wait"),
+            ),
+            (
+                "tick",
+                MetricKind::Histogram,
+                Some(Unit::Microseconds),
+                Some("Tick"),
+                ("us", "Tick"),
+            ),
+            (
+                "packets",
+                MetricKind::Counter,
+                None,
+                Some("{packet} Packets sent"),
+                ("{packet}", "Packets sent"),
+            ),
+            (
+                "usage",
+                MetricKind::Gauge,
+                Some(Unit::Bytes),
+                Some("In use"),
+                ("By", "In use"),
+            ),
+            (
+                "plain",
+                MetricKind::Gauge,
+                None,
+                Some("No unit"),
+                ("1", "No unit"),
+            ),
+        ];
+        for (name, kind, unit, text, _) in cases {
+            let key = Key::from_name(name);
+            match (kind, text) {
+                (MetricKind::Counter, Some(text)) => {
+                    recorder.describe_counter(name.into(), unit, text.into());
+                }
+                (MetricKind::Gauge, Some(text)) => {
+                    recorder.describe_gauge(name.into(), unit, text.into());
+                }
+                (MetricKind::Histogram, Some(text)) => {
+                    recorder.describe_histogram(name.into(), unit, text.into());
+                }
+                (_, None) => {}
+            }
+            match kind {
+                MetricKind::Counter => recorder.register_counter(&key, &METADATA).increment(1),
+                MetricKind::Gauge => recorder.register_gauge(&key, &METADATA).set(1.0),
+                MetricKind::Histogram => recorder.register_histogram(&key, &METADATA).record(1.0),
+            }
+        }
+
+        let mut want: Vec<Exported> = cases
+            .iter()
+            .map(|(name, _, _, _, (unit, description))| {
+                (
+                    (*name).to_string(),
+                    (*unit).to_string(),
+                    (*description).to_string(),
+                    1,
+                )
+            })
+            .collect();
+        want.sort();
+        metrics::with_local_recorder(&recorder, || {
+            crate::metrics::ProcessMetrics::new("").update();
+        });
+
+        let (process, described): (Vec<Exported>, Vec<Exported>) = exported(&provider, &exporter)
+            .into_iter()
+            .partition(|(name, ..)| name.starts_with("process_"));
+        assert_eq!(described, want);
+        // (process gauge, unit). Open descriptors are read on Linux alone.
+        let process_units = [
+            ("process_cpu_seconds_total", "s"),
+            ("process_open_fds", "1"),
+            ("process_resident_memory_bytes", "By"),
+            ("process_start_time_seconds", "s"),
+            ("process_virtual_memory_bytes", "By"),
+        ];
+        let got: Vec<(&str, &str)> = process
+            .iter()
+            .map(|(name, unit, ..)| (name.as_str(), unit.as_str()))
+            .collect();
+        for found in &got {
+            assert!(process_units.contains(found), "{found:?}");
+        }
+        if cfg!(target_os = "linux") {
+            assert_eq!(got, process_units, "every process gauge on Linux");
+        }
+    }
+
+    /// `Counter::absolute` exports the value given, cumulatively, not the sum
+    /// of every value given: the exporter adds the difference from the last.
+    #[test]
+    fn an_absolute_counter_exports_the_value_given() {
+        let (provider, exporter, bare, units) = otel();
+        let recorder = SteadyRecorder::with_units(bare, units);
+        let key = Key::from_name(COUNTER);
+        let mut exported_values = Vec::new();
+        for absolute in [10, 25, 25] {
+            recorder
+                .register_counter(&key, &METADATA)
+                .absolute(absolute);
+            provider
+                .force_flush()
+                .expect("the in-memory exporter takes the flush");
+            let finished = exporter.get_finished_metrics().expect("the flush exported");
+            let value = finished
+                .iter()
+                .flat_map(|resource| resource.scope_metrics())
+                .flat_map(|scope| scope.metrics())
+                .filter_map(|metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                        sum.data_points().last().map(|point| point.value())
+                    }
+                    _ => None,
+                })
+                .last();
+            exported_values.push(value);
+            exporter.reset();
+        }
+        assert_eq!(exported_values, vec![Some(10), Some(25), Some(25)]);
+    }
+
     /// When this fails the exporter gives a name's description to every instrument, and `SteadyRecorder` can stop handing it over.
     #[test]
     fn the_bare_exporter_splits_a_described_metric_into_two_instruments() {
-        let found = exported_streams(|recorder| Box::new(recorder));
+        let found = exported_streams(|recorder, _| Box::new(recorder));
 
         for name in [COUNTER, GAUGE, HISTOGRAM] {
             let count = found

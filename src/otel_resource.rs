@@ -1,12 +1,13 @@
 // Project:   scalo
 // File:      src/otel_resource.rs
-// Purpose:   Replica identity on the OTLP resource
+// Purpose:   Replica, host and version identity on the OTLP resource
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Replica identity for the OTLP resource metrics and spans carry.
+//! Replica, host and version identity for the OTLP resource metrics, spans and
+//! the OTLP transport carry.
 //!
 //! Without `service.instance.id` every replica of a service pushes one series,
 //! the replicas overwrite each other, and a rate over the pushed copy is
@@ -19,10 +20,15 @@
 //!
 //! `k8s.pod.name` comes from `OTEL_RESOURCE_ATTRIBUTES`, then `POD_NAME`, then
 //! `HOSTNAME` when running in Kubernetes, and is left off otherwise.
+//!
+//! `service.version` comes from `SERVICE_VERSION`, the variable the logger
+//! reads. `host.name`, `host.id` (the machine id on Linux and macOS) and
+//! `host.arch` come from the host, and `os.type` from the build target. Any of
+//! them `OTEL_RESOURCE_ATTRIBUTES` sets is left to it.
 
 use std::sync::OnceLock;
 
-use opentelemetry::{Key, KeyValue};
+use opentelemetry::{KeyValue, Value};
 use opentelemetry_sdk::resource::{EnvResourceDetector, ResourceDetector};
 
 /// Semantic-convention key for the replica's identity.
@@ -31,33 +37,64 @@ const SERVICE_INSTANCE_ID: &str = "service.instance.id";
 /// Semantic-convention key for the Kubernetes pod name.
 const K8S_POD_NAME: &str = "k8s.pod.name";
 
-/// `service.instance.id` and, when the pod can be named, `k8s.pod.name`,
-/// leaving out any key `OTEL_RESOURCE_ATTRIBUTES` already sets so the
-/// operator's value stays.
+/// Semantic-convention key for the version of the service.
+const SERVICE_VERSION: &str = "service.version";
+
+/// Semantic-convention key for the operating system.
+const OS_TYPE: &str = "os.type";
+
+/// `service.instance.id`, `k8s.pod.name` when the pod can be named,
+/// `service.version` when `SERVICE_VERSION` is set, and the host's
+/// attributes, leaving out any key `OTEL_RESOURCE_ATTRIBUTES` already sets so
+/// the operator's value stays.
 #[must_use]
 pub(crate) fn instance_attributes() -> Vec<KeyValue> {
     let from_env = EnvResourceDetector::new().detect();
     let pod_name = non_empty_var("POD_NAME");
     let hostname = non_empty_var("HOSTNAME");
 
-    let mut attributes = Vec::with_capacity(2);
-    if from_env
-        .get(&Key::from_static_str(SERVICE_INSTANCE_ID))
-        .is_none()
-    {
-        let id = pod_name
-            .clone()
-            .or_else(|| hostname.clone())
-            .unwrap_or_else(|| generated_instance_id().to_string());
-        attributes.push(KeyValue::new(SERVICE_INSTANCE_ID, id));
-    }
-    if from_env.get(&Key::from_static_str(K8S_POD_NAME)).is_none()
-        && let Some(pod) = pod_name
-            .or_else(|| hostname.filter(|_| crate::env::Environment::detect().is_kubernetes()))
+    let id = pod_name
+        .clone()
+        .or_else(|| hostname.clone())
+        .unwrap_or_else(|| generated_instance_id().to_string());
+    let mut attributes = vec![KeyValue::new(SERVICE_INSTANCE_ID, id)];
+    if let Some(pod) =
+        pod_name.or_else(|| hostname.filter(|_| crate::env::Environment::detect().is_kubernetes()))
     {
         attributes.push(KeyValue::new(K8S_POD_NAME, pod));
     }
+    if let Some(version) = non_empty_var("SERVICE_VERSION") {
+        attributes.push(KeyValue::new(SERVICE_VERSION, version));
+    }
+    attributes.extend_from_slice(host_attributes());
+    attributes.retain(|kv| from_env.get(&kv.key).is_none());
     attributes
+}
+
+/// `host.name`, `host.id` and `host.arch` where the host gives them, and
+/// `os.type`, read once per process.
+fn host_attributes() -> &'static [KeyValue] {
+    static HOST: OnceLock<Vec<KeyValue>> = OnceLock::new();
+    HOST.get_or_init(|| {
+        let detected = opentelemetry_resource_detectors::HostResourceDetector::default().detect();
+        let mut attributes: Vec<KeyValue> = detected
+            .iter()
+            // An empty /etc/machine-id, as many container images ship, is no id.
+            .filter(|(_, value)| !matches!(value, Value::String(s) if s.as_str().trim().is_empty()))
+            .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
+            .collect();
+        attributes.push(KeyValue::new(OS_TYPE, os_type()));
+        attributes
+    })
+}
+
+/// The `os.type` value for the build target, as OpenTelemetry names it.
+fn os_type() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "dragonfly" => "dragonflybsd",
+        other => other,
+    }
 }
 
 /// The variable's trimmed value, or `None` when it is unset or blank.
@@ -83,6 +120,8 @@ fn generated_instance_id() -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use opentelemetry::Key;
+
     use super::*;
 
     /// Every variable the identity reads, so the host's own cannot leak in.
@@ -92,6 +131,7 @@ mod tests {
             ("POD_NAME", None),
             ("HOSTNAME", None),
             ("KUBERNETES_SERVICE_HOST", None),
+            ("SERVICE_VERSION", None),
         ]
     }
 
@@ -196,6 +236,85 @@ mod tests {
                 assert_eq!(get(&attributes, K8S_POD_NAME), None);
             }
         });
+    }
+
+    /// The version, host and OS attributes each come through, and each one
+    /// `OTEL_RESOURCE_ATTRIBUTES` sets is left to it.
+    #[test]
+    fn version_host_and_os_yield_to_otel_resource_attributes() {
+        /// (case, variables, attributes wanted, attributes left out)
+        type Case = (
+            &'static str,
+            Vec<(&'static str, &'static str)>,
+            Vec<(&'static str, &'static str)>,
+            Vec<&'static str>,
+        );
+        let os = if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            std::env::consts::OS
+        };
+        let cases: [Case; 3] = [
+            (
+                "SERVICE_VERSION names the version",
+                vec![("SERVICE_VERSION", "2.4.1")],
+                vec![(SERVICE_VERSION, "2.4.1"), (OS_TYPE, os)],
+                vec![],
+            ),
+            (
+                "a blank SERVICE_VERSION is no version",
+                vec![("SERVICE_VERSION", " ")],
+                vec![(OS_TYPE, os)],
+                vec![SERVICE_VERSION],
+            ),
+            (
+                "the operator's values stay",
+                vec![
+                    ("SERVICE_VERSION", "2.4.1"),
+                    (
+                        "OTEL_RESOURCE_ATTRIBUTES",
+                        "service.version=9,host.name=pinned,host.id=pinned,host.arch=pinned,os.type=pinned",
+                    ),
+                ],
+                vec![],
+                vec![
+                    SERVICE_VERSION,
+                    "host.name",
+                    "host.id",
+                    "host.arch",
+                    OS_TYPE,
+                ],
+            ),
+        ];
+        for (case, set, wanted, left_out) in cases {
+            temp_env::with_vars(vars(&set), || {
+                let attributes = instance_attributes();
+                for (key, value) in &wanted {
+                    assert_eq!(
+                        get(&attributes, key).as_deref(),
+                        Some(*value),
+                        "{case}: {key}"
+                    );
+                }
+                for key in &left_out {
+                    assert_eq!(get(&attributes, key), None, "{case}: {key}");
+                }
+                for kv in &attributes {
+                    assert!(
+                        !kv.value.as_str().trim().is_empty(),
+                        "{case}: {} is blank",
+                        kv.key
+                    );
+                }
+            });
+        }
+        if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+            let host = temp_env::with_vars(cleared(), instance_attributes);
+            assert!(
+                get(&host, "host.name").is_some(),
+                "the host is named: {host:?}"
+            );
+        }
     }
 
     #[test]
