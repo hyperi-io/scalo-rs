@@ -280,13 +280,12 @@ impl GrpcConfig {
 
 impl crate::transport::traits::FromCascade for GrpcConfig {}
 
-#[cfg(test)]
+#[cfg(all(test, feature = "yaml", feature = "figment"))]
 mod tests {
     use super::*;
 
     /// A removed TLS key fails the load, naming its replacement, where the
     /// client would dial with the key dropped.
-    #[cfg(all(feature = "yaml", feature = "figment"))]
     #[test]
     fn a_removed_tls_key_fails_the_load() {
         crate::tls_config::assert_removed::<GrpcConfig>(&[
