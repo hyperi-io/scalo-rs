@@ -21,10 +21,39 @@ pub(crate) const QUEUE_FORMAT_VERSION: &str = "0.7.0";
 /// The stamped versions a queue may carry and still open.
 pub(crate) const QUEUE_FORMAT_ACCEPTS: &str = "0.7.*";
 
-/// The lock file a process of an earlier format may still hold, read before
-/// this open rewrites it. That format writes a `token=` line into a lock file
-/// it creates, and removes the file when it stops.
-pub(crate) fn earlier_owner(base: &Path) -> Option<String> {
+/// Refuses a queue stamped in another format while a lock file names an owner
+/// of the earlier one, reading only, so a refused open changes no file. That
+/// format writes a `token=` line into a lock file it creates, and removes the
+/// file when it stops.
+///
+/// # Errors
+///
+/// `Unsupported` naming the lock file and its pid.
+pub(crate) fn refuse_earlier_owner(base: &Path) -> io::Result<()> {
+    let Some(owner) = earlier_owner(base) else {
+        return Ok(());
+    };
+    let file = base.join("version").join("contents");
+    let stamp = std::fs::read_to_string(&file).unwrap_or_default();
+    let ours = Version::parse(stamp.trim())
+        .ok()
+        .zip(VersionReq::parse(QUEUE_FORMAT_ACCEPTS).ok())
+        .is_some_and(|(named, accepted)| accepted.matches(&named));
+    if ours {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{} names spool format {}, and {owner}. Stop that process, or remove the lock file once it is gone",
+            file.display(),
+            stamp.trim()
+        ),
+    ))
+}
+
+/// The lock file naming a process of an earlier format, and its pid.
+fn earlier_owner(base: &Path) -> Option<String> {
     ["send.lock", "recv.lock"].into_iter().find_map(|name| {
         let text = std::fs::read_to_string(base.join(name)).ok()?;
         text.lines().any(|line| line.starts_with("token=")).then(|| {
@@ -40,14 +69,14 @@ pub(crate) fn earlier_owner(base: &Path) -> Option<String> {
 /// Stamps the format into a queue that has none, or checks the one it has.
 /// A queue in an earlier format that holds no unread entry is cleared and
 /// stamped, since nothing in it is lost. The caller holds the queue's locks,
-/// so no other open races the stamp.
+/// so no other open races the stamp, and has run [`refuse_earlier_owner`].
 ///
 /// # Errors
 ///
 /// `InvalidData` naming the file when it holds no version. `Unsupported` for a
-/// later format, and for an earlier one that still holds entries or whose
-/// owner may still run. Otherwise the read's, removal's or write's error.
-pub(crate) fn check_queue_version(base: &Path, earlier_owner: Option<&str>) -> io::Result<()> {
+/// later format, and for an earlier one that still holds entries. Otherwise
+/// the read's, removal's or write's error.
+pub(crate) fn check_queue_version(base: &Path) -> io::Result<()> {
     let dir = base.join("version");
     std::fs::create_dir_all(&dir)?;
     let file = dir.join("contents");
@@ -86,11 +115,6 @@ pub(crate) fn check_queue_version(base: &Path, earlier_owner: Option<&str>) -> i
         return Err(refused(
             "which a later release wrote. Open it with that release".to_string(),
         ));
-    }
-    if let Some(owner) = earlier_owner {
-        return Err(refused(format!(
-            "and {owner}. Stop that process, or remove the lock file once it is gone"
-        )));
     }
     match unread(base)? {
         Some((0, _)) => {
@@ -209,7 +233,7 @@ mod tests {
                 std::fs::create_dir_all(dir.path().join("version")).unwrap();
                 std::fs::write(dir.path().join("version").join("contents"), stamp).unwrap();
             }
-            match check_queue_version(dir.path(), None) {
+            match check_queue_version(dir.path()) {
                 Ok(()) => {
                     assert_eq!(refused, None, "{name}: opened");
                     let stamped =
@@ -224,8 +248,8 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
-        check_queue_version(dir.path(), None).unwrap();
-        check_queue_version(dir.path(), None).expect("a stamped queue reopens");
+        check_queue_version(dir.path()).unwrap();
+        check_queue_version(dir.path()).expect("a stamped queue reopens");
     }
 
     /// An entry as the earlier format wrote it: the same header, then the payload.
@@ -341,7 +365,7 @@ mod tests {
             if let Some(lock) = lock {
                 std::fs::write(base.join("send.lock"), lock).unwrap();
             }
-            let opened = check_queue_version(base, earlier_owner(base).as_deref());
+            let opened = refuse_earlier_owner(base).and_then(|()| check_queue_version(base));
             let stamped = std::fs::read_to_string(base.join("version").join("contents")).unwrap();
             match (opened, refused) {
                 (Ok(()), None) => {

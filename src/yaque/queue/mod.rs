@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use super::header::{EOF, Header};
 use super::sync::{FileGuard, Shared};
-use super::version::{check_queue_version, earlier_owner};
+use super::version::{check_queue_version, refuse_earlier_owner};
 
 /// What a queue opens with.
 #[derive(Debug, Clone, Copy)]
@@ -57,11 +57,11 @@ pub(crate) fn segment_filename(base: &Path, segment: u64) -> PathBuf {
 /// version stamp or segment name this build does not read, or the I/O error.
 pub(crate) fn channel(base: &Path, options: Options) -> io::Result<(Sender, Receiver)> {
     std::fs::create_dir_all(base)?;
-    // Read before the locks below rewrite the files.
-    let earlier = earlier_owner(base);
+    // Before the locks below rewrite the lock files.
+    refuse_earlier_owner(base)?;
     let send_lock = lock(base, "send.lock", "sender")?;
     let recv_lock = lock(base, "recv.lock", "receiver")?;
-    check_queue_version(base, earlier.as_deref())?;
+    check_queue_version(base)?;
     let shared = Arc::new(Shared::default());
     let sender = Sender::open(base, options, Arc::clone(&shared), send_lock)?;
     let receiver = Receiver::open(base, options, shared, recv_lock)?;
@@ -706,6 +706,43 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
         drop(first);
         channel(&path, options(512)).expect("released");
+    }
+
+    /// Every file under `dir` and its bytes.
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(snapshot(&path));
+            } else {
+                files.insert(path.clone(), std::fs::read(&path).unwrap());
+            }
+        }
+        files
+    }
+
+    /// A drained 0.6 queue whose lock file names a 0.6 owner is refused on
+    /// every open, and no refused open changes a file in it, so a restart
+    /// loop never clears it under the running 0.6 process.
+    #[test]
+    fn an_earlier_owner_is_refused_without_touching_the_queue() {
+        let (_dir, path) = test_queue_dir();
+        std::fs::create_dir_all(path.join("version")).unwrap();
+        std::fs::write(path.join("version").join("contents"), "0.6.6\n").unwrap();
+        let segment = [entry(b"first"), entry(b"second")].concat();
+        std::fs::write(segment_filename(&path, 0), &segment).unwrap();
+        let mut saved = [0_u8; 16];
+        saved[8..].copy_from_slice(&(segment.len() as u64).to_be_bytes());
+        std::fs::write(path.join(crate::yaque::RECV_METADATA), saved).unwrap();
+        std::fs::write(path.join("send.lock"), "pid=4242\ntoken=7\n").unwrap();
+        let before = snapshot(&path);
+        for open in 1..=2 {
+            let err = channel(&path, options(512)).err().expect("refused");
+            assert_eq!(err.kind(), io::ErrorKind::Unsupported, "open {open}: {err}");
+            assert!(err.to_string().contains("pid 4242"), "open {open}: {err}");
+            assert_eq!(snapshot(&path), before, "open {open} changed the queue");
+        }
     }
 
     /// A copy of a lock's handle, as a spawned child holds until it execs,
