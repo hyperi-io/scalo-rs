@@ -383,7 +383,7 @@ fn resource(resolved: &ResolvedOtelConfig) -> opentelemetry_sdk::Resource {
     }
     if !resolved.deployment_environment.is_empty() {
         builder = builder.with_attribute(opentelemetry::KeyValue::new(
-            "deployment.environment.name",
+            crate::otel_resource::DEPLOYMENT_ENVIRONMENT,
             resolved.deployment_environment.clone(),
         ));
     }

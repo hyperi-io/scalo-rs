@@ -32,14 +32,19 @@ pub(super) struct OtlpResource {
 }
 
 impl OtlpResource {
-    /// `service.name`, the replica, host and version identity,
-    /// `OTEL_RESOURCE_ATTRIBUTES` and the SDK's own attributes, with
+    /// `service.name`, `deployment.environment.name` from the resolved app
+    /// env as the metrics resource has it, the replica, host and version
+    /// identity, `OTEL_RESOURCE_ATTRIBUTES` and the SDK's own attributes, with
     /// `config.resource_attributes` set last so they win.
     pub(super) fn new(config: &OtlpConfig) -> Self {
         let mut builder = opentelemetry_sdk::Resource::builder();
         if let Some(name) = config.service_name.as_deref().filter(|n| !n.is_empty()) {
             builder = builder.with_service_name(name.to_string());
         }
+        builder = builder.with_attribute(opentelemetry::KeyValue::new(
+            crate::otel_resource::DEPLOYMENT_ENVIRONMENT,
+            crate::env::get_app_env(),
+        ));
         builder = builder.with_attributes(crate::otel_resource::instance_attributes());
         for (key, value) in &config.resource_attributes {
             builder =
@@ -353,7 +358,8 @@ mod tests {
                 .collect(),
             ..OtlpConfig::default()
         };
-        let resource = OtlpResource::new(&config);
+        let resource =
+            temp_env::with_var("APP_ENV", Some("staging"), || OtlpResource::new(&config));
         let records = [record(b"a", &[], None), record(b"b", &[], None)];
         let request = resource.request(&records, 7);
 
@@ -366,6 +372,11 @@ mod tests {
                 .and_then(|kv| kv.value.clone())
         };
         assert_eq!(attribute("service.name"), Some(text("shipper")));
+        assert_eq!(
+            attribute("deployment.environment.name"),
+            Some(text("staging")),
+            "the resolved app env, as on the metrics resource"
+        );
         assert_eq!(
             attribute("service.instance.id"),
             Some(text("pinned")),
