@@ -952,10 +952,11 @@ mod tests {
             .into_iter()
             .partition(|(name, ..)| name.starts_with("process_"));
         assert_eq!(described, want);
-        // (process gauge, unit). Open descriptors are read on Linux alone.
+        // (process gauge, unit). Open descriptors are read on Linux, handles on Windows.
         let process_units = [
             ("process_cpu_seconds_total", "s"),
             ("process_open_fds", "1"),
+            ("process_open_handles", "1"),
             ("process_resident_memory_bytes", "By"),
             ("process_start_time_seconds", "s"),
             ("process_virtual_memory_bytes", "By"),
@@ -968,7 +969,11 @@ mod tests {
             assert!(process_units.contains(found), "{found:?}");
         }
         if cfg!(target_os = "linux") {
-            assert_eq!(got, process_units, "every process gauge on Linux");
+            let linux: Vec<(&str, &str)> = process_units
+                .into_iter()
+                .filter(|(name, _)| *name != "process_open_handles")
+                .collect();
+            assert_eq!(got, linux, "every process gauge on Linux");
         }
     }
 

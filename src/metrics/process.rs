@@ -85,6 +85,12 @@ impl ProcessMetrics {
             Unit::Seconds,
             "Start time of the process since unix epoch in seconds"
         );
+        #[cfg(windows)]
+        metrics::describe_gauge!(
+            "process_open_handles",
+            Unit::Count,
+            "Number of open handles"
+        );
     }
 
     /// Update process metrics.
@@ -96,10 +102,15 @@ impl ProcessMetrics {
         let Some(system) = guard.as_mut() else {
             return;
         };
+        // CPU time and memory alone: the command line, environment and disk
+        // usage `everything()` reads are not exported.
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[self.pid]),
             true,
-            ProcessRefreshKind::everything(),
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .without_tasks(),
         );
 
         if let Some(process) = system.process(self.pid) {
@@ -121,10 +132,28 @@ impl ProcessMetrics {
                 }
             }
 
+            #[cfg(windows)]
+            if let Some(handles) = open_handles() {
+                metrics::gauge!("process_open_handles").set(f64::from(handles));
+            }
+
             // Start time
             metrics::gauge!("process_start_time_seconds").set(self.start_time);
         }
     }
+}
+
+/// Handles this process holds open (Windows only).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn open_handles() -> Option<u32> {
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+    let mut count = 0_u32;
+    // SAFETY: the pseudo-handle GetCurrentProcess returns needs no closing, and
+    // `count` is a live u32 the call writes.
+    unsafe { GetProcessHandleCount(GetCurrentProcess(), &raw mut count) }.ok()?;
+    Some(count)
 }
 
 /// Count open file descriptors (Linux only).
@@ -144,11 +173,73 @@ mod tests {
         assert!(pm.start_time > 0.0);
     }
 
+    /// An update sets CPU time, memory and start time as gauges, each with its
+    /// unit, the open descriptors on Linux and the open handles on Windows.
     #[test]
     fn test_process_metrics_update() {
-        let pm = ProcessMetrics::new("test");
-        // Should not panic
-        pm.update();
+        use metrics_util::MetricKind;
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let pm = ProcessMetrics::new("test");
+            pm.update();
+            pm.update();
+        });
+        let found: Vec<(String, MetricKind, Option<Unit>, bool)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(key, unit, _, value)| {
+                let set = match value {
+                    DebugValue::Gauge(value) => value.into_inner() >= 0.0,
+                    DebugValue::Counter(_) | DebugValue::Histogram(_) => false,
+                };
+                (key.key().name().to_string(), key.kind(), unit, set)
+            })
+            .collect();
+        let has = |name: &str, kind: MetricKind, unit: Unit| {
+            found
+                .iter()
+                .any(|(n, k, u, set)| n == name && *k == kind && *u == Some(unit) && *set)
+        };
+        assert!(
+            has(
+                "process_cpu_seconds_total",
+                MetricKind::Gauge,
+                Unit::Seconds
+            ),
+            "{found:?}"
+        );
+        assert!(
+            has(
+                "process_resident_memory_bytes",
+                MetricKind::Gauge,
+                Unit::Bytes
+            ),
+            "{found:?}"
+        );
+        assert!(
+            has(
+                "process_start_time_seconds",
+                MetricKind::Gauge,
+                Unit::Seconds
+            ),
+            "{found:?}"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(
+                has("process_open_fds", MetricKind::Gauge, Unit::Count),
+                "{found:?}"
+            );
+        }
+        if cfg!(windows) {
+            assert!(
+                has("process_open_handles", MetricKind::Gauge, Unit::Count),
+                "{found:?}"
+            );
+        }
     }
 
     /// The collector tracks this process alone, never the rest of the host.

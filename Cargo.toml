@@ -67,7 +67,7 @@ strmatch = ["regex", "regex-automata", "regex-syntax", "aho-corasick", "memchr",
 
 # Tiers, and why `metrics` pulls the OTLP exporters: docs/core-pillars/metrics.md#feature-tiers.
 metrics-core = ["dep:metrics", "tracing"]
-metrics-process = ["metrics-core", "sysinfo"]
+metrics-process = ["metrics-core", "sysinfo", "dep:windows"]
 metrics = ["metrics-process", "concurrency", "metrics-exporter-prometheus", "dep:crossbeam-epoch", "tokio", "serde_json", "otel-metrics", "otel-tracing"]
 
 # `metrics` enables `otel-metrics`, never the reverse: the other direction is a cargo feature cycle.
