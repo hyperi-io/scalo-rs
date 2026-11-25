@@ -89,7 +89,7 @@ Ready is deliberate: a deploy's readiness gate fails any pod that is not
 meant to survive.
 
 The gate parks on [`ConfigWatch`](config.md) -- the same file-mtime poll and
-SIGHUP the reloader uses -- re-reads through the app's `load_config`, and
+SIGHUP (Unix only) the reloader uses -- re-reads through the app's `load_config`, and
 re-evaluates the predicate. A load that fails while idle is logged and the
 previous config kept. Shutdown while idle exits 0 rather than starting work on
 the way out.

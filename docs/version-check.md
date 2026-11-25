@@ -89,7 +89,7 @@ POST body, matching scalo-py field for field:
 free-form deployment strings cannot leak. `instance_id` is derived from
 what the app runs on -- first hit wins: explicit config id, Kubernetes
 (UUIDv5 over the serviceaccount cluster CA + namespace), `/etc/machine-id`
-app-scoped outside containers, a UUID persisted under `~/.config/scalo/`,
+app-scoped outside containers (Linux only), a UUID persisted in the user's config directory,
 then an ephemeral UUID. The UUIDv5 namespace is shared with scalo-py, so both
 chassis derive the same id on the same platform, and the derived forms are
 one-way -- nothing about the host is recoverable.

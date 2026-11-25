@@ -21,7 +21,7 @@ never constructs `HttpServer`. An app that stands up only `HttpServer` on the
 contract's `metrics_port` will answer the health probes and 404 the scrape.
 
 The server respects the same `CancellationToken` as the rest of the runtime so
-SIGTERM drains in-flight requests before exit.
+SIGTERM, or a console close or system shutdown on Windows, drains in-flight requests before exit.
 
 ---
 
@@ -134,7 +134,7 @@ http_server:
 | `HttpServer::new(config)` | Build from explicit config |
 | `HttpServer::bind(addr)` | Build with just a bind address |
 | `.with_tls(ServerTls)` | Terminate TLS with a loaded `ServerTls` (`tls` feature) |
-| `.serve(app)` | Run until SIGTERM or Ctrl-C, merging the probe and config routes |
+| `.serve(app)` | Run until SIGTERM or Ctrl-C (a console close or system shutdown on Windows), merging the probe and config routes |
 | `.serve_with_shutdown(app, shutdown)` | Run until the shutdown future resolves |
 | `.serve_with_handle(app)` | Returns (`ShutdownHandle`, `ServerFuture`) |
 | `.set_ready(bool)` | Toggle the ready flag |

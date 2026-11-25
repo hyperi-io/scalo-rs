@@ -137,7 +137,8 @@ Each drain send is bounded by `send_timeout_ms`, the limit the hot path uses. A 
 - `max_spool_items` -- record limit for the spool.
 - `max_spool_bytes` -- most bytes the spool's files take on disk. Each record counts as stored, compressed and framed, plus its 4-byte header. The records a segment has delivered stay on disk until the whole segment goes, so one segment's worth of the cap is held back for them, and with a cap the segment shrinks to a quarter of it. The files then stay within the cap, give or take one record.
 - `disk_aware: { max_usage_percent, poll_interval_secs }` -- background
-  `statvfs` poller. Once filesystem use crosses the threshold,
+  poller, `statvfs` on Linux and macOS and `GetDiskFreeSpaceExW` on Windows
+  ([../platforms.md](../platforms.md)). Once filesystem use crosses the threshold,
   `disk_available` flips false and spool writes return
   `DiskUnavailable`. A `poll_interval_secs` of 0 reads as 1.
 

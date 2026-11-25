@@ -192,7 +192,7 @@ flat (K8s) and nested (double-underscore) forms. `config::load_typed` and
 
 ## Hot-reload
 
-`ConfigReloader<T>` watches the config file (and/or SIGHUP / periodic timer),
+`ConfigReloader<T>` watches the config file (and/or SIGHUP, Unix only / periodic timer),
 rebuilds the typed view on change, and publishes it through `SharedConfig<T>`.
 The reloader is built with a reload closure, then started:
 

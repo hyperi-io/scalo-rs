@@ -217,6 +217,10 @@ fn set_executable(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as the unix build, which can fail"
+)]
 fn set_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
