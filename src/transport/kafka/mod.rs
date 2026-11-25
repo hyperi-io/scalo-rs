@@ -53,6 +53,7 @@ mod acks;
 mod admin;
 mod classify;
 mod metrics;
+mod pause;
 mod producer;
 #[cfg(all(feature = "transport-kafka-test-support", unix))]
 pub mod test_support;
@@ -63,6 +64,7 @@ pub use admin::{KafkaAdmin, TopicInfo};
 pub use metrics::{
     BrokerMetrics, KafkaMetrics, StatsContext, healthy_broker_count, total_consumer_lag,
 };
+pub use pause::{PartitionControlError, PartitionOp};
 pub use producer::{KafkaProducer, ProducerMetrics, ProducerProfile};
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 use types::config;
@@ -423,6 +425,8 @@ pub struct KafkaTransport {
     asked_ends: AskedEnds,
     /// Source acknowledgement config, arming and held offsets.
     acks: acks::KafkaAcks,
+    /// Partitions the caller holds paused, shared with the gate actuator.
+    pauses: Arc<pause::PauseState>,
     /// The producer's `message.max.bytes`, for screening records before a send.
     message_max_bytes: usize,
     /// What a send's `Ok` proves under the producer's `acks`.
@@ -594,10 +598,46 @@ fn action_after_fatal(current: ConsumerProtocol, code: RDKafkaErrorCode) -> Fata
     }
 }
 
-/// A poll job still running, with the client it polls.
+/// A poll job no receive has taken the records of yet, with the client it polls.
 struct InFlightPoll {
     client: Arc<BaseConsumer<StatsContext>>,
-    job: tokio::task::JoinHandle<Polled>,
+    job: PollJobState,
+}
+
+/// Where a poll job has got to.
+enum PollJobState {
+    Running(tokio::task::JoinHandle<Polled>),
+    /// Finished under a seek, which waits for it, for the next receive to take.
+    Finished(Polled),
+}
+
+impl InFlightPoll {
+    /// Wait for the job to finish and keep its result here. Dropped mid-wait,
+    /// the job runs on and the next caller waits for it.
+    async fn settle(&mut self) -> TransportResult<()> {
+        if let PollJobState::Running(job) = &mut self.job {
+            let polled = job
+                .await
+                .map_err(|e| TransportError::Recv(format!("kafka poll task failed: {e}")))?;
+            self.job = PollJobState::Finished(polled);
+        }
+        Ok(())
+    }
+
+    /// Leave out the finished job's records of `topic`/`partition` at or
+    /// after `from`, which a seek there reads again, and return how many.
+    fn leave_out(&mut self, topic: &str, partition: i32, from: i64) -> usize {
+        let PollJobState::Finished(Polled::Records { spans, .. }) = &mut self.job else {
+            return 0;
+        };
+        let before = spans.len();
+        spans.retain(|span| {
+            span.token.partition != partition
+                || &*span.token.topic != topic
+                || span.token.offset < from
+        });
+        before - spans.len()
+    }
 }
 
 /// What a poll job that ran on a client since replaced hands back: its
@@ -1494,6 +1534,7 @@ impl KafkaTransport {
             partition_limited_flag,
             asked_ends: AskedEnds::new(consumer_config.as_ref()),
             acks: acks::KafkaAcks::default(),
+            pauses: Arc::default(),
             message_max_bytes,
             delivery,
             poll_cap: config.sizing.effective_poll_cap(),
@@ -1567,6 +1608,7 @@ impl KafkaTransport {
     pub fn gate_actuator(&self) -> Box<dyn crate::governor::GateActuator> {
         Box::new(KafkaGateActuator {
             consumer: self.consumer.clone(),
+            pauses: Arc::clone(&self.pauses),
         })
     }
 
@@ -1708,6 +1750,166 @@ impl KafkaTransport {
         count_revoke_discarded(REVOKE_STAGE_BUFFER, records);
     }
 
+    /// Stop fetching `partitions` until [`resume_partitions`](Self::resume_partitions)
+    /// names them. The member stays in its group, so no rebalance follows.
+    ///
+    /// All or none: every partition must be one this consumer holds now. A
+    /// partition held paused stays paused across the inbound gate's resume.
+    /// A revoke ends the hold, as librdkafka forgets a pause across a
+    /// rebalance, and a partition assigned again, or a rebuilt consumer,
+    /// starts unpaused. [`paused_partitions`](Self::paused_partitions) shows
+    /// which holds stand.
+    ///
+    /// Pausing stops fetching. Records a receive already took still arrive,
+    /// and keep calling `recv`, which serves the group's heartbeat.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionControlError::NoConsumer`] on a transport that only sends,
+    /// [`NotAssigned`](PartitionControlError::NotAssigned) for a partition this
+    /// consumer does not hold, and [`Refused`](PartitionControlError::Refused)
+    /// when librdkafka refuses the call. Nothing is paused then. Each is
+    /// counted in `transport_partition_control_errors_total`.
+    pub fn pause_partitions(
+        &self,
+        partitions: &[(&str, i32)],
+    ) -> Result<(), PartitionControlError> {
+        let consumer = self
+            .client()
+            .ok_or(PartitionControlError::NoConsumer {
+                op: PartitionOp::Pause,
+            })
+            .map_err(pause::counted)?;
+        self.pauses
+            .pause(&*consumer, partitions)
+            .map_err(pause::counted)
+    }
+
+    /// Release the hold [`pause_partitions`](Self::pause_partitions) put on
+    /// `partitions`, and fetch them again. One the inbound gate holds stays
+    /// paused until the gate resumes, and one not held is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionControlError::NoConsumer`] on a transport that only sends,
+    /// and [`Refused`](PartitionControlError::Refused) when librdkafka refuses
+    /// the call. The hold stands then, so the call can be made again. Each is
+    /// counted in `transport_partition_control_errors_total`.
+    pub fn resume_partitions(
+        &self,
+        partitions: &[(&str, i32)],
+    ) -> Result<(), PartitionControlError> {
+        let consumer = self
+            .client()
+            .ok_or(PartitionControlError::NoConsumer {
+                op: PartitionOp::Resume,
+            })
+            .map_err(pause::counted)?;
+        self.pauses
+            .resume(&*consumer, partitions)
+            .map_err(pause::counted)
+    }
+
+    /// The partitions [`pause_partitions`](Self::pause_partitions) holds
+    /// paused now, by topic then partition.
+    #[must_use]
+    pub fn paused_partitions(&self) -> Vec<(Arc<str>, i32)> {
+        self.pauses.held()
+    }
+
+    /// Read `topic`/`partition` again from `offset`: the next record of it a
+    /// receive returns is the one at `offset`, or where `auto.offset.reset`
+    /// points when retention has removed it. Seeking a paused partition
+    /// moves where it reads from once resumed.
+    ///
+    /// Call it between receives, from the task that receives. It waits for a
+    /// poll a dropped receive left running and leaves out what that poll read
+    /// of the partition at or after `offset`, and no receive polls and no
+    /// commit lands until it returns.
+    ///
+    /// Once armed, every offset of the partition at or after `offset` is
+    /// forgotten, so no commit passes `offset` until the copies read again are
+    /// released. Release the tokens of the records at or after `offset` that
+    /// were handed out before the seek, delivered or dropped, after it
+    /// returns: each is the old copy's release and commits nothing. One
+    /// released before it may commit past `offset`. One never released holds
+    /// the partition's commit at its offset until a revoke or a restart.
+    ///
+    /// # Errors
+    ///
+    /// [`PartitionControlError::InvalidOffset`] for a negative offset,
+    /// [`NoConsumer`](PartitionControlError::NoConsumer) on a transport that
+    /// only sends, [`NotAssigned`](PartitionControlError::NotAssigned) for a
+    /// partition this consumer does not hold, and
+    /// [`Refused`](PartitionControlError::Refused) when librdkafka refuses the
+    /// seek or it does not finish within 10 s. Nothing is forgotten then, and
+    /// the partition reads on from where it was. Each is counted in
+    /// `transport_partition_control_errors_total`.
+    pub async fn seek_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<(), PartitionControlError> {
+        self.seek_inner(topic, partition, offset)
+            .await
+            .map_err(pause::counted)
+    }
+
+    async fn seek_inner(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> Result<(), PartitionControlError> {
+        if offset < 0 {
+            return Err(PartitionControlError::InvalidOffset {
+                topic: topic.to_string(),
+                partition,
+                offset,
+            });
+        }
+        let consumer = self.client().ok_or(PartitionControlError::NoConsumer {
+            op: PartitionOp::Seek,
+        })?;
+        if consumer.context().assignment(topic, partition).is_none() {
+            return Err(PartitionControlError::NotAssigned {
+                op: PartitionOp::Seek,
+                topic: topic.to_string(),
+                partition,
+            });
+        }
+        let mut in_flight = self.in_flight.lock().await;
+        let _serial = self.acks.serialise_commit().await;
+        if let Some(running) = in_flight.as_mut() {
+            match running.settle().await {
+                Ok(()) => {
+                    let left_out = running.leave_out(topic, partition, offset);
+                    tracing::debug!(
+                        topic,
+                        partition,
+                        left_out,
+                        "kafka seek: a poll in flight's records past the seek point are read again"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "kafka seek: the poll in flight failed");
+                    *in_flight = None;
+                }
+            }
+        }
+        let owned_topic = topic.to_string();
+        let seeker = Arc::clone(&consumer);
+        tokio::task::spawn_blocking(move || seek_one(&seeker, &owned_topic, partition, offset))
+            .await
+            .map_err(|e| PartitionControlError::Refused {
+                op: PartitionOp::Seek,
+                detail: format!("seek task failed: {e}"),
+            })??;
+        self.acks.rewound(&Arc::from(topic), partition, offset);
+        Ok(())
+    }
+
     /// Replace the consumer client with a new one joined under `protocol`,
     /// subscribed to the same topics.
     ///
@@ -1752,6 +1954,8 @@ impl KafkaTransport {
             )
         };
         self.deferred_recv_error.lock().take();
+        // The new client pauses nothing, and reads every partition again.
+        self.pauses.clear();
         count_consumer_rebuild(protocol);
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => drop(runtime.spawn_blocking(move || drop(old))),
@@ -2653,6 +2857,7 @@ impl KafkaTransport {
         }
         // Rebalances run inside the poll, so what one changed is known before
         // anything this poll read is held or handed out.
+        self.pauses.rebalanced(&*consumer, &rebalanced);
         let revoked_at = self.acks.rebalanced(rebalanced);
         let (arena, mut spans) = match polled {
             Polled::Empty => {
@@ -2773,14 +2978,22 @@ impl KafkaTransport {
             };
             InFlightPoll {
                 client: Arc::clone(consumer),
-                job: tokio::task::spawn_blocking(move || job.run()),
+                job: PollJobState::Running(tokio::task::spawn_blocking(move || job.run())),
             }
         });
-        let polled = (&mut running.job).await;
+        let settled = running.settle().await;
         let stale = !Arc::ptr_eq(&running.client, consumer);
-        *in_flight = None;
-        let polled =
-            polled.map_err(|e| TransportError::Recv(format!("kafka poll task failed: {e}")))?;
+        let taken = in_flight.take();
+        settled?;
+        let Some(InFlightPoll {
+            job: PollJobState::Finished(polled),
+            ..
+        }) = taken
+        else {
+            return Err(TransportError::Recv(
+                "kafka poll job ended without a result".into(),
+            ));
+        };
         // Taken under the lock, so a revoke a waiting receive's poll serves is
         // left for that receive to check its own records against.
         let rebalanced = consumer.context().take_rebalanced();
@@ -2858,6 +3071,30 @@ impl KafkaTransport {
             .map_err(|e| TransportError::Commit(e.to_string()))?;
         Ok(())
     }
+}
+
+/// How long a seek waits for librdkafka's fetcher to take the new offset.
+const SEEK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Seek one partition, waiting until librdkafka will hand out nothing it
+/// fetched from the old position.
+fn seek_one(
+    consumer: &BaseConsumer<StatsContext>,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+) -> Result<(), PartitionControlError> {
+    let refused = |e: &KafkaError| PartitionControlError::refused(PartitionOp::Seek, e);
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(topic, partition, Offset::Offset(offset))
+        .map_err(|e| refused(&e))?;
+    let sought = consumer
+        .seek_partitions(tpl, SEEK_TIMEOUT)
+        .map_err(|e| refused(&e))?;
+    for element in sought.elements() {
+        element.error().map_err(|e| refused(&e))?;
+    }
+    Ok(())
 }
 
 /// Highest offset per `(topic, partition)` across `tokens`.
@@ -3308,15 +3545,18 @@ fn drains(class: classify::RecvFailure) -> bool {
 /// Holds the transport's consumer slot (see [`KafkaTransport::gate_actuator`]),
 /// so it acts on whichever client the transport runs now. On the rising edge it
 /// reads the live assignment and pauses exactly those partitions. On the
-/// falling edge it resumes them. Pausing the assignment (not unsubscribing)
-/// keeps the member in the group, so no rebalance fires while held.
-/// Pause/resume failures are logged but never panic -- the gate's edge
+/// falling edge it resumes them, less the partitions a caller holds paused
+/// with [`KafkaTransport::pause_partitions`]. Pausing the assignment (not
+/// unsubscribing) keeps the member in the group, so no rebalance fires while
+/// held. Pause/resume failures are logged but never panic -- the gate's edge
 /// bookkeeping has already advanced, and a missed pause degrades to "kept
 /// ingesting", never a deadlock.
 #[cfg(feature = "governor")]
 struct KafkaGateActuator {
     /// `None` for a transport that only sends: pause and resume do nothing.
     consumer: Option<SharedConsumer>,
+    /// The transport's pause state, which the edges record the gate's hold in.
+    pauses: Arc<pause::PauseState>,
 }
 
 #[cfg(feature = "governor")]
@@ -3334,16 +3574,10 @@ impl crate::governor::GateActuator for KafkaGateActuator {
         let Some(consumer) = self.client() else {
             return;
         };
-        match consumer.assignment() {
-            Ok(tpl) => match consumer.pause(&tpl) {
-                Ok(()) => consumer.context().set_paused(true),
-                Err(e) => {
-                    tracing::warn!(error = %e, "kafka gate: pause(assignment) failed");
-                    gate_actuator_error("pause");
-                }
-            },
+        match self.pauses.gate_pause(&*consumer) {
+            Ok(()) => consumer.context().set_paused(true),
             Err(e) => {
-                tracing::warn!(error = %e, "kafka gate: assignment() failed on pause");
+                tracing::warn!(error = %e, "kafka gate: pausing the assignment failed");
                 gate_actuator_error("pause");
             }
         }
@@ -3353,16 +3587,10 @@ impl crate::governor::GateActuator for KafkaGateActuator {
         let Some(consumer) = self.client() else {
             return;
         };
-        match consumer.assignment() {
-            Ok(tpl) => match consumer.resume(&tpl) {
-                Ok(()) => consumer.context().set_paused(false),
-                Err(e) => {
-                    tracing::warn!(error = %e, "kafka gate: resume(assignment) failed");
-                    gate_actuator_error("resume");
-                }
-            },
+        match self.pauses.gate_resume(&*consumer) {
+            Ok(()) => consumer.context().set_paused(false),
             Err(e) => {
-                tracing::warn!(error = %e, "kafka gate: assignment() failed on resume");
+                tracing::warn!(error = %e, "kafka gate: resuming the assignment failed");
                 gate_actuator_error("resume");
             }
         }
@@ -4562,8 +4790,116 @@ mod tests {
     ) {
         *transport.in_flight.lock().await = Some(InFlightPoll {
             client,
-            job: tokio::spawn(async move { polled }),
+            job: PollJobState::Finished(polled),
         });
+    }
+
+    fn span_at(topic: &Arc<str>, partition: i32, offset: i64) -> Span {
+        Span {
+            key: Some(Arc::clone(topic)),
+            token: KafkaToken::new(Arc::clone(topic), partition, offset),
+            timestamp_ms: None,
+            format: PayloadFormat::Auto,
+            range: 0..0,
+            rebalances: 0,
+        }
+    }
+
+    /// A seek leaves out what a poll in flight read of its partition at or
+    /// past the seek point, and nothing else: the consumer reads that again.
+    #[tokio::test]
+    async fn a_seek_leaves_out_what_a_poll_in_flight_read_past_it() {
+        let transport = broker_free("scalo-seek-in-flight", ConsumerProtocol::Classic).await;
+        let events: Arc<str> = Arc::from("events");
+        let other: Arc<str> = Arc::from("other");
+        let mut in_flight = InFlightPoll {
+            client: transport.consumer(),
+            job: PollJobState::Running(tokio::spawn({
+                let spans = vec![
+                    span_at(&events, 0, 4),
+                    span_at(&events, 0, 5),
+                    span_at(&events, 0, 6),
+                    span_at(&events, 1, 9),
+                    span_at(&other, 0, 9),
+                ];
+                async move {
+                    Polled::Records {
+                        arena: Vec::new(),
+                        spans,
+                        stopped_by: None,
+                    }
+                }
+            })),
+        };
+        in_flight.settle().await.expect("the job finishes");
+        assert_eq!(in_flight.leave_out("events", 0, 5), 2);
+        let PollJobState::Finished(Polled::Records { spans, .. }) = in_flight.job else {
+            panic!("a finished job keeps its records");
+        };
+        let kept: Vec<(String, i32, i64)> = spans
+            .iter()
+            .map(|s| (s.token.topic.to_string(), s.token.partition, s.token.offset))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("events".to_string(), 0, 4),
+                ("events".to_string(), 1, 9),
+                ("other".to_string(), 0, 9)
+            ]
+        );
+    }
+
+    /// Each refusal comes back typed, before any librdkafka call, from a
+    /// consumer that holds no partition.
+    #[tokio::test]
+    async fn pause_resume_and_seek_refuse_a_partition_this_consumer_does_not_hold() {
+        let transport = broker_free("scalo-pause-unassigned", ConsumerProtocol::Classic).await;
+        let paused = transport.pause_partitions(&[("events", 0)]);
+        assert!(matches!(
+            paused,
+            Err(PartitionControlError::NotAssigned {
+                op: PartitionOp::Pause,
+                partition: 0,
+                ..
+            })
+        ));
+        assert_eq!(transport.paused_partitions(), Vec::<(Arc<str>, i32)>::new());
+        transport
+            .resume_partitions(&[("events", 0)])
+            .expect("a partition never paused resumes as a no-op");
+        let sought = transport.seek_partition("events", 0, 5).await;
+        assert!(matches!(
+            sought,
+            Err(PartitionControlError::NotAssigned {
+                op: PartitionOp::Seek,
+                ..
+            })
+        ));
+        let negative = transport.seek_partition("events", 0, -1).await;
+        assert!(matches!(
+            negative,
+            Err(PartitionControlError::InvalidOffset { offset: -1, .. })
+        ));
+
+        let sender = KafkaTransport::sender(&KafkaConfig {
+            brokers: vec!["127.0.0.1:1".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("a sending transport constructs broker-free");
+        assert_eq!(
+            sender.pause_partitions(&[("events", 0)]),
+            Err(PartitionControlError::NoConsumer {
+                op: PartitionOp::Pause
+            })
+        );
+        assert_eq!(
+            sender.seek_partition("events", 0, 5).await,
+            Err(PartitionControlError::NoConsumer {
+                op: PartitionOp::Seek
+            })
+        );
     }
 
     /// A poll left in flight on a client replaced since is never settled

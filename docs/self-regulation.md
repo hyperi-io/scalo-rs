@@ -169,7 +169,7 @@ flowchart LR
   `pause()` once on the rising edge, `resume()` once on the falling edge. It
   pauses the inbound SOURCE (stops pulling new work) -- never the outbound
   drain. See [backpressure.md](backpressure.md) for why gating the drain
-  deadlocks.
+  deadlocks. On Kafka the falling edge leaves paused any partition an app holds with `KafkaTransport::pause_partitions`, and an app's resume while the gate holds leaves the partition to the gate's ([transport/backends.md](transport/backends.md#receiving-and-committing)).
 
 ---
 

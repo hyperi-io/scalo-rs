@@ -14,6 +14,12 @@ release and the target before bumping.
 
 **Consumer adjustment** -- a `match` on either enum adds the arm. A caller that matched the message text to wait out an old owner matches the variant instead.
 
+### Kafka per-partition pause, resume and seek (additive, BEHAVIOUR CHANGE)
+
+`KafkaTransport::pause_partitions`, `resume_partitions`, `paused_partitions` and `seek_partition` hold chosen partitions paused and read one again from an offset. A refusal is `PartitionControlError`, counted in `transport_partition_control_errors_total`. The inbound gate's resume now leaves a partition an app holds paused. Once acknowledgements are armed, a seek forgets the held offsets at and past the seek point, so the tokens handed out before it are released after it. An `Errored` release of a copy handed out before a revoke or a seek is the old copy's and withholds nothing, where it pinned the copy read again before. See [transport/backends.md](transport/backends.md#receiving-and-committing).
+
+**Consumer adjustment** -- none for an app that calls none of the four.
+
 ## 2.14.38
 
 ### The spool and the tiered sink sync on a timer, hold OS locks, and cap the disk (BEHAVIOUR CHANGE)

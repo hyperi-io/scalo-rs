@@ -28,6 +28,7 @@ counter transport_message_too_large_total transport="file"
 counter transport_message_too_large_total transport="grpc"
 counter transport_message_too_large_total transport="kafka"
 counter transport_message_too_large_total transport="syslog"
+counter transport_partition_control_errors_total transport="kafka" op=<error.op().as_str()> reason=<error.reason()>
 counter transport_proxy_refused_total transport=<transport>
 counter transport_received_bytes_total transport="file"
 counter transport_received_bytes_total transport="grpc"

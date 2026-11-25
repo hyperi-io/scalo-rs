@@ -19,6 +19,11 @@
 //! revoke until an assignment gives it back, nothing of it is held or
 //! committed here, and an offset handed out before the revoke commits nothing
 //! when it is released, even after the partition comes back.
+//!
+//! A seek back to an offset forgets every offset of the partition at or after
+//! it, the same way: the consumer reads them again, an offset handed out
+//! before the seek commits nothing when it is released, and no commit passes
+//! the seek point until the copies read again are released.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -146,6 +151,29 @@ impl PartitionHold {
             back.truncate_from(first);
         }
         self.runs.push_back(run);
+    }
+
+    /// Forget every offset at or above `from`, which the consumer reads again.
+    /// One handed out and not yet released turns stale. The highest release
+    /// goes when it is at or above `from`, so no commit passes `from` until
+    /// the copies read again are released.
+    fn rewind(&mut self, from: i64) {
+        self.stale.extend(
+            self.runs
+                .iter()
+                .flat_map(|r| r.held.iter())
+                .filter(|h| h.offset >= from && !h.released && !h.withheld)
+                .map(|h| h.offset),
+        );
+        while self.runs.back().is_some_and(|r| r.first() >= from) {
+            self.runs.pop_back();
+        }
+        if let Some(back) = self.runs.back_mut()
+            && back.last() >= from
+        {
+            back.truncate_from(from);
+        }
+        self.highest_released = self.highest_released.filter(|&h| h < from);
     }
 
     fn release(&mut self, offset: i64) {
@@ -276,7 +304,8 @@ impl KafkaAcks {
         targets
     }
 
-    /// Record an `Errored` release: the offsets stay held.
+    /// Record an `Errored` release: the offsets stay held. A stale offset's
+    /// release is the old copy's, so it withholds nothing.
     pub(super) fn withhold(&self, tokens: &[KafkaToken]) {
         let oldest = {
             let mut partitions = self.partitions.lock();
@@ -284,6 +313,9 @@ impl KafkaAcks {
                 .iter()
                 .filter_map(|t| {
                     let hold = partitions.get_mut(&(Arc::clone(&t.topic), t.partition))?;
+                    if hold.stale.remove(&t.offset) {
+                        return None;
+                    }
                     let run = hold
                         .runs
                         .iter_mut()
@@ -365,6 +397,21 @@ impl KafkaAcks {
         drop(partitions);
         self.publish_held();
         revoked_at
+    }
+
+    /// Forget every offset of `topic`/`partition` at or after `from`, after a
+    /// seek there: the consumer reads them again, and no commit passes `from`
+    /// until the copies read again are released. An offset handed out before
+    /// the seek and released after it commits nothing.
+    pub(super) fn rewound(&self, topic: &Arc<str>, partition: i32, from: i64) {
+        let mut partitions = self.partitions.lock();
+        if let Some(hold) = partitions.get_mut(&(Arc::clone(topic), partition))
+            && !hold.unowned
+        {
+            hold.rewind(from);
+        }
+        drop(partitions);
+        self.publish_held();
     }
 
     /// Record the commits that landed.
@@ -834,6 +881,106 @@ mod tests {
             targets(&acks, &reread).is_empty(),
             "an Errored offset this member still owns holds the commit below it"
         );
+    }
+
+    /// When the old copies of 6..10, records the caller kept, are released
+    /// around a seek back to 5.
+    #[derive(Clone, Copy, Debug)]
+    enum OldCopies {
+        DeliveredBeforeTheSeek,
+        DeliveredAfterTheSeek,
+        DeliveredAfterTheCopiesReadAgain,
+        ErroredAfterTheSeek,
+    }
+
+    /// Offset 5 is the first record the caller did not keep, so it seeks back
+    /// there and releases that record's token as dropped. Whenever the copies
+    /// above it are released, no commit passes 5 until the copies read again
+    /// are released.
+    #[test]
+    fn a_commit_never_passes_a_seek_point() {
+        for old_copies in [
+            OldCopies::DeliveredBeforeTheSeek,
+            OldCopies::DeliveredAfterTheSeek,
+            OldCopies::DeliveredAfterTheCopiesReadAgain,
+            OldCopies::ErroredAfterTheSeek,
+        ] {
+            let acks = KafkaAcks::default();
+            let handed_out = register(&acks, 0, 0..10);
+            let (kept, rest) = handed_out.split_at(5);
+            let (dropped, kept_above) = rest.split_at(1);
+            let mut seen = targets(&acks, kept);
+            if matches!(old_copies, OldCopies::DeliveredBeforeTheSeek) {
+                seen.extend(targets(&acks, kept_above));
+            }
+            acks.rewound(&Arc::from("events"), 0, 5);
+            seen.extend(targets(&acks, dropped));
+            match old_copies {
+                OldCopies::DeliveredAfterTheSeek => seen.extend(targets(&acks, kept_above)),
+                OldCopies::ErroredAfterTheSeek => acks.withhold(kept_above),
+                OldCopies::DeliveredBeforeTheSeek | OldCopies::DeliveredAfterTheCopiesReadAgain => {
+                }
+            }
+            // A repeat release of a kept record recomputes the commit.
+            seen.extend(targets(&acks, &kept[4..]));
+            assert!(
+                seen.iter().all(|&next| next <= 5),
+                "{old_copies:?}: committed past the seek point: {seen:?}"
+            );
+
+            let read_again = register(&acks, 0, 5..10);
+            let mut after = targets(&acks, &read_again);
+            if matches!(old_copies, OldCopies::DeliveredAfterTheCopiesReadAgain) {
+                assert_eq!(
+                    after,
+                    vec![6],
+                    "the first release of 6..10 is the old copies', so they hold the commit"
+                );
+                after = targets(&acks, kept_above);
+            }
+            assert_eq!(after, vec![10], "{old_copies:?}");
+            assert_eq!(acks.held().count, 0, "{old_copies:?}");
+        }
+    }
+
+    /// Releases of the copies above a seek point, racing the seek from
+    /// another thread, never commit past it.
+    #[test]
+    fn a_release_racing_the_seek_never_commits_past_it() {
+        for _ in 0..200 {
+            let acks = KafkaAcks::default();
+            let handed_out = register(&acks, 0, 0..50);
+            assert_eq!(targets(&acks, &handed_out[..5]), vec![5]);
+            let above = &handed_out[6..];
+            let seen = std::thread::scope(|s| {
+                let releaser = s.spawn(|| {
+                    above
+                        .iter()
+                        .flat_map(|t| targets(&acks, std::slice::from_ref(t)))
+                        .collect::<Vec<i64>>()
+                });
+                let seeker = s.spawn(|| acks.rewound(&Arc::from("events"), 0, 5));
+                seeker.join().expect("seeker thread");
+                releaser.join().expect("releaser thread")
+            });
+            let repeat = targets(&acks, &handed_out[..5]);
+            assert!(
+                seen.iter().chain(&repeat).all(|&next| next <= 5),
+                "committed past the seek point: {seen:?} {repeat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_seek_on_a_partition_this_member_lost_changes_nothing() {
+        let acks = KafkaAcks::default();
+        let handed_out = register(&acks, 0, 0..10);
+        acks.rebalanced(vec![change(1, true, 0)]);
+        acks.rewound(&Arc::from("events"), 0, 5);
+        acks.rebalanced(vec![change(2, false, 0)]);
+        assert_eq!(targets(&acks, &handed_out), [] as [i64; 0]);
+        let read_again = register(&acks, 0, 0..10);
+        assert_eq!(targets(&acks, &read_again), vec![10]);
     }
 
     #[test]

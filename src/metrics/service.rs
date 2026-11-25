@@ -154,6 +154,10 @@ impl ServiceMetrics {
             "transport_revoke_discarded_total",
             "Records a revoke kept from a write, as the partition's next owner reads them again, by stage"
         );
+        metrics::describe_counter!(
+            "transport_partition_control_errors_total",
+            "Partition pauses, resumes and seeks that took no effect, by op and reason"
+        );
 
         // Push transport descriptors into manifest registry. Labels are every
         // key an emitter sets: `path` on gRPC RouteBatch sends, `reason` on
@@ -296,6 +300,20 @@ impl ServiceMetrics {
                 .into(),
             unit: String::new(),
             labels: vec!["transport".into(), "stage".into()],
+            group: "platform".into(),
+            buckets: None,
+            use_cases: vec![],
+            dashboard_hint: None,
+        });
+        reg.push(MetricDescriptor {
+            name: "transport_partition_control_errors_total".into(),
+            metric_type: MetricType::Counter,
+            description: "Partition pauses, resumes and seeks that took no effect, by op (pause, \
+                          resume, seek) and reason (no_consumer, not_assigned, invalid_offset, \
+                          refused)"
+                .into(),
+            unit: String::new(),
+            labels: vec!["transport".into(), "op".into(), "reason".into()],
             group: "platform".into(),
             buckets: None,
             use_cases: vec![],

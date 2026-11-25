@@ -149,6 +149,8 @@ pub struct StatsContext {
     /// Whether the inbound gate has this consumer's assignment paused.
     #[cfg(feature = "governor")]
     paused: AtomicBool,
+    /// Whether a caller holds any of this consumer's partitions paused.
+    partitions_held: AtomicBool,
     /// Whether the last statistics showed a local queue full enough that
     /// librdkafka stops fetching.
     starved: AtomicBool,
@@ -366,6 +368,7 @@ impl StatsContext {
             assigned: RwLock::new(HashMap::new()),
             #[cfg(feature = "governor")]
             paused: AtomicBool::new(false),
+            partitions_held: AtomicBool::new(false),
             starved: AtomicBool::new(false),
             queue_cap: QueueCap::default(),
             asked_ends: RwLock::new(HashMap::new()),
@@ -437,15 +440,27 @@ impl StatsContext {
         self.paused.load(Ordering::Acquire)
     }
 
+    /// Record whether a caller holds any partition paused. A release of the
+    /// last one drops the ends asked of the broker, as the gate's resume does.
+    pub(crate) fn set_partitions_held(&self, held: bool) {
+        self.partitions_held.store(held, Ordering::Release);
+        if !self.needs_asked_ends()
+            && let Ok(mut ends) = self.asked_ends.write()
+        {
+            ends.clear();
+        }
+    }
+
     /// Whether librdkafka is fetching nothing for some held partition, so its
     /// end has to be asked of the broker: the gate has the assignment paused,
-    /// or the last statistics showed a local queue at its cap.
+    /// a caller holds a partition paused, or the last statistics showed a
+    /// local queue at its cap.
     pub(crate) fn needs_asked_ends(&self) -> bool {
         #[cfg(feature = "governor")]
         if self.is_paused() {
             return true;
         }
-        self.starved.load(Ordering::Acquire)
+        self.partitions_held.load(Ordering::Acquire) || self.starved.load(Ordering::Acquire)
     }
 
     /// The log ends the broker reported, used by every statistics callback
