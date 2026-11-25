@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/spool_codec.rs
-// Purpose:   Shared on-disk spool helpers (CRC framing, lock recovery, quarantine)
+// Purpose:   Shared on-disk spool helpers: framing, open, sync, quarantine, full disk, metrics
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -10,38 +10,45 @@
 //! and the `TieredSink` cold path so the integrity + recovery behaviour is
 //! defined once.
 //!
-//! - **CRC framing** ([`frame`] / [`unframe`]): an optional CRC32C header in
-//!   front of each record's on-disk bytes. The underlying queue (yaque) only
-//!   parity-checks the LENGTH header, so a torn write / bit-rot in the payload
-//!   would otherwise be returned silently. The checksum turns that into a
-//!   detectable [`CorruptionError`].
-//! - **Open** ([`open_queue`]): clears lock files a stopped process left behind,
-//!   refuses a queue a live process still holds, and quarantines a queue that
-//!   will not open under [`CorruptionPolicy::Quarantine`].
-//! - **Queue files** ([`open_queue`] checks them): a `version/contents` yaque
-//!   cannot read, or a `.q` file that is not a segment, would panic yaque, so
-//!   they are refused as an error the open policy handles.
-//! - **Receive position** ([`open_queue`] repairs it): a `recv-metadata` yaque
-//!   left torn or pointing at a segment that is gone becomes a replay from the
-//!   first segment, instead of a queue that will not open.
-//! - **Sync** ([`sync_segments`]): fsync of the segment files, which yaque never
-//!   does, so a record that was pushed survives the host losing power.
-//! - **Count** ([`queued_items_and_bytes`]): what a queue directory still
-//!   holds, read once at open so the counters after it move incrementally.
+//! - **Framing** ([`prefix`] / [`unframe`]): each entry's codec, write time
+//!   and CRC32C in front of its body. The queue parity-checks only the length
+//!   header, so the checksum is what turns a torn write or bit-rot in the body
+//!   into a [`CorruptionError`].
+//! - **Open** ([`open_queue`]): refuses a queue another open holds, replays a
+//!   receive position a crash left unusable, and quarantines a queue that will
+//!   not open under [`CorruptionPolicy::Quarantine`].
+//! - **Sync** ([`sync_segments`]): fsync of the segments written since the
+//!   last sync, so a record that was pushed survives the host losing power.
+//! - **Full disk** ([`FullDisk`]): refuses writes while the disk is full and
+//!   tries again on a backoff, so a full disk backpressures and never panics.
 //! - **Quarantine** ([`quarantine`]): move a corrupt queue's files into a
 //!   timestamped subdirectory of the spool path (forensics preserved, never
 //!   deleted). The spool path itself is never renamed, so it works when the
 //!   path is a mount point.
+//! - **Metrics** ([`StoreMetrics`]): what a store takes in, writes and holds.
 //!
 //! [`Spool`]: crate::spool::Spool
 
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use crate::yaque;
+use crate::backoff::Backoff;
+use crate::compression::Codec;
+use crate::yaque::{self, QueueState};
 
 use serde::{Deserialize, Serialize};
+
+/// The default bytes a segment holds before the next entry starts a new one.
+pub(crate) const DEFAULT_SEGMENT_BYTES: u64 = 16 << 20;
+
+/// The default read-ahead buffer.
+pub(crate) const DEFAULT_READ_BUFFER_BYTES: usize = 64 << 10;
+
+/// The default time between timed syncs, in milliseconds.
+pub(crate) const DEFAULT_SYNC_INTERVAL_MS: u64 = 500;
 
 /// What to do when a corrupt cache is detected (queue won't open, or a CRC check
 /// fails on read).
@@ -61,8 +68,7 @@ pub enum CorruptionPolicy {
     Fail,
 }
 
-/// A record's on-disk bytes failed their CRC32C check (torn write / bit-rot), or
-/// the framing was too short to hold the header.
+/// An entry's stored bytes failed their CRC32C check, or are too short to hold its prefix.
 #[derive(Debug, Clone)]
 pub struct CorruptionError(pub String);
 
@@ -72,85 +78,151 @@ impl std::fmt::Display for CorruptionError {
     }
 }
 
-/// Frame `body` with a CRC32C header when `crc` is enabled.
-///
-/// Layout when `crc`: `[crc32c(body): u32 LE][body]`. The checksum covers
-/// exactly the bytes that land on disk, so it detects a torn write or bit-rot
-/// the queue's length-only header would miss. When `crc` is off, `body` is
-/// returned unchanged (the on-disk format is byte-identical to pre-CRC).
-#[must_use]
-pub fn frame(crc: bool, body: Vec<u8>) -> Vec<u8> {
-    if !crc {
-        return body;
-    }
-    let sum = crc32c::crc32c(&body);
-    let mut out = Vec::with_capacity(body.len() + 4);
-    out.extend_from_slice(&sum.to_le_bytes());
-    out.extend_from_slice(&body);
-    out
+/// Bytes in front of each entry's body: a tag, a CRC32C and the write time.
+pub(crate) const PREFIX_LEN: usize = 13;
+
+/// The tag bit set on an entry that carries its CRC.
+const CHECKED: u8 = 0x80;
+
+/// Milliseconds since the Unix epoch, 0 for a clock set before it.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
-/// Verify and strip the CRC32C header (inverse of [`frame`]).
+/// The prefix of an entry whose `body` was compressed with `codec` at
+/// `written_ms`: the codec's tag, then with `crc` a CRC32C over the tag, the
+/// time and the body, then the time, both little endian.
+#[must_use]
+pub(crate) fn prefix(codec: Codec, crc: bool, written_ms: u64, body: &[u8]) -> [u8; PREFIX_LEN] {
+    tagged(codec.tag(), crc, written_ms, body)
+}
+
+/// [`prefix`] for any codec tag, known to this build or not.
+#[must_use]
+pub(crate) fn tagged(tag: u8, crc: bool, written_ms: u64, body: &[u8]) -> [u8; PREFIX_LEN] {
+    let mut prefix = [0; PREFIX_LEN];
+    prefix[0] = tag | if crc { CHECKED } else { 0 };
+    prefix[5..].copy_from_slice(&written_ms.to_le_bytes());
+    if crc {
+        let sum = checksum(prefix[0], &prefix[5..], body);
+        prefix[1..5].copy_from_slice(&sum.to_le_bytes());
+    }
+    prefix
+}
+
+fn checksum(tag: u8, time: &[u8], body: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc32c::crc32c_append(crc32c::crc32c(&[tag]), time), body)
+}
+
+/// A stored entry, its prefix read and its CRC checked.
+#[derive(Debug)]
+pub(crate) struct Entry<'a> {
+    /// The codec its body was compressed with, or the tag of one this build does not know.
+    pub(crate) codec: Result<Codec, u8>,
+    pub(crate) body: &'a [u8],
+}
+
+/// When an entry was written, in milliseconds since the Unix epoch, read from
+/// its prefix without checking the CRC. 0 for one too short to hold it.
+#[cfg(feature = "tiered-sink")]
+pub(crate) fn written_ms(raw: &[u8]) -> u64 {
+    raw.get(5..PREFIX_LEN)
+        .and_then(|time| time.try_into().ok())
+        .map_or(0, u64::from_le_bytes)
+}
+
+/// Reads an entry's prefix and checks its CRC, borrowing the body.
 ///
 /// # Errors
-/// [`CorruptionError`] if the record is shorter than the 4-byte header or the
-/// checksum does not match -- corruption surfaces as an error, never as
-/// silently-wrong bytes handed downstream.
-pub fn unframe(crc: bool, raw: Vec<u8>) -> Result<Vec<u8>, CorruptionError> {
-    if !crc {
-        return Ok(raw);
-    }
-    if raw.len() < 4 {
-        return Err(CorruptionError(
-            "record shorter than the 4-byte CRC header".to_string(),
-        ));
-    }
-    let (header, body) = raw.split_at(4);
-    let expected = u32::from_le_bytes(header.try_into().unwrap_or([0; 4]));
-    let actual = crc32c::crc32c(body);
-    if expected != actual {
+/// [`CorruptionError`] when the entry is shorter than its prefix or fails its
+/// CRC, so damaged bytes are never handed on.
+pub(crate) fn unframe(raw: &[u8]) -> Result<Entry<'_>, CorruptionError> {
+    let Some((&[tag, c0, c1, c2, c3, ref time @ ..], body)) = raw.split_first_chunk::<PREFIX_LEN>()
+    else {
         return Err(CorruptionError(format!(
-            "CRC32C mismatch (expected {expected:08x}, computed {actual:08x}) -- torn write or bit-rot"
+            "entry of {} bytes is shorter than its {PREFIX_LEN}-byte prefix",
+            raw.len()
         )));
+    };
+    if tag & CHECKED != 0 {
+        let expected = u32::from_le_bytes([c0, c1, c2, c3]);
+        let actual = checksum(tag, time, body);
+        if expected != actual {
+            return Err(CorruptionError(format!(
+                "CRC32C mismatch (stored {expected:08x}, computed {actual:08x})"
+            )));
+        }
     }
-    Ok(body.to_vec())
+    let codec_tag = tag & !CHECKED;
+    Ok(Entry {
+        codec: Codec::from_tag(codec_tag).ok_or(codec_tag),
+        body,
+    })
 }
 
-/// Lock files yaque keeps in a queue directory, as `(label, path segments)`.
-///
-/// `version/lock` guards the version check, which spins without a timeout while
-/// the file exists, so a leftover one hangs every open.
-const LOCK_FILES: [(&str, &[&str]); 3] = [
-    ("send", &["send.lock"]),
-    ("recv", &["recv.lock"]),
-    ("version", &["version", "lock"]),
-];
+/// Whether the last entry of a queue's newest segment is whole: one that fails
+/// its CRC there is a torn write, and the open cuts it off.
+pub(crate) fn whole(raw: &[u8]) -> bool {
+    unframe(raw).is_ok()
+}
+
+/// One decompressor per codec the entries name, each made on first use.
+#[derive(Default)]
+pub(crate) struct Decoders {
+    engines: [Option<crate::compression::Compressor>; Codec::ALL.len()],
+}
+
+impl Decoders {
+    /// Replaces `out` with `entry`'s body decompressed under its own codec.
+    ///
+    /// # Errors
+    /// A codec this build does not know or lacks, or a body that does not
+    /// decompress under it.
+    pub(crate) fn decode_into(
+        &mut self,
+        entry: &Entry<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let codec = entry.codec.map_err(|tag| {
+            format!("the entry names codec tag {tag}, which this build does not know")
+        })?;
+        let slot = &mut self.engines[usize::from(codec.tag())];
+        if slot.is_none() {
+            *slot = Some(
+                crate::compression::Compressor::new(crate::compression::Compression::new(codec))
+                    .map_err(|e| format!("the entry's codec {codec} cannot run here: {e}"))?,
+            );
+        }
+        let Some(engine) = slot.as_mut() else {
+            return Err(format!("no {codec} decoder"));
+        };
+        engine
+            .decompress_into(entry.body, out, usize::MAX)
+            .map_err(|e| format!("the entry does not decompress under its codec {codec}: {e}"))
+    }
+}
 
 /// Name prefix of the subdirectories [`quarantine`] creates inside a spool path.
 const QUARANTINE_PREFIX: &str = "corrupt-";
-
-/// How long an owner may take between creating a lock file and writing it.
-///
-/// yaque creates the file and writes `pid=..\ntoken=..` straight after, so an
-/// empty lock younger than this may belong to an owner that is mid-write.
-const LOCK_WRITE_GRACE: Duration = Duration::from_millis(500);
 
 /// What triggered a quarantine, for the counter and the log line.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum QuarantineTrigger {
     /// The queue would not open.
     OpenFailed,
-    /// A record failed its CRC check on read. Only the standalone spool recovers on read.
-    #[cfg(feature = "spool")]
-    CrcMismatch,
+    /// A header failed its parity check, so no later entry can be found.
+    DamagedHeader,
 }
 
 impl QuarantineTrigger {
     fn label(self) -> &'static str {
         match self {
             Self::OpenFailed => "open_failed",
-            #[cfg(feature = "spool")]
-            Self::CrcMismatch => "crc_mismatch",
+            Self::DamagedHeader => "damaged_header",
         }
     }
 }
@@ -177,170 +249,103 @@ impl std::fmt::Display for OpenError {
     }
 }
 
-/// Open the yaque queue at `path` for sending and receiving.
+/// Open the queue at `path` for sending and receiving.
 ///
-/// Lock files left by a process that no longer exists are removed first, using
-/// yaque's pid+token check. An empty or unparseable lock counts as stale. A
-/// lock a live process holds refuses the open and is never treated as
-/// corruption. When the queue still will not open, `policy` decides:
+/// The directory is created owner-only on unix. A queue another open holds,
+/// in this process or another, is refused and never treated as corruption:
+/// the OS drops a dead process's locks, so no lock is ever stale. A receive
+/// position a crash left unusable is replaced by a replay from the first
+/// segment. When the queue still will not open, `policy` decides:
 /// [`CorruptionPolicy::Quarantine`] moves its files into a `corrupt-*`
 /// subdirectory and opens a fresh queue, [`CorruptionPolicy::Fail`] returns the
 /// error. Environmental failures (permission, full or read-only disk) are
 /// never quarantined, because moving the queue aside would orphan its records.
-///
-/// The lock check reads the process table of this pid namespace only, so two
-/// processes in different namespaces sharing one volume cannot see each other.
 ///
 /// # Errors
 /// [`OpenError::Locked`] for a live owner, [`OpenError::Failed`] otherwise.
 pub(crate) fn open_queue(
     path: &Path,
     policy: CorruptionPolicy,
+    options: yaque::Options,
 ) -> Result<(yaque::Sender, yaque::Receiver), OpenError> {
-    release_stale_locks(path)?;
-    let validated = validate_queue_files(path);
-    if validated.is_ok() {
-        repair_recv_position(path).map_err(|e| {
-            OpenError::Failed(format!(
-                "cannot repair the receive position in {}: {e}",
-                path.display()
-            ))
-        })?;
-    }
-    let open_err = match validated.and_then(|()| yaque::channel(path)) {
+    create_spool_dir(path).map_err(|e| {
+        OpenError::Failed(format!(
+            "cannot create spool directory {}: {e}",
+            path.display()
+        ))
+    })?;
+    repair_recv_position(path).map_err(|e| {
+        OpenError::Failed(format!(
+            "cannot repair the receive position in {}: {e}",
+            path.display()
+        ))
+    })?;
+    let open_err = match yaque::channel(path, options) {
         Ok(queue) => return Ok(queue),
         Err(e) => e,
     };
-    // channel() drops what it acquired on failure, so a lock present now is another owner's.
-    if let Some(lock) = held_lock(path) {
-        return Err(OpenError::Locked(format!(
-            "{} appeared while opening: {open_err}",
-            lock.display()
-        )));
+    if open_err.kind() == io::ErrorKind::WouldBlock {
+        return Err(OpenError::Locked(open_err.to_string()));
     }
-    if is_environmental(open_err.kind()) || policy == CorruptionPolicy::Fail {
+    // A queue in another format is not damage: its records wait for the release that wrote them.
+    if is_environmental(open_err.kind())
+        || open_err.kind() == io::ErrorKind::Unsupported
+        || policy == CorruptionPolicy::Fail
+    {
         return Err(OpenError::Failed(open_err.to_string()));
     }
     quarantine(path, QuarantineTrigger::OpenFailed, &open_err.to_string())
         .map_err(|e| OpenError::Failed(format!("{open_err}; quarantine failed: {e}")))?;
-    validate_queue_files(path)
-        .and_then(|()| yaque::channel(path))
+    yaque::channel(path, options)
         .map_err(|e| OpenError::Failed(format!("{open_err}; fresh open failed: {e}")))
 }
 
-/// The versions of yaque a queue's `version/contents` may name. It is the
-/// range `src/yaque/version.rs` accepts, and a test checks that a queue yaque
-/// creates satisfies it.
-const YAQUE_QUEUE_VERSIONS: &str = "0.6.*";
+/// Creates the spool directory, owner-only on unix, where the records it holds
+/// are no other user's to read.
+fn create_spool_dir(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(path)
+}
 
-/// Refuse a queue directory yaque would panic on, as an error the open policy
-/// handles like any queue that will not open.
-///
-/// yaque panics, where it could return an error, on a `version/contents` that
-/// does not parse as a version or names another release line, and on a `.q`
-/// file whose name is not a segment number. A panic takes the whole process in
-/// a service built with `panic = "abort"`, so the files are read here first.
+/// Quarantines the queue in `path` because a header in it failed its parity
+/// check, and opens a fresh one. The caller has closed both halves.
+#[cfg(feature = "tiered-sink")]
 ///
 /// # Errors
-/// An [`io::ErrorKind::InvalidData`] error naming the file, or the [`io::Error`]
-/// of a read that failed.
-fn validate_queue_files(path: &Path) -> io::Result<()> {
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let file = entry?.path();
-        if file.extension().and_then(|e| e.to_str()) == Some("q")
-            && file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .is_none()
-        {
-            return Err(invalid_queue(format!(
-                "{} is not a numbered segment",
-                file.display()
-            )));
-        }
-    }
-
-    let version = path.join("version").join("contents");
-    let contents = match std::fs::read(&version) {
-        Ok(contents) => contents,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    // An empty file is a queue yaque has not stamped yet, and it stamps it. A
-    // file of only whitespace is not empty to yaque, which parses it as a
-    // version and panics.
-    if contents.is_empty() {
-        return Ok(());
-    }
-    let text = String::from_utf8_lossy(&contents);
-    let text = text.trim();
-    let shown: String = text.chars().take(40).collect();
-    let named = semver::Version::parse(text).map_err(|e| {
-        invalid_queue(format!(
-            "{} does not hold a version ({e}): {shown:?}",
-            version.display()
-        ))
-    })?;
-    let accepted = semver::VersionReq::parse(YAQUE_QUEUE_VERSIONS).map_err(|e| {
-        invalid_queue(format!(
-            "{YAQUE_QUEUE_VERSIONS} is not a version range: {e}"
-        ))
-    })?;
-    if !accepted.matches(&named) {
-        return Err(invalid_queue(format!(
-            "{} names version {named}, and this build reads {YAQUE_QUEUE_VERSIONS}",
-            version.display()
-        )));
-    }
-    Ok(())
+/// [`OpenError::Failed`] when the move or the fresh open fails.
+pub(crate) fn quarantine_damaged(
+    path: &Path,
+    cause: &str,
+    options: yaque::Options,
+) -> Result<(yaque::Sender, yaque::Receiver), OpenError> {
+    quarantine(path, QuarantineTrigger::DamagedHeader, cause)
+        .map_err(|e| OpenError::Failed(format!("{cause}; quarantine failed: {e}")))?;
+    yaque::channel(path, options)
+        .map_err(|e| OpenError::Failed(format!("{cause}; fresh open failed: {e}")))
 }
 
-fn invalid_queue(message: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-/// The segment numbers in a yaque queue directory, ascending. Segments are
-/// `<n>.q`.
+/// The segment numbers in `path`, skipping any `.q` file not named for one,
+/// which the queue's own open refuses.
 fn segment_numbers(path: &Path) -> io::Result<Vec<u64>> {
-    let mut segments = Vec::new();
-    for entry in std::fs::read_dir(path)? {
-        let file = entry?.path();
-        if file.extension().and_then(|e| e.to_str()) == Some("q")
-            && let Some(number) = file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok())
-        {
-            segments.push(number);
-        }
+    match yaque::segments(path) {
+        Err(e) if e.kind() == io::ErrorKind::InvalidData => Ok(Vec::new()),
+        other => other,
     }
-    segments.sort_unstable();
-    Ok(segments)
 }
 
-/// The file yaque keeps the receive position in: the segment, then the byte
-/// offset in it, as two big-endian u64.
-const RECV_STATE_FILE: &str = "recv-metadata";
-
-/// Replace a receive position yaque cannot use with the start of the queue's
-/// first segment.
+/// Replace a receive position the queue cannot use with the start of the
+/// queue's first segment.
 ///
-/// yaque saves the position by truncating `recv-metadata` and then writing 16
-/// bytes, with no sync. A kill between the two leaves it short, and a power loss
-/// can leave it naming a segment that is gone or an offset past the end of the
-/// segment, the data it counted never having reached the disk. yaque refuses to
-/// open such a queue, and the quarantine policy then moves every spooled record
-/// aside. Replaying from the first segment instead delivers each record at
-/// least once: the records of that segment already consumed come again, and none
-/// is lost.
+/// A power loss can leave `recv-metadata` short, naming a segment that is
+/// gone, or an offset past the end of the segment, the data it counted never
+/// having reached the disk. Replaying from the first segment instead delivers
+/// each record at least once: the records of that segment already consumed
+/// come again, and none is lost.
 fn repair_recv_position(path: &Path) -> io::Result<()> {
-    let state = path.join(RECV_STATE_FILE);
+    let state = path.join(yaque::RECV_METADATA);
     let saved = match std::fs::read(&state) {
         Ok(saved) => saved,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -351,7 +356,15 @@ fn repair_recv_position(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     match segments.first() {
-        Some(&first) => write_recv_position(path, first)?,
+        Some(&segment) => yaque::write_position(
+            &state,
+            &path.join(format!("{}.tmp", yaque::RECV_METADATA)),
+            QueueState {
+                segment,
+                position: 0,
+            },
+            true,
+        )?,
         None => std::fs::remove_file(&state)?,
     }
     #[cfg(feature = "tracing")]
@@ -363,8 +376,8 @@ fn repair_recv_position(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether `saved` is a position yaque can resume from: 16 bytes naming a
-/// segment that exists, at an offset inside it.
+/// Whether `saved` is a position the queue can resume from: 16 bytes naming
+/// a segment that exists, at an offset inside it.
 fn recv_position_is_usable(path: &Path, saved: &[u8], segments: &[u64]) -> bool {
     let (Some(segment), Some(offset)) = (saved.get(0..8), saved.get(8..16)) else {
         return false;
@@ -378,21 +391,9 @@ fn recv_position_is_usable(path: &Path, saved: &[u8], segments: &[u64]) -> bool 
         && std::fs::metadata(path.join(format!("{segment}.q"))).is_ok_and(|m| offset <= m.len())
 }
 
-/// Write the receive position as `segment`, offset 0, through a temporary file
-/// and a rename, so a crash leaves the old position or the new one.
-fn write_recv_position(path: &Path, segment: u64) -> io::Result<()> {
-    let temporary = path.join(format!("{RECV_STATE_FILE}.tmp"));
-    let mut file = std::fs::File::create(&temporary)?;
-    file.write_all(&segment.to_be_bytes())?;
-    file.write_all(&0_u64.to_be_bytes())?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temporary, path.join(RECV_STATE_FILE))?;
-    sync_directory(path)
-}
-
 /// Flush a directory's entries to stable storage, so a file created or renamed
-/// in it survives a power loss. Windows has no such call, and does nothing.
+/// in it survives a power loss. Windows has no directory sync: there the
+/// segment's own flush is the last step, and this does nothing.
 fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(path)?.sync_all()?;
@@ -401,18 +402,9 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// What a queue's syncs have done, so the next one does only what is left.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct Synced {
-    /// The oldest segment still to flush: older ones are full and flushed.
-    pub(crate) from: u64,
-    /// Whether the directories above the queue's own are flushed.
-    pub(crate) ancestors: bool,
-}
-
 /// The directories a sync flushes: the queue's own, and on the first sync every
-/// directory above it up to the root, because yaque creates the whole path when
-/// it opens and any of those entries can be new.
+/// directory above it up to the root, because opening creates the whole path
+/// and any of those entries can be new.
 fn directories_to_sync(path: &Path, ancestors: bool) -> Vec<PathBuf> {
     if !ancestors {
         return vec![path.to_path_buf()];
@@ -425,137 +417,68 @@ fn directories_to_sync(path: &Path, ancestors: bool) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Flush the queue's segment files from `done.from` upward to stable storage,
-/// and its directory with them. The first call flushes every directory above
-/// it too, so a spool created by its first push is not lost with a directory
-/// entry. Returns what the next call starts from.
+/// Flush what was written since the last sync to stable storage, and return
+/// the segment that was open, for the next call to start from.
 ///
-/// yaque flushes each send to the operating system and never syncs, so a
-/// pushed record survives its process being killed, and survives the host
-/// losing power only once this has run. Start from [`Synced::default`] to sync
-/// everything the directory holds.
+/// `last` is the segment open at the last sync, `None` before the first. The
+/// open segment is flushed through its own handle. Segments closed since the
+/// last sync are flushed by path, and the queue's directory only when a
+/// segment was created since, so a steady run of syncs costs one data flush
+/// each. The first sync flushes every segment the directory holds, and every
+/// directory above the queue up to the root.
 ///
 /// # Errors
-/// Propagates the directory read or a segment's or directory's sync
-/// [`io::Error`]. A directory above the queue's parent that this process may
-/// not open is skipped, because it is one this process did not create.
-pub(crate) fn sync_segments(path: &Path, done: Synced) -> io::Result<Synced> {
-    let mut newest = done.from;
-    for number in segment_numbers(path)?
-        .into_iter()
-        .filter(|n| *n >= done.from)
-    {
+/// Propagates a segment's or directory's sync [`io::Error`]. A directory above
+/// the queue's parent that this process may not open is skipped, because it
+/// is one this process did not create.
+pub(crate) fn sync_segments(
+    path: &Path,
+    last: Option<u64>,
+    open: (u64, Arc<std::fs::File>),
+) -> io::Result<u64> {
+    let (segment, file) = open;
+    let closed: Vec<u64> = match last {
+        None => segment_numbers(path)?
+            .into_iter()
+            .filter(|n| *n < segment)
+            .collect(),
+        Some(last) => (last..segment).collect(),
+    };
+    for number in closed {
         // Opened for write, though nothing is written, because Windows cannot
         // flush a handle that cannot write.
         match std::fs::OpenOptions::new()
             .write(true)
             .open(path.join(format!("{number}.q")))
         {
-            Ok(file) => file.sync_data()?,
-            // The receiver consumed it and yaque deleted it since the listing.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        }
-        newest = number;
-    }
-    for (index, dir) in directories_to_sync(path, done.ancestors).iter().enumerate() {
-        match sync_directory(dir) {
-            Ok(()) => {}
-            // The queue's directory and its parent are the ones this process
-            // creates entries in, so they must flush. Above them, one it may not
-            // open is one it did not create.
-            Err(e) if index > 1 && e.kind() == io::ErrorKind::PermissionDenied => {}
+            Ok(closed) => closed.sync_data()?,
+            // The receiver consumed and deleted it since.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
     }
-    Ok(Synced {
-        from: newest,
-        ancestors: true,
-    })
-}
-
-/// Remove every lock file whose owner is gone. Refuse when a live owner holds one.
-fn release_stale_locks(path: &Path) -> Result<(), OpenError> {
-    for (label, segments) in LOCK_FILES {
-        let lock = segments.iter().fold(path.to_path_buf(), |p, s| p.join(s));
-        match release_one(&lock) {
-            Ok(Some(reason)) => record_stale_lock(path, label, reason),
-            Ok(None) => {}
-            Err(e) => return Err(e),
+    file.sync_data()?;
+    if last != Some(segment) {
+        for (index, dir) in directories_to_sync(path, last.is_none()).iter().enumerate() {
+            match sync_directory(dir) {
+                Ok(()) => {}
+                // The queue's directory and its parent are the ones this process
+                // creates entries in, so they must flush. Above them, one it may not
+                // open is one it did not create.
+                Err(e) if index > 1 && e.kind() == io::ErrorKind::PermissionDenied => {}
+                // macOS's sealed system volume refuses the full flush its sync_all asks for.
+                #[cfg(target_os = "macos")]
+                Err(e)
+                    if index > 1
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::ReadOnlyFilesystem | io::ErrorKind::Unsupported
+                        ) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
-    Ok(())
-}
-
-/// Release one lock file, returning why it was stale, or `None` if it was absent.
-fn release_one(lock: &Path) -> Result<Option<&'static str>, OpenError> {
-    let Some(contents) = read_lock(lock)? else {
-        return Ok(None);
-    };
-    if parse_lock(&contents).is_none() {
-        let age = std::fs::metadata(lock)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .unwrap_or(LOCK_WRITE_GRACE);
-        if let Some(wait) = LOCK_WRITE_GRACE.checked_sub(age).filter(|w| !w.is_zero()) {
-            std::thread::sleep(wait);
-            return release_one(lock);
-        }
-        return match std::fs::remove_file(lock) {
-            Ok(()) => Ok(Some("unparseable")),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(OpenError::Failed(format!(
-                "cannot remove stale lock {}: {e}",
-                lock.display()
-            ))),
-        };
-    }
-    match yaque::recovery::unlock(lock) {
-        Ok(()) => Ok(Some("dead_owner")),
-        // yaque reports a live owner, or this process's own lock, as ErrorKind::Other.
-        Err(e) if e.kind() == io::ErrorKind::Other => Err(OpenError::Locked(e.to_string())),
-        Err(e) => Err(OpenError::Failed(format!(
-            "cannot release lock {}: {e}",
-            lock.display()
-        ))),
-    }
-}
-
-/// Read a lock file, `None` when it does not exist. Non-UTF-8 reads as unparseable.
-fn read_lock(lock: &Path) -> Result<Option<String>, OpenError> {
-    match std::fs::read(lock) {
-        Ok(bytes) => Ok(Some(String::from_utf8(bytes).unwrap_or_default())),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(OpenError::Failed(format!(
-            "cannot read lock {}: {e}",
-            lock.display()
-        ))),
-    }
-}
-
-/// Parse a yaque lock the way `yaque::recovery::unlock` does, which panics on a
-/// lock it cannot parse, so this must reject everything that would.
-fn parse_lock(contents: &str) -> Option<(i32, u64)> {
-    fn field<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
-        let rest = contents.split(key).nth(1)?;
-        let end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        Some(&rest[..end])
-    }
-    // yaque parses the pid as libc::pid_t, which is i32 on every unix target.
-    let pid = field(contents, "pid=")?.parse::<i32>().ok()?;
-    let token = field(contents, "token=")?.parse::<u64>().ok()?;
-    Some((pid, token))
-}
-
-/// The first lock file present in `path`, if any.
-fn held_lock(path: &Path) -> Option<PathBuf> {
-    LOCK_FILES
-        .iter()
-        .map(|(_, segments)| segments.iter().fold(path.to_path_buf(), |p, s| p.join(s)))
-        .find(|lock| lock.exists())
+    Ok(segment)
 }
 
 /// Errors that describe the host, not the queue: quarantining would not help.
@@ -570,19 +493,293 @@ fn is_environmental(kind: io::ErrorKind) -> bool {
     )
 }
 
-/// Count and log a cleared lock so a recovery after a hard kill is never silent.
-fn record_stale_lock(path: &Path, lock: &'static str, reason: &'static str) {
+/// Whether a write failed for want of space: a full disk, a quota, or a file
+/// size limit.
+pub(crate) fn is_full(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded | io::ErrorKind::FileTooLarge
+    )
+}
+
+/// The wait before writing again after a write found the disk full. It
+/// doubles with each retry that finds the disk still full.
+const FULL_DISK_RETRY: Backoff = Backoff::new(Duration::from_millis(100), Duration::from_secs(5));
+
+/// Tracks a store's disk filling up. While the disk is full, writes are
+/// refused without touching it until the next retry, which the backoff
+/// spaces out, or until the queue deletes a consumed segment. The queue's
+/// failed write is already cut back, so nothing torn is left.
+pub(crate) struct FullDisk {
+    store: &'static str,
+    failures: u32,
+    since: Option<Instant>,
+    retry_at: Option<Instant>,
+    /// The queue's freed bytes when last asked.
+    freed: u64,
+    flag: Arc<AtomicBool>,
+}
+
+impl FullDisk {
+    pub(crate) fn new(store: &'static str) -> Self {
+        Self {
+            store,
+            failures: 0,
+            since: None,
+            retry_at: None,
+            freed: 0,
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Set while the disk is full, for a health check.
+    #[cfg(any(test, feature = "health", feature = "tiered-sink"))]
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.flag)
+    }
+
+    /// Whether a write may be tried now: the backoff has run out, or the
+    /// queue has deleted segment bytes since, `freed` being its running total.
+    pub(crate) fn admits(&mut self, now: Instant, freed: u64) -> bool {
+        if freed != self.freed {
+            self.freed = freed;
+            self.retry_at = None;
+        }
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// Counts `bytes` refused, without a write.
+    pub(crate) fn refused(&self, bytes: usize) {
+        count_refused(self.store, bytes);
+    }
+
+    /// Records a write that found the disk full.
+    pub(crate) fn failed(&mut self, now: Instant, bytes: usize, error: &io::Error) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + FULL_DISK_RETRY.delay(self.failures));
+        count_refused(self.store, bytes);
+        if self.since.is_none() {
+            self.since = Some(now);
+            self.flag.store(true, Ordering::Relaxed);
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                store = self.store,
+                error = %error,
+                "the spool's disk is full; refusing writes until space frees, retrying on a backoff"
+            );
+        }
+        #[cfg(not(feature = "tracing"))]
+        let _ = error;
+    }
+
+    /// Records a write that went through, ending a full-disk wait.
+    pub(crate) fn wrote(&mut self, now: Instant) {
+        if let Some(since) = self.since.take() {
+            let waited = now.saturating_duration_since(since);
+            #[cfg(feature = "metrics")]
+            ::metrics::counter!("spool_disk_full_wait_milliseconds_total", "store" => self.store)
+                .increment(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+            #[cfg(feature = "tracing")]
+            tracing::info!(
+                store = self.store,
+                waited_ms = waited.as_millis(),
+                "the spool's disk has room again"
+            );
+            let _ = waited;
+            self.flag.store(false, Ordering::Relaxed);
+        }
+        self.failures = 0;
+        self.retry_at = None;
+    }
+}
+
+fn count_refused(store: &'static str, bytes: usize) {
     #[cfg(feature = "metrics")]
-    ::metrics::counter!("spool_stale_locks_cleared_total", "lock" => lock, "reason" => reason)
-        .increment(1);
-    #[cfg(feature = "tracing")]
-    tracing::warn!(
-        path = %path.display(),
-        lock,
-        reason,
-        "cleared a spool lock left by a process that is no longer running"
-    );
-    let _ = (path, lock, reason);
+    ::metrics::counter!("spool_disk_full_refused_bytes_total", "store" => store)
+        .increment(bytes as u64);
+    #[cfg(not(feature = "metrics"))]
+    let _ = (store, bytes);
+}
+
+/// The error a store returns for a write its full disk refused.
+pub(crate) fn full_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::StorageFull,
+        "the spool's disk is full; retry once the drain frees space",
+    )
+}
+
+/// What one store reports, registered once so a record costs an atomic add.
+pub(crate) struct StoreMetrics {
+    #[cfg(feature = "metrics")]
+    bytes_in: ::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    bytes_written: ::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    compress_micros: ::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    disk_bytes: ::metrics::Gauge,
+    #[cfg(feature = "metrics")]
+    reserved_bytes: ::metrics::Gauge,
+    #[cfg(feature = "metrics")]
+    cut_short: ::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    damaged: ::metrics::Counter,
+    #[cfg(feature = "metrics")]
+    oldest_age: ::metrics::Gauge,
+    store: &'static str,
+}
+
+impl StoreMetrics {
+    /// The metrics of `store`, writing under `codec`.
+    pub(crate) fn new(store: &'static str, codec: Codec) -> Self {
+        #[cfg(not(feature = "metrics"))]
+        let _ = (store, codec);
+        Self {
+            #[cfg(feature = "metrics")]
+            bytes_in: ::metrics::counter!("spool_bytes_in_total", "store" => store, "codec" => codec.name()),
+            #[cfg(feature = "metrics")]
+            bytes_written: ::metrics::counter!("spool_bytes_written_total", "store" => store, "codec" => codec.name()),
+            #[cfg(feature = "metrics")]
+            compress_micros: ::metrics::counter!("spool_codec_microseconds_total", "store" => store, "codec" => codec.name(), "op" => "compress"),
+            #[cfg(feature = "metrics")]
+            disk_bytes: ::metrics::gauge!("spool_disk_bytes", "store" => store),
+            #[cfg(feature = "metrics")]
+            reserved_bytes: ::metrics::gauge!("spool_memory_reserved_bytes", "store" => store),
+            #[cfg(feature = "metrics")]
+            cut_short: ::metrics::counter!("spool_drain_cut_short_total", "store" => store),
+            #[cfg(feature = "metrics")]
+            damaged: ::metrics::counter!("spool_damaged_entries_total", "store" => store),
+            #[cfg(feature = "metrics")]
+            oldest_age: ::metrics::gauge!("spool_oldest_age_seconds", "store" => store),
+            store,
+        }
+    }
+
+    /// An entry that failed its CRC and was dropped: counted, and logged once.
+    pub(crate) fn damaged(&self, error: &CorruptionError) {
+        #[cfg(feature = "metrics")]
+        self.damaged.increment(1);
+        tracing::warn!(store = self.store, error = %error, "dropped a spooled entry that failed its CRC");
+    }
+
+    /// The age of the oldest entry held, from its write time, 0 for none.
+    #[cfg(feature = "tiered-sink")]
+    pub(crate) fn oldest(&self, written_ms: u64) {
+        #[cfg(feature = "metrics")]
+        self.oldest_age
+            .set(age(written_ms).map_or(0.0, |age| age.as_secs_f64()));
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, written_ms);
+    }
+
+    /// A record of `bytes_in` taken in and `written` bytes appended, after
+    /// `compressing` spent in the codec.
+    pub(crate) fn wrote(&self, bytes_in: usize, written: usize, compressing: Duration) {
+        #[cfg(feature = "metrics")]
+        {
+            self.bytes_in.increment(bytes_in as u64);
+            self.bytes_written.increment(written as u64);
+            self.compress_micros
+                .increment(u64::try_from(compressing.as_micros()).unwrap_or(u64::MAX));
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, bytes_in, written, compressing);
+    }
+
+    /// The bytes the store's segment files hold.
+    pub(crate) fn disk(&self, bytes: u64) {
+        #[cfg(feature = "metrics")]
+        self.disk_bytes.set(bytes as f64);
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, bytes);
+    }
+
+    /// The bytes a read holds reserved with the memory guard, and whether the
+    /// guard cut the read short.
+    pub(crate) fn reserved(&self, bytes: u64, cut_short: bool) {
+        #[cfg(feature = "metrics")]
+        {
+            self.reserved_bytes.set(bytes as f64);
+            if cut_short {
+                self.cut_short.increment(1);
+            }
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = (self, bytes, cut_short);
+    }
+}
+
+/// The open queue's shared half, swapped when a quarantine opens a fresh one.
+pub(crate) type QueueCell = Arc<parking_lot::Mutex<Option<Arc<yaque::Shared>>>>;
+
+/// Syncs the queue in `cell` to stable storage on the blocking pool: the
+/// segments written since the last sync, the directory when a segment was
+/// created since, and the receiver's committed position. Records how long it
+/// took in `spool_sync_seconds`.
+///
+/// # Errors
+/// A sync's or the position save's [`io::Error`], or the blocking task's
+/// failure as [`io::ErrorKind::Other`].
+pub(crate) async fn sync_queue(
+    path: PathBuf,
+    store: &'static str,
+    cell: QueueCell,
+) -> io::Result<()> {
+    let Some(shared) = cell.lock().clone() else {
+        return Ok(());
+    };
+    tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let synced = sync_now(&path, &shared);
+        #[cfg(feature = "metrics")]
+        ::metrics::histogram!("spool_sync_seconds", "store" => store)
+            .record(started.elapsed().as_secs_f64());
+        let _ = (started, store);
+        synced
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+fn sync_now(path: &Path, shared: &yaque::Shared) -> io::Result<()> {
+    let open = shared
+        .open_segment()
+        .ok_or_else(|| io::Error::other("the spool has no open segment"))?;
+    // A segment deleted under the open handle would sync to a file no restart finds.
+    std::fs::metadata(path.join(format!("{}.q", open.0)))?;
+    let segment = sync_segments(path, shared.synced(), open)?;
+    shared.mark_synced(segment);
+    shared.save_position()
+}
+
+/// Syncs a queue every interval, and once more at shutdown, so a power loss
+/// loses at most about one interval of writes.
+pub(crate) struct SyncTicker {
+    pub(crate) path: PathBuf,
+    pub(crate) store: &'static str,
+    pub(crate) cell: QueueCell,
+}
+
+impl crate::concurrency::PeriodicTask for SyncTicker {
+    async fn tick(&mut self) -> Result<(), crate::concurrency::TickError> {
+        sync_queue(self.path.clone(), self.store, Arc::clone(&self.cell))
+            .await
+            .map_err(|e| crate::concurrency::TickError::Generic(Box::new(e)))
+    }
+
+    async fn shutdown(&mut self) -> Result<(), crate::concurrency::TickError> {
+        self.tick().await
+    }
+}
+
+/// Starts the timed sync, unless `every` is zero.
+pub(crate) fn start_sync_ticker(
+    ticker: SyncTicker,
+    every: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Option<crate::concurrency::PeriodicWorker> {
+    (!every.is_zero()).then(|| crate::concurrency::PeriodicWorker::spawn(ticker, every, shutdown))
 }
 
 /// Move every file of the queue at `path` into a new `corrupt-*` subdirectory.
@@ -626,9 +823,7 @@ pub(crate) fn quarantine(
             std::fs::rename(&src, dest.join(name))?;
         }
     }
-    #[cfg(feature = "metrics")]
-    ::metrics::counter!("spool_quarantined_total", "trigger" => trigger.label()).increment(1);
-    #[cfg(feature = "tracing")]
+    quarantined(trigger);
     tracing::warn!(
         path = %path.display(),
         quarantined = %dest.display(),
@@ -636,8 +831,51 @@ pub(crate) fn quarantine(
         cause,
         "spool could not be used; moved its files aside and started a fresh queue"
     );
-    let _ = (trigger.label(), cause);
     Ok(Some(dest))
+}
+
+/// Counts one quarantine in `spool_quarantined_total{trigger}`.
+fn quarantined(trigger: QuarantineTrigger) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!("spool_quarantined_total", "trigger" => trigger.label()).increment(1);
+    #[cfg(not(feature = "metrics"))]
+    let _ = trigger;
+}
+
+/// Copies the newest segment's bytes from a damaged header at `from` to its
+/// end into a new `corrupt-*` subdirectory of its queue, synced, before the
+/// open cuts them off. No entry past the header can be found, so they are
+/// kept for inspection. Counted as `trigger="damaged_header"`, warned once.
+///
+/// # Errors
+/// The copy's, a sync's or the subdirectory create's [`io::Error`]. The open
+/// then fails, and cuts nothing.
+pub(crate) fn keep_damaged_tail(segment: &Path, from: u64) -> io::Result<()> {
+    use std::io::{Seek as _, SeekFrom};
+    let (Some(base), Some(name)) = (segment.parent(), segment.file_name()) else {
+        return Err(io::Error::other(format!(
+            "{} names no segment in a queue directory",
+            segment.display()
+        )));
+    };
+    let dest = create_quarantine_dir(base)?;
+    let mut source = std::fs::File::open(segment)?;
+    source.seek(SeekFrom::Start(from))?;
+    let kept = dest.join(name);
+    let mut copy = std::fs::File::create(&kept)?;
+    let bytes = io::copy(&mut source, &mut copy)?;
+    copy.sync_all()?;
+    sync_directory(&dest)?;
+    sync_directory(base)?;
+    quarantined(QuarantineTrigger::DamagedHeader);
+    tracing::warn!(
+        segment = %segment.display(),
+        offset = from,
+        bytes,
+        quarantined = %kept.display(),
+        "a header in the newest spool segment is damaged; moved the segment from it aside"
+    );
+    Ok(())
 }
 
 /// The local-time `YYYYMMDD-HHMMSS-<nanos>` in a quarantine directory's name.
@@ -660,108 +898,75 @@ fn create_quarantine_dir(path: &Path) -> io::Result<PathBuf> {
     Err(last)
 }
 
-/// Count the records a yaque queue directory still holds and sum their
-/// payload bytes, header excluded.
-///
-/// yaque stores messages as `[4-byte Hamming header][payload]` in `<n>.q`
-/// segments, and the receiver position lives in `recv-metadata` (two
-/// big-endian u64: segment, position). Counts from the receiver position to the
-/// end of the highest segment. Reads every segment, so it runs off the async
-/// runtime, once at open.
-pub(crate) fn queued_items_and_bytes(path: &Path) -> io::Result<(u64, u64)> {
-    if !path.is_dir() {
-        return Ok((0, 0));
-    }
+/// Whether an error is the queue reporting a damaged header, which no read
+/// can get past.
+pub(crate) fn is_damaged_header(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData
+}
 
-    let recv_metadata_path = path.join(RECV_STATE_FILE);
-    let (recv_segment, recv_position) = if recv_metadata_path.exists() {
-        let data = std::fs::read(&recv_metadata_path)?;
-        match (data.get(0..8), data.get(8..16)) {
-            (Some(segment), Some(position)) => (
-                u64::from_be_bytes(segment.try_into().unwrap_or([0; 8])),
-                u64::from_be_bytes(position.try_into().unwrap_or([0; 8])),
-            ),
-            _ => (0, 0),
-        }
-    } else {
-        (0, 0)
-    };
-
-    let segments: Vec<u64> = segment_numbers(path)?
-        .into_iter()
-        .filter(|&seg_num| seg_num >= recv_segment)
-        .collect();
-
-    let header_eof: [u8; 4] = [255, 255, 255, 255];
-    let mut count = 0_u64;
-    let mut bytes = 0_u64;
-    for &seg_num in &segments {
-        let file_data = std::fs::read(path.join(format!("{seg_num}.q")))?;
-        let mut pos = if seg_num == recv_segment {
-            usize::try_from(recv_position).unwrap_or(usize::MAX)
-        } else {
-            0
-        };
-        while let Some(header) = pos.checked_add(4).and_then(|end| file_data.get(pos..end)) {
-            let header: [u8; 4] = header.try_into().unwrap_or([0; 4]);
-            if header == header_eof {
-                break;
-            }
-            // Length in the low 26 bits of the Hamming-encoded header.
-            let payload_len = (u32::from_be_bytes(header) & 0x03_FF_FF_FF) as usize;
-            pos += 4 + payload_len;
-            if pos <= file_data.len() {
-                count += 1;
-                bytes += payload_len as u64;
-            }
-        }
-    }
-    Ok((count, bytes))
+/// How long ago `written_ms` was, `None` for 0, which stands for no entry.
+#[cfg(feature = "tiered-sink")]
+pub(crate) fn age(written_ms: u64) -> Option<Duration> {
+    (written_ms > 0).then(|| Duration::from_millis(now_ms().saturating_sub(written_ms)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// An entry reads back with its codec and time, and a flip of any byte
+    /// its CRC covers is caught. Without the CRC only the length is checked.
     #[test]
-    fn frame_unframe_round_trips() {
-        let body = b"the payload bytes".to_vec();
-        let framed = frame(true, body.clone());
-        assert_eq!(framed.len(), body.len() + 4, "4-byte CRC header prepended");
-        assert_eq!(unframe(true, framed).unwrap(), body);
-    }
-
-    #[test]
-    fn frame_off_is_identity() {
-        let body = b"x".to_vec();
-        assert_eq!(frame(false, body.clone()), body);
-        assert_eq!(unframe(false, body.clone()).unwrap(), body);
-    }
-
-    #[test]
-    fn unframe_detects_corruption() {
-        let mut framed = frame(true, b"original".to_vec());
-        let last = framed.len() - 1;
-        framed[last] ^= 0xFF; // flip a payload byte
-        assert!(unframe(true, framed).is_err());
-        // Too short to hold the header.
-        assert!(unframe(true, vec![1, 2]).is_err());
-    }
-
-    #[test]
-    fn parse_lock_accepts_only_what_yaque_can_parse() {
-        assert_eq!(parse_lock("pid=12\ntoken=34\n"), Some((12, 34)));
-        // Every shape here would panic yaque's unlock.
-        for bad in [
-            "",
-            "pid=\ntoken=1",
-            "pid=1\n",
-            "pid=x\ntoken=1",
-            "token=1",
-            "pid=99999999999\ntoken=1",
-            "pid=1\ntoken=99999999999999999999999",
+    fn framing_round_trips_and_catches_damage() {
+        let body = b"the payload bytes";
+        for (codec, crc) in [
+            (Codec::Zstd, true),
+            (Codec::Lz4, true),
+            (Codec::None, false),
         ] {
-            assert_eq!(parse_lock(bad), None, "{bad:?}");
+            let framed = [&prefix(codec, crc, 1_700_000_000_123, body)[..], body].concat();
+            let entry = unframe(&framed).unwrap();
+            assert_eq!(entry.codec, Ok(codec), "{codec}");
+            #[cfg(feature = "tiered-sink")]
+            assert_eq!(written_ms(&framed), 1_700_000_000_123, "{codec}");
+            assert_eq!(entry.body, body, "{codec}");
+            for at in [0, 1, 6, PREFIX_LEN, framed.len() - 1] {
+                let mut damaged = framed.clone();
+                damaged[at] ^= 0x01;
+                // Bit 0 of the tag turns zstd into none and lz4 into gzip, the CRC catches it.
+                assert_eq!(
+                    unframe(&damaged).is_err(),
+                    crc,
+                    "{codec}: byte {at} flipped"
+                );
+            }
+        }
+        assert!(unframe(&[1, 2]).is_err(), "too short for the prefix");
+        let unknown = [&tagged(0x0F, true, 1, body)[..], body].concat();
+        assert_eq!(
+            unframe(&unknown).unwrap().codec,
+            Err(0x0F),
+            "a codec this build does not know"
+        );
+    }
+
+    /// Each entry decodes under the codec it names, whatever the one before it used.
+    #[test]
+    fn each_entry_decodes_under_its_own_codec() {
+        let record = b"a record that compresses a record that compresses".repeat(4);
+        let mut decoders = Decoders::default();
+        for codec in [Codec::Zstd, Codec::None, Codec::Lz4, Codec::Zstd] {
+            let mut packed = Vec::new();
+            crate::compression::Compressor::new(crate::compression::Compression::new(codec))
+                .unwrap()
+                .compress_into(&record, &mut packed)
+                .unwrap();
+            let framed = [&prefix(codec, true, 1, &packed)[..], &packed].concat();
+            let mut out = Vec::new();
+            decoders
+                .decode_into(&unframe(&framed).unwrap(), &mut out)
+                .unwrap();
+            assert_eq!(out, record, "{codec}");
         }
     }
 
@@ -789,7 +994,7 @@ mod tests {
         assert!(!spool.join("0.q").exists());
 
         std::fs::write(spool.join("1.q"), b"seg").unwrap();
-        let second = quarantine(&spool, QuarantineTrigger::OpenFailed, "test")
+        let second = quarantine(&spool, QuarantineTrigger::DamagedHeader, "test")
             .unwrap()
             .expect("files moved");
         assert_ne!(first, second);
@@ -828,31 +1033,86 @@ mod tests {
         }
     }
 
-    /// `sync_segments` reports the newest segment, which the next call starts
-    /// from, and passes over one the receiver deleted since the listing.
+    /// The open counts a damaged tail it keeps aside as a quarantine, never
+    /// as a torn entry, and leaves the queue readable up to it.
+    #[cfg(feature = "metrics")]
     #[test]
-    fn sync_segments_reports_the_newest_segment() {
+    fn a_kept_damaged_tail_is_counted_as_a_quarantine() {
         let dir = tempfile::tempdir().unwrap();
-        for number in 0..3 {
-            std::fs::write(dir.path().join(format!("{number}.q")), b"segment").unwrap();
+        let path = dir.path().join("q");
+        let options = yaque::Options {
+            segment_bytes: 1 << 20,
+            damaged_tail: Some(keep_damaged_tail),
+            ..options()
+        };
+        {
+            let (mut sender, _receiver) = yaque::channel(&path, options).unwrap();
+            for record in [&b"kept"[..], b"damaged", b"after"] {
+                sender.send(&[], record).unwrap();
+            }
         }
-        std::fs::write(dir.path().join(RECV_STATE_FILE), b"not a segment").unwrap();
+        let segment = path.join("0.q");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes[4 + 4] ^= 0x04;
+        std::fs::write(&segment, &bytes).unwrap();
 
-        let synced = sync_segments(dir.path(), Synced::default()).unwrap();
-        assert_eq!(synced.from, 2);
-        assert!(synced.ancestors);
-        std::fs::remove_file(dir.path().join("1.q")).unwrap();
-        let again = sync_segments(dir.path(), Synced { from: 1, ..synced }).unwrap();
-        assert_eq!(again.from, 2);
-        let beyond = sync_segments(dir.path(), Synced { from: 5, ..synced }).unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let rendered = ::metrics::with_local_recorder(&recorder, || {
+            let (_sender, mut receiver) = yaque::channel(&path, options).unwrap();
+            assert_eq!(receiver.read(10, u64::MAX, None).unwrap().entries, 1);
+            assert_eq!(receiver.taken()[0], b"kept");
+            recorder.handle().render()
+        });
+        assert!(
+            rendered.contains("spool_quarantined_total{trigger=\"damaged_header\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("spool_torn_entries_cut_total"),
+            "{rendered}"
+        );
         assert_eq!(
-            beyond.from, 5,
-            "no segment at or above 5, so the start stays"
+            std::fs::metadata(&segment).unwrap().len(),
+            8,
+            "cut after the first entry"
         );
     }
 
-    /// yaque creates every missing directory of the queue's path, so the first
-    /// sync flushes each one up to the root, and later syncs only the queue's.
+    fn options() -> yaque::Options {
+        yaque::Options {
+            segment_bytes: 16,
+            read_buffer_bytes: 4096,
+            recycle_bytes: 1 << 16,
+            whole: None,
+            damaged_tail: None,
+            store: "test",
+        }
+    }
+
+    fn open(sender: &yaque::Sender) -> (u64, Arc<std::fs::File>) {
+        sender.shared().open_segment().expect("an open segment")
+    }
+
+    /// A sync flushes the open segment through its handle, the segments
+    /// closed since by path, and passes over one the receiver deleted.
+    #[test]
+    fn a_sync_covers_what_was_written_since_the_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue");
+        let (mut sender, _receiver) = open_queue(&path, CorruptionPolicy::Fail, options()).unwrap();
+        for _ in 0..3 {
+            sender.send(&[], &[0; 20]).unwrap();
+        }
+        let first = sync_segments(&path, None, open(&sender)).unwrap();
+        assert_eq!(first, 2, "the open segment");
+        std::fs::remove_file(path.join("1.q")).unwrap();
+        let again = sync_segments(&path, Some(1), open(&sender)).unwrap();
+        assert_eq!(again, 2);
+        assert_eq!(sync_segments(&path, Some(2), open(&sender)).unwrap(), 2);
+    }
+
+    /// The first sync flushes each directory up to the root, and later syncs
+    /// only the queue's.
     #[test]
     fn the_first_sync_flushes_every_directory_above_the_queue() {
         let root = tempfile::tempdir().unwrap();
@@ -880,21 +1140,55 @@ mod tests {
                 "{level} is in {all:?}"
             );
         }
-        assert_eq!(all.last().map(PathBuf::as_path), Some(Path::new("/")));
-        sync_segments(&queue, Synced::default()).expect("the whole chain syncs");
+        // `/` on unix, a drive's root such as `\\?\C:\` on Windows.
+        assert!(
+            all.last().is_some_and(|root| root.parent().is_none()),
+            "ends at the root: {all:?}"
+        );
     }
 
-    /// A queue yaque stamps names a version `YAQUE_QUEUE_VERSIONS` accepts, so
-    /// a change to the stamped version that leaves the range behind fails here
-    /// and not in a service reopening its spool.
+    #[cfg(unix)]
     #[test]
-    fn a_queue_yaque_creates_passes_the_version_check() {
+    fn the_spool_directory_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fresh");
-        drop(yaque::channel(&path).unwrap());
-        let stamped = std::fs::read_to_string(path.join("version").join("contents")).unwrap();
-        assert!(!stamped.trim().is_empty(), "yaque stamped no version");
-        validate_queue_files(&path).unwrap_or_else(|e| panic!("{stamped:?}: {e}"));
+        let path = dir.path().join("fresh").join("spool");
+        drop(open_queue(&path, CorruptionPolicy::Fail, options()).unwrap());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+    }
+
+    /// A full-disk wait refuses writes until its backoff runs out, and a write
+    /// that goes through ends it.
+    #[test]
+    fn a_full_disk_backs_off_and_recovers() {
+        let mut full = FullDisk::new("test");
+        let now = Instant::now();
+        assert!(full.admits(now, 0));
+        full.failed(now, 10, &full_error());
+        assert!(full.flag().load(Ordering::Relaxed), "health flag set");
+        assert!(!full.admits(now, 0), "refused inside the backoff");
+        assert!(
+            full.admits(now + Duration::from_secs(6), 0),
+            "retried after it"
+        );
+        full.failed(now, 10, &full_error());
+        assert!(full.admits(now, 4096), "retried once a segment is deleted");
+        assert!(
+            full.flag().load(Ordering::Relaxed),
+            "still full until a write goes through"
+        );
+        full.wrote(now + Duration::from_secs(6));
+        assert!(!full.flag().load(Ordering::Relaxed));
+        assert!(full.admits(now, 4096));
+        for kind in [
+            io::ErrorKind::StorageFull,
+            io::ErrorKind::QuotaExceeded,
+            io::ErrorKind::FileTooLarge,
+        ] {
+            assert!(is_full(&kind.into()), "{kind:?}");
+        }
+        assert!(!is_full(&io::ErrorKind::PermissionDenied.into()));
     }
 
     #[test]

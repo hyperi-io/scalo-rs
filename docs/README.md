@@ -122,7 +122,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Pipeline | [pipeline/tiered-sink.md](pipeline/tiered-sink.md) | Resilient delivery, disk spillover, circuit breaker |
 | Pipeline | [pipeline/sink-stack.md](pipeline/sink-stack.md) | Outbound control stack: timeout / load-shed / concurrency / retry / rate-limit |
 | Pipeline | [pipeline/dlq.md](pipeline/dlq.md) | File, Kafka, HTTP backends |
-| Pipeline | [pipeline/spool.md](pipeline/spool.md) | Disk-backed async FIFO (yaque) |
+| Pipeline | [pipeline/spool.md](pipeline/spool.md) | Disk-backed async FIFO |
 | Pipeline | [pipeline/strmatch.md](pipeline/strmatch.md) | 4-tier regex->fast-path matcher (Byte / Literal / LiteralSet / Regex) |
 | Pipeline | [pipeline/rules.md](pipeline/rules.md) | Ordered first-match rules that set target fields: native tests or CEL Fast, clamp, hit counters, hot reload |
 | Pipeline | [pipeline/scaling.md](pipeline/scaling.md) | `ScalingPressure`, KEDA external scaler signal |

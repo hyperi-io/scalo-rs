@@ -28,6 +28,7 @@ memory). See [../backpressure.md](../backpressure.md) and [../self-regulation.md
 | Kafka receiver | Pause its assigned partitions |
 | `BatchEngine` | Smaller batches, more frequent flushes |
 | `ScalingPressure` | Jump the KEDA signal to 100 past its memory gate |
+| Spool and tiered-sink drain | Reserve each record before reading it. A refusal ends the read after its first record, so the drain goes on in smaller batches |
 
 The guard publishes the ratio, and it owns none of these policies.
 

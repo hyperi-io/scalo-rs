@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/spool/queue.rs
-// Purpose:   Disk-backed async FIFO queue implementation using yaque
+// Purpose:   Disk-backed async FIFO queue implementation
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -8,14 +8,28 @@
 
 //! Disk-backed async FIFO queue implementation.
 
-use crate::spool::{CorruptionPolicy, Result, SpoolConfig, SpoolError};
-use crate::yaque::{self, Receiver, Sender};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::compression::{Codec, Compression, Compressor};
+use crate::concurrency::PeriodicWorker;
+use crate::spool::{CorruptionPolicy, Result, SpoolConfig, SpoolError};
+use crate::spool_codec::{
+    self, CorruptionError, Decoders, FullDisk, QueueCell, StoreMetrics, SyncTicker,
+};
+use crate::yaque::{self, MemoryGuard, Receiver, Sender};
+use tokio_util::sync::CancellationToken;
+
+/// The `store` label on the spool's metrics.
+const STORE: &str = "spool";
 
 /// Disk-backed async FIFO queue with optional compression.
 ///
-/// Crash-safe writes, survives restarts. Built on scalo's copy of yaque 0.6.6,
-/// a transactional persistent queue.
+/// Crash-safe writes, survives restarts. A push writes the record once, from
+/// the caller's bytes or the compressor's reused buffer. A pop reads into a
+/// reused buffer, and [`pop_front_into`](Self::pop_front_into) decodes into
+/// the caller's.
 pub struct Spool {
     /// `None` only after a failed recovery, which leaves the spool closed.
     queue: Option<Queue>,
@@ -25,11 +39,25 @@ pub struct Spool {
     /// moved by each push and take, so `max_size_bytes` never walks the
     /// directory.
     bytes: u64,
-    /// What [`sync`](Self::sync) has flushed, so a call does only what is left.
-    synced: crate::spool_codec::Synced,
+    /// Compresses pushes, and its output buffer, both reused.
+    compressor: Compressor,
+    packed: Vec<u8>,
+    /// Decompresses each pop under the codec its entry names.
+    decoders: Decoders,
+    full: FullDisk,
+    metrics: StoreMetrics,
+    /// The open queue's shared half, for the timed sync.
+    cell: QueueCell,
+    shutdown: CancellationToken,
+    ticker: Option<PeriodicWorker>,
+    #[cfg(feature = "memory")]
+    memory: Option<Arc<MemoryGuard>>,
+    /// Degraded while the disk is full. Leaves the registry with the spool.
+    #[cfg(feature = "health")]
+    _disk_health: crate::health::HealthRegistration,
 }
 
-/// The open yaque handles. Each holds a lock file in the queue directory.
+/// The open queue. Each half holds an OS lock on its lock file.
 struct Queue {
     sender: Sender,
     receiver: Receiver,
@@ -42,29 +70,42 @@ fn live(queue: &mut Option<Queue>) -> Result<&mut Queue> {
     })
 }
 
+/// Why a stored record did not decode.
+enum Unreadable {
+    /// Its CRC did not match.
+    Damaged(CorruptionError),
+    /// It did not decompress.
+    Codec(String),
+}
+
 impl Spool {
     /// Open the queue at the configured path, creating it if absent.
     ///
-    /// Lock files left by a process that was killed are cleared first, so a
-    /// restart after a hard kill finds its queue. A queue another live process
-    /// (or another open `Spool` in this one) holds is refused.
+    /// A queue another live process (or another open `Spool` in this one)
+    /// holds is refused. A process that was killed holds nothing: the OS
+    /// dropped its locks.
     ///
     /// # Errors
     ///
     /// Returns [`SpoolError::Open`] if the queue is locked by a live owner, or
     /// cannot be opened and was not quarantined (see
-    /// [`CorruptionPolicy`]).
+    /// [`CorruptionPolicy`]), and [`SpoolError::Compression`] for a
+    /// `compression_level` zstd does not take.
     pub async fn open(config: SpoolConfig) -> Result<Self> {
-        // Reads the process table, may wait out a lock mid-write, and walks
-        // segment files, so it runs off the runtime.
+        let codec = if config.compress {
+            Compression::new(Codec::Zstd).with_level(config.compression_level)
+        } else {
+            Compression::NONE
+        };
+        let compressor =
+            Compressor::new(codec).map_err(|e| SpoolError::Compression(e.to_string()))?;
+        // Walks segment files and may cut a torn tail, so it runs off the runtime.
         let path = config.path.clone();
         let policy = config.on_corruption;
+        let options = options(&config);
         let (sender, receiver, len, bytes) = tokio::task::spawn_blocking(move || {
-            let (sender, receiver) = open_queue(&path, policy)?;
-            // yaque exposes no count API -- parse segment files to count items
-            // between the receiver position and the end.
-            let (len, bytes) = crate::spool_codec::queued_items_and_bytes(&path).unwrap_or((0, 0));
-            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            let (sender, receiver) = open_queue(&path, policy, options)?;
+            let (len, bytes) = receiver.queued().unwrap_or((0, 0));
             Ok::<_, SpoolError>((sender, receiver, len, bytes))
         })
         .await
@@ -73,35 +114,80 @@ impl Spool {
             message: format!("spool open task failed: {e}"),
         })??;
 
+        let cell: QueueCell = Arc::new(parking_lot::Mutex::new(Some(sender.shared())));
+        let shutdown = CancellationToken::new();
+        let ticker = spool_codec::start_sync_ticker(
+            SyncTicker {
+                path: config.path.clone(),
+                store: STORE,
+                cell: Arc::clone(&cell),
+            },
+            Duration::from_millis(config.sync_interval_ms),
+            shutdown.clone(),
+        );
+        let full = FullDisk::new(STORE);
+        #[cfg(feature = "health")]
+        let disk_health = {
+            let flag = full.flag();
+            crate::health::HealthRegistry::register_scoped("spool_disk", move || {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::health::HealthStatus::Degraded
+                } else {
+                    crate::health::HealthStatus::Healthy
+                }
+            })
+        };
+        let metrics = StoreMetrics::new(STORE, codec.codec);
+        metrics.disk(sender.disk_bytes());
         Ok(Self {
             queue: Some(Queue { sender, receiver }),
             config,
-            len,
+            len: usize::try_from(len).unwrap_or(usize::MAX),
             bytes,
-            synced: crate::spool_codec::Synced::default(),
+            compressor,
+            packed: Vec::new(),
+            decoders: Decoders::default(),
+            full,
+            metrics,
+            cell,
+            shutdown,
+            ticker,
+            #[cfg(feature = "memory")]
+            memory: None,
+            #[cfg(feature = "health")]
+            _disk_health: disk_health,
         })
+    }
+
+    /// Reserve each record's length with `guard` before reading it, and
+    /// release it once the record is handed off.
+    #[cfg(feature = "memory")]
+    #[must_use]
+    pub fn with_memory_guard(mut self, guard: Arc<MemoryGuard>) -> Self {
+        self.memory = Some(guard);
+        self
     }
 
     /// Quarantine the current (corrupt) cache and reopen a fresh empty queue.
     ///
     /// Moves the queue's files into a timestamped `corrupt-*` subdirectory of
     /// the spool path (forensics preserved) and opens a fresh queue in place.
-    /// Used by the read paths when a CRC check fails under the Quarantine policy.
-    /// Returns the quarantine subdirectory, if anything was moved.
-    fn recover(&mut self, reason: &str) -> Result<Option<std::path::PathBuf>> {
-        // yaque handles save state and delete their locks by path on drop, so they close first.
+    /// Used by the read paths when a header is damaged, under either policy.
+    fn recover(&mut self, trigger: spool_codec::QuarantineTrigger, reason: &str) -> Result<()> {
+        // The halves hold the queue's locks, so they close before the fresh queue opens.
         self.queue = None;
+        *self.cell.lock() = None;
         self.len = 0;
         self.bytes = 0;
-        self.synced = crate::spool_codec::Synced::default();
-        let moved = crate::spool_codec::quarantine(
+        spool_codec::quarantine(&self.config.path, trigger, reason)?;
+        let (sender, receiver) = open_queue(
             &self.config.path,
-            crate::spool_codec::QuarantineTrigger::CrcMismatch,
-            reason,
+            CorruptionPolicy::Fail,
+            options(&self.config),
         )?;
-        let (sender, receiver) = open_queue(&self.config.path, CorruptionPolicy::Fail)?;
+        *self.cell.lock() = Some(sender.shared());
         self.queue = Some(Queue { sender, receiver });
-        Ok(moved)
+        Ok(())
     }
 
     /// Create a new spool at the given path with default settings.
@@ -126,12 +212,14 @@ impl Spool {
     ///
     /// A push that returns `Ok` is in the operating system's hands, so it
     /// survives the process being killed. It survives the host losing power
-    /// once [`sync`](Self::sync) has run, which `sync_on_push` does on every
-    /// push.
+    /// once a sync has run: the timed sync every `sync_interval_ms`,
+    /// [`sync`](Self::sync), or `sync_on_push`, which syncs on every push.
     ///
     /// # Errors
     ///
-    /// Errors on size/item-count cap, compression failure, or I/O. A failed
+    /// Errors on size/item-count cap, compression failure, or I/O, and
+    /// [`SpoolError::DiskFull`] while the disk is full: nothing is written, and
+    /// a retry once the consumer frees space goes through. A failed
     /// `sync_on_push` sync returns the error with the record queued, so a retry
     /// can queue it twice.
     pub async fn push(&mut self, data: &[u8]) -> Result<()> {
@@ -140,29 +228,49 @@ impl Spool {
         {
             return Err(SpoolError::MaxItemsReached { max });
         }
-
-        let body = if self.config.compress {
-            self.compress(data)?
+        let started = Instant::now();
+        let body: &[u8] = if self.config.compress {
+            self.compressor
+                .compress_into(data, &mut self.packed)
+                .map_err(|e| SpoolError::Compression(e.to_string()))?;
+            &self.packed
         } else {
-            data.to_vec()
+            data
         };
-        let to_write = Self::frame(self.config.crc, body);
-        let written = to_write.len() as u64;
+        let compressing = started.elapsed();
+        let prefix = spool_codec::prefix(
+            self.compressor.compression().codec,
+            self.config.crc,
+            spool_codec::now_ms(),
+            body,
+        );
+        let written = prefix.len() + body.len();
 
         if let Some(max_bytes) = self.config.max_size_bytes
-            && self.bytes.saturating_add(written) > max_bytes
+            && self.bytes.saturating_add(written as u64) > max_bytes
         {
             return Err(SpoolError::MaxSizeReached { max_bytes });
         }
 
-        live(&mut self.queue)?
-            .sender
-            .send(to_write)
-            .await
-            .map_err(|e| SpoolError::Queue(e.to_string()))?;
+        let now = Instant::now();
+        let queue = live(&mut self.queue)?;
+        if !self.full.admits(now, queue.sender.freed()) {
+            self.full.refused(4 + written);
+            return Err(SpoolError::DiskFull(spool_codec::full_error().to_string()));
+        }
+        match queue.sender.send(&prefix, body) {
+            Ok(()) => self.full.wrote(now),
+            Err(e) if spool_codec::is_full(&e) => {
+                self.full.failed(now, 4 + written, &e);
+                return Err(SpoolError::DiskFull(e.to_string()));
+            }
+            Err(e) => return Err(SpoolError::Io(e)),
+        }
+        self.metrics.wrote(data.len(), 4 + written, compressing);
+        self.metrics.disk(queue.sender.disk_bytes());
 
         self.len += 1;
-        self.bytes += written;
+        self.bytes += written as u64;
         #[cfg(feature = "metrics")]
         ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
         if self.config.sync_on_push {
@@ -173,10 +281,10 @@ impl Spool {
 
     /// Sync every record pushed so far to disk.
     ///
-    /// yaque flushes each push to the operating system and never syncs, so
-    /// without this a record survives the process being killed but not the
-    /// host losing power. One call covers any number of pushes: push a batch,
-    /// then sync once.
+    /// A push is flushed to the operating system and survives the process
+    /// being killed, but not the host losing power until a sync has run. One
+    /// call covers any number of pushes: push a batch, then sync once. The
+    /// timed sync does the same every `sync_interval_ms`.
     ///
     /// The sync runs on tokio's blocking pool.
     ///
@@ -187,67 +295,134 @@ impl Spool {
     /// spool.
     pub async fn sync(&mut self) -> Result<()> {
         live(&mut self.queue)?;
-        let path = self.config.path.clone();
-        let done = self.synced;
-        self.synced =
-            tokio::task::spawn_blocking(move || crate::spool_codec::sync_segments(&path, done))
-                .await
-                .map_err(|e| SpoolError::Queue(format!("spool sync task failed: {e}")))?
-                .map_err(SpoolError::Io)?;
-        Ok(())
+        spool_codec::sync_queue(self.config.path.clone(), STORE, Arc::clone(&self.cell))
+            .await
+            .map_err(SpoolError::Io)
     }
 
     /// Take one record of `written` bytes off the counts.
     fn taken(&mut self, written: usize) {
         self.len = self.len.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(written as u64);
+        #[cfg(feature = "metrics")]
+        ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
     }
 
-    /// Apply the configured [`CorruptionPolicy`] to a read-time error.
-    ///
-    /// Under `Quarantine`, a [`SpoolError::Corrupted`] triggers
-    /// [`recover`](Self::recover) (the corrupt cache is moved aside, a fresh
-    /// queue takes its place) and returns `Ok(())` so the caller reports an empty
-    /// queue. Any other error, or the `Fail` policy, propagates unchanged.
-    fn recover_on_read(&mut self, e: SpoolError) -> Result<()> {
-        if self.config.on_corruption == CorruptionPolicy::Quarantine
-            && matches!(e, SpoolError::Corrupted(_))
-        {
-            self.recover("CRC mismatch on read")?;
-            Ok(())
-        } else {
-            Err(e)
+    /// Once the spool is empty, ends a drained segment so its file goes.
+    fn release_drained(&mut self) {
+        if self.len > 0 {
+            return;
         }
+        let Some(queue) = self.queue.as_mut() else {
+            return;
+        };
+        let released = queue
+            .sender
+            .release_drained(queue.receiver.position())
+            .and_then(|released| {
+                if released {
+                    queue.receiver.sweep()
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(e) = released {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(error = %e, "cannot release the spool's drained segment");
+            let _ = e;
+        }
+        self.metrics.disk(queue.sender.disk_bytes());
+    }
+
+    /// Reads the front record into the open transaction. `Ok(None)` when the
+    /// queue is empty, or after a damaged header quarantined it.
+    fn read_front(&mut self) -> Result<Option<usize>> {
+        #[cfg(feature = "memory")]
+        let guard = self.memory.as_deref();
+        #[cfg(not(feature = "memory"))]
+        let guard: Option<&MemoryGuard> = None;
+        let queue = live(&mut self.queue)?;
+        let read = queue.receiver.read(1, u64::MAX, guard);
+        self.metrics
+            .reserved(queue.receiver.reserved_bytes(), false);
+        match read {
+            Ok(taken) if taken.entries == 0 => Ok(None),
+            Ok(_) => Ok(Some(queue.receiver.taken()[0].len())),
+            Err(e) if spool_codec::is_damaged_header(&e) => {
+                self.recover(
+                    spool_codec::QuarantineTrigger::DamagedHeader,
+                    &e.to_string(),
+                )?;
+                Ok(None)
+            }
+            Err(e) => Err(SpoolError::Io(e)),
+        }
+    }
+
+    /// Ends the open transaction: commits the record read, or returns it.
+    fn finish(&mut self, commit: bool) {
+        #[cfg(feature = "memory")]
+        let guard = self.memory.as_deref();
+        #[cfg(not(feature = "memory"))]
+        let guard: Option<&MemoryGuard> = None;
+        if let Some(queue) = self.queue.as_mut() {
+            queue.receiver.commit(usize::from(commit), guard);
+            self.metrics
+                .reserved(queue.receiver.reserved_bytes(), false);
+        }
+    }
+
+    /// Decodes the record the open transaction holds into `out`, under the
+    /// codec its entry names.
+    fn decode_front(&mut self, out: &mut Vec<u8>) -> std::result::Result<(), Unreadable> {
+        let Some(queue) = self.queue.as_ref() else {
+            return Err(Unreadable::Codec("spool is closed".into()));
+        };
+        let entry =
+            spool_codec::unframe(&queue.receiver.taken()[0]).map_err(Unreadable::Damaged)?;
+        self.decoders
+            .decode_into(&entry, out)
+            .map_err(Unreadable::Codec)
+    }
+
+    /// Drops the record that failed its CRC, counting it. Under `Fail` the
+    /// caller then returns [`SpoolError::Corrupted`] naming it.
+    fn drop_damaged(&mut self, written: usize, error: &CorruptionError) -> Result<()> {
+        self.finish(true);
+        self.taken(written);
+        self.release_drained();
+        self.metrics.damaged(error);
+        if self.config.on_corruption == CorruptionPolicy::Fail {
+            return Err(SpoolError::Corrupted(error.to_string()));
+        }
+        Ok(())
     }
 
     /// Peek at the first item without removing it.
     ///
-    /// yaque has no direct peek -- `try_recv` then let the guard roll back
-    /// on drop to leave the item in the queue.
-    ///
     /// # Errors
     ///
-    /// Returns an error if decompression fails or an I/O error occurs. A CRC
-    /// failure under `Fail` policy returns [`SpoolError::Corrupted`]; under
-    /// `Quarantine` the cache is recovered and `Ok(None)` is returned.
+    /// Returns an error if decompression fails or an I/O error occurs. A record
+    /// that fails its CRC is dropped and counted, and under the `Fail` policy
+    /// returns [`SpoolError::Corrupted`]. Under `Quarantine` the peek goes on
+    /// to the next record.
     pub async fn peek(&mut self) -> Result<Option<Vec<u8>>> {
-        // `step` is owned, so the receiver borrow (held by the guard + the match
-        // scrutinee) is fully released before any `recover_on_read` call.
-        let step: Option<Result<Vec<u8>>> = match live(&mut self.queue)?.receiver.try_recv() {
-            Ok(guard) => {
-                let outcome = Self::unframe(self.config.crc, guard.to_vec())
-                    .and_then(|body| Self::decode(self.config.compress, body));
-                // No commit -- guard rollback on drop keeps the item.
-                drop(guard);
-                Some(outcome)
+        let mut out = Vec::new();
+        loop {
+            let Some(written) = self.read_front()? else {
+                return Ok(None);
+            };
+            match self.decode_front(&mut out) {
+                Ok(()) => {
+                    self.finish(false);
+                    return Ok(Some(out));
+                }
+                Err(Unreadable::Damaged(error)) => self.drop_damaged(written, &error)?,
+                Err(Unreadable::Codec(reason)) => {
+                    self.finish(false);
+                    return Err(SpoolError::Decompression(reason));
+                }
             }
-            Err(yaque::TryRecvError::Io(e)) => Some(Err(SpoolError::Io(e))),
-            Err(yaque::TryRecvError::QueueEmpty) => None,
-        };
-        match step {
-            Some(Ok(data)) => Ok(Some(data)),
-            Some(Err(e)) => self.recover_on_read(e).map(|()| None),
-            None => Ok(None),
         }
     }
 
@@ -257,18 +432,11 @@ impl Spool {
     ///
     /// Returns an error if an I/O error occurs.
     pub async fn pop(&mut self) -> Result<()> {
-        let written = match live(&mut self.queue)?.receiver.try_recv() {
-            Ok(guard) => {
-                let written = guard.len();
-                guard
-                    .commit()
-                    .map_err(|e| SpoolError::Queue(e.to_string()))?;
-                written
-            }
-            Err(yaque::TryRecvError::Io(e)) => return Err(SpoolError::Io(e)),
-            Err(yaque::TryRecvError::QueueEmpty) => return Ok(()), // Nothing to pop
-        };
-        self.taken(written);
+        if let Some(written) = self.read_front()? {
+            self.finish(true);
+            self.taken(written);
+            self.release_drained();
+        }
         Ok(())
     }
 
@@ -278,35 +446,37 @@ impl Spool {
     ///
     /// Returns an error if decompression fails or an I/O error occurs.
     pub async fn pop_front(&mut self) -> Result<Option<Vec<u8>>> {
-        let step: Option<Result<(Vec<u8>, usize)>> =
-            match live(&mut self.queue)?.receiver.try_recv() {
-                Ok(guard) => {
-                    let written = guard.len();
-                    let decoded = Self::unframe(self.config.crc, guard.to_vec())
-                        .and_then(|body| Self::decode(self.config.compress, body));
-                    match decoded {
-                        Ok(data) => match guard.commit() {
-                            Ok(()) => Some(Ok((data, written))),
-                            Err(e) => Some(Err(SpoolError::Queue(e.to_string()))),
-                        },
-                        Err(e) => {
-                            drop(guard); // roll back -- leave the item for recovery
-                            Some(Err(e))
-                        }
-                    }
-                }
-                Err(yaque::TryRecvError::Io(e)) => Some(Err(SpoolError::Io(e))),
-                Err(yaque::TryRecvError::QueueEmpty) => None,
+        let mut out = Vec::new();
+        Ok(self.pop_front_into(&mut out).await?.then_some(out))
+    }
+
+    /// Pop the first item into `out`, replacing its contents. `Ok(false)` when
+    /// the queue is empty. Reusing `out` across calls, a pop allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if decompression fails or an I/O error occurs. A record
+    /// that fails its CRC is dropped and counted, and under the `Fail` policy
+    /// returns [`SpoolError::Corrupted`]. Under `Quarantine` the pop goes on to
+    /// the next record.
+    pub async fn pop_front_into(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+        loop {
+            let Some(written) = self.read_front()? else {
+                return Ok(false);
             };
-        match step {
-            Some(Ok((data, written))) => {
-                self.taken(written);
-                #[cfg(feature = "metrics")]
-                ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
-                Ok(Some(data))
+            match self.decode_front(out) {
+                Ok(()) => {
+                    self.finish(true);
+                    self.taken(written);
+                    self.release_drained();
+                    return Ok(true);
+                }
+                Err(Unreadable::Damaged(error)) => self.drop_damaged(written, &error)?,
+                Err(Unreadable::Codec(reason)) => {
+                    self.finish(false);
+                    return Err(SpoolError::Decompression(reason));
+                }
             }
-            Some(Err(e)) => self.recover_on_read(e).map(|()| None),
-            None => Ok(None),
         }
     }
 
@@ -314,41 +484,18 @@ impl Spool {
     ///
     /// # Errors
     ///
-    /// Returns an error if decompression fails or an I/O error occurs.
+    /// Returns an error if decompression fails or an I/O error occurs. A record
+    /// that fails its CRC is dropped and counted, and under the `Fail` policy
+    /// returns [`SpoolError::Corrupted`] once, naming it.
     pub async fn recv(&mut self) -> Result<Vec<u8>> {
-        let guard = live(&mut self.queue)?
-            .receiver
-            .recv()
-            .await
-            .map_err(|e| SpoolError::Queue(e.to_string()))?;
-
-        // `guard` is a let-binding (not a match temporary), so dropping it fully
-        // releases the receiver borrow before any recover.
-        let written = guard.len();
-        let decoded = Self::unframe(self.config.crc, guard.to_vec())
-            .and_then(|body| Self::decode(self.config.compress, body));
-        let data = match decoded {
-            Ok(data) => {
-                guard
-                    .commit()
-                    .map_err(|e| SpoolError::Queue(e.to_string()))?;
-                data
+        loop {
+            let mut out = Vec::new();
+            if self.pop_front_into(&mut out).await? {
+                return Ok(out);
             }
-            Err(e) => {
-                drop(guard);
-                // recv has no Option for "empty": under Quarantine we recover
-                // (cache moved aside, fresh queue) then still surface the
-                // corruption once so the caller knows the in-flight record was lost.
-                self.recover_on_read(e)?;
-                return Err(SpoolError::Corrupted(
-                    "recovered from corrupt cache; the in-flight record was lost".into(),
-                ));
-            }
-        };
-        self.taken(written);
-        #[cfg(feature = "metrics")]
-        ::metrics::gauge!("spool_queue_depth").set(self.len as f64);
-        Ok(data)
+            let receiver = &mut live(&mut self.queue)?.receiver;
+            std::future::poll_fn(|cx| receiver.poll_ready(cx)).await;
+        }
     }
 
     /// Approximate item count, tracked internally.
@@ -369,23 +516,23 @@ impl Spool {
     ///
     /// Returns an error if an I/O error occurs.
     pub fn clear(&mut self) -> Result<()> {
-        // yaque has no built-in clear -- drain by committing every item.
         let queue = live(&mut self.queue)?;
         loop {
-            match queue.receiver.try_recv() {
-                Ok(guard) => {
-                    guard
-                        .commit()
-                        .map_err(|e| SpoolError::Queue(e.to_string()))?;
-                }
-                Err(yaque::TryRecvError::QueueEmpty) => break,
-                Err(yaque::TryRecvError::Io(e)) => return Err(SpoolError::Io(e)),
+            // Bounded reads, so a large backlog is never in memory at once.
+            let taken = queue
+                .receiver
+                .read(1024, 4 << 20, None)
+                .map_err(SpoolError::Io)?;
+            if taken.entries == 0 {
+                break;
             }
+            queue.receiver.commit(taken.entries, None);
         }
         self.len = 0;
         self.bytes = 0;
         #[cfg(feature = "metrics")]
         ::metrics::gauge!("spool_queue_depth").set(0.0);
+        self.release_drained();
         Ok(())
     }
 
@@ -420,36 +567,51 @@ impl Spool {
         Ok(total)
     }
 
-    /// Compress data using zstd.
-    fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        zstd::encode_all(data, self.config.compression_level)
-            .map_err(|e| SpoolError::Compression(e.to_string()))
-    }
-
-    /// CRC32C framing -- delegates to the shared [`spool_codec`](crate::spool_codec).
-    fn frame(crc: bool, body: Vec<u8>) -> Vec<u8> {
-        crate::spool_codec::frame(crc, body)
-    }
-
-    /// Decompress the record body when compression is enabled.
-    fn decode(compress: bool, body: Vec<u8>) -> Result<Vec<u8>> {
-        if compress {
-            zstd::decode_all(body.as_slice()).map_err(|e| SpoolError::Decompression(e.to_string()))
+    /// Stop the timed sync, after one last sync of everything pushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpoolError::Io`] when the last sync fails.
+    pub async fn close(mut self) -> Result<()> {
+        self.shutdown.cancel();
+        if let Some(ticker) = self.ticker.take() {
+            ticker
+                .join()
+                .await
+                .map_err(|e| SpoolError::Queue(format!("spool sync task failed: {e}")))?;
         } else {
-            Ok(body)
+            self.sync().await?;
         }
-    }
-
-    /// Verify+strip the CRC header (shared logic). A checksum failure becomes
-    /// [`SpoolError::Corrupted`].
-    fn unframe(crc: bool, raw: Vec<u8>) -> Result<Vec<u8>> {
-        crate::spool_codec::unframe(crc, raw).map_err(|e| SpoolError::Corrupted(e.0))
+        Ok(())
     }
 }
 
-/// Open the yaque queue through the shared lock-recovery + quarantine path.
-fn open_queue(path: &Path, policy: CorruptionPolicy) -> Result<(Sender, Receiver)> {
-    crate::spool_codec::open_queue(path, policy).map_err(|e| SpoolError::Open {
+impl Drop for Spool {
+    fn drop(&mut self) {
+        // The timed sync's shutdown runs one last sync.
+        self.shutdown.cancel();
+    }
+}
+
+/// The queue options a spool opens with.
+fn options(config: &SpoolConfig) -> yaque::Options {
+    yaque::Options {
+        segment_bytes: config.segment_bytes,
+        read_buffer_bytes: config.read_buffer_bytes,
+        recycle_bytes: config.read_buffer_bytes,
+        whole: Some(spool_codec::whole),
+        damaged_tail: Some(spool_codec::keep_damaged_tail),
+        store: STORE,
+    }
+}
+
+/// Open the queue through the shared lock and quarantine path.
+fn open_queue(
+    path: &Path,
+    policy: CorruptionPolicy,
+    options: yaque::Options,
+) -> Result<(Sender, Receiver)> {
+    spool_codec::open_queue(path, policy, options).map_err(|e| SpoolError::Open {
         path: path.display().to_string(),
         message: e.to_string(),
     })
@@ -737,124 +899,138 @@ mod tests {
         assert_eq!(spool.pop_front().await.unwrap(), Some(payload));
     }
 
-    /// Corrupt one payload byte in a CRC-enabled spool's segment file.
-    fn flip_payload_byte(path: &std::path::Path) {
-        let seg = path.join("0.q");
-        let mut bytes = std::fs::read(&seg).unwrap();
-        let mid = bytes.len() / 2;
-        bytes[mid] ^= 0xFF;
-        std::fs::write(&seg, &bytes).unwrap();
+    /// A record damaged on disk is dropped and counted, and the records on
+    /// either side of it still come back in order. `Fail` also returns
+    /// `Corrupted` once for it. Nothing is quarantined.
+    #[tokio::test]
+    async fn a_damaged_record_is_dropped_counted_and_the_rest_read() {
+        for policy in [CorruptionPolicy::Quarantine, CorruptionPolicy::Fail] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("damaged");
+            let records: [&[u8]; 3] = [b"record-0", b"record-1", b"record-2"];
+            let config = SpoolConfig::new(&path).on_corruption(policy);
+            let mut spool = Spool::open(config.clone()).await.unwrap();
+            for record in records {
+                spool.push(record).await.unwrap();
+            }
+            drop(spool);
+            // One body byte of the middle record, past its 4-byte header and its prefix.
+            let entry = 4 + spool_codec::PREFIX_LEN + records[0].len();
+            let segment = path.join("0.q");
+            let mut bytes = std::fs::read(&segment).unwrap();
+            bytes[entry + 4 + spool_codec::PREFIX_LEN + 1] ^= 0xFF;
+            std::fs::write(&segment, &bytes).unwrap();
+
+            #[cfg(feature = "metrics")]
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            #[cfg(feature = "metrics")]
+            let _metrics = ::metrics::set_default_local_recorder(&recorder);
+            let mut spool = Spool::open(config).await.unwrap();
+            assert_eq!(spool.pop_front().await.unwrap(), Some(records[0].to_vec()));
+            if policy == CorruptionPolicy::Fail {
+                assert!(
+                    matches!(spool.pop_front().await, Err(SpoolError::Corrupted(_))),
+                    "Fail returns the damage once"
+                );
+            }
+            assert_eq!(
+                spool.pop_front().await.unwrap(),
+                Some(records[2].to_vec()),
+                "{policy:?}: the read goes on past it"
+            );
+            assert_eq!(spool.pop_front().await.unwrap(), None, "{policy:?}");
+            #[cfg(feature = "metrics")]
+            assert!(
+                recorder
+                    .handle()
+                    .render()
+                    .contains("spool_damaged_entries_total{store=\"spool\"} 1"),
+                "{policy:?}: counted once"
+            );
+            let quarantined = std::fs::read_dir(&path)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("corrupt-"));
+            assert!(!quarantined, "{policy:?}: nothing quarantined");
+        }
     }
 
+    /// A damaged header in the newest segment keeps every record before it.
+    /// The open copies the segment from that header on into a `corrupt-*`
+    /// directory, cuts it off, and takes new records after it.
     #[tokio::test]
-    async fn test_crc_detects_payload_corruption_under_fail_policy() {
-        // The crux: with CRC on (Fail policy), a flipped payload byte on disk
-        // must surface as SpoolError::Corrupted, never as silently-wrong bytes.
+    async fn a_damaged_header_in_the_newest_segment_is_kept_aside_at_open() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("corrupt-queue");
-        {
-            let cfg = SpoolConfig::new(&path)
-                .crc(true)
-                .on_corruption(CorruptionPolicy::Fail);
-            let mut spool = Spool::open(cfg).await.unwrap();
-            spool
-                .push(b"the original bytes that must not silently change")
-                .await
-                .unwrap();
+        let path = dir.path().join("damaged-header");
+        let config = SpoolConfig::new(&path);
+        let records: Vec<Vec<u8>> = (0..10)
+            .map(|i| format!("record-{i}").into_bytes())
+            .collect();
+        let mut spool = Spool::open(config.clone()).await.unwrap();
+        for record in &records {
+            spool.push(record).await.unwrap();
         }
-        flip_payload_byte(&path);
+        drop(spool);
+        let entry = 4 + spool_codec::PREFIX_LEN + records[0].len();
+        let segment = path.join("0.q");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        // A parity bit of record 4's header.
+        bytes[4 * entry] ^= 0x04;
+        std::fs::write(&segment, &bytes).unwrap();
 
-        let cfg = SpoolConfig::new(&path)
-            .crc(true)
-            .on_corruption(CorruptionPolicy::Fail);
-        let mut spool = Spool::open(cfg).await.unwrap();
-        let result = spool.pop_front().await;
-        assert!(
-            matches!(result, Err(SpoolError::Corrupted(_))),
-            "Fail policy must surface corruption, got {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_corruption_quarantines_and_starts_fresh() {
-        // Default policy: a corrupt cache is renamed aside (timestamped, for
-        // forensics) and a FRESH queue takes its place -- the service continues
-        // rather than stopping or serving bad data.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("spill-cache");
-        {
-            // Default on_corruption == Quarantine.
-            let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-                .await
-                .unwrap();
-            spool.push(b"poisoned record").await.unwrap();
+        let mut spool = Spool::open(config).await.unwrap();
+        assert_eq!(spool.len(), 4);
+        for record in &records[..4] {
+            assert_eq!(spool.pop_front().await.unwrap().as_ref(), Some(record));
         }
-        flip_payload_byte(&path);
-
-        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-            .await
-            .unwrap();
-        // The corrupt record reads back as "empty" after the cache is recovered.
-        assert_eq!(
-            spool.pop_front().await.unwrap(),
-            None,
-            "Quarantine recovers to a fresh empty queue"
-        );
-
-        // The corrupt queue was preserved in a timestamped subdirectory of the path.
-        let quarantined: Vec<_> = std::fs::read_dir(&path)
+        assert_eq!(spool.pop_front().await.unwrap(), None);
+        let kept: Vec<_> = std::fs::read_dir(&path)
             .unwrap()
-            .filter_map(std::result::Result::ok)
+            .flatten()
             .filter(|e| e.file_name().to_string_lossy().starts_with("corrupt-"))
             .collect();
+        assert_eq!(kept.len(), 1, "one corrupt-* directory");
         assert_eq!(
-            quarantined.len(),
-            1,
-            "corrupt cache must be moved aside, not deleted"
+            std::fs::read(kept[0].path().join("0.q")).unwrap(),
+            bytes[4 * entry..],
+            "the bytes from the damaged header on are kept"
         );
-        assert!(quarantined[0].path().join("0.q").exists());
-
-        // The fresh queue is fully usable.
-        spool.push(b"after recovery").await.unwrap();
-        assert_eq!(
-            spool.pop_front().await.unwrap(),
-            Some(b"after recovery".to_vec())
-        );
+        spool.push(b"after").await.unwrap();
+        assert_eq!(spool.pop_front().await.unwrap(), Some(b"after".to_vec()));
     }
 
+    /// A header damaged on disk quarantines the queue on read. The old
+    /// handles close before the fresh queue opens, so their drop can neither
+    /// release the fresh locks nor overwrite its saved position.
     #[tokio::test]
     async fn test_recovered_queue_keeps_its_locks_and_position() {
-        // The corrupt queue's handles close before the fresh queue opens, so their
-        // drop can neither delete the fresh locks nor overwrite its saved position.
         let dir = tempdir().unwrap();
         let path = dir.path().join("spill-cache");
+        // A segment per record, so the damaged one is not the newest, which the open would cut.
+        let mut config = SpoolConfig::new(&path);
+        config.segment_bytes = 16;
         {
-            let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-                .await
-                .unwrap();
-            spool.push(b"consumed first").await.unwrap();
-            spool.push(b"poisoned record").await.unwrap();
+            let mut spool = Spool::open(config.clone()).await.unwrap();
+            for record in [&b"consumed first"[..], b"poisoned record", b"third"] {
+                spool.push(record).await.unwrap();
+            }
             assert_eq!(
                 spool.pop_front().await.unwrap(),
                 Some(b"consumed first".to_vec())
             );
         }
-        // Flip the last byte, which belongs to the second record.
-        let seg = path.join("0.q");
-        let mut bytes = std::fs::read(&seg).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        std::fs::write(&seg, &bytes).unwrap();
+        let segment = path.join("1.q");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        bytes[0] ^= 0x04;
+        std::fs::write(&segment, &bytes).unwrap();
 
-        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-            .await
-            .unwrap();
+        let mut spool = Spool::open(config.clone()).await.unwrap();
         assert_eq!(spool.pop_front().await.unwrap(), None, "recovered to empty");
         assert!(path.join("send.lock").exists(), "fresh sender lock held");
         assert!(path.join("recv.lock").exists(), "fresh receiver lock held");
         assert!(
             matches!(
-                Spool::open(SpoolConfig::new(&path).crc(true)).await,
+                Spool::open(config.clone()).await,
                 Err(SpoolError::Open { .. })
             ),
             "a second open of the recovered queue is refused"
@@ -862,9 +1038,7 @@ mod tests {
 
         spool.push(b"after recovery").await.unwrap();
         drop(spool);
-        let mut spool = Spool::open(SpoolConfig::new(&path).crc(true))
-            .await
-            .unwrap();
+        let mut spool = Spool::open(config).await.unwrap();
         assert_eq!(
             spool.pop_front().await.unwrap(),
             Some(b"after recovery".to_vec()),
@@ -872,6 +1046,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_reopens_after_a_stale_lock() {
         let dir = tempdir().unwrap();
@@ -952,15 +1127,17 @@ mod tests {
     /// release, and on a `.q` file that is not a segment number, which ends a
     /// service built with `panic = "abort"`. Each is an open failure instead:
     /// `fail` returns an error naming the file, and `quarantine` sets the queue
-    /// aside, opens a fresh one and keeps the corrupt files.
+    /// aside, opens a fresh one and keeps the corrupt files. A queue in another
+    /// spool format is refused under both.
     #[tokio::test]
     async fn a_queue_yaque_would_panic_on_is_an_open_failure() {
         let version = std::path::Path::new("version").join("contents");
         let version_named = version.display().to_string();
         // (case, text for the version file or None for a stray `.q` file, what the error names)
-        let cases: [(&str, Option<&str>, &str); 5] = [
+        let cases: [(&str, Option<&str>, &str); 6] = [
             ("not a version", Some("not a version"), &version_named),
-            ("another release", Some("0.5.2"), &version_named),
+            ("the format before", Some("0.6.6"), &version_named),
+            ("an older format", Some("0.5.2"), &version_named),
             ("only whitespace", Some("\n"), &version_named),
             ("not a segment", None, "foo.q"),
             (
@@ -988,9 +1165,17 @@ mod tests {
                 "{name}: {failed}"
             );
 
-            let mut fresh = Spool::open(SpoolConfig::new(&path))
-                .await
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let opened = Spool::open(SpoolConfig::new(&path)).await;
+            if version_text.is_some_and(|text| text.starts_with("0.")) {
+                // Another spool format is refused under quarantine too, and nothing moves.
+                assert!(
+                    matches!(&opened, Err(SpoolError::Open { message, .. }) if message.contains("spool format")),
+                    "{name}: {opened:?}"
+                );
+                assert!(path.join("0.q").exists(), "{name}: records left in place");
+                continue;
+            }
+            let mut fresh = opened.unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(fresh.is_empty(), "{name}: a fresh queue");
             fresh.push(b"new").await.unwrap();
             assert_eq!(fresh.pop_front().await.unwrap(), Some(b"new".to_vec()));

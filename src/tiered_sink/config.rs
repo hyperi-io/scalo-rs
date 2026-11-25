@@ -31,9 +31,9 @@ pub struct TieredSinkConfig {
     pub send_timeout_ms: u64,
 
     /// Codec for spilled records: `none`, `zstd`, `lz4`, or `snappy` with the
-    /// `compression-snappy` feature. Default zstd at level 3. A cache keeps no
-    /// codec per record, so the drain holds at an entry another codec wrote
-    /// until the sink reopens under that codec. Change it on an empty spool.
+    /// `compression-snappy` feature. Default zstd at level 3. Each record names
+    /// the codec it was written with, so a change applies to new records and
+    /// the ones already spilled still drain.
     #[serde(default = "default_compression")]
     #[cfg_attr(
         feature = "config-schema",
@@ -49,8 +49,7 @@ pub struct TieredSinkConfig {
     #[serde(default)]
     pub ordering: OrderingMode,
 
-    /// Maximum spool size in bytes, as stored. A spill past it is handled by
-    /// [`when_full`](Self::when_full).
+    /// Most bytes the spool's files take on disk, one segment of read records included. A spill past it is handled by [`when_full`](Self::when_full).
     #[serde(default)]
     pub max_spool_bytes: Option<u64>,
 
@@ -62,6 +61,11 @@ pub struct TieredSinkConfig {
     /// Default `Block` (lossless backpressure -- preserves current behaviour).
     #[serde(default)]
     pub when_full: WhenFull,
+
+    /// Milliseconds a `send` the full spool blocks waits for the drain to make
+    /// room before it returns `SpoolFull`. 0 returns at once. Default 1000.
+    #[serde(default = "default_when_full_wait_ms")]
+    pub when_full_wait_ms: u64,
 
     /// Circuit breaker: failures before opening circuit.
     #[serde(default = "default_circuit_failure_threshold")]
@@ -93,20 +97,19 @@ pub struct TieredSinkConfig {
     #[serde(default)]
     pub disk_aware: Option<DiskAwareConfig>,
 
-    /// Prepend a CRC32C checksum to each spilled record and verify it on drain.
-    /// Detects torn writes / bit-rot that the queue's length-only header cannot
-    /// (a flipped payload byte would otherwise replay silently-wrong). A drained
-    /// record that fails the check is dropped and logged at error level, never
-    /// sent. No metric counts it.
-    /// Default false (on-disk format unchanged unless enabled).
-    #[serde(default)]
+    /// Write a CRC32C over each spilled record's codec tag, write time and body,
+    /// and check it on drain. A record that fails it is dropped, logged and
+    /// counted in `spool_damaged_entries_total`, never sent. Default true. Off,
+    /// the field is still written, as zeros, and only the length is checked.
+    #[serde(default = "default_true")]
     pub crc: bool,
 
     /// What to do when the spill cache cannot be opened (corrupt segments /
     /// metadata). Default [`CorruptionPolicy::Quarantine`]: move the corrupt
     /// queue's files into a timestamped `corrupt-*` subdirectory of
     /// `spool_path` and start fresh, so a poisoned spill cache can never block
-    /// startup. A cache another live sink holds is refused, never quarantined.
+    /// startup. A cache another live sink holds, or one written in another
+    /// spool format, is refused, never quarantined.
     #[serde(default)]
     pub on_corruption: CorruptionPolicy,
 
@@ -120,6 +123,18 @@ pub struct TieredSinkConfig {
     /// when the sink is down.
     #[serde(default)]
     pub sync_on_spill: bool,
+
+    /// Milliseconds between timed syncs of the spill to disk. 0 turns them off. Default 500.
+    #[serde(default = "default_sync_interval_ms")]
+    pub sync_interval_ms: u64,
+
+    /// Bytes a segment file holds before the next record starts a new one. Default 16 MiB.
+    #[serde(default = "default_segment_bytes")]
+    pub segment_bytes: u64,
+
+    /// The drain's read-ahead buffer in bytes. Default 64 KiB.
+    #[serde(default = "default_read_buffer_bytes")]
+    pub read_buffer_bytes: usize,
 }
 
 /// The codecs a spill takes.
@@ -137,8 +152,16 @@ fn compression_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     ACCEPTS.schema()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_send_timeout_ms() -> u64 {
     1000 // 1 second
+}
+
+fn default_when_full_wait_ms() -> u64 {
+    1000
 }
 
 fn default_circuit_failure_threshold() -> u32 {
@@ -161,6 +184,18 @@ fn default_drain_batch_max_bytes() -> u64 {
     4 * 1024 * 1024
 }
 
+fn default_sync_interval_ms() -> u64 {
+    crate::spool_codec::DEFAULT_SYNC_INTERVAL_MS
+}
+
+fn default_segment_bytes() -> u64 {
+    crate::spool_codec::DEFAULT_SEGMENT_BYTES
+}
+
+fn default_read_buffer_bytes() -> usize {
+    crate::spool_codec::DEFAULT_READ_BUFFER_BYTES
+}
+
 impl TieredSinkConfig {
     /// Create a new config with the given spool path.
     #[must_use]
@@ -174,15 +209,19 @@ impl TieredSinkConfig {
             max_spool_bytes: None,
             max_spool_items: None,
             when_full: WhenFull::default(),
+            when_full_wait_ms: default_when_full_wait_ms(),
             circuit_failure_threshold: default_circuit_failure_threshold(),
             circuit_reset_timeout_ms: default_circuit_reset_timeout_ms(),
             drain_interval_ms: default_drain_interval_ms(),
             drain_batch_max_records: default_drain_batch_max_records(),
             drain_batch_max_bytes: default_drain_batch_max_bytes(),
             disk_aware: None,
-            crc: false,
+            crc: true,
             on_corruption: CorruptionPolicy::Quarantine,
             sync_on_spill: false,
+            sync_interval_ms: default_sync_interval_ms(),
+            segment_bytes: default_segment_bytes(),
+            read_buffer_bytes: default_read_buffer_bytes(),
         }
     }
 
@@ -254,6 +293,14 @@ impl TieredSinkConfig {
     #[must_use]
     pub fn when_full(mut self, policy: WhenFull) -> Self {
         self.when_full = policy;
+        self
+    }
+
+    /// Set how long a blocked `send` waits for room (see
+    /// [`when_full_wait_ms`](Self::when_full_wait_ms)).
+    #[must_use]
+    pub fn when_full_wait(mut self, wait: Duration) -> Self {
+        self.when_full_wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         self
     }
 
@@ -442,8 +489,9 @@ impl DrainStrategy {
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhenFull {
-    /// Backpressure: the spool write fails so the caller slows the inbound
-    /// source. Lossless. Default (matches pre-2.10 behaviour).
+    /// Backpressure: `send` waits up to `when_full_wait_ms` for the drain to
+    /// make room, then fails so the caller slows the inbound source. Lossless.
+    /// Default.
     #[default]
     Block,
     /// Write the overflowing record to the DLQ set with `TieredSink::with_dlq`,
@@ -466,8 +514,9 @@ pub enum OrderingMode {
     #[default]
     Interleaved,
 
-    /// Drain spool completely before new messages use hot path.
-    /// Guarantees strict FIFO ordering but blocks new traffic during drain.
+    /// Drain spool completely before new messages use hot path, so every
+    /// spooled record reaches the sink before any record sent after it.
+    /// New records spool behind the backlog while it drains.
     StrictFifo,
 }
 

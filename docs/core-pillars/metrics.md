@@ -205,7 +205,9 @@ What a source holds until delivery, and the guarantee the pipeline gives ([../pi
 | `batch_engine_max_chunk_size` | none | gauge, the configured `batch_processing.max_chunk_size` |
 | `engine_filter_dlq_discarded_total` | none | dead letters a `BatchEngine` run loop discarded under `FilterDlqPolicy::DiscardWithMetric` |
 | `tiered_sink_dead_letters_total` | `reason`, `outcome` | records a tiered sink's drain or full spool could not deliver: `outcome="dlq"` once its DLQ confirmed one, `dropped` otherwise. See [tiered-sink.md](../pipeline/tiered-sink.md#metrics) |
-| `tiered_sink_drain_held` | none | gauge, `1` while a tiered sink's drain holds at a spilled entry its codec cannot read. See [tiered-sink.md](../pipeline/tiered-sink.md#changing-the-codec) |
+| `tiered_sink_drain_held` | none | gauge, `1` while a tiered sink's drain holds at a spilled entry it cannot read. See [tiered-sink.md](../pipeline/tiered-sink.md#changing-the-codec) |
+| `spool_damaged_entries_total` | `store` | spooled records dropped because they failed their CRC. See [spool.md](../pipeline/spool.md#damaged-records) |
+| `spool_oldest_age_seconds` | `store` | gauge, age of the oldest record a tiered sink's spill holds, `0` with none |
 | `transport_message_too_large_total` | `transport` | records over a sender's size ceiling. gRPC counts a record over `max_message_size` that `send` rejects before sending or the receiver rejects with `OutOfRange`, and one `send_batch` leaves out of a block, which answers the block `FilteredDlq` and counts in `pipeline_dead_letters_dropped_total{reason="too_large"}`. Kafka counts a record librdkafka rejects as over `message.max.bytes`. Syslog counts a message over `max_message_bytes` on TCP, TLS or RELP. A `send` of such a record answers `FilteredDlq` |
 | `transport_truncated_total` | `transport` | messages cut to a sender's size ceiling and sent. Syslog over UDP counts a message over `max_message_bytes` |
 | `transport_ack_held` / `transport_ack_held_bytes` | `transport` | records and payload bytes whose acknowledgement is held |

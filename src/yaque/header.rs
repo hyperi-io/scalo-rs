@@ -2,11 +2,10 @@
 // Copyright 2020 Pedro Bittencourt Arruda. Apache License 2.0, see /NOTICE.
 // Modified for scalo.
 
-//! Hamming-encoded headers for the preppers. Reading a corrupted header can
-//! have devastating consequences. It is better to panic. And yes, this _has_
-//! happened in a real world scenario (SIGKILL).
+//! The 4-byte header in front of every entry: a 26-bit length and six parity
+//! bits over it, so a damaged header reads as an error, never as a length.
 //!
-//! Here is how to generate the parity masks, in Python:
+//! The parity masks come from this Python:
 //! ```python
 //! pow2 = {1, 2, 4, 8, 16, 32}
 //!
@@ -18,149 +17,110 @@
 //! ```
 //! See [this section in Wikipedia](https://en.wikipedia.org/wiki/Hamming_code#General_algorithm).
 
-/// Parity check mask.
-const P0: u32 = 0b11_1111_1111_1111_1111_1111_1111; // just a regular parity check (not Hamming!)
-/// Hamming first parity bit mask.
-const P1: u32 = 0b10_1010_1010_1010_1101_0101_1011;
-/// Hamming second parity bit mask.
-const P2: u32 = 0b11_0011_0011_0011_0110_0110_1101;
-/// Hamming third parity bit mask.
-const P3: u32 = 0b11_1100_0011_1100_0111_1000_1110;
-/// Hamming fourth parity bit mask.
-const P4: u32 = 0b11_1111_1100_0000_0111_1111_0000;
-/// Hamming fifth parity bit mask.
-const P5: u32 = 0b11_1111_1111_1111_1000_0000_0000;
+use std::io;
 
-/// A structure holding all the header info.
+/// The parity masks, in the order their bits sit above the length.
+const MASKS: [u32; 6] = [
+    0b11_1111_1111_1111_1111_1111_1111,
+    0b10_1010_1010_1010_1101_0101_1011,
+    0b11_0011_0011_0011_0110_0110_1101,
+    0b11_1100_0011_1100_0111_1000_1110,
+    0b11_1111_1100_0000_0111_1111_0000,
+    0b11_1111_1111_1111_1000_0000_0000,
+];
+
+/// The longest entry a header can describe: 64 MiB less one byte.
+pub(crate) const MAX_LEN: u32 = 0x03FF_FFFF;
+
+/// The marker that ends a segment, in place of a header.
+pub(crate) const EOF: [u8; 4] = [255; 4];
+
+/// An entry's header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Header {
-    /// The length of the payload.
+pub(crate) struct Header {
     len: u32,
 }
 
 impl Header {
-    /// Creates a new [`Header`] from header info (just the length by now).
-    pub fn new(len: u32) -> Header {
-        // last 6bits clean or 26bit available ~= 67MB:
-        assert!(
-            len == len & 0x03_FF_FF_FFu32,
-            "length too big: {} > 2 ^ 26",
-            len
-        );
-
-        Header { len }
+    /// The header of an entry of `len` bytes, or `None` past [`MAX_LEN`].
+    pub(crate) fn for_len(len: usize) -> Option<Self> {
+        u32::try_from(len)
+            .ok()
+            .filter(|len| *len <= MAX_LEN)
+            .map(|len| Self { len })
     }
 
-    /// Gets the length of the payload.
-    pub fn len(&self) -> u32 {
+    /// The length of the entry's payload.
+    pub(crate) fn len(self) -> u32 {
         self.len
     }
 
-    /// Encodes this header into the actual bits.
-    pub fn encode(&self) -> [u8; 4] {
-        let mut encoded = self.len;
-
-        // parities:
-        encoded |= ((self.len & P0).count_ones() & 0b1) << 26;
-        encoded |= ((self.len & P1).count_ones() & 0b1) << 27;
-        encoded |= ((self.len & P2).count_ones() & 0b1) << 28;
-        encoded |= ((self.len & P3).count_ones() & 0b1) << 29;
-        encoded |= ((self.len & P4).count_ones() & 0b1) << 30;
-        encoded |= ((self.len & P5).count_ones() & 0b1) << 31;
-
-        u32::to_be_bytes(encoded)
+    /// The header as it is written.
+    pub(crate) fn encode(self) -> [u8; 4] {
+        (self.len | parity(self.len) << 26).to_be_bytes()
     }
 
-    /// Decodes a header from the actual bits.
-    pub fn decode(header: [u8; 4]) -> Header {
-        let encoded = u32::from_be_bytes(header);
-
-        // check parities...
-
-        fn xor(a: bool, b: bool) -> bool {
-            a && b || !a && !b
+    /// Reads a header as it was written.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidData` when a parity bit does not match the length.
+    pub(crate) fn decode(bytes: [u8; 4]) -> io::Result<Self> {
+        let encoded = u32::from_be_bytes(bytes);
+        let len = encoded & MAX_LEN;
+        if encoded >> 26 != parity(len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("entry header {bytes:02x?} fails its parity check"),
+            ));
         }
-
-        assert!(
-            xor(
-                (encoded & P0).count_ones() as u8 & 0b1 != 0,
-                encoded & (1 << 26) != 0
-            ),
-            "parity 0 wrong: {:?}",
-            header
-        );
-        assert!(
-            xor(
-                (encoded & P1).count_ones() as u8 & 0b1 != 0,
-                encoded & (1 << 27) != 0
-            ),
-            "parity 1 wrong: {:?}",
-            header
-        );
-        assert!(
-            xor(
-                (encoded & P2).count_ones() as u8 & 0b1 != 0,
-                encoded & (1 << 28) != 0
-            ),
-            "parity 2 wrong: {:?}",
-            header
-        );
-        assert!(
-            xor(
-                (encoded & P3).count_ones() as u8 & 0b1 != 0,
-                encoded & (1 << 29) != 0
-            ),
-            "parity 3 wrong: {:?}",
-            header
-        );
-        assert!(
-            xor(
-                (encoded & P4).count_ones() as u8 & 0b1 != 0,
-                encoded & (1 << 30) != 0
-            ),
-            "parity 4 wrong: {:?}",
-            header
-        );
-        assert!(
-            xor(
-                (encoded & P5).count_ones() as u8 & 0b1 != 0,
-                encoded & (1 << 31) != 0
-            ),
-            "parity 5 wrong: {:?}",
-            header
-        );
-
-        // clear flags
-        Header::new(encoded & 0x03_FF_FF_FFu32)
+        Ok(Self { len })
     }
 }
 
+/// The six parity bits of `len`, lowest first.
+fn parity(len: u32) -> u32 {
+    MASKS
+        .iter()
+        .rev()
+        .fold(0, |bits, mask| bits << 1 | ((len & mask).count_ones() & 1))
+}
+
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
-    fn lots_of_lengths() -> impl Iterator<Item = Header> {
-        let mut rng = crate::yaque::test_rng();
-        (0..)
-            .map(move |_| Header::new(rng() as u32 & 0x03_FF_FF_FFu32))
-            .take(1_000_000)
-    }
-
+    /// Every length round-trips, and every single-bit flip of a header is caught.
     #[test]
-    fn encode_length_ok() {
-        let lengths = lots_of_lengths();
-
-        for (_i, header) in lengths.enumerate() {
-            // println!("{}", i);
-            assert_eq!(header, Header::decode(header.encode()));
+    fn a_header_round_trips_and_any_flipped_bit_is_an_error() {
+        let mut rng = crate::yaque::test_rng();
+        let lengths = [0, 1, 4, 255, 4096, MAX_LEN - 1, MAX_LEN]
+            .into_iter()
+            .chain((0..10_000).map(|_| u32::try_from(rng() & u64::from(MAX_LEN)).unwrap()));
+        for len in lengths {
+            let header = Header::for_len(usize::try_from(len).unwrap()).unwrap();
+            let bytes = header.encode();
+            assert_eq!(Header::decode(bytes).unwrap(), header, "{len}");
+            let word = u32::from_be_bytes(bytes);
+            for bit in 0..32 {
+                let flipped = (word ^ 1 << bit).to_be_bytes();
+                assert!(
+                    Header::decode(flipped).is_err(),
+                    "{len} with bit {bit} flipped"
+                );
+            }
         }
     }
 
     #[test]
-    #[should_panic]
-    fn encode_gibberish() {
-        let bad = *b"Asbt";
-        println!("{:?}", bad);
-        println!("{:?}", Header::decode(bad));
+    fn lengths_past_the_header_and_foreign_bytes_are_refused() {
+        let max = usize::try_from(MAX_LEN).unwrap();
+        for (len, fits) in [(max, true), (max + 1, false), (usize::MAX, false)] {
+            assert_eq!(Header::for_len(len).is_some(), fits, "{len}");
+        }
+        for bytes in [*b"Asbt", EOF] {
+            let err = Header::decode(bytes).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{bytes:?}");
+        }
     }
 }

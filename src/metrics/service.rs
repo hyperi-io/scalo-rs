@@ -679,6 +679,20 @@ impl ServiceMetrics {
                     "",
                     &[],
                 ),
+                (
+                    "tiered_sink_drain_read_errors_total",
+                    "Tiered sink drain passes whose spill read failed",
+                    MetricType::Counter,
+                    "",
+                    &[],
+                ),
+                (
+                    "tiered_sink_drain_stalled",
+                    "1 while the tiered sink's spool counts records its drain does not find, else 0",
+                    MetricType::Gauge,
+                    "",
+                    &[],
+                ),
             ],
         );
         #[cfg(any(feature = "spool", feature = "tiered-sink"))]
@@ -686,18 +700,109 @@ impl ServiceMetrics {
             &reg,
             &[
                 (
-                    "spool_stale_locks_cleared_total",
-                    "Spool lock files left by a dead process and removed on open, by lock and reason",
-                    MetricType::Counter,
-                    "",
-                    &["lock", "reason"],
-                ),
-                (
                     "spool_quarantined_total",
                     "Spool caches moved aside into a corrupt-* subdirectory, by trigger",
                     MetricType::Counter,
                     "",
                     &["trigger"],
+                ),
+                (
+                    "spool_bytes_in_total",
+                    "Bytes a spool took in, before compression",
+                    MetricType::Counter,
+                    "bytes",
+                    &["store", "codec"],
+                ),
+                (
+                    "spool_bytes_written_total",
+                    "Bytes a spool appended to its segment files",
+                    MetricType::Counter,
+                    "bytes",
+                    &["store", "codec"],
+                ),
+                (
+                    "spool_codec_microseconds_total",
+                    "Time a spool spent in its codec",
+                    MetricType::Counter,
+                    "microseconds",
+                    &["store", "codec", "op"],
+                ),
+                (
+                    "spool_disk_bytes",
+                    "Bytes a spool's segment files hold on disk",
+                    MetricType::Gauge,
+                    "bytes",
+                    &["store"],
+                ),
+                (
+                    "spool_disk_full_refused_bytes_total",
+                    "Bytes a spool refused because its disk was full",
+                    MetricType::Counter,
+                    "bytes",
+                    &["store"],
+                ),
+                (
+                    "spool_disk_full_wait_milliseconds_total",
+                    "Time a spool waited for its full disk to have room again",
+                    MetricType::Counter,
+                    "milliseconds",
+                    &["store"],
+                ),
+                (
+                    "spool_memory_reserved_bytes",
+                    "Bytes a spool's read holds reserved with the memory guard",
+                    MetricType::Gauge,
+                    "bytes",
+                    &["store"],
+                ),
+                (
+                    "spool_drain_cut_short_total",
+                    "Spool reads the memory guard stopped after their first record",
+                    MetricType::Counter,
+                    "",
+                    &["store"],
+                ),
+                (
+                    "spool_damaged_entries_total",
+                    "Spooled records dropped because they failed their CRC",
+                    MetricType::Counter,
+                    "",
+                    &["store"],
+                ),
+                (
+                    "spool_oldest_age_seconds",
+                    "Age of the oldest record a spool holds, 0 when it holds none",
+                    MetricType::Gauge,
+                    "seconds",
+                    &["store"],
+                ),
+                (
+                    "spool_sync_seconds",
+                    "Time one sync of a spool to disk took",
+                    MetricType::Histogram,
+                    "seconds",
+                    &["store"],
+                ),
+                (
+                    "spool_position_save_failures_total",
+                    "Saves of a spool's read position that failed",
+                    MetricType::Counter,
+                    "",
+                    &["store"],
+                ),
+                (
+                    "spool_segment_delete_failures_total",
+                    "Consumed spool segment files that could not be deleted",
+                    MetricType::Counter,
+                    "",
+                    &["store"],
+                ),
+                (
+                    "spool_torn_entries_cut_total",
+                    "Torn entries cut off the end of a spool when it opened",
+                    MetricType::Counter,
+                    "",
+                    &["store"],
                 ),
             ],
         );
@@ -1117,8 +1222,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} missing from the manifest"));
             assert_eq!(found.labels, labels, "{name}");
         }
-        // Every series the tiered sink writes, with the type and label keys its emitters use.
-        #[cfg(feature = "tiered-sink")]
+    }
+
+    /// Every series the tiered sink writes, with the type and label keys its emitters use.
+    #[cfg(feature = "tiered-sink")]
+    #[tokio::test]
+    async fn test_register_lists_tiered_sink_series() {
+        let mgr = super::super::MetricsManager::new_for_test("test_app");
+        let _dfe = ServiceMetrics::register(&mgr);
+        let manifest = mgr.registry().manifest();
         for (name, metric_type, labels) in [
             ("test_app_spool_hot_path_total", MetricType::Counter, vec![]),
             (
@@ -1162,14 +1274,39 @@ mod tests {
                 vec![],
             ),
             (
-                "test_app_spool_stale_locks_cleared_total",
-                MetricType::Counter,
-                vec!["lock", "reason"],
-            ),
-            (
                 "test_app_spool_quarantined_total",
                 MetricType::Counter,
                 vec!["trigger"],
+            ),
+            (
+                "test_app_spool_bytes_written_total",
+                MetricType::Counter,
+                vec!["store", "codec"],
+            ),
+            (
+                "test_app_spool_disk_bytes",
+                MetricType::Gauge,
+                vec!["store"],
+            ),
+            (
+                "test_app_spool_sync_seconds",
+                MetricType::Histogram,
+                vec!["store"],
+            ),
+            (
+                "test_app_spool_damaged_entries_total",
+                MetricType::Counter,
+                vec!["store"],
+            ),
+            (
+                "test_app_spool_oldest_age_seconds",
+                MetricType::Gauge,
+                vec!["store"],
+            ),
+            (
+                "test_app_tiered_sink_drain_stalled",
+                MetricType::Gauge,
+                vec![],
             ),
         ] {
             let found = manifest
