@@ -14,7 +14,7 @@ at startup, then handed to every component that needs parallelism
 
 | API | Backend | Use for | Avoid for |
 | ----- | --------- | --------- | ----------- |
-| `process_batch(items, f)` | rayon `par_iter` | JSON parse, transforms, compression, CEL eval, routing | Anything that needs `.await` |
+| `process_batch(items, f)` | rayon `par_iter` | JSON parse, transforms, compression, [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) eval, routing | Anything that needs `.await` |
 | `fan_out_async(items, f)` | tokio `spawn` with concurrency cap | Enrichment lookups, external APIs, storage writes | Pure-CPU loops (steals from the runtime) |
 
 Both preserve input order in the output and return

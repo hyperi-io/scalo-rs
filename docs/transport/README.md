@@ -236,7 +236,7 @@ Source: [../../src/transport/](../../src/transport/) -- particularly
 - [grpc.md](grpc.md) -- gRPC `send_batch` blocks joined into one call
 - [http.md](http.md) -- HTTP sending: credentials, framing, failover, proxy, status answers
 - [otlp.md](otlp.md) -- OTLP log records to a collector, send only
-- [filter-engine.md](filter-engine.md) -- tiered CEL filtering
+- [filter-engine.md](filter-engine.md) -- tiered [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) filtering
 - [routing.md](routing.md) -- `RoutedSender` for originators
 - [custom.md](custom.md) -- writing a custom sender, the delivery guarantee
 - [../auto-wiring.md](../auto-wiring.md) -- factory in the pillar model

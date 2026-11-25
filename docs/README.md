@@ -104,7 +104,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Transport | [transport/grpc.md](transport/grpc.md) | gRPC `send_batch` blocks joined into one call |
 | Transport | [transport/http.md](transport/http.md) | HTTP sending: credentials, body framing, compression, failover, proxy, redirects, status answers |
 | Transport | [transport/otlp.md](transport/otlp.md) | OTLP log records to a collector over gRPC or HTTP, and how each answer maps |
-| Transport | [transport/filter-engine.md](transport/filter-engine.md) | 3-tier filter (SIMD / compiled CEL / complex CEL) |
+| Transport | [transport/filter-engine.md](transport/filter-engine.md) | 3-tier filter (SIMD / compiled [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) / complex CEL) |
 | Transport | [transport/routing.md](transport/routing.md) | `RoutedSender`, the named sink set: routes, fan-out |
 | Transport | [transport/delivery-path.md](transport/delivery-path.md) | Inline delivery, the gRPC fan-in buffer, the benched alternatives and their numbers, parked parallel fan-out |
 | Transport | [transport/custom.md](transport/custom.md) | Writing a custom sender, registering it by type name, the delivery guarantee |

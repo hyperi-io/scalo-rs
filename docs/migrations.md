@@ -649,7 +649,7 @@ When librdkafka refuses a key, a value or a combination of them, `KafkaTransport
 
 ### `rules` feature: ordered first-match rules (additive)
 
-New `scalo::rules`: a rule set that, per target field in order, takes the first row that matches and resolves a value. Native tests or CEL Fast conditions, literal, copy and bounded-lookup values, a per-call clamp to an allowed set, per-row hit counters (`rules_hits_total`, `rules_clamped_total`), and a reloader that keeps the last good set when a new one does not compile. See [pipeline/rules.md](pipeline/rules.md).
+New `scalo::rules`: a rule set that, per target field in order, takes the first row that matches and resolves a value. Native tests or [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md) Fast conditions, literal, copy and bounded-lookup values, a per-call clamp to an allowed set, per-row hit counters (`rules_hits_total`, `rules_clamped_total`), and a reloader that keeps the last good set when a new one does not compile. See [pipeline/rules.md](pipeline/rules.md).
 
 **Consumer adjustment** -- none.
 

@@ -441,7 +441,7 @@ Every backend reads `filters_in` and `filters_out` from its own
 config section and instantiates a [`TransportFilterEngine`](filter-engine.md)
 at construction. No backend-specific filter code -- the engine is the
 same across all seven. A backend with no filters configured skips the
-engine, and Tier-1 filters run without CEL.
+engine, and Tier-1 filters run without [CEL](https://github.com/cel-expr/cel-spec/blob/master/doc/langdef.md).
 
 ---
 
