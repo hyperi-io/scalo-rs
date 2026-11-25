@@ -2,7 +2,7 @@
 
 Disk-backed async FIFO queue. Crash-safe, persistent, with optional zstd compression and bounded size, for any pipeline that needs durable store-and-forward. `TieredSink` does not use `Spool`: it runs its own queue for disk spillover and shares the locks, quarantine, sync and full-disk handling below.
 
-The queue started as yaque 0.6.6 (<https://github.com/tokahuke/yaque>, Apache-2.0), copied into scalo as the private module `src/yaque` because upstream looked abandoned: no release and no commit to its default branch since 2023-11. scalo has since replaced its locks, its wake-up and its read path, and put a codec tag, a CRC32C and the write time in front of every record (spool format 0.7). A drained spool written in an earlier format is cleared and stamped 0.7 when it opens. One still holding records is refused ([Quarantine](#quarantine)).
+The queue started as yaque 0.6.6 (<https://github.com/tokahuke/yaque>, Apache-2.0), copied into scalo as the private module `src/yaque` because upstream looked abandoned: no release and no commit to its default branch since 2023-11. scalo has since replaced its locks, its wake-up and its read path, and put a codec tag, a CRC32C, the write time, a record count and a decoded length in front of every entry (spool format 0.8). Each format reads the one before it ([Format and upgrades](#format-and-upgrades)).
 
 For most workloads you want `TieredSink` (transport + spool + circuit
 breaker + drain). Reach for `Spool` directly only when you're building
@@ -17,7 +17,7 @@ buffer, a checkpoint store, or a custom drainer.
 | ---------- | ------- |
 | FIFO order | Strict -- the queue is a single-producer / single-consumer log |
 | Persistent | Survives restarts, segment files in the queue directory |
-| Crash-safe | A record is committed only once read whole. The committed position is saved in `recv-metadata` every 250 records or 350 ms, and by each timed sync |
+| Crash-safe | A record is committed only once read whole. The committed position is saved in `recv-metadata` every 250 records or 350 ms, and by each timed sync. An entry counts as the records it holds |
 | Async-native | `recv()` awaits when empty, and the push in the same process wakes it. No file watcher, no thread |
 | Optional compression | zstd at construction-time level (1-22, clamped). Each record names its codec |
 | Integrity | A CRC32C per record, on by default. A damaged record is dropped and counted, never returned |
@@ -31,24 +31,28 @@ Directly in the configured `path`:
 
 ```text
 <path>/
-|-- 0.q                # segment file -- [4-byte header][13-byte prefix][record] ... [end marker]
+|-- 0.q                # segment file -- [4-byte header][21-byte prefix][body] ... [end marker]
 |-- 1.q
 |-- ...
 |-- recv-metadata      # 16 bytes: (segment u64 BE, position u64 BE)
 |-- send.lock          # OS-locked by the open spool
 |-- recv.lock
-`-- version/contents   # the spool format, 0.7.0
+`-- version/contents   # the spool format, 0.8.0
 ```
 
-Each record's 13-byte prefix:
+Each entry's 21-byte prefix:
 
 | Bytes | Holds |
 | --- | --- |
-| 0 | The codec's tag in the low 4 bits, and bit 7 set when the CRC is written |
-| 1-4 | CRC32C over byte 0, bytes 5-12 and the record, little endian. Zeros with `crc: false` |
-| 5-12 | When the record was written, milliseconds since the Unix epoch, little endian |
+| 0 | The codec's tag in the low 4 bits, bit 6 set on a 0.8 entry, and bit 7 set when the CRC is written |
+| 1-4 | CRC32C over byte 0, bytes 5-20 and the body, little endian. Zeros with `crc: false` |
+| 5-12 | When the entry was written, milliseconds since the Unix epoch, little endian |
+| 13-16 | The records the body holds, little endian. Always 1 in a `Spool` |
+| 17-20 | The body's length once decoded, little endian |
 
-A segment takes records until it passes `segment_bytes` (16 MiB), then an end marker closes it and the next record starts a new file. A record bigger than a segment gets one to itself. The receiver position is two big-endian u64s pointing at the next record. A read is a transaction: `pop_front` and `recv` commit it, and `peek` hands the record back. A segment file is deleted once every record in it is committed.
+A `Spool` entry's body is one record, compressed. A tiered sink's spill packs its records into one compressed body, each framed by its 4-byte little-endian length ([tiered-sink.md](tiered-sink.md#batched-spills)). A read reserves the decoded length with the memory guard, decodes to exactly that length, and drops an entry that decodes to any other as damaged.
+
+A segment takes entries until it passes `segment_bytes` (16 MiB), then an end marker closes it and the next entry starts a new file. An entry bigger than a segment gets one to itself. The receiver position is two big-endian u64s pointing at the next record. A read is a transaction: `pop_front` and `recv` commit it, and `peek` hands the record back. A segment file is deleted once every record in it is committed.
 
 `Spool::open` counts what is queued by walking the segments' headers from the saved position, seeking past each record rather than reading it.
 
@@ -58,7 +62,9 @@ A segment takes records until it passes `segment_bytes` (16 MiB), then an end ma
 
 - A successful `push().await` has written the record with one write, so it survives the process being killed (`tests/spool_crash.rs` kills a writer with SIGKILL and reads every acknowledged record back). The receiver reads only records the sender has finished writing.
 - A write that fails part way, on a full disk or an I/O error, is cut back to the last whole record before the error returns. A record a kill left torn at the end of the newest segment is cut off when the spool next opens, and a segment a kill left closed by its end marker is followed by a new one, so no record is ever written behind a torn one or a marker.
-- The timed sync runs every `sync_interval_ms` (500 ms, 0 turns it off): it flushes the open segment, the directory when a segment was created since the last sync, and saves the read position. A power loss or a node crash loses at most about one interval of pushed records. A process kill loses none. `sync().await` does the same at once, and `sync_on_push: true` on every push, at the cost of one disk sync each. `close().await` runs a last sync.
+- The timed sync runs every `sync_interval_ms` (500 ms, 0 turns it off): it flushes the open segment, the directory when a segment was created since the last sync, and saves the read position. A sync with nothing written since the last flushes nothing, which spares a laptop's battery and an SSD's writes. A power loss or a node crash loses at most about one interval of pushed records. A process kill loses none. `sync().await` does the same at once, and `sync_on_push: true` on every push, at the cost of one disk sync each. `close().await` runs a last sync.
+- A flush that fails is not tried again on the same data: Linux can report a second `fsync` clean after the first lost the pages. The sync reports the failure, every later sync reports it again until something is written, and the next write starts a new segment.
+- Linux flushes segments with `fdatasync` and the directory with `fsync`. macOS's `sync_data` is `F_FULLFSYNC`. Windows flushes a segment with `FlushFileBuffers`, and the directory by `FlushFileBuffers` on a handle opened with backup semantics. Whether that directory flush keeps a new segment's entry through a power cut on Windows is not yet tested.
 - On restart, reading resumes from the saved position. Records committed since it was saved come again: up to 250, or 350 ms of them.
 - The position is saved through a temporary file and a rename, so a kill leaves the old position or the new one. A power loss can still leave it naming a segment that is gone or an offset past the end of one. `Spool::open` and `TieredSink::new` detect either and replay from the first segment, with a warn, so records consumed from it before the crash come again. The queue is not quarantined.
 - `clear()` reads and commits every record in bounded batches.
@@ -77,8 +83,6 @@ When a queue will not open, `on_corruption` decides (default `quarantine`). A qu
 - `fail` returns the error.
 
 A record's 4-byte header carries parity bits. One that fails them is damaged, and no record after it can be found, so a read that meets it quarantines the queue under either policy, counted as `trigger="damaged_header"`.
-
-A `version/contents` naming an earlier spool format opens once the queue holds no unread record: the open counts them from the saved position by walking the headers, which 0.6 and 0.7 share, then deletes the segments and `recv-metadata`, stamps 0.7 and logs it at info. A queue that still holds records is refused with `Open` under either policy, naming how many and their bytes, and nothing moves. Drain it with the release that wrote it, or remove the directory, losing them. So is one whose header count stops at a damaged header, one with a later format, and one whose `send.lock` or `recv.lock` still names a 0.6 owner, which removes its lock files when it stops. That last refusal comes before the open takes its locks, so it changes no file.
 
 A damaged header in the newest segment is met at open, where the sender looks for its end. The records before it stay. The segment from that header on is copied into a new `corrupt-*` subdirectory, synced, then cut off, counted as `trigger="damaged_header"` with one warn. The records after it are kept there for inspection, not replayed.
 
@@ -100,7 +104,17 @@ A segment file goes as soon as every record in it is committed. Once the spool i
 
 ### Memory
 
-A push copies nothing: the record goes to the disk from the caller's bytes, or from the compressor's reused buffer. The write side holds no records. A pop reads each record into a buffer kept for the next one, up to `read_buffer_bytes`, and `pop_front_into(&mut buf)` decodes into the caller's buffer, so a loop of pops allocates nothing. With `with_memory_guard(guard)`, each record's length is reserved before it is read and released once it is handed off. A refused reservation never refuses the pop itself.
+A push copies nothing: the record goes to the disk from the caller's bytes, or from the compressor's reused buffer. The write side holds no records. A pop reads each record into a buffer kept for the next one, up to `read_buffer_bytes`, and `pop_front_into(&mut buf)` decodes into the caller's buffer, so a loop of pops allocates nothing. With `with_memory_guard(guard)`, each record's decoded length, or its stored length for a 0.7 entry, is reserved before it is read and released once it is handed off. A refused reservation never refuses the pop itself.
+
+---
+
+## Format and upgrades
+
+`version/contents` names the spool format, which follows the layout on disk, never scalo's release. Each format reads the one before it and writes only its own. That is the one place the spool keeps compatibility: an app on the edge updates itself while its sink is down, and must not strand what it spilled.
+
+- 0.8 opens a 0.7 queue as it is. A 0.7 entry has no count bit, so it reads as one record, its decode capped at 4 MiB, the default drain cap, and past that it is damaged. The open restamps the queue 0.8.0, synced, before the first 0.8 entry, so a 0.7 build refuses it as a later format rather than misread it.
+- An older format opens once it holds no unread record. The open counts them from the saved position by walking the headers every format shares, then deletes the segments and `recv-metadata`, stamps 0.8 and logs it at info.
+- An older format still holding records is refused with `Open` under either policy, naming how many and their bytes, and nothing moves. Drain it with the release that wrote it, or remove the directory, losing them. So is one whose header count stops at a damaged header, one in a later format, and one whose `send.lock` or `recv.lock` still names a 0.6 owner. That last refusal comes before the open takes its locks, so it changes no file.
 
 ---
 
@@ -132,10 +146,10 @@ At 1 KiB zstd 3 halves what reaches the disk, and at 16 KiB it writes a quarter.
 
 Think about which resource is short first. On the tiered sink, set `compression: {codec: ..., level: ...}`. A `Spool` takes `compress` and `compression_level`, zstd only.
 
-- **Your disk is the bottleneck.** That's any of three caps: capacity (the volume fills), throughput (MB/s) or IOPS (a cloud volume's provisioned limits). Each one is a trade of CPU for disk. A higher zstd level stores fewer bytes, so the same volume holds a longer outage, the same MB/s carries more records, and fewer blocks are written. Each step up costs noticeably more CPU for a few percent saving, so check the spool metrics below before and after.
-- **Your CPU is the bottleneck** (the receiver at full ingest is the usual case). Drop to lz4 on the tiered sink, or zstd level 1. You write more bytes, and the app keeps its CPU.
-- **Your records are small** (a few hundred bytes). Compression saves little per record. lz4 or `none` costs far less CPU for nearly the same disk.
-- **`none`** suits a fast local disk with plenty of room.
+- Disk short: capacity (the volume fills), throughput (MB/s) or IOPS (a cloud volume's provisioned limits). Each is a trade of CPU for disk. A higher zstd level stores fewer bytes, so the same volume holds a longer outage, the same MB/s carries more records, and fewer blocks are written. Each step up costs noticeably more CPU for a few percent saving, so check the spool metrics below before and after.
+- CPU short (the receiver at full ingest is the usual case): lz4 on the tiered sink, or zstd level 1. You write more bytes, and the app keeps its CPU.
+- Small records, a few hundred bytes each: compressed one at a time they save little, so a `Spool` takes lz4 or `none`. The tiered sink compresses a whole batch of spills as one body ([tiered-sink.md](tiered-sink.md#batched-spills)), which gets small records nearer the ratio of large ones.
+- `none` suits a fast local disk with plenty of room.
 
 `spool_bytes_in_total{store,codec}` counts the bytes taken in, `spool_bytes_written_total{store,codec}` the bytes written to disk, and `spool_codec_microseconds_total{store,codec,op="compress"}` the time spent compressing. If compression time climbs while the app's own work slows, the codec is too expensive for that host. If written bytes climb while the disk sits at its cap, it's too cheap.
 
