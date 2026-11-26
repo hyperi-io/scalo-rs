@@ -97,6 +97,13 @@ pub enum FramingError {
         max: usize,
     },
 
+    /// The unit holds more records than [`DecodeLimits::max_records`].
+    #[error("framing: a unit of more than max_records {max} records")]
+    TooManyRecords {
+        /// The limit.
+        max: usize,
+    },
+
     /// [`StreamDecoder`] was given a framing that decodes whole units only.
     #[error("framing: this framing decodes whole units, not a stream")]
     NotAStream,
@@ -133,6 +140,12 @@ pub struct DecodeLimits {
     /// trusted, and the bytes from it to the next `\n` are read as an LF line.
     /// Read as at least `max_record_bytes`.
     pub max_frame_bytes: usize,
+    /// Most records [`Framing::decode`] takes from one unit, those over
+    /// `max_record_bytes` included. A unit with more is refused whole at the
+    /// first record past the limit, so its sender can retry it smaller and
+    /// nothing past the limit is held. A [`StreamDecoder`] has no unit and
+    /// does not read it.
+    pub max_records: usize,
 }
 
 impl DecodeLimits {
@@ -141,7 +154,11 @@ impl DecodeLimits {
         max_decoded_bytes: usize::MAX,
         max_record_bytes: usize::MAX,
         max_frame_bytes: usize::MAX,
+        max_records: usize::MAX,
     };
+
+    /// The usual `max_records` for input from outside: 100000.
+    pub const DEFAULT_MAX_RECORDS: usize = 100_000;
 
     /// Refuse a unit over `max_decoded_bytes`.
     ///
@@ -153,6 +170,21 @@ impl DecodeLimits {
             return Err(FramingError::TooLarge {
                 len: unit.len(),
                 max: self.max_decoded_bytes,
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuse one more record in a unit that holds `held`, when `held` is
+    /// already `max_records`.
+    ///
+    /// # Errors
+    ///
+    /// [`FramingError::TooManyRecords`].
+    pub fn check_records(&self, held: usize) -> Result<(), FramingError> {
+        if held >= self.max_records {
+            return Err(FramingError::TooManyRecords {
+                max: self.max_records,
             });
         }
         Ok(())
@@ -253,8 +285,10 @@ pub trait Framing: Send + Sync + std::fmt::Debug {
     ///
     /// # Errors
     ///
-    /// [`FramingError`] when the unit is over `limits.max_decoded_bytes` or
-    /// is not well framed.
+    /// [`FramingError`] when the unit is over `limits.max_decoded_bytes`,
+    /// holds more than `limits.max_records` records, or is not well framed. An
+    /// app's own `decode` refuses the record past the limit with
+    /// [`DecodeLimits::check_records`].
     fn decode<'a>(
         &self,
         unit: &'a [u8],
@@ -264,8 +298,10 @@ pub trait Framing: Send + Sync + std::fmt::Debug {
         let mut decoded = Decoded::default();
         let mut at = 0;
         while let Some(rest) = unit.get(at..).filter(|rest| !rest.is_empty()) {
+            let held = decoded.records.len() + decoded.oversize.len();
             let len = match self.split(rest, 0, limits, true)? {
                 Split::Record { record, len } => {
+                    limits.check_records(held)?;
                     decoded.records.push(&rest[record]);
                     len
                 }
@@ -274,6 +310,7 @@ pub trait Framing: Send + Sync + std::fmt::Debug {
                     len,
                     rest: None,
                 } => {
+                    limits.check_records(held)?;
                     decoded.oversize.push(&rest[record]);
                     len
                 }
@@ -512,6 +549,7 @@ impl Framing for JsonConcat {
                 return Err(FramingError::UnexpectedByte(at));
             }
             let end = container_end(unit, at)?;
+            limits.check_records(values.len())?;
             values.push(&unit[at..end]);
             at = skip_whitespace(unit, end);
         }
@@ -547,7 +585,7 @@ impl Framing for JsonArray {
         if unit.get(open) != Some(&b'[') {
             return Err(FramingError::NotAnArray(found(unit, open)));
         }
-        let (elements, after) = array_elements(unit, open)?;
+        let (elements, after) = array_elements(unit, open, limits)?;
         end_of_unit(unit, after)?;
         Ok(Decoded::from_records(
             elements.into_iter().map(|range| &unit[range]),
@@ -588,6 +626,7 @@ impl JsonWrapped {
         &self,
         unit: &[u8],
         open: usize,
+        limits: &DecodeLimits,
     ) -> Result<(Option<Vec<Range<usize>>>, usize), FramingError> {
         let mut elements = None;
         let mut at = skip_whitespace(unit, open + 1);
@@ -605,7 +644,7 @@ impl JsonWrapped {
                 if unit.get(at) != Some(&b'[') {
                     return Err(FramingError::NotAnArray(found(unit, at)));
                 }
-                let (array, after) = array_elements(unit, at)?;
+                let (array, after) = array_elements(unit, at, limits)?;
                 elements = Some(array);
                 at = skip_whitespace(unit, after);
             } else {
@@ -653,7 +692,7 @@ impl Framing for JsonWrapped {
         if unit.get(open) != Some(&b'{') {
             return Err(FramingError::NotAnObject(found(unit, open)));
         }
-        let (elements, after) = self.members(unit, open)?;
+        let (elements, after) = self.members(unit, open, limits)?;
         end_of_unit(unit, after)?;
         let elements = elements.ok_or_else(|| FramingError::MissingKey(self.key.clone()))?;
         Ok(Decoded::from_records(
@@ -690,6 +729,7 @@ impl Framing for Single {
         limits: &DecodeLimits,
     ) -> Result<Decoded<'a>, FramingError> {
         limits.check(unit)?;
+        limits.check_records(0)?;
         Ok(Decoded::from_records([unit], limits))
     }
 }
@@ -744,7 +784,12 @@ static FRAMINGS: Registry<dyn Framing> = Registry::new("framing", BUILT_IN);
 ///         limits: &DecodeLimits,
 ///     ) -> Result<Decoded<'a>, FramingError> {
 ///         limits.check(unit)?;
-///         let records = unit.split(|&b| b == 0x1e).filter(|r| !r.is_empty());
+///         let records: Vec<&[u8]> = unit
+///             .split(|&b| b == 0x1e)
+///             .filter(|r| !r.is_empty())
+///             .enumerate()
+///             .map(|(held, r)| limits.check_records(held).map(|()| r))
+///             .collect::<Result<_, _>>()?;
 ///         Ok(Decoded::from_records(records, limits))
 ///     }
 /// }
@@ -1223,7 +1268,11 @@ fn end_of_unit(bytes: &[u8], at: usize) -> Result<(), FramingError> {
 
 /// The elements of the array whose `[` is at `open`, without the whitespace
 /// around them, and the index past its `]`.
-fn array_elements(bytes: &[u8], open: usize) -> Result<(Vec<Range<usize>>, usize), FramingError> {
+fn array_elements(
+    bytes: &[u8],
+    open: usize,
+    limits: &DecodeLimits,
+) -> Result<(Vec<Range<usize>>, usize), FramingError> {
     let mut elements = Vec::new();
     let mut at = open + 1;
     loop {
@@ -1232,7 +1281,7 @@ fn array_elements(bytes: &[u8], open: usize) -> Result<(Vec<Range<usize>>, usize
             None => return Err(FramingError::UnexpectedEof),
             Some(b']') if elements.is_empty() => return Ok((elements, at + 1)),
             Some(b']' | b',') => return Err(FramingError::EmptyElement(at)),
-            Some(_) => {}
+            Some(_) => limits.check_records(elements.len())?,
         }
         let end = value_end(bytes, at, b']')?;
         let trimmed = bytes[at..end]
@@ -1322,6 +1371,7 @@ mod tests {
         max_decoded_bytes: usize::MAX,
         max_record_bytes: 4,
         max_frame_bytes: 8,
+        max_records: usize::MAX,
     };
 
     const ANY: DecodeLimits = DecodeLimits::UNBOUNDED;
@@ -1540,6 +1590,48 @@ mod tests {
             );
         }
         assert_ne!(eof.to_string(), "");
+    }
+
+    /// A unit of `max_records` records decodes, and one more refuses it whole,
+    /// at the default limit and a small one. Blank lines are no records, an
+    /// oversize record is one, and what follows the record past the limit is
+    /// never framed, so a malformed tail still answers `TooManyRecords`.
+    #[test]
+    fn a_unit_over_max_records_is_refused_whole() {
+        let cap = DecodeLimits::DEFAULT_MAX_RECORDS;
+        let limited = |max_records| DecodeLimits {
+            max_records,
+            ..SMALL
+        };
+        let lines = |n: usize| "1\n".repeat(n).into_bytes();
+        let array = |n: usize| format!("[{}]", vec!["1"; n].join(",")).into_bytes();
+        let over = |max| Err(FramingError::TooManyRecords { max });
+        let wrapped = wrapped();
+        // (framing, unit, max_records, records taken or the refusal)
+        let cases: Vec<(&dyn Framing, Vec<u8>, usize, Result<usize, FramingError>)> = vec![
+            (&Ndjson, lines(cap - 1), cap, Ok(cap - 1)),
+            (&Ndjson, lines(cap), cap, Ok(cap)),
+            (&Ndjson, lines(cap + 1), cap, over(cap)),
+            (&JsonArray, array(cap - 1), cap, Ok(cap - 1)),
+            (&JsonArray, array(cap), cap, Ok(cap)),
+            (&JsonArray, array(cap + 1), cap, over(cap)),
+            (&Ndjson, b"a\nb\n\n\n".to_vec(), 2, Ok(2)),
+            (&Ndjson, b"a\nlonger\nb".to_vec(), 2, over(2)),
+            (&Lf, b"a\nb\nc".to_vec(), 2, over(2)),
+            (&OCTET, b"3 <ab3 <cd3 <ef".to_vec(), 2, over(2)),
+            (&JsonArray, b"[1,2,{\"unclosed".to_vec(), 2, over(2)),
+            (&JsonConcat, b"{}[]{}".to_vec(), 2, over(2)),
+            (&wrapped, br#"{"records":[1,2,3]}"#.to_vec(), 2, over(2)),
+            (&wrapped, br#"{"records":[1,2]}"#.to_vec(), 2, Ok(2)),
+            (&Single, b"one".to_vec(), 1, Ok(1)),
+            (&Single, b"one".to_vec(), 0, over(0)),
+        ];
+        for (framing, unit, max_records, want) in cases {
+            let got = framing
+                .decode(&unit, &limited(max_records))
+                .map(|d| d.records.len() + d.oversize.len());
+            assert_eq!(got, want, "{framing:?} {} bytes", unit.len());
+        }
     }
 
     #[test]

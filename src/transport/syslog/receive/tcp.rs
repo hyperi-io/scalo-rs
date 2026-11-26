@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      src/transport/syslog/receive/tcp.rs
-// Purpose:   Syslog TCP and TLS listeners: framing, keepalive, idle and frame timeouts
+// Purpose:   Syslog TCP and TLS listeners: admission, framing, keepalive and timeouts
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -8,6 +8,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
@@ -17,7 +18,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::config::millis;
-use super::{Inbox, SyslogListenConfig, SyslogReceiver};
+use super::ip_filter::IpFilter;
+use super::{Inbox, LogEvery, SyslogListenConfig, SyslogReceiver};
 use crate::framing::{DecodeLimits, Frame, Framing, OctetCounting, StreamDecoder};
 use crate::tls::ServerTls;
 use crate::transport::core::Meter;
@@ -26,6 +28,9 @@ use crate::transport::core::Meter;
 /// descriptors.
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
+/// The least time between two logged refusals on one listener.
+const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(5);
+
 /// How every connection of a listener reads its frames.
 pub(super) struct Connection {
     pub(super) framing: Arc<dyn Framing>,
@@ -33,6 +38,7 @@ pub(super) struct Connection {
     pub(super) keepalive: Option<Duration>,
     pub(super) idle: Option<Duration>,
     pub(super) frame_timeout: Option<Duration>,
+    pub(super) first_byte: Option<Duration>,
 }
 
 impl Connection {
@@ -45,13 +51,62 @@ impl Connection {
                 .then(|| Duration::from_secs(config.tcp_keepalive_secs)),
             idle: millis(config.idle_timeout_ms),
             frame_timeout: millis(config.frame_timeout_ms),
+            first_byte: millis(config.first_byte_timeout_ms),
         }
+    }
+}
+
+/// Which connections one listener takes: the IP filter's senders, up to its
+/// connection cap.
+pub(super) struct Gate {
+    filter: Arc<IpFilter>,
+    open: Arc<AtomicUsize>,
+    /// 0 holds no limit.
+    max: usize,
+}
+
+impl Gate {
+    pub(super) fn new(filter: Arc<IpFilter>, max: usize) -> Self {
+        Self {
+            filter,
+            open: Arc::default(),
+            max,
+        }
+    }
+
+    /// A place for a connection from `peer`, held until it drops, or why
+    /// there is none. Only the listener's accept loop calls it, so a check
+    /// then an add cannot overshoot the cap.
+    pub(super) fn admit(&self, peer: SocketAddr) -> Result<Slot, Closed> {
+        if !self.filter.admits(peer.ip()) {
+            return Err(Closed::IpFilter);
+        }
+        if self.max > 0 && self.open.load(Ordering::Acquire) >= self.max {
+            return Err(Closed::OverLimit);
+        }
+        self.open.fetch_add(1, Ordering::AcqRel);
+        Ok(Slot(Arc::clone(&self.open)))
+    }
+}
+
+/// One connection's place under its listener's cap, given back on drop.
+pub(super) struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 /// Why a connection is closed before its peer closes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Closed {
+    /// The sender is not one `ip_filter` takes.
+    IpFilter,
+    /// The listener already holds `max_connections`.
+    OverLimit,
+    /// Nothing sent within `first_byte_timeout_ms` of the accept.
+    NoFirstByte,
     /// No frame within `idle_timeout_ms`.
     Idle,
     /// A frame begun and not ended within `frame_timeout_ms`.
@@ -61,20 +116,37 @@ pub(super) enum Closed {
 impl Closed {
     fn as_str(self) -> &'static str {
         match self {
+            Self::IpFilter => "ip_filter",
+            Self::OverLimit => "over_limit",
+            Self::NoFirstByte => "no_first_byte",
             Self::Idle => "idle",
             Self::FrameTimeout => "frame_timeout",
         }
     }
+
+    /// Count the close in `transport_connections_closed_total`.
+    fn count(self) {
+        metrics::counter!(
+            "transport_connections_closed_total",
+            "transport" => "syslog",
+            "reason" => self.as_str()
+        )
+        .increment(1);
+    }
 }
 
-/// Accept connections on `listener` until `shutdown`, each read on a task of its own.
+/// Accept connections on `listener` until `shutdown`, each read on a task of
+/// its own. A connection `gate` refuses is closed as it is accepted, before
+/// any byte of it is read.
 pub(super) async fn accept(
     listener: TcpListener,
     tls: Option<ServerTls>,
     connection: Arc<Connection>,
+    gate: Gate,
     inbox: Arc<Inbox>,
     shutdown: CancellationToken,
 ) {
+    let mut refusals = LogEvery::new(REFUSAL_LOG_EVERY);
     loop {
         let (stream, peer) = tokio::select! {
             biased;
@@ -86,6 +158,16 @@ pub(super) async fn accept(
                     continue;
                 }
             },
+        };
+        let slot = match gate.admit(peer) {
+            Ok(slot) => slot,
+            Err(why) => {
+                why.count();
+                if refusals.due() {
+                    tracing::info!(%peer, reason = why.as_str(), "syslog: connection refused");
+                }
+                continue;
+            }
         };
         if let Some(idle) = connection.keepalive
             && let Err(e) = keep_alive(&stream, idle)
@@ -99,6 +181,12 @@ pub(super) async fn accept(
             shutdown.clone(),
         );
         tokio::spawn(async move {
+            let _slot = slot;
+            if let Some(limit) = connection.first_byte
+                && !first_byte(&stream, peer, limit, &shutdown).await
+            {
+                return;
+            }
             let Some(tls) = tls else {
                 read(stream, peer, &connection, &inbox, &shutdown).await;
                 return;
@@ -114,6 +202,31 @@ pub(super) async fn accept(
                 Err(e) => tracing::debug!(%peer, error = %e, "syslog: TLS handshake failed"),
             }
         });
+    }
+}
+
+/// Wait up to `limit` for `stream`'s first byte, leaving it to be read. False
+/// when none arrives in time, counted, or the peer closes first, or shutdown.
+async fn first_byte(
+    stream: &TcpStream,
+    peer: SocketAddr,
+    limit: Duration,
+    shutdown: &CancellationToken,
+) -> bool {
+    let mut byte = [0_u8; 1];
+    let peeked = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return false,
+        peeked = tokio::time::timeout(limit, stream.peek(&mut byte)) => peeked,
+    };
+    match peeked {
+        Ok(Ok(read)) => read > 0,
+        Ok(Err(_)) => false,
+        Err(_elapsed) => {
+            Closed::NoFirstByte.count();
+            tracing::debug!(%peer, "syslog: connection closed, nothing sent");
+            false
+        }
     }
 }
 
@@ -177,12 +290,7 @@ pub(super) async fn read<S: AsyncRead + Unpin>(
             biased;
             () = shutdown.cancelled() => return None,
             () = until(wake) => {
-                metrics::counter!(
-                    "transport_connections_closed_total",
-                    "transport" => "syslog",
-                    "reason" => why.as_str()
-                )
-                .increment(1);
+                why.count();
                 tracing::debug!(%peer, reason = why.as_str(), "syslog: connection closed");
                 return Some(why);
             }

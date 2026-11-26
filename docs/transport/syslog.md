@@ -128,13 +128,36 @@ A connection closes after `idle_timeout_ms` with no frame, and when a frame begu
 | `tcp_keepalive_secs` | 60 | keepalive probes after this long quiet, then every this long. 0 is off |
 | `idle_timeout_ms` | 600000 | close a connection with no frame for this long. 0 keeps it |
 | `frame_timeout_ms` | 30000 | close a connection whose frame has not ended this long after its first byte. 0 waits for ever |
+| `first_byte_timeout_ms` | 30000 | close a connection that sends nothing this long after it is accepted. 0 waits for ever |
+| `max_connections` | 10000 | connections the TCP listener holds open, and the TLS listener the same again. 0 holds no limit |
+| `ip_filter` | `disabled` | `mode` (`disabled`, `allowlist`, `denylist`) and `cidrs`, the senders TCP, TLS and UDP take traffic from |
 | `udp_recv_buffer_bytes` | 8388608 | `SO_RCVBUF`. A smaller grant is logged: raise `net.core.rmem_max` |
 | `udp_batch_size` | 64 | datagrams read per wake |
 | `recv_buffer_size` | 10000 | records queued for `recv` |
 | `recv_timeout_ms` | 100 | how long `recv` waits for a first record |
 | `filters_in` | none | inbound filters on each record ([filter-engine.md](filter-engine.md)) |
 
-A config with no address, `tls_address` without `tls` or the other way round, an address that is not `ip:port`, or a zero `max_message_bytes`, `recv_buffer_size` or `udp_batch_size` is refused at build. Each listener binds before any serves, so a failed bind leaves none.
+A config with no address, `tls_address` without `tls` or the other way round, an address that is not `ip:port`, a zero `max_message_bytes`, `recv_buffer_size` or `udp_batch_size`, an `ip_filter` entry that is not a CIDR, or an `allowlist` with no `cidrs` is refused at build. Each listener binds before any serves, so a failed bind leaves none.
+
+### Who gets in
+
+The receiver is often the edge facing senders it does not control, so each listener checks a connection before it reads a byte of it:
+
+- `ip_filter` takes senders by CIDR, IPv4 and IPv6. `mode: allowlist` takes only those in `cidrs`, `denylist` all but those, and `disabled`, the default, everyone. A dual-stack listener sees an IPv4 sender as `::ffff:a.b.c.d` and checks it as `a.b.c.d`. A refused TCP or TLS connection is closed as it is accepted, before the TLS handshake, and counted with `reason="ip_filter"`. A refused datagram is dropped and counted in `transport_dropped_total{reason="ip_filter"}`. Refusals log at most once per 5 s per listener.
+- `max_connections` caps the connections the TCP listener holds open, and the TLS listener the same again. One past it is closed as it is accepted, `reason="over_limit"`. There is no per-sender cap.
+- `first_byte_timeout_ms` closes a connection that sends nothing that long after it is accepted, `reason="no_first_byte"`, so a sender cannot hold a place under the cap by opening connections and going quiet. On TLS the handshake then has `tls.handshake_timeout_ms`.
+
+### UDP throughput and loss
+
+Each wake reads every datagram ready, up to `udp_batch_size`, with `recvmmsg` on Linux and a read per datagram elsewhere. Each is copied once into a shared block that its record is a slice of. Equal datagrams from one sender that the kernel joined by receive offload are split back into their datagrams.
+
+A datagram the kernel drops because the socket's receive buffer is full is lost before any read sees it. On Linux the receiver reads the socket's own count from `/proc/net/udp` and `/proc/net/udp6` every 10 s into `transport_dropped_total{reason="kernel"}`. A rising count wants a larger `udp_recv_buffer_bytes`, a larger `net.core.rmem_max`, or a faster `recv`. Elsewhere nothing reads it.
+
+`tests/syslog_udp_rate.rs` measures the datagrams a second `recv` hands over on loopback, ignored by default:
+
+```sh
+cargo nextest run --release --features transport-syslog --run-ignored only --no-capture -E 'test(syslog_udp_rate)'
+```
 
 ---
 

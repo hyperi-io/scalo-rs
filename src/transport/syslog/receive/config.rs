@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::ip_filter::IpFilterConfig;
 use crate::framing::{CarriageReturns, DecodeLimits};
 use crate::tls_config::ServerTlsConfig;
 use crate::transport::error::{TransportError, TransportResult};
@@ -62,6 +63,18 @@ pub struct SyslogListenConfig {
     /// A TCP or TLS connection with no frame for this long, in ms, is closed.
     /// 0 keeps it. Default 600000.
     pub idle_timeout_ms: u64,
+    /// A TCP or TLS connection that sends nothing for this long after it is
+    /// accepted, in ms, is closed before its TLS handshake. 0 waits for ever.
+    /// Default 30000.
+    pub first_byte_timeout_ms: u64,
+    /// Most connections the TCP listener holds open at once, and the TLS
+    /// listener the same again. One past it is closed as it is accepted.
+    /// 0 holds no limit. Default 10000.
+    pub max_connections: usize,
+    /// Which senders TCP, TLS and UDP take traffic from. A refused connection
+    /// is closed as it is accepted, and a refused datagram dropped. Default
+    /// `disabled`, every sender.
+    pub ip_filter: IpFilterConfig,
     /// Once a frame's first byte arrives, the rest has this long, in ms, or the
     /// connection is closed. 0 waits for ever. Default 30000.
     pub frame_timeout_ms: u64,
@@ -91,6 +104,9 @@ impl Default for SyslogListenConfig {
             carriage_returns: CarriageReturns::Strip,
             tcp_keepalive_secs: 60,
             idle_timeout_ms: 600_000,
+            first_byte_timeout_ms: 30_000,
+            max_connections: 10_000,
+            ip_filter: IpFilterConfig::default(),
             frame_timeout_ms: 30_000,
             udp_recv_buffer_bytes: 8 * 1024 * 1024,
             udp_batch_size: 64,
@@ -122,13 +138,14 @@ impl SyslogListenConfig {
         <Self as crate::transport::traits::FromCascade>::from_cascade_key("transport.syslog.listen")
     }
 
-    /// The limits each TCP or TLS message is framed under.
+    /// The limits each TCP or TLS message is framed under. A connection is a
+    /// stream with no unit to cap, so its bytes and records are unbounded.
     #[must_use]
     pub fn limits(&self) -> DecodeLimits {
         DecodeLimits {
-            max_decoded_bytes: usize::MAX,
             max_record_bytes: self.max_message_bytes,
             max_frame_bytes: self.max_frame_bytes,
+            ..DecodeLimits::UNBOUNDED
         }
     }
 

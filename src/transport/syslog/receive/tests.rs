@@ -557,6 +557,143 @@ async fn tls_records_arrive_after_the_handshake() {
     assert_eq!(records, [&b"<14>ab"[..], b"<14>cd"], "CRs strip by default");
 }
 
+/// Whether the server closes `stream` within 5 s, reading and keeping anything
+/// it sends first.
+async fn closed_by_server(stream: &mut TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut buf = [0_u8; 64];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) => return true,
+            Ok(Ok(_)) => {}
+            Err(_elapsed) => return false,
+        }
+    }
+}
+
+/// The IP filter closes a TCP connection from a sender it does not take as
+/// it is accepted, and drops its datagrams, queueing nothing of either. A
+/// sender it takes is read as usual.
+#[tokio::test]
+async fn the_ip_filter_turns_away_senders_it_does_not_take() {
+    let listen = |mode, cidr: &str| SyslogListenConfig {
+        tcp_address: Some("127.0.0.1:0".into()),
+        udp_address: Some("127.0.0.1:0".into()),
+        ip_filter: IpFilterConfig {
+            mode,
+            cidrs: vec![cidr.into()],
+        },
+        recv_timeout_ms: 50,
+        ..SyslogListenConfig::default()
+    };
+    // (mode, cidr, whether loopback is taken)
+    let cases = [
+        (IpFilterMode::Allowlist, "10.0.0.0/8", false),
+        (IpFilterMode::Allowlist, "127.0.0.0/8", true),
+        (IpFilterMode::Denylist, "127.0.0.1/32", false),
+        (IpFilterMode::Denylist, "::1/128", true),
+    ];
+    for (mode, cidr, taken) in cases {
+        let receiver = SyslogReceiver::new(&listen(mode, cidr)).await.unwrap();
+        let mut tcp = TcpStream::connect(receiver.tcp_addr().unwrap())
+            .await
+            .unwrap();
+        if taken {
+            tcp.write_all(b"<14>tcp\n").await.unwrap();
+        } else {
+            assert!(
+                closed_by_server(&mut tcp).await,
+                "{mode:?} {cidr}: TCP left open"
+            );
+            let _ = tcp.write_all(b"<14>tcp\n").await;
+        }
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(b"<14>udp", receiver.udp_addr().unwrap())
+            .await
+            .unwrap();
+        let got = if taken {
+            take(&receiver, 2).await.len()
+        } else {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            receiver.recv(10).await.unwrap().records.len()
+        };
+        assert_eq!(got, if taken { 2 } else { 0 }, "{mode:?} {cidr}");
+        receiver.close().await.unwrap();
+    }
+}
+
+/// Past `max_connections` a connection is closed as it is accepted, and the
+/// place a closed one held is taken by the next. Each TCP and TLS listener
+/// has its own cap.
+#[tokio::test]
+async fn a_listener_holds_at_most_max_connections() {
+    let receiver = SyslogReceiver::new(&SyslogListenConfig {
+        tcp_address: Some("127.0.0.1:0".into()),
+        max_connections: 1,
+        recv_timeout_ms: 50,
+        ..SyslogListenConfig::default()
+    })
+    .await
+    .unwrap();
+    let addr = receiver.tcp_addr().unwrap();
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    first.write_all(b"<14>first\n").await.unwrap();
+    assert_eq!(take(&receiver, 1).await.len(), 1, "the first is read");
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert!(
+        closed_by_server(&mut second).await,
+        "the second is over the cap"
+    );
+    drop(first);
+    let mut third = None;
+    let until = Instant::now() + Duration::from_secs(5);
+    while third.is_none() && Instant::now() < until {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"<14>third\n").await.unwrap();
+        stream.shutdown().await.unwrap();
+        if take(&receiver, 1).await.len() == 1 {
+            third = Some(stream);
+        }
+    }
+    assert!(third.is_some(), "the first's place was never given back");
+}
+
+/// A connection that sends nothing within `first_byte_timeout_ms` is closed,
+/// and one whose first byte comes in time is read.
+#[tokio::test]
+async fn a_connection_that_sends_nothing_is_closed() {
+    let receiver = SyslogReceiver::new(&SyslogListenConfig {
+        tcp_address: Some("127.0.0.1:0".into()),
+        first_byte_timeout_ms: 200,
+        recv_timeout_ms: 50,
+        ..SyslogListenConfig::default()
+    })
+    .await
+    .unwrap();
+    let addr = receiver.tcp_addr().unwrap();
+    let started = Instant::now();
+    let mut silent = TcpStream::connect(addr).await.unwrap();
+    assert!(
+        closed_by_server(&mut silent).await,
+        "a silent connection kept"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "closed early"
+    );
+
+    let mut prompt = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    prompt.write_all(b"<14>a\n").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    prompt.write_all(b"<14>b\n").await.unwrap();
+    assert_eq!(
+        take(&receiver, 2).await.len(),
+        2,
+        "a prompt sender is read on"
+    );
+}
+
 /// A config with nothing to listen on, or a TLS listener without its TLS, is
 /// refused naming what to set.
 #[tokio::test]
@@ -594,6 +731,18 @@ async fn a_config_that_cannot_listen_is_refused() {
                 ..SyslogListenConfig::default()
             },
             "udp_address `logs:514` is not ip:port",
+        ),
+        (
+            "an allowlist of nothing",
+            SyslogListenConfig {
+                tcp_address: local.clone(),
+                ip_filter: IpFilterConfig {
+                    mode: IpFilterMode::Allowlist,
+                    cidrs: Vec::new(),
+                },
+                ..SyslogListenConfig::default()
+            },
+            "an allowlist with no cidrs",
         ),
         (
             "no queue",
@@ -654,8 +803,9 @@ fn every_listen_key_reaches_the_config_through_the_cascade() {
          max_message_bytes: 1000\n      max_frame_bytes: 2000\n      carriage_returns: keep\n      \
          tcp_keepalive_secs: 3\n      idle_timeout_ms: 4\n      frame_timeout_ms: 5\n      \
          udp_recv_buffer_bytes: 6\n      udp_batch_size: 7\n      recv_buffer_size: 8\n      \
-         recv_timeout_ms: 9\n      filters_in:\n        - expression: 'level == \"debug\"'\n          \
-         action: drop\n",
+         recv_timeout_ms: 9\n      first_byte_timeout_ms: 10\n      max_connections: 11\n      \
+         ip_filter:\n        mode: denylist\n        cidrs: [\"10.0.0.0/8\"]\n      \
+         filters_in:\n        - expression: 'level == \"debug\"'\n          action: drop\n",
     )
     .unwrap();
     temp_env::with_vars(
@@ -667,6 +817,18 @@ fn every_listen_key_reaches_the_config_through_the_cascade() {
             (
                 "SYSLOGR__TRANSPORT__SYSLOG__LISTEN__CARRIAGE_RETURNS",
                 Some("strip"),
+            ),
+            (
+                "SYSLOGR__TRANSPORT__SYSLOG__LISTEN__FIRST_BYTE_TIMEOUT_MS",
+                Some("100"),
+            ),
+            (
+                "SYSLOGR__TRANSPORT__SYSLOG__LISTEN__MAX_CONNECTIONS",
+                Some("110"),
+            ),
+            (
+                "SYSLOGR__TRANSPORT__SYSLOG__LISTEN__IP_FILTER__MODE",
+                Some("allowlist"),
             ),
         ],
         || {
@@ -699,6 +861,12 @@ fn every_listen_key_reaches_the_config_through_the_cascade() {
         udp_batch_size: 70,
         recv_buffer_size: 8,
         recv_timeout_ms: 9,
+        first_byte_timeout_ms: 100,
+        max_connections: 110,
+        ip_filter: IpFilterConfig {
+            mode: IpFilterMode::Allowlist,
+            cidrs: vec!["10.0.0.0/8".into()],
+        },
         filters_in: cfg.filters_in.clone(),
     };
     assert_eq!(cfg, want);
