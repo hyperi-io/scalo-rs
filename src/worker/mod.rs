@@ -51,7 +51,9 @@ mod stats;
 
 #[cfg(feature = "transport")]
 pub use accumulator::records_into_work_batch;
-pub use accumulator::{AccumulatorConfig, AccumulatorFull, BatchAccumulator, BatchDrainer};
+pub use accumulator::{
+    AccumulatorClosed, AccumulatorConfig, AccumulatorFull, BatchAccumulator, BatchDrainer,
+};
 pub use batch::{BatchPipeline, BatchProcessor};
 pub use config::WorkerPoolConfig;
 #[cfg(feature = "worker-batch")]

@@ -456,9 +456,9 @@ pub use governor::{
     doc(cfg(any(feature = "worker-pool", feature = "worker-batch", feature = "worker")))
 )]
 pub use worker::{
-    AccumulatorConfig, AccumulatorFull, AdaptiveWorkerPool, BatchAccumulator, BatchDrainer,
-    BatchPipeline, BatchProcessor, PipelineStats, PipelineStatsSnapshot, ScalingDecision,
-    ScalingInput, WorkerPoolConfig,
+    AccumulatorClosed, AccumulatorConfig, AccumulatorFull, AdaptiveWorkerPool, BatchAccumulator,
+    BatchDrainer, BatchPipeline, BatchProcessor, PipelineStats, PipelineStatsSnapshot,
+    ScalingDecision, ScalingInput, WorkerPoolConfig,
 };
 
 #[cfg(feature = "cli")]

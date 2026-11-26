@@ -238,6 +238,7 @@ impl Dlq {
         let sink_config = BackgroundSinkConfig {
             queue_capacity: config.queue_capacity,
             batch_size: config.batch_size,
+            max_bytes: None,
             flush_interval: std::time::Duration::from_millis(config.flush_interval_ms),
             overflow: Overflow::Drop,
             metric_prefix: Some("dlq"),

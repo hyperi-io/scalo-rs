@@ -78,6 +78,7 @@ fn bench_background_sink_try_push(c: &mut Criterion) {
                 BackgroundSinkConfig {
                     queue_capacity: 1_000_000,
                     batch_size: 4096,
+                    max_bytes: None,
                     flush_interval: Duration::from_millis(50),
                     overflow: Overflow::Drop,
                     metric_prefix: None,
