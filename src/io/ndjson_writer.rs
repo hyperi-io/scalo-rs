@@ -37,12 +37,16 @@ use tracing::{debug, info, warn};
 
 use super::config::FileWriterConfig;
 use super::rotating::{self, LiveFile, OpenMode, Trigger};
+use crate::backoff::Backoff;
 
-/// Shortest wait between reopen attempts after a failed write.
+/// Shortest wait between reopen attempts after a failed write, before jitter.
 const REOPEN_BACKOFF_MIN: Duration = Duration::from_millis(250);
 
 /// Longest wait between reopen attempts while writes keep failing.
 const REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// The wait before a failed reopen or rotation runs again.
+const RETRY_SCHEDULE: Backoff = Backoff::new(REOPEN_BACKOFF_MIN, REOPEN_BACKOFF_MAX);
 
 /// NDJSON file writer with automatic rotation and metrics.
 ///
@@ -87,25 +91,26 @@ struct Target {
 struct Retry {
     /// `None` while the step is succeeding.
     at: Option<Instant>,
-    backoff: Duration,
+    /// Consecutive failures, which set the next wait.
+    failures: u32,
 }
 
 impl Retry {
     const fn new() -> Self {
         Self {
             at: None,
-            backoff: REOPEN_BACKOFF_MIN,
+            failures: 0,
         }
     }
 
     fn record_success(&mut self) {
-        self.at = None;
-        self.backoff = REOPEN_BACKOFF_MIN;
+        *self = Self::new();
     }
 
     fn record_failure(&mut self, now: Instant) {
         if self.at.is_none() {
-            self.at = Some(now + self.backoff);
+            self.failures = 1;
+            self.at = Some(now + RETRY_SCHEDULE.delay(1));
         }
     }
 
@@ -114,8 +119,8 @@ impl Retry {
     }
 
     fn schedule_next(&mut self, now: Instant) {
-        self.backoff = (self.backoff * 2).min(REOPEN_BACKOFF_MAX);
-        self.at = Some(now + self.backoff);
+        self.failures = self.failures.saturating_add(1);
+        self.at = Some(now + RETRY_SCHEDULE.delay(self.failures));
     }
 }
 

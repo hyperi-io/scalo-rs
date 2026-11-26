@@ -13,6 +13,12 @@ use std::time::Duration;
 use super::{AsyncNdjsonWriter, NdjsonWriter, REOPEN_BACKOFF_MIN};
 use crate::io::{FileWriteOptions, FileWriterConfig, RotationPeriod};
 
+/// Longer than the writer's wait after its `failures`-th failed retry, at the
+/// schedule's +20% jitter.
+fn past_retry(failures: u32) -> Duration {
+    (REOPEN_BACKOFF_MIN * 2_u32.pow(failures - 1)).mul_f64(1.25)
+}
+
 fn test_config(dir: &Path) -> FileWriterConfig {
     FileWriterConfig {
         path: dir.to_path_buf(),
@@ -547,7 +553,7 @@ fn a_failed_rotation_writes_on_and_retries() {
     drop(guard);
     assert_eq!(rotated_names(&base, "out.ndjson").len(), 0);
 
-    std::thread::sleep(REOPEN_BACKOFF_MIN * 2);
+    std::thread::sleep(past_retry(1));
     writer.write_line(b"4\n").expect("rotates then lands");
     assert_eq!(
         std::fs::read_to_string(base.join("out.ndjson")).expect("read"),
@@ -586,7 +592,7 @@ fn test_writer_reopens_once_its_directory_is_restored() {
     std::fs::remove_dir_all(dir.path().join("back")).expect("remove dir");
     writer.write_line(b"{\"n\":2}\n").unwrap_err();
     std::fs::create_dir_all(dir.path().join("back")).expect("restore dir");
-    std::thread::sleep(REOPEN_BACKOFF_MIN);
+    std::thread::sleep(past_retry(1));
 
     writer
         .write_line(b"{\"n\":3}\n")
@@ -611,7 +617,7 @@ fn test_writer_reopens_after_its_file_is_deleted_or_replaced() {
             std::fs::write(&path, b"").expect("replace file");
         }
         writer.write_line(b"{\"n\":2}\n").unwrap_err();
-        std::thread::sleep(REOPEN_BACKOFF_MIN);
+        std::thread::sleep(past_retry(1));
 
         writer
             .write_line(b"{\"n\":3}\n")
@@ -629,7 +635,7 @@ fn test_writer_does_not_recreate_a_missing_directory() {
 
     std::fs::remove_dir_all(dir.path().join("gone")).expect("remove dir");
     writer.write_line(b"{\"n\":1}\n").unwrap_err();
-    std::thread::sleep(REOPEN_BACKOFF_MIN);
+    std::thread::sleep(past_retry(1));
     writer.write_line(b"{\"n\":2}\n").unwrap_err();
 
     assert!(!dir.path().join("gone").exists());
@@ -695,7 +701,7 @@ fn test_rotation_into_a_read_only_directory_is_refused_then_recovers() {
     writer.write_line(b"{\"n\":1}\n").unwrap_err();
 
     drop(guard);
-    std::thread::sleep(REOPEN_BACKOFF_MIN);
+    std::thread::sleep(past_retry(1));
     writer
         .write_line(b"{\"n\":2}\n")
         .expect("write once the directory is writable again");
@@ -790,11 +796,11 @@ fn test_writer_does_not_reopen_into_an_unreadable_directory() {
     std::fs::remove_file(target.join("out.ndjson")).expect("remove file");
     writer.write_line(b"{\"n\":1}\n").unwrap_err();
     let guard = ModeGuard::set(&target, 0o300);
-    std::thread::sleep(REOPEN_BACKOFF_MIN);
+    std::thread::sleep(past_retry(1));
     writer.write_line(b"{\"n\":2}\n").unwrap_err();
 
     drop(guard);
-    std::thread::sleep(REOPEN_BACKOFF_MIN * 2);
+    std::thread::sleep(past_retry(2));
     writer
         .write_line(b"{\"n\":3}\n")
         .expect("write once the directory is readable again");
