@@ -136,7 +136,7 @@ impl BatchProcessingConfig {
     pub fn from_cascade(key: &str) -> Result<Self, crate::config::ConfigError> {
         let config: Self = if let Some(cfg) = crate::config::try_get() {
             if cfg.contains(key) {
-                cfg.unmarshal_key(key)?
+                cfg.unmarshal_key_registered(key)?
             } else {
                 Self::default()
             }
@@ -197,6 +197,30 @@ mod tests {
         );
         let absent = BatchProcessingConfig::from_cascade("no_such_section").unwrap();
         assert_eq!(absent.max_chunk_size, 10_000);
+    }
+
+    /// Both worker sections register as they load, so the /config dump shows them.
+    #[test]
+    #[cfg(feature = "config")]
+    fn the_worker_sections_register_as_they_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "batch_processing:\n  max_chunk_size: 500\nworker_pool:\n  max_threads: 4\n",
+        )
+        .unwrap();
+        crate::config::setup(crate::config::ConfigOptions {
+            config_paths: vec![dir.path().to_path_buf()],
+            ..crate::config::ConfigOptions::default()
+        })
+        .unwrap();
+
+        let batch = BatchProcessingConfig::from_cascade("batch_processing").unwrap();
+        assert_eq!(batch.max_chunk_size, 500);
+        crate::worker::WorkerPoolConfig::from_cascade("worker_pool").unwrap();
+        for key in ["batch_processing", "worker_pool"] {
+            assert!(crate::config::registry::is_registered(key), "{key}");
+        }
     }
 
     #[test]
