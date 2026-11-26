@@ -275,9 +275,17 @@ impl OpenBaoConfig {
     }
 }
 
+/// The address of each Vault client `OpenBaoProvider` builds, so a test can
+/// count them.
+#[cfg(test)]
+pub(crate) static CLIENT_BUILDS: parking_lot::Mutex<Vec<String>> =
+    parking_lot::Mutex::new(Vec::new());
+
 /// OpenBao/Vault secret provider.
 pub struct OpenBaoProvider {
     config: OpenBaoConfig,
+    /// The authenticated client every read reuses, built at the first read.
+    client: tokio::sync::Mutex<Option<std::sync::Arc<VaultClient>>>,
 }
 
 impl OpenBaoProvider {
@@ -295,19 +303,47 @@ impl OpenBaoProvider {
             .map_err(SecretsError::ConfigError)?;
         Ok(Self {
             config: config.clone(),
+            client: tokio::sync::Mutex::new(None),
         })
     }
 
-    /// Get an authenticated Vault client.
+    /// The authenticated client, built and logged in at the first call.
     ///
-    /// Creates a new client for each request since `VaultClient` is not Clone.
-    /// The underlying HTTP client uses connection pooling so this is efficient.
-    async fn get_client(&self) -> SecretsResult<VaultClient> {
-        self.create_client().await
+    /// The lock is held across the build, so concurrent first reads log in once.
+    async fn get_client(&self) -> SecretsResult<std::sync::Arc<VaultClient>> {
+        let mut cached = self.client.lock().await;
+        if let Some(client) = cached.as_ref() {
+            return Ok(std::sync::Arc::clone(client));
+        }
+        let client = std::sync::Arc::new(self.create_client().await?);
+        *cached = Some(std::sync::Arc::clone(&client));
+        Ok(client)
+    }
+
+    /// Drop `failed` from the cache so the next read logs in again. A client
+    /// another read has already rebuilt stays.
+    async fn forget_client(&self, failed: &std::sync::Arc<VaultClient>) {
+        let mut cached = self.client.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|client| std::sync::Arc::ptr_eq(client, failed))
+        {
+            *cached = None;
+        }
+    }
+
+    /// Whether a refused read is worth a fresh login: a token from an AppRole
+    /// or Kubernetes login expires, a configured token is the same next time.
+    fn relogin_can_help(&self) -> bool {
+        !matches!(self.config.auth, OpenBaoAuth::Token { .. })
     }
 
     /// Create and authenticate a new Vault client.
     async fn create_client(&self) -> SecretsResult<VaultClient> {
+        #[cfg(test)]
+        {
+            CLIENT_BUILDS.lock().push(self.config.address.clone());
+        }
         let mut settings = VaultClientSettingsBuilder::default();
         settings.address(&self.config.address);
 
@@ -411,29 +447,19 @@ impl OpenBaoProvider {
     ///
     /// Returns an error if the secret cannot be fetched.
     pub async fn get(&self, path: &str, key: &str) -> SecretsResult<SecretValue> {
-        let client = self.get_client().await?;
-
         // "<mount>/<path>", with an optional KV v2 "data" segment after the
         // mount. A path with no "/" reads from the "secret" mount.
         let (mount, secret_path) = Self::parse_path(path)?;
 
-        let endpoint = ReadSecretRequest::builder()
-            .mount(mount)
-            .path(secret_path)
-            .build()
-            .map_err(|e| SecretsError::ConfigError(format!("invalid vault path '{path}': {e}")))?;
-
-        // One KV v2 read returns the data and its version metadata together.
-        let response = vaultrs::api::exec_with_result(&client, endpoint)
-            .await
-            .map_err(|e| {
-                // Check for auth errors (token expired)
-                if e.to_string().contains("403") || e.to_string().contains("permission denied") {
-                    SecretsError::AuthError("Vault token expired or invalid".into())
-                } else {
-                    SecretsError::ProviderError(format!("failed to read secret {path}: {e}"))
-                }
-            })?;
+        let client = self.get_client().await?;
+        let response = match Self::read(&client, &mount, &secret_path, path).await {
+            Err(SecretsError::AuthError(_)) if self.relogin_can_help() => {
+                self.forget_client(&client).await;
+                let client = self.get_client().await?;
+                Self::read(&client, &mount, &secret_path, path).await?
+            }
+            result => result?,
+        };
         let secret: std::collections::HashMap<String, String> =
             serde_json::from_value(response.data).map_err(|e| {
                 SecretsError::ProviderError(format!("failed to read secret {path}: {e}"))
@@ -454,6 +480,30 @@ impl OpenBaoProvider {
             value.as_bytes().to_vec(),
             metadata,
         ))
+    }
+
+    /// One KV v2 read, which returns the data and its version metadata together.
+    async fn read(
+        client: &VaultClient,
+        mount: &str,
+        secret_path: &str,
+        path: &str,
+    ) -> SecretsResult<vaultrs::api::kv2::responses::ReadSecretResponse> {
+        let endpoint = ReadSecretRequest::builder()
+            .mount(mount)
+            .path(secret_path)
+            .build()
+            .map_err(|e| SecretsError::ConfigError(format!("invalid vault path '{path}': {e}")))?;
+        vaultrs::api::exec_with_result(client, endpoint)
+            .await
+            .map_err(|e| {
+                let text = e.to_string();
+                if text.contains("403") || text.contains("permission denied") {
+                    SecretsError::AuthError("Vault token expired or invalid".into())
+                } else {
+                    SecretsError::ProviderError(format!("failed to read secret {path}: {e}"))
+                }
+            })
     }
 
     /// Parse a Vault path into its mount and the secret path under that mount.
@@ -496,7 +546,7 @@ impl SecretProvider for OpenBaoProvider {
         let client = self.get_client().await?;
 
         // Check sys/health endpoint
-        vaultrs::sys::health(&client)
+        vaultrs::sys::health(&*client)
             .await
             .map_err(|e| SecretsError::ProviderError(format!("Vault health check failed: {e}")))?;
 
@@ -530,6 +580,123 @@ mod tests {
         )
         .await;
         assert!(matches!(got, Ok(Err(_))), "the lookup hung or succeeded");
+    }
+
+    /// A fake OpenBao: an AppRole login that issues `token-<n>` and counts
+    /// itself, and a KV v2 read that answers 403 to any token but the newest.
+    async fn fake_openbao() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::Json;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::{get, post};
+        use serde_json::{Value, json};
+
+        let logins = Arc::new(AtomicUsize::new(0));
+        let login_count = Arc::clone(&logins);
+        let read_count = Arc::clone(&logins);
+        let app = axum::Router::new()
+            .route(
+                "/v1/auth/approle/login",
+                post(move || {
+                    let n = login_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        Json(json!({
+                            "request_id": "", "lease_id": "", "lease_duration": 0,
+                            "renewable": false, "data": null, "wrap_info": null,
+                            "warnings": null,
+                            "auth": {
+                                "client_token": format!("token-{n}"), "accessor": "",
+                                "policies": [], "token_policies": [], "metadata": null,
+                                "lease_duration": 60, "renewable": false, "entity_id": "",
+                                "token_type": "service", "orphan": true
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/kv/data/app",
+                get(move |headers: HeaderMap| {
+                    let newest = format!("token-{}", read_count.load(Ordering::SeqCst));
+                    async move {
+                        let token = headers.get("X-Vault-Token").and_then(|v| v.to_str().ok());
+                        if token != Some(newest.as_str()) {
+                            let denied = json!({"errors": ["permission denied"]});
+                            return (StatusCode::FORBIDDEN, Json(denied));
+                        }
+                        let body: Value = json!({
+                            "request_id": "", "lease_id": "", "lease_duration": 0,
+                            "renewable": false, "wrap_info": null, "warnings": null,
+                            "auth": null,
+                            "data": {
+                                "data": {"password": "hunter2"},
+                                "metadata": {
+                                    "created_time": "", "deletion_time": "",
+                                    "custom_metadata": null, "destroyed": false, "version": 3
+                                }
+                            }
+                        });
+                        (StatusCode::OK, Json(body))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, logins)
+    }
+
+    /// Reads reuse one logged-in client, and a read refused once its token is
+    /// superseded logs in again and succeeds.
+    #[tokio::test]
+    async fn reads_reuse_one_login_and_log_in_again_when_refused() {
+        use std::sync::atomic::Ordering;
+
+        let (address, logins) = fake_openbao().await;
+        let provider =
+            OpenBaoProvider::new(&OpenBaoConfig::with_approle(&address, "role", "secret")).unwrap();
+
+        for _ in 0..3 {
+            let value = provider.get("kv/app", "password").await.unwrap();
+            assert_eq!(value.as_str().unwrap(), "hunter2");
+        }
+        assert_eq!(logins.load(Ordering::SeqCst), 1, "three reads, one login");
+
+        // Another login supersedes the provider's token, so its next read is refused.
+        logins.fetch_add(1, Ordering::SeqCst);
+        let value = provider.get("kv/app", "password").await.unwrap();
+        assert_eq!(value.as_str().unwrap(), "hunter2");
+        assert_eq!(
+            logins.load(Ordering::SeqCst),
+            3,
+            "the refused read logged in again"
+        );
+
+        let builds = CLIENT_BUILDS
+            .lock()
+            .iter()
+            .filter(|a| **a == address)
+            .count();
+        assert_eq!(builds, 2, "one client per login");
+    }
+
+    /// A configured token is the same on a second try, so a refused read
+    /// fails without building another client.
+    #[tokio::test]
+    async fn a_refused_configured_token_is_not_retried() {
+        let (address, _) = fake_openbao().await;
+        let provider = OpenBaoProvider::new(&OpenBaoConfig::with_token(&address, "stale")).unwrap();
+
+        let err = provider.get("kv/app", "password").await.unwrap_err();
+        assert!(matches!(err, SecretsError::AuthError(_)), "{err}");
+        let builds = CLIENT_BUILDS
+            .lock()
+            .iter()
+            .filter(|a| **a == address)
+            .count();
+        assert_eq!(builds, 1);
     }
 
     /// The token `from_env` resolved, with every other source of one cleared and
