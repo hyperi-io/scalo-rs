@@ -8,8 +8,8 @@
 
 //! Every record whose source ack is released arrives, under each fault the
 //! harness injects: the engine pipeline builder over a pull-shaped source, a
-//! push-shaped source built armed, and the real gRPC server built armed, and a
-//! hand-rolled `SourceAck` loop over the push source. The same engine pipeline
+//! push-shaped source built armed, and the real gRPC and HTTP servers built
+//! armed, and a hand-rolled `SourceAck` loop over the push source. The same engine pipeline
 //! sends through `AnySender::Custom` too, the path an app's own sender takes.
 
 use std::sync::Arc;
@@ -335,36 +335,23 @@ async fn the_harness_catches_a_push_source_answered_at_enqueue() {
     );
 }
 
-/// The real gRPC receive server under the engine pipeline.
-#[cfg(feature = "transport-grpc")]
-mod grpc {
+/// A real push server killed mid-batch under the engine pipeline: the steps
+/// the gRPC and HTTP servers share.
+#[cfg(any(
+    feature = "transport-grpc",
+    all(feature = "transport-http", feature = "http-server")
+))]
+mod push_server {
     use super::*;
     use scalo::deployment::test_support::conformance::{marked_payloads, marker_of};
-    use scalo::transport::{GrpcConfig, GrpcTransport, PayloadFormat, RecordMeta};
+    use scalo::transport::{PayloadFormat, RecordMeta};
+    use std::future::Future;
     use std::sync::Mutex;
 
-    type Current = Arc<Mutex<Option<Arc<GrpcTransport>>>>;
+    /// The client the pushing task sends through, `None` while no server is up.
+    type Current<C> = Arc<Mutex<Option<Arc<C>>>>;
 
-    /// A receive server, built armed or with the unarmed default.
-    async fn server(armed: bool) -> Arc<GrpcTransport> {
-        Arc::new(
-            GrpcTransport::builder(&GrpcConfig::server("127.0.0.1:0"))
-                .armed(armed)
-                .start()
-                .await
-                .expect("server"),
-        )
-    }
-
-    /// A client of `server` that gives up on a send after 5 s.
-    async fn client_of(server: &GrpcTransport) -> Arc<GrpcTransport> {
-        let uri = format!("http://{}", server.local_addr().expect("bound"));
-        let mut config = GrpcConfig::client(&uri);
-        config.send_timeout_ms = 5_000;
-        Arc::new(GrpcTransport::new(&config).await.expect("client"))
-    }
-
-    fn records(payloads: &[bytes::Bytes]) -> Vec<Record> {
+    pub(super) fn records(payloads: &[bytes::Bytes]) -> Vec<Record> {
         payloads
             .iter()
             .map(|p| Record {
@@ -381,7 +368,7 @@ mod grpc {
 
     /// Send each request of 10 records to whichever server is up, resending it
     /// until it is answered OK, and mark its records acknowledged then.
-    async fn push_until_answered(current: Current, ledger: Ledger, n: u64) {
+    async fn push_until_answered<C: TransportSender>(current: Current<C>, ledger: Ledger, n: u64) {
         for request in marked_payloads(n).chunks(10) {
             let block = records(request);
             loop {
@@ -410,17 +397,25 @@ mod grpc {
         ready()
     }
 
-    /// A gRPC server built armed takes pushes before its pipeline runs, and is
-    /// killed while the engine pipeline holds the send carrying the middle
-    /// marker: every acknowledged record arrives after a new server takes over.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn engine_grpc_armed_kill_mid_batch() {
+    /// A server built armed by `server` takes pushes before its pipeline runs,
+    /// and is killed while the engine pipeline holds the send carrying the
+    /// middle marker: every acknowledged record arrives after a new server
+    /// takes over.
+    pub(super) async fn armed_kill_mid_batch<R, C, SF, CF>(
+        server: impl Fn() -> SF,
+        client_of: impl Fn(Arc<R>) -> CF,
+    ) where
+        R: TransportReceiver + 'static,
+        C: TransportSender + 'static,
+        SF: Future<Output = Arc<R>>,
+        CF: Future<Output = Arc<C>>,
+    {
         let ledger = Ledger::with_records(200);
         let sink = FaultSink::new(ledger.clone());
         sink.hold_at(100);
 
-        let first = server(true).await;
-        let current: Current = Arc::new(Mutex::new(Some(client_of(&first).await)));
+        let first = server().await;
+        let current: Current<C> = Arc::new(Mutex::new(Some(client_of(Arc::clone(&first)).await)));
         let pushing = tokio::spawn(push_until_answered(
             Arc::clone(&current),
             ledger.clone(),
@@ -446,8 +441,8 @@ mod grpc {
         drop(first);
         sink.unhold();
 
-        let second = server(true).await;
-        *current.lock().expect("current") = Some(client_of(&second).await);
+        let second = server().await;
+        *current.lock().expect("current") = Some(client_of(Arc::clone(&second)).await);
         let shutdown = CancellationToken::new();
         let restarted = tokio::spawn(engine_pipeline(
             Arc::clone(&second),
@@ -466,14 +461,14 @@ mod grpc {
         assert_conforms(&ledger.verdict());
     }
 
-    /// The opt-out an app gets by not arming: the default server answers a
-    /// push OK as soon as it is queued, before anything has received it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_unarmed_grpc_default_answers_at_enqueue() {
-        let server = server(false).await;
-        let client = client_of(&server).await;
+    /// The opt-out an app gets by not arming: `server`, built unarmed, answers
+    /// a push OK as soon as it is queued, before anything has received it.
+    pub(super) async fn unarmed_answers_at_enqueue<R, C>(server: &R, client: &C)
+    where
+        R: TransportReceiver,
+        C: TransportSender,
+    {
         let block = records(&marked_payloads(3));
-
         let answered = client.send_batch(&block).await;
         assert!(
             matches!(answered, SendResult::Ok),
@@ -492,5 +487,92 @@ mod grpc {
             }
         }
         assert_eq!(received, 3, "all three queued after their OK");
+    }
+}
+
+/// The real gRPC receive server under the engine pipeline.
+#[cfg(feature = "transport-grpc")]
+mod grpc {
+    use super::push_server::{armed_kill_mid_batch, unarmed_answers_at_enqueue};
+    use scalo::transport::{GrpcConfig, GrpcTransport};
+    use std::sync::Arc;
+
+    /// A receive server, built armed or with the unarmed default.
+    async fn server(armed: bool) -> Arc<GrpcTransport> {
+        Arc::new(
+            GrpcTransport::builder(&GrpcConfig::server("127.0.0.1:0"))
+                .armed(armed)
+                .start()
+                .await
+                .expect("server"),
+        )
+    }
+
+    /// A client of `server` that gives up on a send after 5 s.
+    async fn client_of(server: Arc<GrpcTransport>) -> Arc<GrpcTransport> {
+        let uri = format!("http://{}", server.local_addr().expect("bound"));
+        let mut config = GrpcConfig::client(&uri);
+        config.send_timeout_ms = 5_000;
+        Arc::new(GrpcTransport::new(&config).await.expect("client"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn engine_grpc_armed_kill_mid_batch() {
+        armed_kill_mid_batch(|| server(true), client_of).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_unarmed_grpc_default_answers_at_enqueue() {
+        let server = server(false).await;
+        let client = client_of(Arc::clone(&server)).await;
+        unarmed_answers_at_enqueue(&*server, &*client).await;
+    }
+}
+
+/// The real HTTP receive server under the engine pipeline, each request one
+/// NDJSON body of 10 records.
+#[cfg(all(feature = "transport-http", feature = "http-server"))]
+mod http {
+    use super::push_server::{armed_kill_mid_batch, unarmed_answers_at_enqueue};
+    use scalo::transport::AcknowledgementsConfig;
+    use scalo::transport::http::{HttpTransport, HttpTransportConfig};
+    use std::sync::Arc;
+
+    fn ndjson(mut config: HttpTransportConfig) -> HttpTransportConfig {
+        config.framing.framing_type = "ndjson".into();
+        config
+    }
+
+    /// A receive server with acknowledgements on, built armed or with the
+    /// unarmed default.
+    async fn server(armed: bool) -> Arc<HttpTransport> {
+        Arc::new(
+            HttpTransport::builder(&ndjson(HttpTransportConfig::receiver("127.0.0.1:0")))
+                .acknowledgements(AcknowledgementsConfig::new(true))
+                .armed(armed)
+                .start()
+                .await
+                .expect("server"),
+        )
+    }
+
+    /// A client of `server` that gives up on a send after 5 s.
+    async fn client_of(server: Arc<HttpTransport>) -> Arc<HttpTransport> {
+        let url = format!("http://{}/ingest", server.local_addr().expect("bound"));
+        let mut config = ndjson(HttpTransportConfig::sender(&url));
+        config.send_timeout_ms = 5_000;
+        Arc::new(HttpTransport::new(&config).await.expect("client"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn engine_http_armed_kill_mid_batch() {
+        armed_kill_mid_batch(|| server(true), client_of).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_unarmed_http_default_answers_at_enqueue() {
+        let server = server(false).await;
+        let client = client_of(Arc::clone(&server)).await;
+        unarmed_answers_at_enqueue(&*server, &*client).await;
     }
 }

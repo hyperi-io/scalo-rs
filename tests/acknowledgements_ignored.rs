@@ -1,15 +1,15 @@
 // Project:   scalo
 // File:      tests/acknowledgements_ignored.rs
-// Purpose:   An acknowledgements section under a source that does not hold it warns once
+// Purpose:   An acknowledgements section warns once where it is ignored, and applies under HTTP
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! `AnyReceiver::from_config` warns once per backend when
-//! `<key>.<type>.acknowledgements` sits under a memory, pipe, file or HTTP
-//! source, none of which holds its acknowledgement, and builds the receiver
-//! anyway.
+//! `<key>.<type>.acknowledgements` sits under a memory, pipe or file source,
+//! none of which holds its acknowledgement, and builds the receiver anyway.
+//! Under an HTTP source the section is applied, with no warning.
 //!
 //! The global config installs once per process, and each warning fires once
 //! per process, so this file owns both.
@@ -53,6 +53,28 @@ async fn build_twice(key: &str) {
     }
 }
 
+/// The section reaches an HTTP receive server built armed: on by default and
+/// armed before it listens, off where the section says so.
+#[cfg(all(feature = "transport-http", feature = "http-server"))]
+async fn http_section_applies() {
+    for (key, enabled) in [("transport.http_in", true), ("transport.http_off", false)] {
+        let receiver = AnyReceiver::from_config_armed(key)
+            .await
+            .unwrap_or_else(|e| panic!("{key}: {e}"));
+        let control = scalo::transport::TransportReceiver::ack_control(&receiver)
+            .expect("an HTTP server can hold");
+        assert_eq!(
+            (control.enabled(), control.is_armed()),
+            (enabled, true),
+            "{key}"
+        );
+        let _ = receiver.close().await;
+    }
+}
+
+#[cfg(all(feature = "transport-http", not(feature = "http-server")))]
+async fn http_section_applies() {}
+
 /// The logged lines that carry the warning for `section`.
 fn warnings_for<'a>(out: &'a str, section: &str) -> Vec<&'a str> {
     let field = format!("section={section}");
@@ -76,7 +98,9 @@ async fn a_section_under_a_source_that_does_not_hold_it_warns_once() {
                  acknowledgements:\n        enabled: true\n  \
                file_plain:\n    type: file\n    file:\n      path: \"{}\"\n  \
                http_in:\n    type: http\n    http:\n      listen: \"127.0.0.1:0\"\n      \
-                 acknowledgements:\n        enabled: true\n",
+                 acknowledgements:\n        enabled: true\n  \
+               http_off:\n    type: http\n    http:\n      listen: \"127.0.0.1:0\"\n      \
+                 acknowledgements:\n        enabled: false\n",
             file_in.display(),
             file_plain.display(),
         ),
@@ -110,7 +134,10 @@ async fn a_section_under_a_source_that_does_not_hold_it_warns_once() {
         build_twice("transport.file_plain").await;
     }
     #[cfg(feature = "transport-http")]
-    build_twice("transport.http_in").await;
+    {
+        build_twice("transport.http_in").await;
+        http_section_applies().await;
+    }
 
     drop(guard);
     let out = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
@@ -149,12 +176,9 @@ async fn a_section_under_a_source_that_does_not_hold_it_warns_once() {
     }
     #[cfg(feature = "transport-http")]
     {
-        let lines = warnings_for(&out, "transport.http_in.http.acknowledgements");
-        assert_eq!(lines.len(), 1, "http warns once: {out}");
         assert!(
-            lines[0].contains("not supported on an HTTP source yet")
-                && lines[0].contains("a crash loses records answered but not yet delivered"),
-            "{out}"
+            warnings_for(&out, "transport.http_in.http.acknowledgements").is_empty(),
+            "an HTTP source applies the section without a warning: {out}"
         );
     }
     assert!(out.contains("WARN"), "{out}");

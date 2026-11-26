@@ -1,5 +1,5 @@
 // Project:   scalo
-// File:      src/transport/grpc/pending.rs
+// File:      src/transport/pending.rs
 // Purpose:   Push responses held until the records they carried are released
 // Language:  Rust
 //
@@ -29,9 +29,6 @@ use tokio::time::Instant;
 use crate::transport::ack::{AckControl, AckKind, HeldAcks, HeldBytes, HeldSlot};
 use crate::transport::finalizer::DeliveryStatus;
 use crate::transport::hold::{HoldLadder, hold_budget};
-
-/// The held-byte ceiling when no memory guard sizes it.
-pub(crate) const DEFAULT_MAX_HELD_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The longest a response is held, and the whole budget for a sender that sets
 /// no deadline of its own: the top of the default hold ladder.

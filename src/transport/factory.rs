@@ -1061,6 +1061,30 @@ async fn armed_grpc(
     .await
 }
 
+/// An HTTP receive server built from `config`, with its
+/// `<key>.http.acknowledgements` section, armed before it listens.
+#[cfg(all(feature = "config", feature = "transport-http"))]
+async fn armed_http(
+    config: &super::TransportConfig,
+    key: &str,
+    wire: impl FnOnce(super::http::HttpTransportBuilder<'_>) -> super::http::HttpTransportBuilder<'_>,
+) -> TransportResult<super::http::HttpTransport> {
+    let http_config = config
+        .http
+        .as_ref()
+        .ok_or_else(|| TransportError::Config("http config missing".into()))?;
+    // Off unless the section is present: without one an HTTP source answers at enqueue.
+    let acknowledgements = acknowledgements_section(key, "http")?
+        .unwrap_or(super::ack::AcknowledgementsConfig::new(false));
+    wire(
+        super::http::HttpTransport::builder(http_config)
+            .acknowledgements(acknowledgements)
+            .armed(true),
+    )
+    .start()
+    .await
+}
+
 /// Why a section under a memory or pipe source has no effect.
 #[cfg(all(
     feature = "config",
@@ -1072,12 +1096,6 @@ async fn armed_grpc(
 ))]
 const NO_ACKNOWLEDGEMENT_TO_HOLD: &str = "acknowledgements has no effect here: this source has no \
      acknowledgement to hold, so the pipeline reports best effort";
-
-/// Why a section under an HTTP source has no effect.
-#[cfg(all(feature = "config", feature = "transport-http"))]
-const HTTP_ACKNOWLEDGEMENT_NOT_HELD: &str = "acknowledgements is not supported on an HTTP \
-     source yet: it answers 200 once a request is queued, so a crash loses records answered \
-     but not yet delivered, and the pipeline reports best effort";
 
 /// Why a section under a file source has no effect.
 #[cfg(all(feature = "config", feature = "transport-file"))]
@@ -1093,7 +1111,6 @@ const FILE_ACKNOWLEDGEMENT_NOT_HELD: &str = "acknowledgements is not supported o
         feature = "transport-memory",
         feature = "transport-pipe",
         feature = "transport-file",
-        feature = "transport-http",
         feature = "transport-syslog"
     )
 ))]
@@ -1168,10 +1185,11 @@ impl AnyReceiver {
     /// every token it takes (the `BatchEngine` pipeline builder or
     /// `SourceAck`): the source is armed before it can take a record.
     ///
-    /// A gRPC receive server is built armed, before it listens, so no push is
-    /// answered at enqueue in the gap before the caller's own `arm`. Other
-    /// sources are armed straight after construction, before any `recv`.
-    /// A source with `acknowledgements.enabled: false` is left unarmed.
+    /// A gRPC or HTTP receive server is built armed, before it listens, so no
+    /// push is answered at enqueue in the gap before the caller's own `arm`.
+    /// Other sources are armed straight after construction, before any
+    /// `recv`. A source with `acknowledgements.enabled: false` is left
+    /// unarmed.
     ///
     /// # Errors
     ///
@@ -1184,6 +1202,12 @@ impl AnyReceiver {
             return armed_grpc(&config, key, |builder| builder)
                 .await
                 .map(Self::Grpc);
+        }
+        #[cfg(feature = "transport-http")]
+        if config.transport_type == TransportType::Http {
+            return armed_http(&config, key, |builder| builder)
+                .await
+                .map(Self::Http);
         }
         Ok(Self::from_transport_config(&config)
             .await?
@@ -1212,6 +1236,14 @@ impl AnyReceiver {
             .await
             .map(Self::Grpc);
         }
+        #[cfg(feature = "transport-http")]
+        if config.transport_type == TransportType::Http {
+            return armed_http(&config, key, |builder| {
+                builder.pressure(governor.pressure())
+            })
+            .await
+            .map(Self::Http);
+        }
         Ok(Self::from_transport_config_with_governor(&config, governor)
             .await?
             .apply_acknowledgements(key)?
@@ -1227,9 +1259,9 @@ impl AnyReceiver {
         self
     }
 
-    /// Apply the `<key>.<type>.acknowledgements` section to a Kafka or gRPC
-    /// source, and warn once per backend when one sits under a memory, pipe,
-    /// file or HTTP source, which does not hold its acknowledgement.
+    /// Apply the `<key>.<type>.acknowledgements` section to a Kafka, gRPC or
+    /// HTTP source, and warn once per backend when one sits under a memory,
+    /// pipe, file or syslog source, which does not hold its acknowledgement.
     #[cfg(feature = "config")]
     #[cfg_attr(
         not(any(
@@ -1243,9 +1275,13 @@ impl AnyReceiver {
         )),
         allow(unused_variables)
     )]
-    // Only the Kafka and gRPC arms can fail.
+    // Only the Kafka, gRPC and HTTP arms can fail.
     #[cfg_attr(
-        not(any(feature = "transport-kafka", feature = "transport-grpc")),
+        not(any(
+            feature = "transport-kafka",
+            feature = "transport-grpc",
+            feature = "transport-http"
+        )),
         allow(clippy::unnecessary_wraps)
     )]
     fn apply_acknowledgements(self, key: &str) -> TransportResult<Self> {
@@ -1282,12 +1318,10 @@ impl AnyReceiver {
                 Ok(Self::File(t))
             }
             #[cfg(feature = "transport-http")]
-            Self::Http(t) => {
-                static WARNED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                warn_acknowledgements_ignored(key, "http", &WARNED, HTTP_ACKNOWLEDGEMENT_NOT_HELD);
-                Ok(Self::Http(t))
-            }
+            Self::Http(t) => Ok(match acknowledgements_section(key, "http")? {
+                Some(acks) => Self::Http(t.with_acknowledgements(acks)),
+                None => Self::Http(t),
+            }),
             #[cfg(feature = "transport-syslog")]
             Self::Syslog(t) => {
                 static WARNED: std::sync::atomic::AtomicBool =

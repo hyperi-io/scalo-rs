@@ -22,8 +22,8 @@
 //! - [`AckControl`] -- the run-time view a caller queries through
 //!   [`TransportReceiver::ack_control`]:
 //!   enabled, arm, held.
-//! - [`AcknowledgingReceiver`] -- the type-level capability. Kafka and gRPC
-//!   implement it. HTTP and file do not yet, and pipe and memory cannot.
+//! - [`AcknowledgingReceiver`] -- the type-level capability. Kafka, gRPC and
+//!   HTTP implement it. File does not yet, and pipe and memory cannot.
 //! - [`SourceAck`] -- the release API for a hand-rolled receive loop.
 //! - [`Tickets`] -- admission and outcome for an app's own listeners.
 //! - [`SinkConfirmation`] and [`EffectiveGuarantee`] -- what a sink confirms,
@@ -47,6 +47,10 @@ use super::traits::{FromCascade, TransportReceiver};
 /// Time left before a hold deadline at which a waiting release gives up, so
 /// the source still answers its sender before the sender's own deadline.
 pub const HOLD_RELEASE_MARGIN: Duration = Duration::from_millis(100);
+
+/// The held-byte ceiling of a push source when no memory guard sizes it.
+#[cfg(any(feature = "transport-grpc", feature = "transport-http"))]
+pub(crate) const DEFAULT_MAX_HELD_BYTES: u64 = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -172,7 +176,7 @@ pub trait AckControl: Send + Sync {
 /// A receive transport that can hold its source acknowledgement until every
 /// piece built from a record is delivered.
 ///
-/// Kafka and gRPC implement it. HTTP and file do not yet. Pipe and memory
+/// Kafka, gRPC and HTTP implement it. File does not yet. Pipe and memory
 /// cannot: they have no acknowledgement to hold.
 pub trait AcknowledgingReceiver: TransportReceiver {
     /// The `acknowledgements` config this source was built with.
@@ -369,8 +373,8 @@ pub enum GuaranteeReason {
     SinkConfirmsLocally,
     /// The source has `acknowledgements.enabled: false`.
     AcksDisabled,
-    /// The source does not hold its acknowledgement: pipe and memory have none,
-    /// and HTTP and file do not hold theirs yet.
+    /// The source does not hold its acknowledgement: pipe, memory and syslog
+    /// have none, and file does not hold its own yet.
     SourceCannotAck,
     /// The sink's `Ok` proves nothing beyond the call returning.
     SinkCannotConfirm,
@@ -788,7 +792,13 @@ impl HeldBytes {
     }
 
     /// The counter itself, for a pressure source reading it.
-    #[cfg(all(feature = "governor", feature = "transport-grpc"))]
+    #[cfg(all(
+        feature = "governor",
+        any(
+            feature = "transport-grpc",
+            all(feature = "transport-http", feature = "http-server")
+        )
+    ))]
     pub(crate) fn counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.held)
     }

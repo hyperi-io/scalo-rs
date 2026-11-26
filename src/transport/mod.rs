@@ -87,6 +87,11 @@ pub mod factory;
 pub mod filter;
 pub mod finalizer;
 pub mod hold;
+#[cfg(any(
+    feature = "transport-grpc",
+    all(feature = "transport-http", feature = "http-server")
+))]
+pub(crate) mod pending;
 pub mod propagation;
 mod resolver;
 mod traits;

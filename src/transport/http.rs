@@ -25,12 +25,22 @@
 //! records are queued together into a bounded `tokio::sync::mpsc` channel.
 //! `recv()` drains from this channel.
 //!
+//! ## Held responses
+//!
+//! Once a caller that releases every token it takes arms the server, a POST is
+//! answered only when every record of its body is released: 200 when they
+//! were delivered, dropped by policy or dead-lettered, 503 with `Retry-After`
+//! when they were not, which senders retry with the whole body. A response
+//! still held after `max_hold_ms`, or refused because `max_held_bytes` of
+//! held bodies leave no room, is answered 503 too. Unarmed, or with
+//! acknowledgements off, which they are unless set, the server answers 200
+//! once the records are queued for `recv`.
+//!
 //! ## Shutdown
 //!
-//! The server answers 200 once a body's records are queued for `recv`, so a receiving
-//! service shuts down in this order: `close()`, then `recv` until it returns
-//! `TransportError::Closed`, then its final flush. `close()` answers new POSTs
-//! with 503, which senders retry.
+//! A receiving service shuts down in this order: `close()`, then `recv` until
+//! it returns `TransportError::Closed`, then its final flush. `close()`
+//! answers new POSTs with 503, which senders retry.
 //!
 //! ## Example
 //!
@@ -63,8 +73,15 @@ pub const HTTP_ACCEPTS: Accepts = Accepts::new(
     &[Codec::None, Codec::Gzip, Codec::Zstd],
 );
 
+#[cfg(feature = "http-server")]
+use super::ack::AckControl;
+use super::ack::{AcknowledgementsConfig, AcknowledgingReceiver};
 use super::core::{Lifecycle, Meter};
 use super::error::{TransportError, TransportResult};
+#[cfg(feature = "http-server")]
+use super::finalizer::DeliveryStatus;
+#[cfg(feature = "http-server")]
+use super::pending::{Held, HoldSettings, Outcome, PendingRegistry};
 #[cfg(feature = "http-server")]
 use super::traits::RecvBatch;
 use super::traits::{CommitToken, TransportBase, TransportReceiver, TransportSender};
@@ -87,9 +104,9 @@ type ServerTask = tokio::task::JoinHandle<std::io::Result<()>>;
 
 /// Commit token for HTTP transport.
 ///
-/// HTTP is fire-and-forget from the receiver's perspective, so commit
-/// is a no-op. The token provides sequence tracking and optional
-/// client address for observability.
+/// The response is the acknowledgement, so commit is a no-op. The sequence
+/// number finds the held request a record came from, and the client address
+/// is for observability.
 #[derive(Debug, Clone)]
 pub struct HttpToken {
     /// Local sequence number (monotonically increasing per transport instance).
@@ -167,6 +184,14 @@ fn default_framing() -> crate::framing::FramingConfig {
 
 fn default_max_retry_after_ms() -> u64 {
     60_000
+}
+
+fn default_max_hold_ms() -> u64 {
+    u64::try_from(super::hold::HoldLadder::DEFAULT.top().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn default_max_held_bytes() -> u64 {
+    super::ack::DEFAULT_MAX_HELD_BYTES
 }
 
 /// Configuration for HTTP transport.
@@ -274,6 +299,17 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_max_in_flight_bytes")]
     pub max_in_flight_bytes: usize,
 
+    /// Longest a response is held for its records' delivery, in ms, once
+    /// acknowledgements hold it, after which it is answered 503. Default
+    /// 25000. A sender's own timeout must be longer.
+    #[serde(default = "default_max_hold_ms")]
+    pub max_hold_ms: u64,
+
+    /// Body bytes of held responses past which a request is answered 503,
+    /// except while nothing is held. Default 256 MiB.
+    #[serde(default = "default_max_held_bytes")]
+    pub max_held_bytes: u64,
+
     /// Client TLS for `https://` endpoints, the [`ClientTlsConfig`] every
     /// transport reads: profile, trust, CA files, client certificate and key
     /// pins. The endpoint's host is the name checked, so `server_name` is
@@ -349,6 +385,8 @@ impl Default for HttpTransportConfig {
             send_timeout_ms: default_send_timeout_ms(),
             max_body_bytes: default_max_body_bytes(),
             max_in_flight_bytes: default_max_in_flight_bytes(),
+            max_hold_ms: default_max_hold_ms(),
+            max_held_bytes: default_max_held_bytes(),
             tls: crate::tls::ClientTlsConfig::default(),
             tls_ca_path: Removed,
             tls_trust: Removed,
@@ -384,6 +422,8 @@ impl std::fmt::Debug for HttpTransportConfig {
             .field("send_timeout_ms", &self.send_timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_in_flight_bytes", &self.max_in_flight_bytes)
+            .field("max_hold_ms", &self.max_hold_ms)
+            .field("max_held_bytes", &self.max_held_bytes)
             .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
@@ -475,15 +515,29 @@ pub struct HttpTransport {
     #[cfg(feature = "http-server")]
     recv_timeout_ms: u64,
 
+    /// The `acknowledgements` section this transport was built with.
+    acknowledgements: AcknowledgementsConfig,
+
+    /// Responses held until their records are released, `None` when `listen`
+    /// is unset.
+    #[cfg(feature = "http-server")]
+    pending: Option<Arc<PendingRegistry>>,
+
     /// Transport-level message filter engine.
     filter_engine: super::filter::TransportFilterEngine,
 }
 
 /// Builds an [`HttpTransport`] with what [`HttpTransportConfig`] does not
-/// carry: the pressure governor and a connect resolver.
+/// carry: acknowledgements, the pressure governor and a connect resolver.
+///
+/// An app that releases every token it takes, through the `BatchEngine`
+/// pipeline builder or `SourceAck`, builds its receive server armed, so no
+/// POST is answered before its records are delivered:
 ///
 /// ```rust,ignore
 /// let transport = HttpTransport::builder(&config)
+///     .acknowledgements(app_config.acknowledgements)
+///     .armed(true)
 ///     .resolver(Arc::new(proven_routes))
 ///     .start()
 ///     .await?;
@@ -491,6 +545,8 @@ pub struct HttpTransport {
 #[must_use = "the transport starts only when `start` is awaited"]
 pub struct HttpTransportBuilder<'a> {
     config: &'a HttpTransportConfig,
+    acknowledgements: AcknowledgementsConfig,
+    armed: bool,
     #[cfg(feature = "governor")]
     pressure: Option<Arc<crate::governor::UnifiedPressure>>,
     resolver: Option<Arc<dyn super::ConnectResolver>>,
@@ -500,12 +556,34 @@ impl std::fmt::Debug for HttpTransportBuilder<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpTransportBuilder")
             .field("config", self.config)
+            .field("acknowledgements", &self.acknowledgements)
+            .field("armed", &self.armed)
             .field("resolver", &self.resolver.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl HttpTransportBuilder<'_> {
+    /// The `acknowledgements` section. Enabled, the receive server holds each
+    /// response until its records are released, once a caller arms it.
+    /// Disabled, or never set, it answers 200 once they are queued.
+    pub fn acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
+        self.acknowledgements = acknowledgements;
+        self
+    }
+
+    /// Arm the receive server before it listens, so the first POST that can
+    /// arrive is held until its records are released.
+    ///
+    /// Set it only when the caller releases every token it takes: a held POST
+    /// nobody releases is answered 503 after `max_hold_ms`. Unarmed (the
+    /// default), POSTs are answered once queued until a caller calls
+    /// [`AckControl::arm`].
+    pub fn armed(mut self, armed: bool) -> Self {
+        self.armed = armed;
+        self
+    }
+
     /// Answer 503 on the receive side while `pressure` holds (`governor`
     /// feature), as [`HttpTransport::with_pressure`] does.
     #[cfg(feature = "governor")]
@@ -550,6 +628,8 @@ impl HttpTransport {
     pub fn builder(config: &HttpTransportConfig) -> HttpTransportBuilder<'_> {
         HttpTransportBuilder {
             config,
+            acknowledgements: AcknowledgementsConfig::new(false),
+            armed: false,
             #[cfg(feature = "governor")]
             pressure: None,
             resolver: None,
@@ -628,6 +708,13 @@ impl HttpTransport {
         }
 
         #[cfg(feature = "http-server")]
+        let pending = config
+            .listen
+            .as_ref()
+            .map(|_| hold_registry(config, options.acknowledgements, options.armed))
+            .transpose()?;
+
+        #[cfg(feature = "http-server")]
         let (receiver, local_addr, in_flight, shutdown_tx, server_handle) = if let Some(listen) =
             &config.listen
         {
@@ -636,6 +723,16 @@ impl HttpTransport {
                 .map_err(|e| TransportError::Config(format!("invalid listen address: {e}")))?;
             let in_flight = Arc::new(in_flight_budget(config)?);
             let split = split::BodySplit::new(&config.framing)?;
+
+            // Held bytes near the ceiling hold the same latch the governor's
+            // other sources do. Nothing is held while unarmed or disabled.
+            #[cfg(feature = "governor")]
+            if let (Some(pressure), Some(pending)) = (&pressure, &pending) {
+                pressure.attach_source(Arc::new(crate::governor::AckHeldSource::new(
+                    pending.held_bytes(),
+                    pending.max_held_bytes(),
+                )));
+            }
 
             let (tx, rx) = tokio::sync::mpsc::channel(config.recv_buffer_size);
             let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
@@ -651,6 +748,7 @@ impl HttpTransport {
                     max_body_bytes: config.max_body_bytes,
                     split,
                     decoders: Arc::new(BodyDecoders::new()?),
+                    pending: pending.clone(),
                     #[cfg(feature = "governor")]
                     pressure: pressure.clone(),
                 },
@@ -694,6 +792,8 @@ impl HttpTransport {
         // signature stays uniform without an unused-variable warning.
         #[cfg(all(feature = "governor", not(feature = "http-server")))]
         let _ = pressure;
+        #[cfg(not(feature = "http-server"))]
+        let _ = options.armed;
 
         #[cfg(feature = "logger")]
         tracing::info!(
@@ -727,8 +827,27 @@ impl HttpTransport {
             lifecycle: Lifecycle::new::<Self>(move || !refusals.is_refused()),
             #[cfg(feature = "http-server")]
             recv_timeout_ms: config.recv_timeout_ms,
+            acknowledgements: options.acknowledgements,
+            #[cfg(feature = "http-server")]
+            pending,
             filter_engine,
         })
+    }
+
+    /// Set the `acknowledgements` config. Unset it is off, unlike Kafka and
+    /// gRPC, and the receive server answers 200 once a body is queued, armed
+    /// or not.
+    ///
+    /// `AnyReceiver::from_config` reads it from `<key>.http.acknowledgements`,
+    /// and a section present with no `enabled` key turns it on.
+    #[must_use]
+    pub fn with_acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
+        self.acknowledgements = acknowledgements;
+        #[cfg(feature = "http-server")]
+        if let Some(pending) = &self.pending {
+            pending.set_enabled(acknowledgements.enabled);
+        }
+        self
     }
 
     /// Address the embedded receive server is listening on, or `None` when
@@ -761,6 +880,30 @@ impl HttpTransport {
             Err(e) => tracing::warn!(error = %e, "HTTP: server task panicked"),
         }
     }
+}
+
+/// The registry the receive server holds responses in, refusing a
+/// `max_hold_ms` of 0, which would answer every held request 503.
+#[cfg(feature = "http-server")]
+fn hold_registry(
+    config: &HttpTransportConfig,
+    acknowledgements: AcknowledgementsConfig,
+    armed: bool,
+) -> TransportResult<Arc<PendingRegistry>> {
+    if config.max_hold_ms == 0 {
+        return Err(TransportError::Config(
+            "max_hold_ms is 0, which answers every held request 503".into(),
+        ));
+    }
+    Ok(Arc::new(PendingRegistry::new(HoldSettings {
+        enabled: acknowledgements.enabled,
+        armed,
+        max_held_bytes: config.max_held_bytes,
+        max_hold: std::time::Duration::from_millis(config.max_hold_ms),
+        label: "http",
+        #[cfg(feature = "memory")]
+        guard: None,
+    })))
 }
 
 /// The receive side's body-byte budget, refusing a `max_in_flight_bytes` that
@@ -832,6 +975,8 @@ struct ReceiverState {
     split: split::BodySplit,
     /// Decoding contexts for a compressed request body, kept between requests.
     decoders: Arc<BodyDecoders>,
+    /// Responses held until their records are released.
+    pending: Option<Arc<PendingRegistry>>,
     /// Optional pressure governor (`governor` feature). `None` by default
     /// -> the handler never consults it. When `Some`, the handler rejects with
     /// 503 while `UnifiedPressure::should_hold` holds -- pressure-driven
@@ -917,8 +1062,9 @@ async fn decode_body(
 ///
 /// The pressure check and the byte reservation come before the body is read,
 /// so a held governor or a spent budget costs no body buffer. Answers 200 once
-/// the records are queued. A full queue, a held inbound gate, a spent byte budget
-/// and a closed receiver answer 503, which a sender retries.
+/// the records are queued, or, held, once they are released. A full queue, a
+/// held inbound gate, a spent byte budget, a full held-byte ceiling and a
+/// closed receiver answer 503, which a sender retries.
 #[cfg(feature = "http-server")]
 async fn ingest_handler(
     axum::extract::State(state): axum::extract::State<ReceiverState>,
@@ -937,6 +1083,7 @@ async fn ingest_handler(
         #[cfg(feature = "metrics")]
         metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "pressure")
             .increment(1);
+        note_refusal(&state, "pressure");
         return shed_503();
     }
 
@@ -1014,22 +1161,72 @@ async fn ingest_handler(
         bytes::Bytes::from(decoded)
     };
 
-    queue(&state, permit, body, addr)
+    match queue(&state, permit, body, addr) {
+        Ok(None) => axum::http::StatusCode::OK.into_response(),
+        Ok(Some(held)) => held_answer(held.outcome().await),
+        Err(refused) => refused,
+    }
 }
 
-/// Split `body` into its records by `framing` and queue them together,
-/// answering 200 once they are queued. `permit` holds the body's bytes of the
-/// in-flight budget.
+/// Answer a held request from its outcome: 200 once every record was
+/// delivered, dropped by policy or dead-lettered, 503 otherwise.
+#[cfg(feature = "http-server")]
+fn held_answer(outcome: Outcome) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    match outcome {
+        Outcome::Released(
+            DeliveryStatus::Delivered | DeliveryStatus::Dropped | DeliveryStatus::Rejected,
+        ) => axum::http::StatusCode::OK.into_response(),
+        Outcome::Released(DeliveryStatus::Errored) | Outcome::Expired | Outcome::Shutdown => {
+            shed_503()
+        }
+    }
+}
+
+/// Count a request refused before it was held, while responses are held.
+#[cfg(feature = "http-server")]
+fn note_refusal(state: &ReceiverState, reason: &'static str) {
+    if let Some(pending) = state.pending.as_ref().filter(|p| p.holding()) {
+        pending.count_refused(reason);
+    }
+}
+
+/// Take the sequence range for a request of `len` records carrying `bytes`
+/// and, while responses are held, reserve its bytes and hold it.
+#[cfg(feature = "http-server")]
+fn admit(
+    state: &ReceiverState,
+    len: u64,
+    bytes: u64,
+) -> Result<(u64, Option<Held>), axum::response::Response> {
+    let Some(pending) = state.pending.as_ref().filter(|p| p.holding()) else {
+        return Ok((state.sequence.fetch_add(len, Ordering::Relaxed), None));
+    };
+    let Some(reservation) = pending.reserve(bytes) else {
+        pending.count_refused("ceiling");
+        #[cfg(feature = "metrics")]
+        metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "ceiling")
+            .increment(1);
+        return Err(shed_503());
+    };
+    let base = state.sequence.fetch_add(len, Ordering::Relaxed);
+    let held = reservation.hold(base, len, pending.budget(None), DeliveryStatus::Delivered);
+    Ok((base, Some(held)))
+}
+
+/// Split `body` into its records by `framing` and queue them together.
+/// `permit` holds the body's bytes of the in-flight budget.
 ///
-/// A body over the record cap is 413, naming the cap, and nothing of it is
-/// queued, so its sender can retry it smaller.
+/// `Ok(None)` is answered 200 now, and `Ok(Some(held))` once its records are
+/// released. A body over the record cap is 413, naming the cap, and nothing
+/// of it is queued, so its sender can retry it smaller.
 #[cfg(feature = "http-server")]
 fn queue(
     state: &ReceiverState,
     mut permit: tokio::sync::OwnedSemaphorePermit,
     body: bytes::Bytes,
     addr: std::net::SocketAddr,
-) -> axum::response::Response {
+) -> Result<Option<Held>, axum::response::Response> {
     use axum::response::IntoResponse as _;
 
     let source = addr.to_string();
@@ -1043,38 +1240,35 @@ fn queue(
         headers: Vec::new(),
     };
     let body_len = body.len();
-    let messages: Vec<Message<HttpToken>> = match state.split.parts(&body) {
+    let (messages, held): (Vec<Message<HttpToken>>, _) = match state.split.parts(&body) {
         split::BodyParts::Whole => {
-            vec![message(
-                body,
-                state.sequence.fetch_add(1, Ordering::Relaxed),
-            )]
+            let (seq, held) = admit(state, 1, body_len as u64)?;
+            (vec![message(body, seq)], held)
         }
         // An empty array: nothing to queue, and its bytes return as the permit drops.
-        split::BodyParts::Each(records) if records.is_empty() => {
-            return axum::http::StatusCode::OK.into_response();
-        }
+        split::BodyParts::Each(records) if records.is_empty() => return Ok(None),
         split::BodyParts::Each(records) => {
             // Each record's message and source address are memory the body's bytes do not count.
             let overhead = records
                 .len()
                 .saturating_mul(size_of::<Message<HttpToken>>() + source.len());
             let Some(more) = reserve(&state.in_flight, overhead) else {
-                return budget_spent();
+                return Err(budget_spent());
             };
             permit.merge(more);
-            let first = state
-                .sequence
-                .fetch_add(records.len() as u64, Ordering::Relaxed);
-            records
+            // One contiguous sequence range per request, so a held request is
+            // found from any of its tokens.
+            let (first, held) = admit(state, records.len() as u64, body_len as u64)?;
+            let messages = records
                 .iter()
                 .zip(first..)
                 .map(|(record, seq)| message(split::slice_of(&body, record), seq))
-                .collect()
+                .collect();
+            (messages, held)
         }
         split::BodyParts::TooMany(max) => {
             let answer = format!("the body holds more than {max} records: send fewer per request");
-            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, answer).into_response();
+            return Err((axum::http::StatusCode::PAYLOAD_TOO_LARGE, answer).into_response());
         }
     };
 
@@ -1083,21 +1277,27 @@ fn queue(
         messages: messages.into_iter(),
         held: permit.num_permits(),
     };
+    // A held request dropped unqueued on a refusal below releases its records Errored.
     match state.sender.try_send(queued) {
         Ok(()) => {
             // The queued records hold their bytes until `recv` takes the last of them.
             permit.forget();
             HttpTransport::count_received(records as u64, body_len as u64);
-            axum::http::StatusCode::OK.into_response()
+            Ok(held.map(|mut held| {
+                held.queued();
+                held
+            }))
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
             HttpTransport::count_backpressured();
-            shed_503()
+            note_refusal(state, "full");
+            Err(shed_503())
         }
         // A closed receiver is shutting down: 503 so the sender retries, not drops.
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             HttpTransport::count_refused();
-            shed_503()
+            note_refusal(state, "closed");
+            Err(shed_503())
         }
     }
 }
@@ -1138,12 +1338,13 @@ impl TransportBase for HttpTransport {
     /// Stop sending and receiving, keeping every record already acknowledged.
     ///
     /// A POST that arrives from here on is answered 503, which a sender
-    /// retries. Records the server already answered 200 for stay queued: call
+    /// retries. Records already queued stay queued: call
     /// [`recv`](TransportReceiver::recv) until it returns
-    /// [`TransportError::Closed`] or they are lost. Open connections finish
-    /// their in-flight requests on their own, and the listener is free when this
-    /// returns. Waits for a `recv` in progress (at most `recv_timeout_ms`).
-    /// Idempotent.
+    /// [`TransportError::Closed`] or they are lost. Held responses are
+    /// answered as their records are released, or 503 at `max_hold_ms`. Open
+    /// connections finish their in-flight requests on their own, and the
+    /// listener is free when this returns. Waits for a `recv` in progress (at
+    /// most `recv_timeout_ms`). Idempotent.
     async fn close(&self) -> TransportResult<()> {
         self.lifecycle.close();
 
@@ -1352,8 +1553,46 @@ impl TransportReceiver for HttpTransport {
     }
 
     async fn commit(&self, _tokens: &[Self::Token]) -> TransportResult<()> {
-        // HTTP is fire-and-forget -- commit is a no-op.
+        // The response is the acknowledgement, so there is nothing to commit.
         Ok(())
+    }
+
+    /// The held-response controls of the receive server. `None` when
+    /// `listen` is unset.
+    #[cfg(feature = "http-server")]
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        self.pending.as_deref().map(|p| p as &dyn AckControl)
+    }
+
+    /// Answer the held requests whose last records these are: 200 for
+    /// `Delivered`, `Dropped` and `Rejected`, 503 for `Errored`, which the
+    /// sender retries. Tokens of requests answered at enqueue, or released
+    /// already, are ignored.
+    #[cfg(feature = "http-server")]
+    async fn release(
+        &self,
+        tokens: &[Self::Token],
+        outcome: DeliveryStatus,
+    ) -> TransportResult<()> {
+        if let Some(pending) = &self.pending {
+            pending.release(tokens.iter().map(|t| t.seq), outcome);
+        }
+        Ok(())
+    }
+
+    /// The earliest instant by which a held request among `tokens` must be
+    /// answered: `max_hold_ms` from admission.
+    #[cfg(feature = "http-server")]
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+        self.pending
+            .as_ref()?
+            .deadline(tokens.iter().map(|t| t.seq))
+    }
+}
+
+impl AcknowledgingReceiver for HttpTransport {
+    fn acknowledgements(&self) -> AcknowledgementsConfig {
+        self.acknowledgements
     }
 }
 
@@ -1363,6 +1602,11 @@ impl Drop for HttpTransport {
         #[cfg(feature = "http-server")]
         if let Some(task) = self.server_task.get_mut().take() {
             task.abort();
+        }
+        // Nothing can release a held record once the transport is gone.
+        #[cfg(feature = "http-server")]
+        if let Some(pending) = &self.pending {
+            pending.shutdown();
         }
     }
 }
@@ -2596,6 +2840,7 @@ mod tests {
             max_body_bytes: 1024,
             split: split::BodySplit::Single,
             decoders: Arc::new(BodyDecoders::new().expect("decoders")),
+            pending: None,
             #[cfg(feature = "governor")]
             pressure: None,
         };
@@ -2620,6 +2865,141 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("1")
         );
+    }
+
+    /// An armed NDJSON receiver with acknowledgements as given.
+    #[cfg(feature = "http-server")]
+    async fn armed_receiver(enabled: bool, max_hold_ms: u64, max_held_bytes: u64) -> HttpTransport {
+        let mut config = receiver_config(100);
+        config.framing.framing_type = "ndjson".into();
+        config.max_hold_ms = max_hold_ms;
+        config.max_held_bytes = max_held_bytes;
+        HttpTransport::builder(&config)
+            .acknowledgements(AcknowledgementsConfig::new(enabled))
+            .armed(true)
+            .start()
+            .await
+            .expect("receiver")
+    }
+
+    /// POST `body` to `receiver` in a task, giving the status and `Retry-After`.
+    #[cfg(feature = "http-server")]
+    fn post(
+        receiver: &HttpTransport,
+        body: &'static str,
+    ) -> tokio::task::JoinHandle<(u16, Option<String>)> {
+        let url = format!("http://{}/ingest", receiver.local_addr().expect("bound"));
+        tokio::spawn(async move {
+            let answer = reqwest::Client::new()
+                .post(url)
+                .body(body)
+                .send()
+                .await
+                .expect("answered");
+            let retry = answer
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            (answer.status().as_u16(), retry)
+        })
+    }
+
+    /// Receive until `n` records have arrived.
+    #[cfg(feature = "http-server")]
+    async fn recv_n(receiver: &HttpTransport, n: usize) -> WorkBatch<HttpToken> {
+        let mut all = receiver.recv(n).await.expect("recv");
+        while all.records.len() < n {
+            let more = receiver.recv(n - all.records.len()).await.expect("recv");
+            all.records.extend(more.records);
+            all.commit_tokens.extend(more.commit_tokens);
+        }
+        all
+    }
+
+    /// Armed, a POST is answered only once every record of its body is
+    /// released: 200 for delivered, dead-lettered or dropped, 503 with
+    /// `Retry-After` for an errored record or a hold past `max_hold_ms`.
+    /// With acknowledgements off it is answered at enqueue.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn a_held_post_is_answered_from_the_release_of_every_record() {
+        use DeliveryStatus as S;
+        let rows = [
+            ("delivered", true, Some(S::Delivered), 200),
+            ("dead-lettered", true, Some(S::Rejected), 200),
+            ("dropped", true, Some(S::Dropped), 200),
+            ("errored", true, Some(S::Errored), 503),
+            ("expired", true, None, 503),
+            ("acks off", false, None, 200),
+        ];
+        for (name, enabled, released, want) in rows {
+            let receiver = armed_receiver(enabled, 500, 1 << 20).await;
+            let answer = post(&receiver, "{\"n\":0}\n{\"n\":1}\n{\"n\":2}\n");
+            let batch = recv_n(&receiver, 3).await;
+            let seqs: Vec<u64> = batch.commit_tokens.iter().map(|t| t.seq).collect();
+            assert_eq!(seqs, [0, 1, 2], "{name}: one contiguous range per request");
+            let control = receiver.ack_control().expect("ack-capable");
+            if let Some(status) = released {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(!answer.is_finished(), "{name}: answered before release");
+                assert_eq!(control.held().count, 3, "{name}");
+                receiver
+                    .release(&batch.commit_tokens[..1], S::Delivered)
+                    .await
+                    .expect("release");
+                receiver
+                    .release(&batch.commit_tokens[1..], status)
+                    .await
+                    .expect("release");
+            }
+            let (code, retry) = answer.await.expect("post task");
+            assert_eq!(code, want, "{name}");
+            let want_retry = (want == 503).then(|| "1".to_owned());
+            assert_eq!(retry, want_retry, "{name}: Retry-After");
+            receiver
+                .release(&batch.commit_tokens, S::Delivered)
+                .await
+                .expect("release");
+            assert_eq!(control.held().count, 0, "{name}: nothing left held");
+            assert_eq!(control.held().bytes, 0, "{name}: the bytes go back");
+        }
+    }
+
+    /// A POST that would take held bodies past `max_held_bytes` is refused 503
+    /// at once, and one is admitted while nothing is held, however large.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn the_held_byte_ceiling_refuses_with_a_retry() {
+        let receiver = armed_receiver(true, 5_000, 8).await;
+        let first = post(&receiver, "{\"over\":\"the ceiling\"}\n");
+        let held = recv_n(&receiver, 1).await;
+        let (code, retry) = post(&receiver, "{}\n").await.expect("post task");
+        assert_eq!(
+            (code, retry.as_deref()),
+            (503, Some("1")),
+            "past the ceiling"
+        );
+        receiver
+            .release(&held.commit_tokens, DeliveryStatus::Delivered)
+            .await
+            .expect("release");
+        assert_eq!(first.await.expect("post task").0, 200);
+    }
+
+    /// Dropping an armed transport answers every POST it still holds 503.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn a_dropped_transport_answers_its_held_posts_503() {
+        let receiver = armed_receiver(true, 5_000, 1 << 20).await;
+        let answer = post(&receiver, "{}\n");
+        let _batch = recv_n(&receiver, 1).await;
+        drop(receiver);
+        let (code, _) = tokio::time::timeout(std::time::Duration::from_secs(2), answer)
+            .await
+            .expect("answered at the drop")
+            .expect("post task");
+        assert_eq!(code, 503);
     }
 
     /// `close()` stops the server even while a client holds a request open,

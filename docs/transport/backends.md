@@ -448,6 +448,10 @@ transport:
       recv_buffer_size: 10000       # requests queued, each with all its records
       max_body_bytes: 16777216      # one request's body, 413 above it
       max_in_flight_bytes: 67108864 # bodies read and queued at once
+      max_hold_ms: 25000            # longest a held response waits, then 503
+      max_held_bytes: 268435456     # bodies held for their answer at once
+      acknowledgements:             # absent: off, answered at enqueue
+        enabled: true               # hold each answer until delivery, once armed
 ```
 
 - Admission: a POST is checked before its body is read. A held governor answers 503, then the request reserves its declared `Content-Length` (or `max_body_bytes` without one) from `max_in_flight_bytes`, and answers 503 with `Retry-After: 1` when that does not fit. The bytes stay reserved while the body's records are queued and come back as `recv` takes the last one, so bodies read and queued never exceed `max_in_flight_bytes`.
@@ -459,8 +463,8 @@ transport:
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
 - Sending: credentials, headers, body framing, compression, failover, proxy, redirects and what each status answers are in [http.md](http.md). A refused, reset or timed-out connection, 408, 429 and every 5xx are retried. 400, 413 and 422 are `Reject`. Any other 3xx or 4xx is `Fatal(Config)`, which a tiered sink's drain keeps spooled until the sink is fixed.
-- Acknowledgement: the server answers 200 once the body's records are queued for `recv`, not once the consumer reads them, so a crash loses what it answered but had not delivered. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`. It does not hold its answer: `<key>.http.acknowledgements` has no effect, and the factory warns once. An endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#a-hand-rolled-loop)).
-- `close()`: answers new POSTs with 503, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Open connections finish their in-flight requests on their own, the listener is free when `close()` returns, and a client that never finishes its request does not hold it open. Dropping the transport stops the server too.
+- Acknowledgement: off unless a `<key>.http.acknowledgements` section is present (`HttpTransport::builder(..).acknowledgements(..)`), unlike Kafka and gRPC. On and armed (`AnyReceiver::from_config_armed`, `.armed(true)`), a POST is answered 200 only once every record of its body is delivered, dropped by policy or dead-lettered. A record released `Errored`, a hold past `max_hold_ms` (0 is refused), and a POST that would pass `max_held_bytes` get 503 with `Retry-After: 1`, and the sender resends the whole body. Held bytes feed the governor's `ack_held` source. Unarmed or off, 200 comes once the records are queued, so a crash loses what was answered. A full queue, a held inbound gate and a closed receiver answer 503 either way.
+- `close()`: answers new POSTs with 503, which senders retry, and keeps every queued record: `recv` returns them, then `TransportError::Closed`. A held answer is given as its records are released, or 503 at `max_hold_ms`. Open connections finish their in-flight requests on their own, the listener is free when `close()` returns, and a client that never finishes its request does not hold it open. Dropping the transport stops the server and answers every held POST 503.
 - Shutdown order: `close()`, then `recv` until `Closed`, then flush. The `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). Flushing first loses the records still queued.
 - Counters: receipts count in `transport_received_*`, never in `transport_sent_total`.
 - `is_healthy()`: `!closed`. Does not probe the endpoint.
