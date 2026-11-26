@@ -150,7 +150,7 @@ pub enum Severity {
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct SyslogConfig {
-    /// The receiver, `host:port` or `[v6]:port`. Required.
+    /// The receiver, `host:port` or `[v6]:port`. Required to send.
     pub address: String,
     /// `tcp` (default), `tls`, `udp` or `relp`.
     pub protocol: SyslogProtocol,
@@ -195,6 +195,8 @@ pub struct SyslogConfig {
     pub proxy: crate::transport::ProxyConfig,
     /// Outbound message filters, applied to each record's payload.
     pub filters_out: Vec<FilterRule>,
+    /// The listeners a receiver built from this config binds. Unset, it sends only.
+    pub listen: Option<super::SyslogListenConfig>,
 }
 
 /// Datagrams over this cannot be sent over IPv4 or IPv6.
@@ -225,6 +227,7 @@ impl Default for SyslogConfig {
             tls: None,
             proxy: crate::transport::ProxyConfig::None,
             filters_out: Vec::new(),
+            listen: None,
         }
     }
 }

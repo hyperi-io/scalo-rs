@@ -555,7 +555,6 @@ impl TransportReceiver for FileTransport {
                     ));
                 }
                 Frame::Record(payload) => {
-                    let payload = bytes::Bytes::from(payload);
                     let format = PayloadFormat::detect(&payload);
                     let timestamp_ms = crate::clock::epoch_millis();
                     pending.push(ReadLine::Record(Message {

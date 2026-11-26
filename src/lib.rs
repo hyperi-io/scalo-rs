@@ -134,6 +134,7 @@ pub mod backoff;
     feature = "transport-memory",
     feature = "transport-pipe",
     feature = "transport-file",
+    feature = "transport-syslog",
     all(feature = "transport-http", feature = "http-server")
 ))]
 pub(crate) mod clock;

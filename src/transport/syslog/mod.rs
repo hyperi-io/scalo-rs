@@ -6,7 +6,8 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Sends records as syslog messages, send only.
+//! Sends records as syslog messages. [`SyslogReceiver`] receives them over
+//! TCP, TLS and UDP, built from the `listen` section.
 //!
 //! Each record's payload is the MSG, after an RFC 5424 or RFC 3164 header
 //! built from config, or as it is when `passthrough` is set and it already
@@ -29,6 +30,7 @@
 
 mod config;
 mod format;
+mod receive;
 pub(crate) mod relp;
 mod stream;
 
@@ -36,6 +38,7 @@ mod stream;
 mod tests;
 
 pub use config::{Facility, Severity, SyslogConfig, SyslogFormat, SyslogFraming, SyslogProtocol};
+pub use receive::{SyslogListenConfig, SyslogReceiver, SyslogToken};
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -265,7 +268,7 @@ impl SyslogTransport {
     ) -> (SendResult, Option<Session>) {
         wire.clear();
         let _ = match self.framing {
-            SyslogFraming::OctetCounting => OctetCounting.encode(messages, wire),
+            SyslogFraming::OctetCounting => OctetCounting::default().encode(messages, wire),
             SyslogFraming::Lf => Lf.encode(messages, wire),
         };
         let open = match current {

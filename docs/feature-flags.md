@@ -82,7 +82,7 @@ Pick `metrics` for service binaries. scalo's series, the tiered sink's and the t
 | `transport-memory` / `-kafka` / `-grpc` / `-file` / `-pipe` / `-http` | Individual backends -- each pulls its deps and no others. `-grpc` and `-http` pull `tls` for their client TLS |
 | `transport-kafka-config` | `transport::kafka`'s config and token types with no client: `KafkaConfig` and `validate`, the provider presets, `KafkaToken`, `PartitionLease` and the profile constants. Builds and links no librdkafka. `transport-kafka` includes it |
 | `transport-grpc-vector-compat` | Vector.dev wire-compat for a transform consumer |
-| `transport-syslog` | Syslog over TCP, TLS, UDP and RELP, send only ([transport/syslog.md](transport/syslog.md)). Pulls `tls`, `jiff` and `sysinfo` |
+| `transport-syslog` | Syslog sent over TCP, TLS, UDP and RELP, and received over TCP, TLS and UDP ([transport/syslog.md](transport/syslog.md)). Pulls `tls`, `jiff`, `sysinfo`, `tokio-util` and `socket2` |
 | `transport-otlp` | OTLP log records and metrics to a collector over gRPC or HTTP/protobuf, send only ([transport/otlp.md](transport/otlp.md)). Pulls `tls`, `reqwest`, `tonic`, `opentelemetry-proto` and `opentelemetry-resource-detectors`, and needs no `protoc` |
 | `transport-all` | All seven backends |
 

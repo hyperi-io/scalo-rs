@@ -441,7 +441,11 @@ pub trait TransportReceiver: TransportBase {
     /// -- record-bounded only, byte cap ignored. Only transports that buffer a
     /// whole poll's bytes in one allocation (Kafka's recv-arena) override it.
     /// Channel/stream transports (Memory, gRPC, ...) already retain only one
-    /// record's bytes at a time, so the fallback is correct for them.
+    /// record's bytes at a time, so the fallback is correct for them. The
+    /// syslog receiver is the exception: each record is a slice of the block
+    /// it was read into, up to 64 KiB on TCP and TLS and 1 MiB on UDP, and
+    /// keeps that whole block alive, so its payload bytes understate what a
+    /// poll holds. Its queue of `recv_buffer_size` records bounds it instead.
     ///
     /// Filter behaviour and the `commit_tokens` contract match
     /// [`recv`](Self::recv).

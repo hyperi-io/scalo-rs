@@ -32,7 +32,7 @@ pub enum TransportType {
     Pipe,
     /// HTTP/HTTPS (webhook delivery, REST ingest).
     Http,
-    /// Syslog over TCP, TLS, UDP or RELP (send only).
+    /// Syslog: sends over TCP, TLS, UDP or RELP, receives over TCP, TLS or UDP.
     Syslog,
     /// OTLP log records to an OpenTelemetry collector (send only).
     Otlp,
@@ -360,7 +360,7 @@ pub struct TransportConfig {
     #[serde(default)]
     pub http: Option<super::http::HttpTransportConfig>,
 
-    /// Syslog transport configuration (send only).
+    /// Syslog transport configuration: the sender, and the `listen` section to receive.
     #[cfg(feature = "transport-syslog")]
     #[serde(default)]
     pub syslog: Option<super::syslog::SyslogConfig>,

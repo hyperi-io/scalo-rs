@@ -1,6 +1,6 @@
 # Syslog
 
-The `transport-syslog` feature sends records to a syslog receiver as `type: syslog`. Each record's payload is the message body, after an RFC 5424 or RFC 3164 header. It sends only.
+The `transport-syslog` feature sends records to a syslog receiver as `type: syslog`. Each record's payload is the message body, after an RFC 5424 or RFC 3164 header. A `listen` section receives syslog as well: see [Receiving](#receiving).
 
 | `protocol` | Wire | Guarantee | `delivery` it needs |
 | --- | --- | --- | --- |
@@ -90,6 +90,54 @@ There is no maintained Rust RELP crate. The client is in `src/transport/syslog/r
 
 ---
 
+## Receiving
+
+`SyslogReceiver` listens on TCP, TLS and UDP and hands each message over as one record, its bytes as they came. The PRI and header are the app's to parse. `type: syslog` builds it when the `syslog` section has a `listen` section:
+
+```yaml
+transport:
+  input:
+    type: syslog
+    syslog:
+      listen:
+        tcp_address: 0.0.0.0:514
+        udp_address: 0.0.0.0:514
+        tls_address: 0.0.0.0:6514
+        carriage_returns: keep
+        tls:
+          cert_file: /etc/tls/syslog.pem
+          key_file: /etc/tls/syslog.key
+```
+
+A TCP or TLS connection carries octet-counted frames and LF lines mixed, read by the `octet_counting` framing ([framing.md](framing.md)). `carriage_returns: keep` leaves the CR before an LF in the record, as receivers that pass the raw line on do. The default `strip` drops it. A message over `max_message_bytes` is skipped by its count, or up to its `\n`, counted in `transport_message_too_large_total`, and the connection carries on. Each record is a slice of the buffer it was read into, so taking one copies nothing. UDP takes one datagram as one record, whatever its size, and an empty datagram as none, counted in `transport_dropped_total{reason="empty"}`.
+
+Records wait in a queue of `recv_buffer_size` for `recv`. A full queue stops the TCP and TLS reads, so the sender's writes back up. A datagram the full queue cannot take is dropped and counted in `transport_dropped_total{reason="queue_full"}`. No protocol here answers the sender, so the guarantee is `written`, or `fire_and_forget` with a UDP listener, and `commit` does nothing. `close` stops the listeners and closes every connection, and `recv` hands over what is queued, then `Closed`.
+
+A connection closes after `idle_timeout_ms` with no frame, and when a frame begun has not ended `frame_timeout_ms` after its first byte, so a sender trickling an oversize frame loses its connection. The frame clock runs only while the socket is awaited, never while a full queue holds the reader. Both closes count in `transport_connections_closed_total` with `reason` `idle` or `frame_timeout`.
+
+`transport.syslog.listen`, or the `listen` section of a `syslog` section. Every key goes through the cascade, YAML and environment alike.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `tcp_address`, `udp_address` | unset | `ip:port` to listen on. Unset, no listener |
+| `tls_address` | unset | `ip:port` for TLS (RFC 5425), with `tls` |
+| `tls` | none | server TLS: `profile`, `cert_file` or `cert_secret`, `key_file` or `key_secret`, `ca_files`, `client_auth`, `reload_interval_secs`, `handshake_timeout_ms` ([../api/tls.md](../api/tls.md)) |
+| `max_message_bytes` | 65536 | largest TCP or TLS message |
+| `max_frame_bytes` | 262144 | largest octet count trusted. A larger count is read as an LF line. At least `max_message_bytes` |
+| `carriage_returns` | `strip` | `keep` leaves the `\r`s before an LF line's `\n` in the record, and a line of one `\r` is a record |
+| `tcp_keepalive_secs` | 60 | keepalive probes after this long quiet, then every this long. 0 is off |
+| `idle_timeout_ms` | 600000 | close a connection with no frame for this long. 0 keeps it |
+| `frame_timeout_ms` | 30000 | close a connection whose frame has not ended this long after its first byte. 0 waits for ever |
+| `udp_recv_buffer_bytes` | 8388608 | `SO_RCVBUF`. A smaller grant is logged: raise `net.core.rmem_max` |
+| `udp_batch_size` | 64 | datagrams read per wake |
+| `recv_buffer_size` | 10000 | records queued for `recv` |
+| `recv_timeout_ms` | 100 | how long `recv` waits for a first record |
+| `filters_in` | none | inbound filters on each record ([filter-engine.md](filter-engine.md)) |
+
+A config with no address, `tls_address` without `tls` or the other way round, an address that is not `ip:port`, or a zero `max_message_bytes`, `recv_buffer_size` or `udp_batch_size` is refused at build. Each listener binds before any serves, so a failed bind leaves none.
+
+---
+
 ## Config
 
 `transport.syslog`, or the `syslog` section of a transport config. Every key goes through the cascade, YAML and environment alike.
@@ -121,6 +169,7 @@ There is no maintained Rust RELP crate. The client is in `src/transport/syslog/r
 | `tls.server_name` | host of `address` | the name the receiver's certificate is checked against |
 | `tls.key_share` | `profile` | `classical` sends a classical key share first, for a receiver behind a middlebox that drops the larger one |
 | `filters_out` | none | outbound filters on each payload ([filter-engine.md](filter-engine.md)) |
+| `listen` | none | the listeners, see [Receiving](#receiving) |
 
 A `tls` section with `protocol: tcp` or `udp` is refused at build, and so are a `proxy` other than `none` with `udp`, an address with no port, a `max_message_bytes` under 480 or, for UDP, over 65507, and a `relp_window` of 0.
 

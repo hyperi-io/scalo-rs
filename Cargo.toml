@@ -180,7 +180,7 @@ transport-file = ["transport", "io"]
 transport-pipe = ["transport"]
 transport-http = ["transport", "transport-proxy", "http", "tls", "compression"]
 # RFC 5424 and 3164 over TCP, TLS, UDP and RELP: docs/transport/syslog.md
-transport-syslog = ["transport", "transport-proxy", "tls", "dep:jiff", "sysinfo"]
+transport-syslog = ["transport", "transport-proxy", "tls", "dep:jiff", "sysinfo", "dep:socket2", "tokio-util"]
 # OTLP log records and metrics over gRPC or HTTP/protobuf, with no protoc to build: docs/transport/otlp.md
 transport-otlp = ["transport", "transport-proxy", "tls", "reqwest", "bytes", "tokio", "dep:tonic", "dep:hyper-util", "dep:prost", "dep:tonic-types", "dep:opentelemetry-proto", "dep:opentelemetry", "opentelemetry_sdk", "dep:opentelemetry-resource-detectors", "dep:flate2", "tonic/gzip"]
 # One egress proxy setting for the stream transports: src/transport/proxy.rs
@@ -258,6 +258,8 @@ sysinfo = { version = ">=0.40.3, <0.41", optional = true }
 
 tokio = { version = ">=1.54.1, <2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-std", "io-util"], optional = true }
 tokio-util = { version = ">=0.7.20, <0.8", optional = true }
+# TCP keepalive and UDP SO_RCVBUF for the syslog listeners. Already in the graph through tokio.
+socket2 = { version = ">=0.6.5, <0.7", optional = true }
 
 # `default-features = false` drops native-tls and OpenSSL, and `rustls-tls` keeps HTTPS.
 reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["json", "rustls"], optional = true }

@@ -363,11 +363,10 @@ impl TransportReceiver for PipeTransport {
                 }
                 Err(e) => return Err(TransportError::Recv(format!("stdin read failed: {e}"))),
             };
-            let Frame::Record(payload) = frame else {
+            let Frame::Record(payload_bytes) = frame else {
                 unreachable!("invariant: no line is oversize under unbounded limits");
             };
 
-            let payload_bytes = bytes::Bytes::from(payload);
             let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
             let format = PayloadFormat::detect(&payload_bytes);
             let timestamp_ms = crate::clock::epoch_millis();

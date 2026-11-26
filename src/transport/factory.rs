@@ -400,6 +400,10 @@ pub enum AnyToken {
     #[cfg(feature = "transport-http")]
     /// HTTP sequence token.
     Http(super::http::HttpToken),
+
+    #[cfg(feature = "transport-syslog")]
+    /// Syslog sequence and sender token.
+    Syslog(super::syslog::SyslogToken),
 }
 
 impl std::fmt::Display for AnyToken {
@@ -417,6 +421,8 @@ impl std::fmt::Display for AnyToken {
             Self::File(t) => std::fmt::Display::fmt(t, f),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => std::fmt::Display::fmt(t, f),
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => std::fmt::Display::fmt(t, f),
             #[allow(unreachable_patterns)]
             _ => write!(f, "none"),
         }
@@ -459,6 +465,9 @@ pub enum AnyReceiver {
 
     #[cfg(feature = "transport-http")]
     Http(super::http::HttpTransport),
+
+    #[cfg(feature = "transport-syslog")]
+    Syslog(super::syslog::SyslogReceiver),
 }
 
 impl TransportBase for AnyReceiver {
@@ -476,6 +485,8 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.close().await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.close().await,
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => t.close().await,
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -497,6 +508,8 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.is_healthy(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.is_healthy(),
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => t.is_healthy(),
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -516,6 +529,8 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.name(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.name(),
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => t.name(),
             #[allow(unreachable_patterns)]
             _ => "none",
         }
@@ -535,6 +550,8 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.delivery_guarantee(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.delivery_guarantee(),
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => t.delivery_guarantee(),
             #[allow(unreachable_patterns)]
             _ => DeliveryGuarantee::Acknowledged,
         }
@@ -554,6 +571,8 @@ impl TransportBase for AnyReceiver {
             Self::File(t) => t.healthcheck().await,
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.healthcheck().await,
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => t.healthcheck().await,
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -572,7 +591,8 @@ impl TransportBase for AnyReceiver {
     feature = "transport-memory",
     feature = "transport-pipe",
     feature = "transport-file",
-    feature = "transport-http"
+    feature = "transport-http",
+    feature = "transport-syslog"
 ))]
 fn wrap_batch<B: CommitToken>(
     batch: WorkBatch<B>,
@@ -592,7 +612,8 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http"
+            feature = "transport-http",
+            feature = "transport-syslog"
         )),
         allow(unused_variables)
     )]
@@ -628,6 +649,11 @@ impl TransportReceiver for AnyReceiver {
                 let batch = t.recv(max).await?;
                 Ok(wrap_batch(batch, AnyToken::Http))
             }
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => {
+                let batch = t.recv(max).await?;
+                Ok(wrap_batch(batch, AnyToken::Syslog))
+            }
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -647,7 +673,8 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http"
+            feature = "transport-http",
+            feature = "transport-syslog"
         )),
         allow(unused_variables)
     )]
@@ -686,6 +713,11 @@ impl TransportReceiver for AnyReceiver {
                 let batch = t.recv_limited(limits).await?;
                 Ok(wrap_batch(batch, AnyToken::Http))
             }
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => {
+                let batch = t.recv_limited(limits).await?;
+                Ok(wrap_batch(batch, AnyToken::Syslog))
+            }
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -700,7 +732,8 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http"
+            feature = "transport-http",
+            feature = "transport-syslog"
         )),
         allow(unused_variables)
     )]
@@ -766,6 +799,15 @@ impl TransportReceiver for AnyReceiver {
                 }))
                 .await
             }
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => {
+                t.commit(&extract_tokens(tokens, |tok| match tok {
+                    AnyToken::Syslog(s) => Some(*s),
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                }))
+                .await
+            }
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -787,6 +829,8 @@ impl TransportReceiver for AnyReceiver {
             Self::File(t) => t.ack_control(),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.ack_control(),
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => t.ack_control(),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -799,7 +843,8 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http"
+            feature = "transport-http",
+            feature = "transport-syslog"
         )),
         allow(unused_variables)
     )]
@@ -877,6 +922,18 @@ impl TransportReceiver for AnyReceiver {
                 )
                 .await
             }
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => {
+                t.release(
+                    &extract_tokens(tokens, |tok| match tok {
+                        AnyToken::Syslog(s) => Some(*s),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }),
+                    outcome,
+                )
+                .await
+            }
             #[allow(unreachable_patterns)]
             _ => Err(TransportError::Config(
                 "no transport variant enabled".into(),
@@ -891,7 +948,8 @@ impl TransportReceiver for AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http"
+            feature = "transport-http",
+            feature = "transport-syslog"
         )),
         allow(unused_variables)
     )]
@@ -930,6 +988,12 @@ impl TransportReceiver for AnyReceiver {
             #[cfg(feature = "transport-http")]
             Self::Http(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
                 AnyToken::Http(h) => Some(h.clone()),
+                #[allow(unreachable_patterns)]
+                _ => None,
+            })),
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {
+                AnyToken::Syslog(s) => Some(*s),
                 #[allow(unreachable_patterns)]
                 _ => None,
             })),
@@ -1000,7 +1064,11 @@ async fn armed_grpc(
 /// Why a section under a memory or pipe source has no effect.
 #[cfg(all(
     feature = "config",
-    any(feature = "transport-memory", feature = "transport-pipe")
+    any(
+        feature = "transport-memory",
+        feature = "transport-pipe",
+        feature = "transport-syslog"
+    )
 ))]
 const NO_ACKNOWLEDGEMENT_TO_HOLD: &str = "acknowledgements has no effect here: this source has no \
      acknowledgement to hold, so the pipeline reports best effort";
@@ -1025,7 +1093,8 @@ const FILE_ACKNOWLEDGEMENT_NOT_HELD: &str = "acknowledgements is not supported o
         feature = "transport-memory",
         feature = "transport-pipe",
         feature = "transport-file",
-        feature = "transport-http"
+        feature = "transport-http",
+        feature = "transport-syslog"
     )
 ))]
 fn warn_acknowledgements_ignored(
@@ -1053,6 +1122,7 @@ fn warn_acknowledgements_ignored(
     feature = "transport-pipe",
     feature = "transport-file",
     feature = "transport-http",
+    feature = "transport-syslog",
 ))]
 fn extract_tokens<T>(tokens: &[AnyToken], pick: impl Fn(&AnyToken) -> Option<T>) -> Vec<T> {
     tokens.iter().filter_map(pick).collect()
@@ -1168,7 +1238,8 @@ impl AnyReceiver {
             feature = "transport-memory",
             feature = "transport-pipe",
             feature = "transport-file",
-            feature = "transport-http"
+            feature = "transport-http",
+            feature = "transport-syslog"
         )),
         allow(unused_variables)
     )]
@@ -1216,6 +1287,13 @@ impl AnyReceiver {
                     std::sync::atomic::AtomicBool::new(false);
                 warn_acknowledgements_ignored(key, "http", &WARNED, HTTP_ACKNOWLEDGEMENT_NOT_HELD);
                 Ok(Self::Http(t))
+            }
+            #[cfg(feature = "transport-syslog")]
+            Self::Syslog(t) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                warn_acknowledgements_ignored(key, "syslog", &WARNED, NO_ACKNOWLEDGEMENT_TO_HOLD);
+                Ok(Self::Syslog(t))
             }
         }
     }
@@ -1282,9 +1360,20 @@ impl AnyReceiver {
                  use a built-in type to receive"
             ))),
 
-            TransportType::Syslog => Err(TransportError::Config(
-                "transport type 'syslog' sends only: use a built-in type to receive".into(),
-            )),
+            #[cfg(feature = "transport-syslog")]
+            TransportType::Syslog => {
+                let listen = config
+                    .syslog
+                    .as_ref()
+                    .and_then(|syslog| syslog.listen.as_ref())
+                    .ok_or_else(|| {
+                        TransportError::Config(
+                            "syslog listen config missing: set syslog.listen to receive".into(),
+                        )
+                    })?;
+                let transport = super::syslog::SyslogReceiver::new(listen).await?;
+                Ok(Self::Syslog(transport))
+            }
             TransportType::Otlp => Err(TransportError::Config(
                 "transport type 'otlp' sends only: use a built-in type to receive".into(),
             )),
@@ -1349,9 +1438,12 @@ impl AnyReceiver {
     ///   `with_pressure(Some(governor.pressure()))`, so it sheds with 503 /
     ///   `Status::unavailable` while the pressure latch holds.
     ///
-    /// Backends with no inbound brake (memory, pipe, file) construct
-    /// exactly as in [`from_transport_config`](Self::from_transport_config) --
-    /// the byte-budget lever already reaches them through the governed driver.
+    /// Backends with no inbound brake the governor works (memory, pipe, file,
+    /// syslog) construct exactly as in
+    /// [`from_transport_config`](Self::from_transport_config). The byte-budget
+    /// lever reaches memory, pipe and file through the governed driver. The
+    /// syslog receiver's brake is its own queue of `recv_buffer_size` records:
+    /// a full one stops its TCP and TLS reads and drops datagrams.
     ///
     /// # Errors
     ///
@@ -1418,7 +1510,8 @@ impl AnyReceiver {
             #[cfg(any(
                 feature = "transport-memory",
                 feature = "transport-pipe",
-                feature = "transport-file"
+                feature = "transport-file",
+                feature = "transport-syslog"
             ))]
             _ => Self::from_transport_config(config).await,
 
