@@ -20,9 +20,9 @@ pub fn register(manager: &MetricsManager, config: &BatchProcessingConfig) {
     emit_thresholds(config);
 }
 
-/// Describe the batch engine's operational metrics, and the self-regulation
-/// ones when `governor` is on, into the manager's manifest registry, with no
-/// engine and no config needed.
+/// Describe the batch engine's operational metrics, and the received block size
+/// when `governor` is on, into the manager's manifest registry, with no engine
+/// and no config needed.
 pub fn describe(manager: &MetricsManager) {
     // Counters
     let _ = manager.counter(
@@ -46,43 +46,13 @@ pub fn describe(manager: &MetricsManager) {
         "Configured batch_processing.max_chunk_size",
     );
 
-    // Self-regulation governor observability (governor feature). Registered so
-    // the metrics manifest advertises them even before the first throttle.
+    // The one governor series the engine's driver writes. The governor's own
+    // are described with the other library series.
     #[cfg(feature = "governor")]
-    {
-        // Names MUST match the emit sites (gate.rs / driver.rs): all carry the
-        // `self_regulation_` domain prefix so the manifest advertises the same
-        // series that actually carry data (a bare `pressure_ratio` would also
-        // collide with MemoryGuard/ScalingPressure on the registry).
-        let _ = manager.gauge(
-            "self_regulation_byte_budget",
-            "Current AIMD byte budget (inbound block size lever)",
-        );
-        let _ = manager.gauge(
-            "self_regulation_recv_block_bytes",
-            "Bytes in the most recent received block (vs the byte budget)",
-        );
-        let _ = manager.gauge(
-            "self_regulation_pressure_ratio",
-            "Combined self-regulation pressure level (0.0-1.0)",
-        );
-        let _ = manager.gauge(
-            "self_regulation_inbound_paused",
-            "1 while the inbound gate is holding under pressure, else 0 (per source)",
-        );
-        let _ = manager.counter(
-            "self_regulation_inbound_pauses_total",
-            "Inbound gate pause (rising-edge) events (per source)",
-        );
-        let _ = manager.counter(
-            "self_regulation_kafka_gate_errors_total",
-            "Kafka pause/resume actuator failures (brake degraded)",
-        );
-        let _ = manager.counter(
-            "self_regulation_max_hold_releases_total",
-            "Inbound holds ended by max_hold with pressure above resume_below (per signal)",
-        );
-    }
+    let _ = manager.gauge(
+        "self_regulation_recv_block_bytes",
+        "Bytes in the most recent received block (vs the byte budget)",
+    );
 }
 
 /// Count one chunk the engine processed, once per chunk. `parsed` is `None`
@@ -150,15 +120,7 @@ mod tests {
             "batch_engine_max_chunk_size",
         ];
         #[cfg(feature = "governor")]
-        expected.extend([
-            "self_regulation_byte_budget",
-            "self_regulation_recv_block_bytes",
-            "self_regulation_pressure_ratio",
-            "self_regulation_inbound_paused",
-            "self_regulation_inbound_pauses_total",
-            "self_regulation_kafka_gate_errors_total",
-            "self_regulation_max_hold_releases_total",
-        ]);
+        expected.push("self_regulation_recv_block_bytes");
         expected.sort_unstable();
         assert_eq!(names(&described), expected);
         assert_eq!(names(&registered), expected);

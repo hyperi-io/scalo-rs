@@ -12,6 +12,7 @@ use metrics::{Counter, Gauge};
 
 use super::super::MetricsManager;
 use super::super::Series;
+use super::super::catalogue;
 
 /// Mandatory metrics for every application.
 ///
@@ -81,18 +82,16 @@ impl AppMetrics {
 
         // BARE name. The recorder's prefix layer adds the namespace at emit time.
         let config_key = "config_reloads_total";
-        manager.registry().describe(
-            "app",
-            &[Series::counter(config_key, "Config reload attempts").labels(&["result"])],
-        );
+        manager
+            .registry()
+            .describe("app", &[catalogue::config_reloads_total()]);
+        // The series `ServiceMetrics` owns: described the same way from either path.
+        manager
+            .registry()
+            .describe("platform", &[catalogue::records_received_total()]);
 
         Self {
-            records_received: manager.counter_with_labels(
-                "records_received_total",
-                "Records received from source",
-                &[],
-                "app",
-            ),
+            records_received: metrics::counter!("records_received_total"),
             records_processed: manager.counter_with_labels(
                 "records_processed_total",
                 "Records successfully processed",

@@ -77,6 +77,7 @@
 //! mgr.start_server_with_routes("0.0.0.0:9090", custom).await.unwrap();
 //! ```
 
+mod catalogue;
 mod container;
 pub mod labels;
 pub mod manifest;
@@ -679,6 +680,7 @@ impl MetricsManager {
             otel_provider: setup.otel_provider,
             gauge_refresh: None,
         };
+        catalogue::describe_library(&manager.registry);
         if manager.exporting() {
             manager.start_gauge_refresh();
         }

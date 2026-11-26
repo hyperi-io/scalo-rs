@@ -102,9 +102,13 @@ an app describing a platform metric again cannot strip its labels, group, use
 cases or dashboard hint. `registered_at` is when the running service's registry
 was created.
 
-The manifest lists what the registry holds, not everything `/metrics` serves:
-the process, container, HTTP client and memory guard gauges are served but not
-described (scalo-rs#137).
+The manifest holds the series scalo writes as well as the app's. `MetricsManager`
+describes the process, container, TLS, governor, secrets, HTTP client, Kafka,
+syslog, DLQ, worker pool and other library series when it is built, each under
+the feature of the code that writes it, so a build lists what it can serve.
+`src/metrics/catalogue.rs` has the entries. A test reads the source and fails on
+a series scalo writes that no manifest describes, and on a described one nothing
+writes.
 
 Two CLI subcommands produce the same JSON without running the service, reading
 `metrics.namespace` from the same config cascade the service loads.

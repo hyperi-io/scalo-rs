@@ -361,8 +361,9 @@ pub(crate) mod capture {
 #[cfg(all(test, feature = "transport-grpc"))]
 mod tests {
     use super::Meter;
+    use crate::source_census::{arguments, parenthesised, sources};
     use std::collections::{BTreeSet, HashMap};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     /// The committed metric set of `src/transport`.
     const FIXTURE: &str = "tests/fixtures/transport-metrics.txt";
@@ -506,52 +507,6 @@ mod tests {
         }
     }
 
-    /// The Rust files of `dir` and below, test modules cut, test files left out.
-    fn sources(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if path.is_dir() && name != "test_support" {
-                sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs")
-                && !name.contains("test")
-                && name != "core.rs"
-            {
-                let text = std::fs::read_to_string(&path).unwrap();
-                let cut = text.find("#[cfg(test)]\nmod tests {").unwrap_or(text.len());
-                out.push((path, text[..cut].to_string()));
-            }
-        }
-    }
-
-    /// `text`, which follows a `(`, up to its matching `)`.
-    fn parenthesised(text: &str) -> &str {
-        let mut depth = 1;
-        let end = text.char_indices().find(|&(_, c)| {
-            depth += i32::from(c == '(') - i32::from(c == ')');
-            depth == 0
-        });
-        &text[..end.map_or(text.len(), |(i, _)| i)]
-    }
-
-    /// Top-level comma-separated arguments.
-    fn arguments(args: &str) -> Vec<String> {
-        let (mut out, mut depth, mut current) = (Vec::new(), 0, String::new());
-        for c in args.chars() {
-            depth += i32::from("([{".contains(c)) - i32::from(")]}".contains(c));
-            if c == ',' && depth == 0 {
-                out.push(std::mem::take(&mut current));
-            } else {
-                current.push(c);
-            }
-        }
-        out.push(current);
-        out.into_iter()
-            .map(|a| a.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|a| !a.is_empty())
-            .collect()
-    }
-
     /// `src/transport`'s metric series, one `kind name labels` line each: every
     /// literal `metrics::` call, and every [`Meter`] count under its
     /// transport's label. A label value that is not a literal shows as `<expr>`.
@@ -559,6 +514,7 @@ mod tests {
         let mut files = Vec::new();
         sources(
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport"),
+            &["core.rs"],
             &mut files,
         );
         let transport_of = |path: &Path| -> String {
