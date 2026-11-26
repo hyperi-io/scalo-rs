@@ -2861,6 +2861,64 @@ mod deleted_topic {
         transport.close().await.expect("close");
     }
 
+    /// How long receives run with the subscribed topic gone.
+    const GONE_FOR: Duration = Duration::from_secs(30);
+
+    /// A topic named in the subscription, deleted under a live consumer and
+    /// created again: no receive fails while it is gone, and the consumer reads
+    /// what is written to it once it is back.
+    #[tokio::test]
+    async fn a_named_topic_deleted_and_recreated_never_fails_a_receive() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let topic = "deleted-named";
+        create_topic_with_partitions(&bootstrap, topic, PARTITIONS).await;
+        produce(&bootstrap, topic, 0..RECORDS).await;
+
+        let config = KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: "deleted-named-group".to_string(),
+            topics: vec![topic.to_string()],
+            ..Default::default()
+        }
+        .with_override("topic.metadata.refresh.interval.ms", "5000");
+        let transport = KafkaTransport::receiver(&config)
+            .await
+            .expect("kafka consumer");
+        let first = read(&transport, topic, RECORDS, CONSUMED_WITHIN).await;
+        assert_eq!(
+            first.len(),
+            RECORDS,
+            "the topic is read before it is deleted"
+        );
+
+        let admin = KafkaAdmin::new(&KafkaConfig {
+            brokers: vec![bootstrap.clone()],
+            group: String::new(),
+            ..Default::default()
+        })
+        .expect("kafka admin");
+        admin.delete_topics(&[topic]).await.expect("delete topic");
+        let gone_until = Instant::now() + GONE_FOR;
+        while Instant::now() < gone_until {
+            if let Err(e) = transport.recv(100).await {
+                panic!("a receive failed with the subscribed topic deleted: {e}");
+            }
+        }
+
+        create_topic_with_partitions(&bootstrap, topic, PARTITIONS).await;
+        produce(&bootstrap, topic, 0..RECORDS).await;
+        let again = read(&transport, topic, RECORDS, CONSUMED_WITHIN).await;
+        assert_eq!(
+            again.len(),
+            RECORDS,
+            "read {} of {RECORDS} records from the recreated topic",
+            again.len()
+        );
+        transport.close().await.expect("close");
+    }
+
     /// A short refresh, so the test waits seconds rather than the 60 s default.
     const FAST_REFRESH: Duration = Duration::from_secs(5);
 
