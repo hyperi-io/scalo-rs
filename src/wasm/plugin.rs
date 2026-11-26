@@ -131,6 +131,7 @@ impl Health {
 pub struct Plugin<W: World> {
     name: Arc<str>,
     digest: [u8; 32],
+    signer: String,
     pre: W::Pre,
     engine: Arc<EngineInner>,
     health: Health,
@@ -140,6 +141,7 @@ impl<W: World> Plugin<W> {
     pub(super) fn new(
         name: Arc<str>,
         digest: [u8; 32],
+        signer: String,
         pre: W::Pre,
         engine: Arc<EngineInner>,
     ) -> Self {
@@ -147,6 +149,7 @@ impl<W: World> Plugin<W> {
         Self {
             name,
             digest,
+            signer,
             pre,
             engine,
             health: Health {
@@ -166,6 +169,13 @@ impl<W: World> Plugin<W> {
     #[must_use]
     pub fn digest(&self) -> &[u8; 32] {
         &self.digest
+    }
+
+    /// Who signed it: a keyless identity, `key:` and the key's fingerprint, or
+    /// `unsigned`.
+    #[must_use]
+    pub fn signer(&self) -> &str {
+        &self.signer
     }
 
     /// `false` once the plugin has trapped `unhealthy_after_traps` times in a

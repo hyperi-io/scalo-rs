@@ -9,6 +9,10 @@
 use std::sync::Arc;
 
 use sha2::Digest;
+use sigstore_verify::bundle::builder::{BundleV03, VerificationMaterialV03};
+use sigstore_verify::crypto::KeyPair;
+use sigstore_verify::types::bundle::{MessageDigest, MessageSignature, SignatureContent};
+use sigstore_verify::types::{DigestBytes, HashAlgorithm};
 use wasmtime::component::{HasSelf, InstancePre, Linker};
 use wasmtime::{Store, Trap};
 
@@ -121,20 +125,55 @@ fn test_config() -> WasmConfig {
 const UNSIGNED_OK: TrustPolicy = TrustPolicy {
     allow_unsigned: true,
     sha256: None,
+    signers: Vec::new(),
 };
 
 fn load(config: WasmConfig) -> Arc<Plugin<FixtureWorld>> {
     let engine = WasmEngine::new(config).unwrap();
     let bytes = guest();
     engine
-        .load::<FixtureWorld>(
-            PluginSource::Bytes {
-                name: "fixture",
-                bytes: &bytes,
-            },
-            &UNSIGNED_OK,
-        )
+        .load::<FixtureWorld>(unsigned("fixture", &bytes), &UNSIGNED_OK)
         .unwrap()
+}
+
+fn unsigned<'a>(name: &'a str, bytes: &'a [u8]) -> PluginSource<'a> {
+    PluginSource::Bytes {
+        name,
+        bytes,
+        bundle: None,
+        signature: None,
+    }
+}
+
+/// A fresh P-256 key and the [`Signer`] that trusts it.
+fn operator_key() -> (KeyPair, Signer) {
+    let pair = KeyPair::generate_ecdsa_p256().unwrap();
+    let public_key = pair.public_key_der().unwrap().to_pem();
+    (pair, Signer::Key { public_key })
+}
+
+/// The base64 signature over `bytes` that `cosign sign-blob --key` writes.
+fn sign(pair: &KeyPair, bytes: &[u8]) -> Vec<u8> {
+    format!("{}\n", pair.sign(bytes).unwrap().to_base64()).into_bytes()
+}
+
+/// A bundle that parses but signs nothing these tests trust: a key-hint
+/// bundle with no certificate, so no keyless signer can accept it.
+fn keyless_impostor(pair: &KeyPair, bytes: &[u8]) -> Vec<u8> {
+    let digest: [u8; 32] = sha2::Sha256::digest(bytes).into();
+    let signature = MessageSignature::new(pair.sign(bytes).unwrap()).with_message_digest(
+        MessageDigest::new(HashAlgorithm::Sha2256, DigestBytes::new(digest.to_vec())),
+    );
+    BundleV03::new(
+        VerificationMaterialV03::PublicKey {
+            hint: "operator".to_string(),
+        },
+        SignatureContent::MessageSignature(signature),
+    )
+    .into_bundle()
+    .to_json()
+    .unwrap()
+    .into_bytes()
 }
 
 fn run(instance: &mut Instance<FixtureWorld>, op: u32, n: u32) -> Result<u32, CallError> {
@@ -266,15 +305,19 @@ fn the_loader_refuses_each_unsafe_plugin_before_any_guest_code_runs() {
     let last = flipped.len() - 1;
     flipped[last] ^= 0xff;
     let pinned = TrustPolicy {
-        allow_unsigned: true,
-        sha256: Some(digest),
+        sha256: Some(super::engine::hex(&digest)),
+        ..UNSIGNED_OK
+    };
+    let bad_pin = TrustPolicy {
+        sha256: Some("zz".to_string()),
+        ..UNSIGNED_OK
     };
     let small = WasmConfig {
         max_module_bytes: 16,
         ..test_config()
     };
 
-    let cases: [LoadCase<'_>; 9] = [
+    let cases: [LoadCase<'_>; 10] = [
         (
             "unsigned, refused by default",
             &good,
@@ -324,23 +367,192 @@ fn the_loader_refuses_each_unsafe_plugin_before_any_guest_code_runs() {
             None,
             Err("compile_error"),
         ),
+        (
+            "a pin that isn't hex",
+            &good,
+            &bad_pin,
+            None,
+            Err("bad_policy"),
+        ),
         ("the pinned digest", &good, &pinned, None, Ok(())),
         ("unsigned, allowed", &good, &UNSIGNED_OK, None, Ok(())),
     ];
     for (case, bytes, trust, config, want) in cases {
         let engine = WasmEngine::new(config.unwrap_or_else(test_config)).unwrap();
         let got = engine
-            .load::<FixtureWorld>(
-                PluginSource::Bytes {
-                    name: "case",
-                    bytes,
-                },
-                trust,
-            )
+            .load::<FixtureWorld>(unsigned("case", bytes), trust)
             .map(|_| ())
             .map_err(|e| e.outcome());
         assert_eq!(got, want, "{case}");
     }
+}
+
+#[test]
+fn a_signature_loads_only_when_a_trusted_signer_made_it_over_these_bytes() {
+    let good = guest();
+    let mut changed = good.clone();
+    let last = changed.len() - 1;
+    changed[last] ^= 0xff;
+    let (trusted, signer) = operator_key();
+    let (stranger, _) = operator_key();
+    let trusted_signature = sign(&trusted, &good);
+    let stranger_signature = sign(&stranger, &good);
+    let trusts_key = TrustPolicy {
+        signers: vec![signer.clone()],
+        ..TrustPolicy::default()
+    };
+    let keyless_and_key = TrustPolicy {
+        signers: vec![
+            Signer::Keyless {
+                identity:
+                    "https://github.com/acme/plugins/.github/workflows/release.yml@refs/heads/main"
+                        .to_string(),
+                issuer: "https://token.actions.githubusercontent.com".to_string(),
+            },
+            signer.clone(),
+        ],
+        ..TrustPolicy::default()
+    };
+    let trusts_nobody = TrustPolicy::default();
+    let impostor = keyless_impostor(&trusted, &good);
+
+    // (case, bytes, bundle, signature, policy, outcome)
+    let cases: [SignCase<'_>; 10] = [
+        (
+            "a trusted key",
+            &good,
+            None,
+            Some(&trusted_signature),
+            &trusts_key,
+            Ok(()),
+        ),
+        (
+            "a trusted key beside a keyless signer",
+            &good,
+            None,
+            Some(&trusted_signature),
+            &keyless_and_key,
+            Ok(()),
+        ),
+        (
+            "another key",
+            &good,
+            None,
+            Some(&stranger_signature),
+            &trusts_key,
+            Err("untrusted_signer"),
+        ),
+        (
+            "bytes changed after signing",
+            &changed,
+            None,
+            Some(&trusted_signature),
+            &trusts_key,
+            Err("untrusted_signer"),
+        ),
+        (
+            "a signature that isn't base64",
+            &good,
+            None,
+            Some(b"%%%"),
+            &trusts_key,
+            Err("bad_signature"),
+        ),
+        (
+            "a bundle that isn't one",
+            &good,
+            Some(b"{}"),
+            None,
+            &keyless_and_key,
+            Err("bad_signature"),
+        ),
+        (
+            "a bundle with no certificate",
+            &good,
+            Some(&impostor),
+            None,
+            &keyless_and_key,
+            Err("bad_signature"),
+        ),
+        (
+            "a bundle and a policy with no keyless signer",
+            &good,
+            Some(&impostor),
+            None,
+            &trusts_key,
+            Err("untrusted_signer"),
+        ),
+        (
+            "a policy naming no signer",
+            &good,
+            None,
+            Some(&trusted_signature),
+            &trusts_nobody,
+            Err("untrusted_signer"),
+        ),
+        (
+            "a bad signature where unsigned is allowed",
+            &good,
+            None,
+            Some(b"%%%"),
+            &UNSIGNED_OK,
+            Err("bad_signature"),
+        ),
+    ];
+    let engine = WasmEngine::new(test_config()).unwrap();
+    for (case, bytes, bundle, signature, trust, want) in cases {
+        let source = PluginSource::Bytes {
+            name: "case",
+            bytes,
+            bundle,
+            signature,
+        };
+        let got = engine
+            .load::<FixtureWorld>(source, trust)
+            .map(|_| ())
+            .map_err(|e| e.outcome());
+        assert_eq!(got, want, "{case}");
+    }
+
+    let source = PluginSource::Bytes {
+        name: "case",
+        bytes: &good,
+        bundle: None,
+        signature: Some(&trusted_signature),
+    };
+    let plugin = engine.load::<FixtureWorld>(source, &trusts_key).unwrap();
+    assert_eq!(plugin.signer(), signer.label());
+    assert!(plugin.signer().starts_with("key:"));
+}
+
+/// A case name, the bytes, the bundle, the signature, the policy and the
+/// outcome.
+type SignCase<'a> = (
+    &'a str,
+    &'a [u8],
+    Option<&'a [u8]>,
+    Option<&'a [u8]>,
+    &'a TrustPolicy,
+    Result<(), &'a str>,
+);
+
+#[test]
+fn a_signed_plugin_loads_from_a_path_with_its_signature_beside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("enrich.wasm");
+    let bytes = guest();
+    let (pair, signer) = operator_key();
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::write(dir.path().join("enrich.wasm.sig"), sign(&pair, &bytes)).unwrap();
+    let policy = TrustPolicy {
+        signers: vec![signer],
+        ..TrustPolicy::default()
+    };
+    let engine = WasmEngine::new(test_config()).unwrap();
+    let plugin = engine
+        .load::<FixtureWorld>(PluginSource::Path(&path), &policy)
+        .unwrap();
+    assert!(plugin.signer().starts_with("key:"));
 }
 
 #[test]

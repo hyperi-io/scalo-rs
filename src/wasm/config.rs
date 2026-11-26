@@ -8,6 +8,8 @@
 
 //! Limits for the wasm host runtime.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Limits every plugin on one [`WasmEngine`](super::WasmEngine) runs under.
@@ -53,6 +55,11 @@ pub struct WasmConfig {
 
     /// Largest `.wasm` file accepted, in bytes. Default 64 MiB.
     pub max_module_bytes: usize,
+
+    /// A Sigstore `trusted_root.json` that keyless signatures chain to. Unset
+    /// uses the public-good root built into scalo, which moves with scalo
+    /// releases. Loading never fetches one.
+    pub trusted_root_path: Option<PathBuf>,
 }
 
 const MIB: usize = 1024 * 1024;
@@ -71,6 +78,7 @@ impl Default for WasmConfig {
             recycle_above_memory_bytes: 64 * MIB,
             unhealthy_after_traps: 5,
             max_module_bytes: 64 * MIB,
+            trusted_root_path: None,
         }
     }
 }

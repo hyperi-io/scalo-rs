@@ -16,12 +16,23 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use sigstore_verify::trust_root::TrustedRoot;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
 
 use super::config::WasmConfig;
 use super::host::HostCtx;
 use super::plugin::{Plugin, World};
+use super::trust::{self, Evidence, Refusal, TrustPolicy};
+
+/// The keyless bundle beside a `.wasm` file: `name.wasm.sigstore.json`.
+const BUNDLE_SUFFIX: &str = ".sigstore.json";
+
+/// The key signature beside a `.wasm` file: `name.wasm.sig`.
+const SIGNATURE_SUFFIX: &str = ".sig";
+
+/// The `signer` a plugin loaded without a signature reports.
+pub(super) const UNSIGNED: &str = "unsigned";
 
 /// How often the ticker advances the epoch, and so the deadline's resolution.
 const EPOCH_TICK: Duration = Duration::from_millis(1);
@@ -48,6 +59,9 @@ pub enum EngineError {
     /// The epoch ticker thread would not start.
     #[error("wasm epoch ticker: {0}")]
     Ticker(#[source] std::io::Error),
+    /// The Sigstore trusted root would not load.
+    #[error("wasm trusted root: {0}")]
+    TrustedRoot(String),
 }
 
 /// Why a plugin did not load. Each variant is refused before any guest code
@@ -100,6 +114,30 @@ pub enum LoadError {
         /// The plugin.
         name: String,
     },
+    /// The signature bundle doesn't parse, or doesn't cover these bytes.
+    #[error("{name} has a bad signature: {detail}")]
+    BadSignature {
+        /// The plugin.
+        name: String,
+        /// sigstore's reason.
+        detail: String,
+    },
+    /// The signature holds up, but no signer in the policy made it.
+    #[error("{name} is not signed by a signer its trust policy names: {detail}")]
+    UntrustedSigner {
+        /// The plugin.
+        name: String,
+        /// sigstore's reason for the last signer tried.
+        detail: String,
+    },
+    /// The trust policy itself doesn't parse.
+    #[error("{name} has a trust policy that doesn't parse: {detail}")]
+    BadPolicy {
+        /// The plugin.
+        name: String,
+        /// What is wrong with it.
+        detail: String,
+    },
     /// The plugin imports an interface plugins may not use.
     #[error("{name} imports {import}, which plugins may not use")]
     ForbiddenImport {
@@ -138,6 +176,9 @@ impl LoadError {
             Self::NotWasm { .. } => "not_wasm",
             Self::DigestMismatch { .. } => "digest_mismatch",
             Self::Unsigned { .. } => "unsigned",
+            Self::BadSignature { .. } => "bad_signature",
+            Self::UntrustedSigner { .. } => "untrusted_signer",
+            Self::BadPolicy { .. } => "bad_policy",
             Self::ForbiddenImport { .. } => "forbidden_import",
             Self::OverLimits { .. } => "over_limits",
             Self::Compile { .. } => "compile_error",
@@ -145,10 +186,12 @@ impl LoadError {
     }
 }
 
-/// Where a plugin's `.wasm` comes from.
+/// Where a plugin's `.wasm` and the proof of who signed it come from.
 #[derive(Debug, Clone, Copy)]
 pub enum PluginSource<'a> {
-    /// A file. The plugin is named after its file stem.
+    /// A file, named after its stem. Its keyless bundle is the file beside it
+    /// with `.sigstore.json` added, and its key signature the one with `.sig`
+    /// added.
     Path(&'a Path),
     /// Bytes already in memory.
     Bytes {
@@ -156,16 +199,11 @@ pub enum PluginSource<'a> {
         name: &'a str,
         /// The `.wasm`.
         bytes: &'a [u8],
+        /// A keyless Sigstore bundle, JSON.
+        bundle: Option<&'a [u8]>,
+        /// A key signature, base64.
+        signature: Option<&'a [u8]>,
     },
-}
-
-/// What a plugin must prove before it loads.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TrustPolicy {
-    /// Load a plugin with no signature, warning on every load. Default `false`.
-    pub allow_unsigned: bool,
-    /// The sha256 the `.wasm` must have.
-    pub sha256: Option<[u8; 32]>,
 }
 
 /// Advances the engine's epoch every [`EPOCH_TICK`] until dropped.
@@ -208,6 +246,7 @@ pub(super) struct EngineInner {
     pub(super) engine: Engine,
     pub(super) config: WasmConfig,
     pub(super) deadline_ticks: u64,
+    trusted_root: TrustedRoot,
     _ticker: Ticker,
 }
 
@@ -221,6 +260,8 @@ pub struct WasmEngine {
 impl WasmEngine {
     /// Start an engine with `config`'s caps.
     pub fn new(config: WasmConfig) -> Result<Self, EngineError> {
+        let trusted_root = trust::trusted_root(config.trusted_root_path.as_deref())
+            .map_err(EngineError::TrustedRoot)?;
         let engine = Engine::new(&engine_config(&config)).map_err(EngineError::Config)?;
         let ticker = Ticker::start(engine.clone()).map_err(EngineError::Ticker)?;
         // One tick more than the timeout, so a call never gets less than it.
@@ -230,6 +271,7 @@ impl WasmEngine {
                 engine,
                 config,
                 deadline_ticks,
+                trusted_root,
                 _ticker: ticker,
             }),
         })
@@ -244,10 +286,11 @@ impl WasmEngine {
     /// Check, compile and link a plugin for world `W`.
     ///
     /// Refuses, in order: a file over `max_module_bytes`, precompiled code,
-    /// anything that isn't WebAssembly, a digest that isn't the pinned one, an
-    /// unsigned plugin the policy doesn't allow, a forbidden import, and a
-    /// plugin that needs more than the engine's caps. Compiling is CPU-bound,
-    /// so call this from a blocking thread, never an async task.
+    /// anything that isn't WebAssembly, a digest that isn't the pinned one, a
+    /// bad signature or one no trusted signer made, an unsigned plugin the
+    /// policy doesn't allow, a forbidden import, and a plugin that needs more
+    /// than the engine's caps. Compiling is CPU-bound, so call this from a
+    /// blocking thread, never an async task.
     pub fn load<W: World>(
         &self,
         source: PluginSource<'_>,
@@ -255,12 +298,25 @@ impl WasmEngine {
     ) -> Result<Arc<Plugin<W>>, LoadError> {
         let limit = self.inner.config.max_module_bytes;
         let read: Vec<u8>;
-        let (name, bytes): (String, &[u8]) = match source {
+        let read_bundle: Option<Vec<u8>>;
+        let read_signature: Option<Vec<u8>>;
+        let (name, bytes, evidence): (String, &[u8], Evidence<'_>) = match source {
             PluginSource::Path(path) => {
                 read = read_capped(path, limit)?;
-                (plugin_name(path), &read)
+                read_bundle = read_beside(path, BUNDLE_SUFFIX, limit)?;
+                read_signature = read_beside(path, SIGNATURE_SUFFIX, limit)?;
+                let evidence = Evidence {
+                    bundle: read_bundle.as_deref(),
+                    signature: read_signature.as_deref(),
+                };
+                (plugin_name(path), &read, evidence)
             }
-            PluginSource::Bytes { name, bytes } => (name.to_string(), bytes),
+            PluginSource::Bytes {
+                name,
+                bytes,
+                bundle,
+                signature,
+            } => (name.to_string(), bytes, Evidence { bundle, signature }),
         };
 
         if bytes.len() > limit {
@@ -273,19 +329,36 @@ impl WasmEngine {
             return Err(LoadError::NotWasm { name });
         }
         let digest: [u8; 32] = Sha256::digest(bytes).into();
-        if let Some(expected) = trust.sha256
-            && expected != digest
-        {
-            return Err(LoadError::DigestMismatch {
-                name,
-                expected: hex(&expected),
-                actual: hex(&digest),
-            });
+        if let Some(pinned) = &trust.sha256 {
+            let Some(expected) = trust::parse_sha256(pinned) else {
+                return Err(LoadError::BadPolicy {
+                    name,
+                    detail: format!("sha256 {pinned:?} is not 64 hex digits"),
+                });
+            };
+            if expected != digest {
+                return Err(LoadError::DigestMismatch {
+                    name,
+                    expected: hex(&expected),
+                    actual: hex(&digest),
+                });
+            }
         }
-        if !trust.allow_unsigned {
-            return Err(LoadError::Unsigned { name });
-        }
-        tracing::warn!(plugin = %name, sha256 = %hex(&digest), "wasm: loading an unsigned plugin, as its trust policy allows");
+        let signer = if evidence.is_empty() {
+            if !trust.allow_unsigned {
+                return Err(LoadError::Unsigned { name });
+            }
+            tracing::warn!(plugin = %name, sha256 = %hex(&digest), "wasm: loading an unsigned plugin, as its trust policy allows");
+            UNSIGNED.to_string()
+        } else {
+            match trust::check(bytes, evidence, trust, &self.inner.trusted_root) {
+                Ok(signer) => signer,
+                Err(Refusal::Bad(detail)) => return Err(LoadError::BadSignature { name, detail }),
+                Err(Refusal::Untrusted(detail)) => {
+                    return Err(LoadError::UntrustedSigner { name, detail });
+                }
+            }
+        };
 
         let engine = &self.inner.engine;
         let component = Component::from_binary(engine, bytes).map_err(|e| LoadError::Compile {
@@ -307,6 +380,7 @@ impl WasmEngine {
         Ok(Arc::new(Plugin::new(
             Arc::from(name),
             digest,
+            signer,
             pre,
             Arc::clone(&self.inner),
         )))
@@ -424,7 +498,18 @@ fn read_capped(path: &Path, limit: usize) -> Result<Vec<u8>, LoadError> {
     Ok(bytes)
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// The file beside `path` with `suffix` added, or `None` when there is none.
+fn read_beside(path: &Path, suffix: &str, limit: usize) -> Result<Option<Vec<u8>>, LoadError> {
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(suffix);
+    let beside = PathBuf::from(beside);
+    if !beside.exists() {
+        return Ok(None);
+    }
+    read_capped(&beside, limit).map(Some)
+}
+
+pub(super) fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     bytes
         .iter()
