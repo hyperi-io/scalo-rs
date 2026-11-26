@@ -84,6 +84,8 @@ pub mod manifest;
 #[cfg(any(feature = "metrics", feature = "otel-metrics"))]
 mod prefix;
 mod process;
+#[cfg(feature = "metrics")]
+mod reresolve;
 pub mod service;
 
 pub use labels::{AuthFailureReason, FlushTrigger, TransportKind, ValidationFailureReason};
@@ -202,6 +204,10 @@ pub struct MetricsConfig {
     pub enable_container_metrics: bool,
     /// Update interval for auto-collected metrics.
     pub update_interval: Duration,
+    /// How long a counter or histogram may go without an update before it
+    /// leaves the Prometheus render. `None` keeps every series. Gauges never
+    /// expire, because many are set once at startup.
+    pub idle_timeout: Option<Duration>,
     /// OTel-specific configuration (only used when `otel-metrics` feature is enabled).
     #[cfg(feature = "otel-metrics")]
     pub otel: OtelMetricsConfig,
@@ -235,6 +241,7 @@ impl Default for MetricsConfig {
             enable_process_metrics: true,
             enable_container_metrics: true,
             update_interval: Duration::from_secs(15),
+            idle_timeout: None,
             #[cfg(feature = "otel-metrics")]
             otel: OtelMetricsConfig::default(),
         }
@@ -278,6 +285,12 @@ pub struct MetricsSettings {
     /// `metrics.update_interval_secs`. Unset, 15. 0 does not parse.
     #[serde(default)]
     pub update_interval_secs: Option<std::num::NonZeroU64>,
+
+    /// Seconds a counter or histogram may go without an update before it
+    /// leaves `/metrics`, under `metrics.idle_timeout_secs`. Unset, series
+    /// never expire. 0 does not parse.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<std::num::NonZeroU64>,
 }
 
 impl MetricsSettings {
@@ -322,6 +335,9 @@ impl MetricsSettings {
                 .map_or(defaults.update_interval, |secs| {
                     Duration::from_secs(secs.get())
                 }),
+            idle_timeout: self
+                .idle_timeout_secs
+                .map(|secs| Duration::from_secs(secs.get())),
             #[cfg(feature = "otel-metrics")]
             otel,
             ..defaults
@@ -397,10 +413,35 @@ where
 #[cfg(all(feature = "metrics", feature = "otel-metrics"))]
 fn install_prom_only(
     namespace: &str,
-    recorder: metrics_exporter_prometheus::PrometheusRecorder,
+    recorder: PromRecorder,
+    handle: PrometheusHandle,
 ) -> PrometheusHandle {
-    let handle = recorder.handle();
     install_prefixed(namespace, recorder, handle)
+}
+
+/// The Prometheus recorder to install as scrape backend.
+#[cfg(feature = "metrics")]
+type PromRecorder = reresolve::ReResolveRecorder<metrics_exporter_prometheus::PrometheusRecorder>;
+
+/// A Prometheus recorder that drops counters and histograms idle past
+/// `idle_timeout` from the render, and its handle. Gauges are exempt: build
+/// info and config values are set once at startup and never touched again.
+/// With a timeout, counter and histogram handles look their series up on
+/// each write, so a handle held across an expiry brings its series back.
+#[cfg(feature = "metrics")]
+fn prometheus_recorder(idle_timeout: Option<Duration>) -> (PromRecorder, PrometheusHandle) {
+    use metrics_util::MetricKindMask;
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .idle_timeout(
+            MetricKindMask::COUNTER | MetricKindMask::HISTOGRAM,
+            idle_timeout,
+        )
+        .build_recorder();
+    let handle = recorder.handle();
+    (
+        reresolve::ReResolveRecorder::new(recorder, idle_timeout.is_some()),
+        handle,
+    )
 }
 
 /// Intermediate struct to pass recorder setup results across cfg boundaries.
@@ -423,10 +464,9 @@ fn install_recorders(
     // --- Prometheus only (no OTel) ---
     #[cfg(all(feature = "metrics", not(feature = "otel-metrics")))]
     {
-        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        // Take the handle from the inner Prometheus recorder BEFORE wrapping:
-        // it shares the registry, so it renders the (prefixed) names too.
-        let handle = recorder.handle();
+        // The handle shares the inner Prometheus registry, so it renders the
+        // (prefixed) names too.
+        let (recorder, handle) = prometheus_recorder(config.idle_timeout);
         // Namespace prefixing happens in ONE place -- the prefix layer on the
         // global recorder. Empty namespace -> install bare.
         RecorderSetup {
@@ -488,8 +528,7 @@ fn install_recorders(
     #[cfg(all(feature = "metrics", feature = "otel-metrics"))]
     {
         // Build Prometheus recorder (without installing globally)
-        let prom_recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-        let prom_handle = prom_recorder.handle();
+        let (prom_recorder, prom_handle) = prometheus_recorder(config.idle_timeout);
 
         if !config.otel.is_active() {
             tracing::info!(
@@ -497,7 +536,11 @@ fn install_recorders(
                 "OTLP metric push disabled; serving Prometheus scrape only"
             );
             return RecorderSetup {
-                prom_handle: Some(install_prom_only(&config.namespace, prom_recorder)),
+                prom_handle: Some(install_prom_only(
+                    &config.namespace,
+                    prom_recorder,
+                    prom_handle,
+                )),
                 otel_provider: None,
             };
         }
@@ -532,7 +575,11 @@ fn install_recorders(
                 // Fallback: just Prometheus if OTel fails
                 tracing::warn!(error = %e, "Failed to build OTel recorder, falling back to Prometheus only");
                 RecorderSetup {
-                    prom_handle: Some(install_prom_only(&config.namespace, prom_recorder)),
+                    prom_handle: Some(install_prom_only(
+                        &config.namespace,
+                        prom_recorder,
+                        prom_handle,
+                    )),
                     otel_provider: None,
                 }
             }
@@ -1768,10 +1815,8 @@ mod tests {
         assert_eq!(bare.namespace, "");
 
         // The refresh interval: 15 s unset, the value given, and 0 refused.
-        assert_eq!(
-            bare.into_config("app").update_interval,
-            Duration::from_secs(15)
-        );
+        let bare = bare.into_config("app");
+        assert_eq!(bare.update_interval, Duration::from_secs(15));
         let every_five: MetricsSettings =
             serde_json::from_str(r#"{"update_interval_secs":5}"#).expect("valid interval");
         assert_eq!(
@@ -1779,6 +1824,79 @@ mod tests {
             Duration::from_secs(5)
         );
         assert!(serde_json::from_str::<MetricsSettings>(r#"{"update_interval_secs":0}"#).is_err());
+
+        // The idle timeout: off unset, the value given, and 0 refused.
+        assert_eq!(bare.idle_timeout, None);
+        let idle: MetricsSettings =
+            serde_json::from_str(r#"{"idle_timeout_secs":300}"#).expect("valid timeout");
+        assert_eq!(
+            idle.into_config("app").idle_timeout,
+            Some(Duration::from_secs(300))
+        );
+        assert!(serde_json::from_str::<MetricsSettings>(r#"{"idle_timeout_secs":0}"#).is_err());
+    }
+
+    /// Render after `idle` with the given timeout: what a once-touched
+    /// counter, histogram and gauge leave behind, plus a counter re-emitted
+    /// by name and a counter and histogram written through handles held
+    /// across the expiry, as the metric groups hold them.
+    #[cfg(feature = "metrics")]
+    fn render_after_idle(timeout: Option<Duration>, idle: Duration) -> String {
+        let (recorder, handle) = prometheus_recorder(timeout);
+        let (held, held_latency) = metrics::with_local_recorder(&recorder, || {
+            metrics::gauge!("idle_startup_info").set(1.0);
+            metrics::counter!("idle_renamed_total").increment(1);
+            metrics::counter!("idle_reemitted_total").increment(1);
+            metrics::histogram!("idle_latency_seconds").record(0.1);
+            (
+                metrics::counter!("idle_held_total", "kind" => "error"),
+                metrics::histogram!("idle_held_seconds"),
+            )
+        });
+        held.increment(1);
+        held_latency.record(0.1);
+        // The first render starts each series' idle clock.
+        handle.render();
+        std::thread::sleep(idle);
+        handle.render();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::counter!("idle_reemitted_total").increment(1);
+        });
+        held.increment(1);
+        held_latency.record(0.2);
+        handle.render()
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn idle_timeout_drops_idle_counters_and_histograms_and_keeps_gauges() {
+        let short = Some(Duration::from_millis(50));
+        let wait = Duration::from_millis(200);
+        // (timeout, series, present after the idle wait)
+        let cases = [
+            (None, "idle_startup_info", true),
+            (None, "idle_renamed_total", true),
+            (None, "idle_latency_seconds", true),
+            (None, "idle_held_total{kind=\"error\"} 2", true),
+            (None, "idle_held_seconds_count 2", true),
+            (short, "idle_startup_info 1", true),
+            (short, "idle_renamed_total", false),
+            (short, "idle_latency_seconds", false),
+            (short, "idle_reemitted_total 1", true),
+            // A handle held across the expiry brings its series back from zero.
+            (short, "idle_held_total{kind=\"error\"} 1", true),
+            (short, "idle_held_seconds_count 1", true),
+        ];
+        let off = render_after_idle(None, wait);
+        let on = render_after_idle(short, wait);
+        for (timeout, series, present) in cases {
+            let render = if timeout.is_some() { &on } else { &off };
+            assert_eq!(
+                render.contains(series),
+                present,
+                "{series} with timeout {timeout:?}:\n{render}"
+            );
+        }
     }
 
     #[test]

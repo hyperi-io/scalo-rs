@@ -13,6 +13,8 @@ provisioning, alert validators, the data-plane docs site).
 
 Process and container metrics (RSS, CPU, open descriptors, cgroup limits) refresh every `update_interval` via [sysinfo](https://crates.io/crates/sysinfo) while the `/metrics` server or OTLP push runs, and container metrics read cgroup v1 and v2 transparently. `update_interval` is 15 s, and `metrics.update_interval_secs` sets it from the cascade (0 does not parse). Each refresh reads this process's CPU time and memory alone.
 
+`metrics.idle_timeout_secs` drops a counter or histogram from `/metrics` once it has gone that many seconds without an update, so series for a renamed or removed component don't pile up across config reloads. Unset (the default), nothing expires, and 0 does not parse. Gauges never expire, because build info and config values are set once at startup. The check runs on each render, so a series leaves on the first scrape after the timeout. A dropped series comes back from zero on its next write, through `counter!` or through a `Counter` or `Histogram` handle held across the expiry. With the timeout on, those handles look their series up on each write, which costs one registry lookup per write.
+
 | Gauge | Unit | Where |
 | --- | --- | --- |
 | `process_cpu_seconds_total` | `s` | everywhere sysinfo reads the process |
