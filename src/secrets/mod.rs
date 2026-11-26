@@ -312,7 +312,7 @@ impl SecretsManager {
     ///
     /// The manager must have its cache off, so `cache_key` only keys the fetch
     /// lock and never reaches a cache entry.
-    #[cfg(any(test, feature = "secrets-aws"))]
+    #[cfg(any(test, feature = "secrets-aws", feature = "secrets-vault"))]
     pub(crate) async fn get_one_off(
         &self,
         cache_key: &str,

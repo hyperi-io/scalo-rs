@@ -280,25 +280,111 @@ fn secrets_config_for_lookup() -> Result<super::SecretsConfig, CredentialError> 
     ))
 }
 
+/// The shared manager that every one-off `vault:` lookup against one OpenBao
+/// connection uses, so its provider logs in once and later lookups reuse the
+/// client.
+///
+/// The key is a digest of the whole resolved connection, credential included,
+/// so a token file rewritten while the process runs resolves to a new key and
+/// a new manager rather than the old token.
+#[cfg(feature = "secrets-vault")]
+async fn shared_vault_manager(
+    config: super::SecretsConfig,
+) -> Result<std::sync::Arc<super::SecretsManager>, CredentialError> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+
+    use super::{SecretsConfig, SecretsManager};
+
+    static MANAGERS: OnceLock<tokio::sync::Mutex<HashMap<[u8; 32], Arc<SecretsManager>>>> =
+        OnceLock::new();
+
+    let Some(openbao) = config.openbao else {
+        unreachable!("invariant: secrets_config_for_lookup always sets the openbao section")
+    };
+    let key = connection_digest(&openbao);
+
+    // Held across the build, so concurrent first lookups build the manager once.
+    let mut managers = MANAGERS
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+    if let Some(manager) = managers.get(&key) {
+        return Ok(Arc::clone(manager));
+    }
+
+    let mut build = SecretsConfig {
+        openbao: Some(openbao),
+        ..SecretsConfig::default()
+    };
+    without_cache(&mut build);
+    let manager = Arc::new(SecretsManager::new(build).map_err(|e| {
+        CredentialError::Vault(format!("failed to initialise secrets manager: {e}"))
+    })?);
+    managers.insert(key, Arc::clone(&manager));
+    Ok(manager)
+}
+
+/// SHA-256 over every field of an OpenBao connection, each one NUL-terminated.
+#[cfg(feature = "secrets-vault")]
+fn connection_digest(openbao: &super::OpenBaoConfig) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    use super::OpenBaoAuth;
+
+    let mut hasher = Sha256::new();
+    let mut field = |value: &str| {
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    };
+    field(&openbao.address);
+    field(openbao.namespace.as_deref().unwrap_or(""));
+    field(openbao.ca_cert.as_deref().unwrap_or(""));
+    field(if openbao.skip_verify { "1" } else { "0" });
+    field(&openbao.timeout_secs.to_string());
+    match &openbao.auth {
+        OpenBaoAuth::Token { token } => {
+            field("token");
+            field(token.expose());
+        }
+        OpenBaoAuth::AppRole {
+            role_id,
+            secret_id,
+            mount,
+        } => {
+            field("approle");
+            field(role_id);
+            field(secret_id.expose());
+            field(mount);
+        }
+        OpenBaoAuth::Kubernetes {
+            role,
+            token_path,
+            mount,
+        } => {
+            field("kubernetes");
+            field(role);
+            field(token_path);
+            field(mount);
+        }
+    }
+    hasher.finalize().into()
+}
+
 #[cfg(feature = "secrets-vault")]
 async fn resolve_vault(spec: &str, path: &str, key: &str) -> Result<String, CredentialError> {
-    use super::{SecretSource, SecretsManager};
+    use super::SecretSource;
 
     let name = one_off_source_name(spec);
-    let mut config = secrets_config_for_lookup()?;
-    config.sources.insert(
-        name.clone(),
-        SecretSource::OpenBao {
-            path: path.to_string(),
-            key: key.to_string(),
-        },
-    );
-
-    let secrets = SecretsManager::new(config).map_err(|e| {
-        CredentialError::Vault(format!("failed to initialise secrets manager: {e}"))
-    })?;
+    let secrets = shared_vault_manager(secrets_config_for_lookup()?).await?;
     let value = secrets
-        .get(&name)
+        .get_one_off(
+            &name,
+            &SecretSource::OpenBao {
+                path: path.to_string(),
+                key: key.to_string(),
+            },
+        )
         .await
         .map_err(|e| CredentialError::Vault(format!("lookup failed for {path}:{key}: {e}")))?;
     let text = value
@@ -347,8 +433,7 @@ fn secrets_config_for_aws_lookup() -> Result<super::SecretsConfig, CredentialErr
 /// lookup, so each region and endpoint pair builds one manager and later
 /// lookups reuse it. `AwsProvider::new` reads nothing else from the config,
 /// and the SDK refreshes the credentials it found itself, so the pair is the
-/// whole key. OpenBao is not shared: its token file can be rewritten while
-/// the process runs.
+/// whole key.
 #[cfg(feature = "secrets-aws")]
 async fn shared_aws_manager(
     config: super::SecretsConfig,
@@ -911,6 +996,59 @@ mod tests {
             .filter(|endpoint| endpoint.as_deref() == Some(ENDPOINT))
             .count();
         assert_eq!(builds, 1, "three aws specs must build one provider");
+    }
+
+    /// Several one-off `vault:` lookups against one connection build one Vault
+    /// client, and a changed token builds another rather than reusing the old.
+    #[tokio::test]
+    #[cfg(all(feature = "secrets-vault", feature = "config"))]
+    async fn vault_lookups_share_one_client_per_connection() {
+        use super::super::vault::CLIENT_BUILDS;
+
+        // A closed port of its own keeps the count to this test when tests share
+        // a process, and refuses every read.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let address = format!("http://127.0.0.1:{port}");
+        let home = tempfile::tempdir().unwrap();
+        let lookups = |token: &'static str, specs: &'static [&'static str]| {
+            temp_env::async_with_vars(
+                [
+                    ("VAULT_ADDR", Some(address.clone())),
+                    ("VAULT_TOKEN", Some(token.to_string())),
+                    ("OPENBAO_TOKEN", None),
+                    ("BAO_TOKEN", None),
+                    ("OPENBAO_ROOT_TOKEN", None),
+                    ("VAULT_ROLE_ID", None),
+                    ("VAULT_SECRET_ID", None),
+                    ("VAULT_K8S_ROLE", None),
+                    ("VAULT_TOKEN_FILE", None),
+                    ("HOME", home.path().to_str().map(str::to_string)),
+                ],
+                async move {
+                    for spec in specs {
+                        let error = resolve(spec).await.unwrap_err().to_string();
+                        assert!(error.contains("lookup failed"), "{error}");
+                    }
+                },
+            )
+        };
+        let builds = || {
+            CLIENT_BUILDS
+                .lock()
+                .iter()
+                .filter(|a| **a == address)
+                .count()
+        };
+
+        lookups("first", &["vault:kv/a:k", "vault:kv/b:k", "vault:kv/c:k"]).await;
+        assert_eq!(builds(), 1, "three vault specs must build one client");
+
+        lookups("second", &["vault:kv/a:k"]).await;
+        assert_eq!(builds(), 2, "a changed token must build its own client");
     }
 
     /// One manager serves several one-off specs, and each spec reads its own
