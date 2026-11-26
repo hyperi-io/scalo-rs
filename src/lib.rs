@@ -312,6 +312,10 @@ pub mod output;
 #[cfg_attr(docsrs, doc(cfg(feature = "expression")))]
 pub mod expression;
 
+#[cfg(feature = "wasm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "wasm")))]
+pub mod wasm;
+
 #[cfg(feature = "rules")]
 #[cfg_attr(docsrs, doc(cfg(feature = "rules")))]
 pub mod rules;

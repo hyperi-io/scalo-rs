@@ -197,6 +197,11 @@ secrets-all = ["secrets-vault", "secrets-aws"]
 # docs/api/tls.md
 tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:arc-swap", "dep:sha2", "base64", "tokio", "tracing"]
 
+# The wasmtime host runtime. Off by default and out of `full`: it adds the compiler to the build.
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha2", "tracing"]
+# Test guests written as WAT. Never in a shipping build, so production never parses text.
+wasm-test-support = ["wasm", "dep:wat"]
+
 # Can leak secrets: not in `full`, off in every shipping build.
 dangerous-diagnostics = []
 
@@ -362,6 +367,13 @@ vaultrs = { version = ">=0.8.0, <0.9", optional = true }
 aws-config = { version = ">=1.13.4, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
 # Never below 1.117: the first release to need aws-smithy-json 0.63.1.
 aws-sdk-secretsmanager = { version = ">=1.130.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+
+# Held to the 48 LTS line, moved LTS to LTS. No `cache`: a disk cache of compiled code is a .cwasm.
+wasmtime = { version = ">=48.0.10, <49", default-features = false, features = ["runtime", "std", "cranelift", "component-model", "pooling-allocator", "parallel-compilation", "addr2line"], optional = true }
+# `p2` turns on `wasmtime/async`, which the sync linker compiles in and never calls.
+wasmtime-wasi = { version = ">=48.0.10, <49", default-features = false, features = ["p2"], optional = true }
+# WAT to .wasm for test guests.
+wat = { version = ">=1.263.0, <2", optional = true }
 
 # One `rdkafka` per target: `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys.
 # docs/deployment/native-deps.md
