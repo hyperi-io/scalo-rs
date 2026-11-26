@@ -300,13 +300,7 @@ The OTLP resource names the replica, so each pod of a service writes its own ser
 
 ## Testing
 
-Parallel tests panic if multiple call `MetricsManager::new()` -- the global
-Prometheus recorder installs once per process. scalo's own tests use the
-crate-private `new_for_test()`: it skips the install but keeps the registry,
-descriptor push, and namespacing, and the macros become no-ops. A consumer's
-tests get one process per test under `cargo nextest`. Most of scalo's tests verify
-descriptor registration and naming, not recorded values. Recording itself is
-verified in the integration suite, where one fixture installs the recorder.
+The global recorder installs once per process. The first `MetricsManager` installs it, and every later one renders that installed recorder, which every metric in the process reaches, so two managers in one test process both render what was recorded. They share one namespace prefix, the first manager's. A recorder installed from outside scalo leaves a manager's `render()` empty, with a warning. scalo's own tests use the crate-private `new_for_test()`, which skips the install but keeps the registry, descriptor push and namespacing.
 
 ---
 

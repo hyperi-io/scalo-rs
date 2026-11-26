@@ -346,20 +346,60 @@ pub fn shutdown_otel_export() {
     }
 }
 
+/// The Prometheus handle of the recorder a manager installed globally. A
+/// recorder installs once per process, so a later manager renders this one,
+/// which every metric reaches, rather than an empty registry of its own.
+#[cfg(feature = "metrics")]
+static INSTALLED_PROM: std::sync::OnceLock<PrometheusHandle> = std::sync::OnceLock::new();
+
+/// Install `recorder` globally and return the handle a manager renders: its
+/// own `handle` when the install took, the installed one when an earlier
+/// manager's did.
+#[cfg(feature = "metrics")]
+fn install_global<R>(recorder: R, handle: PrometheusHandle) -> PrometheusHandle
+where
+    R: metrics::Recorder + Sync + 'static,
+{
+    if metrics::set_global_recorder(recorder).is_ok() {
+        // Only the first install succeeds, so this set does too.
+        let _ = INSTALLED_PROM.set(handle.clone());
+        return handle;
+    }
+    if let Some(installed) = INSTALLED_PROM.get() {
+        tracing::debug!("global metrics recorder already installed; rendering the installed one");
+        return installed.clone();
+    }
+    tracing::warn!(
+        "a global metrics recorder from outside scalo is installed, so this manager's render() is empty"
+    );
+    handle
+}
+
+/// Install `recorder` under `namespace`'s prefix, or bare for an empty one.
+#[cfg(feature = "metrics")]
+fn install_prefixed<R>(namespace: &str, recorder: R, handle: PrometheusHandle) -> PrometheusHandle
+where
+    R: metrics::Recorder + Sync + 'static,
+{
+    if namespace.is_empty() {
+        install_global(recorder, handle)
+    } else {
+        install_global(
+            prefix::PrefixRecorder::new(namespace.to_string(), recorder),
+            handle,
+        )
+    }
+}
+
 /// Scrape-only install, used when OTLP is switched off or its exporter cannot
 /// be built. Losing the push path must never cost the `/metrics` endpoint.
 #[cfg(all(feature = "metrics", feature = "otel-metrics"))]
-fn install_prom_only(namespace: &str, recorder: metrics_exporter_prometheus::PrometheusRecorder) {
-    if namespace.is_empty() {
-        if let Err(e) = metrics::set_global_recorder(recorder) {
-            tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-        }
-    } else {
-        let prefixed = prefix::PrefixRecorder::new(namespace.to_string(), recorder);
-        if let Err(e) = metrics::set_global_recorder(prefixed) {
-            tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-        }
-    }
+fn install_prom_only(
+    namespace: &str,
+    recorder: metrics_exporter_prometheus::PrometheusRecorder,
+) -> PrometheusHandle {
+    let handle = recorder.handle();
+    install_prefixed(namespace, recorder, handle)
 }
 
 /// Intermediate struct to pass recorder setup results across cfg boundaries.
@@ -388,18 +428,8 @@ fn install_recorders(
         let handle = recorder.handle();
         // Namespace prefixing happens in ONE place -- the prefix layer on the
         // global recorder. Empty namespace -> install bare.
-        if config.namespace.is_empty() {
-            if let Err(e) = metrics::set_global_recorder(recorder) {
-                tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-            }
-        } else {
-            let prefixed = prefix::PrefixRecorder::new(config.namespace.clone(), recorder);
-            if let Err(e) = metrics::set_global_recorder(prefixed) {
-                tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-            }
-        }
         RecorderSetup {
-            prom_handle: Some(handle),
+            prom_handle: Some(install_prefixed(&config.namespace, recorder, handle)),
         }
     }
 
@@ -465,9 +495,8 @@ fn install_recorders(
                 reason = otel_types::inactive_reason(&config.otel),
                 "OTLP metric push disabled; serving Prometheus scrape only"
             );
-            install_prom_only(&config.namespace, prom_recorder);
             return RecorderSetup {
-                prom_handle: Some(prom_handle),
+                prom_handle: Some(install_prom_only(&config.namespace, prom_recorder)),
                 otel_provider: None,
             };
         }
@@ -493,28 +522,16 @@ fn install_recorders(
                     .add_recorder(otel_recorder)
                     .build();
 
-                if config.namespace.is_empty() {
-                    if let Err(e) = metrics::set_global_recorder(fanout) {
-                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-                    }
-                } else {
-                    let prefixed = prefix::PrefixRecorder::new(config.namespace.clone(), fanout);
-                    if let Err(e) = metrics::set_global_recorder(prefixed) {
-                        tracing::warn!(error = %e, "global metrics recorder already installed; keeping existing");
-                    }
-                }
-
                 RecorderSetup {
-                    prom_handle: Some(prom_handle),
+                    prom_handle: Some(install_prefixed(&config.namespace, fanout, prom_handle)),
                     otel_provider: Some(provider),
                 }
             }
             Err(e) => {
                 // Fallback: just Prometheus if OTel fails
                 tracing::warn!(error = %e, "Failed to build OTel recorder, falling back to Prometheus only");
-                install_prom_only(&config.namespace, prom_recorder);
                 RecorderSetup {
-                    prom_handle: Some(prom_handle),
+                    prom_handle: Some(install_prom_only(&config.namespace, prom_recorder)),
                     otel_provider: None,
                 }
             }
@@ -1588,6 +1605,23 @@ mod tests {
         drop(idle);
     }
     use super::*;
+
+    /// A recorder installs once per process, and a second manager renders the
+    /// installed one instead of an empty registry.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_second_manager_in_one_process_renders_what_the_process_records() {
+        let first = MetricsManager::with_config(MetricsConfig::offline(""));
+        let second = MetricsManager::with_config(MetricsConfig::offline(""));
+        ::metrics::counter!("second_manager_probe_total").increment(1);
+        for (name, manager) in [("first", &first), ("second", &second)] {
+            let rendered = manager.render();
+            assert!(
+                rendered.contains("second_manager_probe_total"),
+                "{name} rendered: {rendered:?}"
+            );
+        }
+    }
 
     #[test]
     fn readiness_set_after_the_server_started_is_honoured() {
