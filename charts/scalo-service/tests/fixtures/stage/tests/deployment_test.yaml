@@ -309,6 +309,104 @@ tests:
             name: OTEL_SERVICE_NAME
             value: overridden
 
+  - it: renders integrationEnv after extraEnv, and extraEnv wins a name both set
+    set:
+      extraEnv:
+        SHARED: from-overlay
+      integrationEnv:
+        AAA_INTEGRATION: "1"
+        SHARED: from-platform
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0]
+          value:
+            name: SHARED
+            value: from-overlay
+      - equal:
+          path: spec.template.spec.containers[0].env[1]
+          value:
+            name: AAA_INTEGRATION
+            value: "1"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SHARED
+            value: from-platform
+
+  - it: drops an integrationEnv name the chart derives
+    set:
+      integrationEnv:
+        OTEL_SERVICE_NAME: from-platform
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_SERVICE_NAME
+            value: event-stage
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OTEL_SERVICE_NAME
+            value: from-platform
+
+  - it: renders an integrationEnv string through tpl and takes a valueFrom
+    set:
+      integrationEnv:
+        BROKERS: "{{ .Release.Namespace }}-kafka:9092"
+        BROKER_PASSWORD:
+          valueFrom:
+            secretKeyRef:
+              name: "{{ .Release.Name }}-kafka"
+              key: password
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BROKERS
+            value: apps-kafka:9092
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BROKER_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: release-kafka
+                key: password
+
+  - it: leaves OPENSSL_CONF to a platform's integrationEnv
+    set:
+      integrationEnv:
+        OPENSSL_CONF: /etc/platform/openssl.cnf
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSSL_CONF
+            value: /etc/platform/openssl.cnf
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSSL_CONF
+            value: /tmp/scalo-openssl.cnf
+
+  - it: takes an overlay's OPENSSL_CONF over a platform's
+    set:
+      extraEnv:
+        OPENSSL_CONF: /etc/overlay/openssl.cnf
+      integrationEnv:
+        OPENSSL_CONF: /etc/platform/openssl.cnf
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSSL_CONF
+            value: /etc/overlay/openssl.cnf
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSSL_CONF
+            value: /etc/platform/openssl.cnf
+
   - it: points OPENSSL_CONF at the Kafka TLS floor file under /tmp
     asserts:
       - contains:

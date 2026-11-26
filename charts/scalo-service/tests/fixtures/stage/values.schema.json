@@ -301,6 +301,21 @@
         ]
       }
     },
+    "integrationEnv": {
+      "description": "Environment variables by name that a platform sets for an integration. extraEnv wins a name both set. A scalar is rendered through tpl, and an object is a valueFrom.",
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          { "type": ["string", "number", "boolean"] },
+          {
+            "type": "object",
+            "properties": { "valueFrom": { "type": "object" } },
+            "required": ["valueFrom"],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
     "extraEnvFrom": { "$ref": "#/$defs/objectList" },
     "extraVolumes": { "$ref": "#/$defs/objectList" },
     "extraVolumeMounts": { "$ref": "#/$defs/objectList" },

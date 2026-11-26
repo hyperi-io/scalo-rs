@@ -1,15 +1,15 @@
 {{/*
-scalo-service.extraEnv -- the `extraEnv` map as env entries in name order, as
-{"items": [...]}, minus any name the chart derives itself, so one name never appears
-twice in a container. A scalar value is rendered through `tpl`; a map is a `valueFrom`,
-also through `tpl`. Takes (dict "ctx" . "derived" LIST-OF-NAMES).
+scalo-service.extraEnv -- an env map (`extraEnv` or `integrationEnv`) as env entries in
+name order, as {"items": [...]}, minus each name in `drop`, so one name never appears
+twice in a container. A scalar value is rendered through `tpl`, and a map is a `valueFrom`,
+also through `tpl`. Takes (dict "ctx" . "env" MAP "drop" LIST-OF-NAMES).
 */}}
 {{- define "scalo-service.extraEnv" -}}
 {{- $ctx := .ctx -}}
-{{- $derived := .derived | default list -}}
+{{- $drop := .drop | default list -}}
 {{- $items := list -}}
-{{- range $name, $value := $ctx.Values.extraEnv | default dict -}}
-{{- if not (has $name $derived) -}}
+{{- range $name, $value := .env | default dict -}}
+{{- if not (has $name $drop) -}}
 {{- if kindIs "map" $value -}}
 {{- $items = append $items (dict "name" $name "valueFrom" (tpl (toYaml $value.valueFrom) $ctx | fromYaml)) -}}
 {{- else -}}

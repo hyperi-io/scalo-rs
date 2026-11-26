@@ -53,25 +53,27 @@ emptyDir path has a sizeLimit.
 {{/*
 scalo-service.opensslEnv -- OPENSSL_CONF at the contract's openssl_conf (default
 /tmp/scalo-openssl.cnf), the file a Kafka client writes its OpenSSL TLS floor into, as
-{"items": [...]}. No item when openssl_conf is empty, or when extraEnv sets OPENSSL_CONF,
-so an operator's own OpenSSL config wins.
+{"items": [...]}. No item when openssl_conf is empty, or when extraEnv or integrationEnv
+sets OPENSSL_CONF, so an operator's own OpenSSL config wins.
 */}}
 {{- define "scalo-service.opensslEnv" -}}
 {{- $contract := include "scalo-service.contract" . | fromJson -}}
 {{- $path := "/tmp/scalo-openssl.cnf" -}}
 {{- if hasKey $contract "openssl_conf" }}{{ $path = $contract.openssl_conf }}{{ end -}}
 {{- $items := list -}}
-{{- if and $path (not (hasKey (.Values.extraEnv | default dict) "OPENSSL_CONF")) -}}
+{{- $set := or (hasKey (.Values.extraEnv | default dict) "OPENSSL_CONF") (hasKey (.Values.integrationEnv | default dict) "OPENSSL_CONF") -}}
+{{- if and $path (not $set) -}}
 {{- $items = append $items (dict "name" "OPENSSL_CONF" "value" $path) -}}
 {{- end -}}
 {{- dict "items" $items | toJson -}}
 {{- end -}}
 
 {{/*
-scalo-service.env -- the container env as {"items": [...]}: `extraEnv` first, then the
-namespace, OTel identity, version-check overrides, writable path limits, the OpenSSL
-config and secret references. A name the chart derives is dropped from extraEnv, so a
-server-side apply never meets one name twice.
+scalo-service.env -- the container env as {"items": [...]}: `extraEnv` first, then
+`integrationEnv`, then the namespace, OTel identity, version-check overrides, writable
+path limits, the OpenSSL config and secret references. Each name renders once: a name
+the chart derives is dropped from both maps, and an extraEnv name from integrationEnv,
+so a server-side apply never meets one name twice.
 */}}
 {{- define "scalo-service.env" -}}
 {{- $derived := list (include "scalo-service.podNamespaceEnv" . | fromJson) -}}
@@ -82,6 +84,8 @@ server-side apply never meets one name twice.
 {{- $derived = concat $derived (include "scalo-service.secretEnv" . | fromJson).items -}}
 {{- $names := list -}}
 {{- range $derived }}{{ $names = append $names .name }}{{ end -}}
-{{- $extra := (include "scalo-service.extraEnv" (dict "ctx" . "derived" $names) | fromJson).items -}}
-{{- dict "items" (concat $extra $derived) | toJson -}}
+{{- $extra := (include "scalo-service.extraEnv" (dict "ctx" . "env" .Values.extraEnv "drop" $names) | fromJson).items -}}
+{{- $operator := keys (.Values.extraEnv | default dict) -}}
+{{- $integration := (include "scalo-service.extraEnv" (dict "ctx" . "env" .Values.integrationEnv "drop" (concat $names $operator)) | fromJson).items -}}
+{{- dict "items" (concat $extra $integration $derived) | toJson -}}
 {{- end -}}
