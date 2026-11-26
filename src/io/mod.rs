@@ -31,10 +31,12 @@ mod config;
 mod ndjson_writer;
 mod rotating;
 
+#[cfg(feature = "transport-file")]
+pub(crate) use config::NO_AGE_LIMIT;
 #[cfg(feature = "config-schema")]
 pub(crate) use config::compress_rotated_schema;
 pub use config::{
     DEFAULT_SPOOL_ROOT, FileMode, FileWriteOptions, FileWriterConfig, ROTATED_ACCEPTS,
-    RotationPeriod,
+    RotatedNaming, RotationPeriod,
 };
 pub use ndjson_writer::{AsyncNdjsonWriter, NdjsonWriter};

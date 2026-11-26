@@ -47,7 +47,7 @@ use super::work_batch::WorkBatch;
 use crate::compression::Compression;
 use crate::framing::{DecodeLimits, Frame, Framing, Lf, StreamDecoder};
 use crate::io::{
-    FileWriteOptions, FileWriterConfig, NdjsonWriter, ROTATED_ACCEPTS, RotationPeriod,
+    FileWriteOptions, FileWriterConfig, NO_AGE_LIMIT, NdjsonWriter, ROTATED_ACCEPTS, RotationPeriod,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -162,10 +162,11 @@ impl FileTransportConfig {
         let config = FileWriterConfig {
             path: dir.to_path_buf(),
             rotation: self.rotation,
-            max_age_days: self.max_age_days.unwrap_or(u32::MAX),
+            max_age_days: self.max_age_days.unwrap_or(NO_AGE_LIMIT),
             compress_rotated,
             write: self.write.private_by_default(),
         };
+        config.check_naming().map_err(TransportError::Config)?;
         Ok((config, name.to_owned()))
     }
 
@@ -1175,13 +1176,14 @@ mod tests {
             dir.path().join("settings.yaml"),
             "transport:\n  file:\n    path: /var/log/app/out.ndjson\n    rotation: daily\n    \
              max_age_days: 3\n    compress_rotated: {codec: zstd}\n    max_bytes: 1048576\n    \
-             max_files: 4\n    file_mode: \"0640\"\n",
+             max_files: 4\n    naming: stamped\n    file_mode: \"0640\"\n",
         )
         .unwrap();
         temp_env::with_vars(
             [
                 ("FILEKEYS__TRANSPORT__FILE__DURABLE", Some("true")),
                 ("FILEKEYS__TRANSPORT__FILE__MAX_FILES", Some("9")),
+                ("FILEKEYS__TRANSPORT__FILE__NAMING", Some("numbered")),
                 ("FILEKEYS__TRANSPORT__FILE__DIR_MODE", Some("0750")),
             ],
             || {
@@ -1201,6 +1203,11 @@ mod tests {
         assert_eq!(config.compress_rotated, Compression::new(Codec::Zstd));
         assert_eq!(config.write.max_bytes, Some(1_048_576));
         assert_eq!(config.write.max_files, Some(9), "env wins");
+        assert_eq!(
+            config.write.naming,
+            crate::io::RotatedNaming::Numbered,
+            "env wins"
+        );
         assert!(config.write.durable, "from env");
         assert_eq!(
             config.write.file_mode.map(crate::io::FileMode::bits),
@@ -1229,6 +1236,24 @@ mod tests {
             Err(TransportError::Config(_))
         ));
         assert_eq!(config.write, FileWriteOptions::default());
+
+        let numbered = FileTransportConfig {
+            path: "/tmp/out.ndjson".into(),
+            write: FileWriteOptions {
+                naming: crate::io::RotatedNaming::Numbered,
+                ..FileWriteOptions::default()
+            },
+            ..FileTransportConfig::default()
+        };
+        assert!(numbered.writer_config().is_ok(), "no age limit by default");
+        let aged = FileTransportConfig {
+            max_age_days: Some(3),
+            ..numbered
+        };
+        assert!(
+            matches!(aged.writer_config(), Err(TransportError::Config(e)) if e.contains("max_age_days 3")),
+            "numbered refuses an age limit at build"
+        );
     }
 
     /// The sent file and the folders made for it are private by default, and

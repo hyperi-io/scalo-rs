@@ -9,9 +9,11 @@
 //! The live file under [`super::NdjsonWriter`].
 //!
 //! Opening cuts a last line with no newline back to the newline before it. An
-//! append lands whole or is cut back off. Rotation renames the live file to
-//! `<name>.<local YYYYMMDDTHHMMSS>[.N]`, then applies the count and age limits
-//! and compresses all but the six newest rotated files with `compress_rotated`.
+//! append lands whole or is cut back off. Stamped rotation renames the live
+//! file to `<name>.<local YYYYMMDDTHHMMSS>[.N]`, then applies the count and age
+//! limits and compresses all but the six newest rotated files with
+//! `compress_rotated`. Numbered rotation moves `<name>.1` onwards up one,
+//! renames the live file to `<name>.1`, then deletes numbers past `max_files`.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -23,7 +25,7 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use tracing::{debug, warn};
 
-use super::config::{FileMode, FileWriterConfig, RotationPeriod};
+use super::config::{FileMode, FileWriterConfig, RotatedNaming, RotationPeriod};
 use crate::compression::Codec;
 
 /// Rotated files left uncompressed when `compress_rotated` names a codec, newest first.
@@ -372,7 +374,14 @@ fn stamp(at: &ZonedDateTime) -> String {
 
 /// Renames the live file to its rotated name and returns that name. The
 /// caller has dropped its handle.
-pub(super) fn rename_live(live: &Path) -> io::Result<PathBuf> {
+pub(super) fn rename_live(live: &Path, naming: RotatedNaming) -> io::Result<PathBuf> {
+    match naming {
+        RotatedNaming::Stamped => rename_stamped(live),
+        RotatedNaming::Numbered => rename_numbered(live),
+    }
+}
+
+fn rename_stamped(live: &Path) -> io::Result<PathBuf> {
     let now = stamp(&ZonedDateTime::now());
     let existing = rotated_files(live)?;
     let mut number = existing
@@ -411,10 +420,94 @@ fn rotated_name(live: &Path, stamp: &str, number: u32) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Applies the count and age limits to the rotated files of `live`, then
-/// compresses those past the newest six. Failures are logged and skipped:
-/// retention never fails a write.
+/// `<live>.<number>`.
+fn numbered_name(live: &Path, number: u32) -> PathBuf {
+    let mut name = live.as_os_str().to_owned();
+    name.push(format!(".{number}"));
+    PathBuf::from(name)
+}
+
+/// The number of `<live>.<N>`, for N from 1 with no leading zero, refusing
+/// every other name.
+fn parse_numbered(live: &OsStr, name: &OsStr) -> Option<u32> {
+    let digits = name
+        .to_str()?
+        .strip_prefix(live.to_str()?)?
+        .strip_prefix('.')?;
+    if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The numbered rotated files of `live`, lowest number first.
+fn numbered_files(live: &Path) -> io::Result<Vec<(u32, PathBuf)>> {
+    let Some(live_name) = live.file_name() else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for entry in fs::read_dir(parent_of(live))? {
+        let entry = entry?;
+        if let Some(number) = parse_numbered(live_name, &entry.file_name()) {
+            found.push((number, entry.path()));
+        }
+    }
+    found.sort_unstable_by_key(|(number, _)| *number);
+    Ok(found)
+}
+
+/// Moves `<live>.1` up to the first gap one number higher, highest first, then
+/// renames the live file to `<live>.1`. Files past a gap stay put, so a
+/// rotation that fails partway and is tried again moves nothing twice.
+fn rename_numbered(live: &Path) -> io::Result<PathBuf> {
+    let files = numbered_files(live)?;
+    let run = files
+        .iter()
+        .zip(1..)
+        .take_while(|((number, _), want)| number == want)
+        .count();
+    for (number, path) in files[..run].iter().rev() {
+        fs::rename(path, numbered_name(live, number.saturating_add(1)))?;
+    }
+    let first = numbered_name(live, 1);
+    fs::rename(live, &first)?;
+    Ok(first)
+}
+
+/// Applies the retention `naming` calls for to the rotated files of `live`.
+/// Failures are logged and skipped: retention never fails a write.
 pub(super) fn retain(live: &Path, config: &FileWriterConfig, label: &str) {
+    match config.write.naming {
+        RotatedNaming::Stamped => retain_stamped(live, config, label),
+        RotatedNaming::Numbered => retain_numbered(live, config.write.max_files, label),
+    }
+}
+
+/// Deletes the numbered files of `live` past `keep`.
+fn retain_numbered(live: &Path, keep: Option<u32>, label: &str) {
+    let Some(keep) = keep else {
+        return;
+    };
+    let files = match numbered_files(live) {
+        Ok(files) => files,
+        Err(e) => {
+            warn!(label, path = %live.display(), error = %e, "could not list rotated files");
+            return;
+        }
+    };
+    for (_, path) in files.iter().filter(|(number, _)| *number > keep) {
+        match fs::remove_file(path) {
+            Ok(()) => debug!(label, path = %path.display(), "rotated file removed"),
+            Err(e) => {
+                warn!(label, path = %path.display(), error = %e, "could not remove a rotated file");
+            }
+        }
+    }
+}
+
+/// Applies the count and age limits to the stamped rotated files of `live`,
+/// then compresses those past the newest six.
+fn retain_stamped(live: &Path, config: &FileWriterConfig, label: &str) {
     let mut kept = match rotated_files(live) {
         Ok(files) => files,
         Err(e) => {

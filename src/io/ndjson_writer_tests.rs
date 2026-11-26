@@ -229,6 +229,137 @@ fn max_files_keeps_the_newest() {
     }
 }
 
+/// `numbered` moves each `.N` up one and the live file to `.1`, keeps
+/// `max_files` numbers, and leaves other names alone. Rotation still runs
+/// before a batch that would pass `max_bytes`: an oversized batch rotates a
+/// non-empty file and lands whole in the fresh one, and an empty file takes it
+/// without rotating.
+#[test]
+fn numbered_rotation_moves_each_number_up() {
+    use crate::io::RotatedNaming;
+
+    struct Case {
+        name: &'static str,
+        keep: Option<u32>,
+        max_bytes: u64,
+        planted: &'static [(&'static str, &'static str)],
+        batches: &'static [&'static str],
+        live: &'static str,
+        others: &'static [(&'static str, &'static str)],
+    }
+    let one_per_rotation: &[&str] = &["1\n", "2\n", "3\n", "4\n"];
+    let cases = [
+        Case {
+            name: "keep 2 drops the oldest",
+            keep: Some(2),
+            max_bytes: 2,
+            planted: &[],
+            batches: one_per_rotation,
+            live: "4\n",
+            others: &[("out.ndjson.1", "3\n"), ("out.ndjson.2", "2\n")],
+        },
+        Case {
+            name: "unset keeps every number",
+            keep: None,
+            max_bytes: 2,
+            planted: &[],
+            batches: one_per_rotation,
+            live: "4\n",
+            others: &[
+                ("out.ndjson.1", "3\n"),
+                ("out.ndjson.2", "2\n"),
+                ("out.ndjson.3", "1\n"),
+            ],
+        },
+        Case {
+            name: "keep 0 deletes the file at each rotation",
+            keep: Some(0),
+            max_bytes: 2,
+            planted: &[],
+            batches: one_per_rotation,
+            live: "4\n",
+            others: &[],
+        },
+        Case {
+            name: "an oversized batch rotates a non-empty file and lands whole",
+            keep: None,
+            max_bytes: 4,
+            planted: &[],
+            batches: &["a\n", "w\nx\ny\nz\n", "b\n"],
+            live: "b\n",
+            others: &[("out.ndjson.1", "w\nx\ny\nz\n"), ("out.ndjson.2", "a\n")],
+        },
+        Case {
+            name: "an empty file takes an oversized batch without rotating",
+            keep: None,
+            max_bytes: 4,
+            planted: &[],
+            batches: &["w\nx\ny\nz\n"],
+            live: "w\nx\ny\nz\n",
+            others: &[],
+        },
+        Case {
+            name: "a gap stops the move, numbers past keep go, other names stay",
+            keep: Some(3),
+            max_bytes: 2,
+            planted: &[
+                ("out.ndjson.1", "p1\n"),
+                ("out.ndjson.3", "p3\n"),
+                ("out.ndjson.7", "p7\n"),
+                ("out.ndjson.01", "z"),
+                ("out.ndjson.20260302T140000", "s\n"),
+                ("out.ndjson.pos", "x"),
+            ],
+            batches: &["a\n", "b\n"],
+            live: "b\n",
+            others: &[
+                ("out.ndjson.01", "z"),
+                ("out.ndjson.1", "a\n"),
+                ("out.ndjson.2", "p1\n"),
+                ("out.ndjson.20260302T140000", "s\n"),
+                ("out.ndjson.3", "p3\n"),
+                ("out.ndjson.pos", "x"),
+            ],
+        },
+    ];
+    for case in cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, text) in case.planted {
+            std::fs::write(dir.path().join(name), text).expect("plant");
+        }
+        let write = FileWriteOptions {
+            max_bytes: Some(case.max_bytes),
+            max_files: case.keep,
+            naming: RotatedNaming::Numbered,
+            ..FileWriteOptions::default()
+        };
+        let config = FileWriterConfig {
+            max_age_days: crate::io::config::NO_AGE_LIMIT,
+            ..with_write(dir.path(), RotationPeriod::Never, write)
+        };
+        let writer = NdjsonWriter::new(&config, "", "out.ndjson", "test").expect(case.name);
+        for batch in case.batches {
+            let lines = batch.matches('\n').count() as u64;
+            writer.write_buf(batch.as_bytes(), lines).expect(case.name);
+        }
+        let live = std::fs::read_to_string(dir.path().join("out.ndjson")).expect("read");
+        assert_eq!(live, case.live, "{}", case.name);
+        let others: Vec<(String, String)> = rotated_names(dir.path(), "out.ndjson")
+            .into_iter()
+            .map(|name| {
+                let text = std::fs::read_to_string(dir.path().join(&name)).expect("read");
+                (name, text)
+            })
+            .collect();
+        let want: Vec<(String, String)> = case
+            .others
+            .iter()
+            .map(|(name, text)| ((*name).to_string(), (*text).to_string()))
+            .collect();
+        assert_eq!(others, want, "{}", case.name);
+    }
+}
+
 /// A reader holding the live file open does not stop the rename, and keeps
 /// reading the rotated file.
 #[test]

@@ -378,7 +378,7 @@ pub struct GrpcTransport {
 /// deadline.
 #[derive(Clone)]
 struct Wire {
-    client: proto::transport_client::TransportClient<tonic::transport::Channel>,
+    clients: Clients,
     /// The TLS settings of an `https://` endpoint, which names a handshake
     /// failure. `None` in plain text.
     settings: Option<crate::tls::ProfileSettings>,
@@ -474,6 +474,7 @@ pub struct GrpcTransportBuilder<'a> {
     max_held_bytes: Option<u64>,
     max_hold: Duration,
     drain_deadline: Duration,
+    resolver: Option<Arc<dyn super::ConnectResolver>>,
 }
 
 impl std::fmt::Debug for GrpcTransportBuilder<'_> {
@@ -485,6 +486,7 @@ impl std::fmt::Debug for GrpcTransportBuilder<'_> {
             .field("max_held_bytes", &self.max_held_bytes)
             .field("max_hold", &self.max_hold)
             .field("drain_deadline", &self.drain_deadline)
+            .field("resolver", &self.resolver.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -553,12 +555,21 @@ impl GrpcTransportBuilder<'_> {
         self
     }
 
+    /// Dial the endpoint where `resolver` says. Each call then goes out on a
+    /// connection of its own, closed after, so a changed answer takes the
+    /// next call, and a `proxy` other than `none` fails
+    /// [`start`](Self::start). See [`ConnectResolver`](super::ConnectResolver).
+    pub fn resolver(mut self, resolver: Arc<dyn super::ConnectResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
     /// Bind the receive server and build the client, as configured.
     ///
     /// # Errors
     ///
     /// Returns error if the listen address is invalid or the server fails to
-    /// start.
+    /// start, or a resolver is set beside a proxy.
     pub async fn start(self) -> TransportResult<GrpcTransport> {
         GrpcTransport::new_inner(self).await
     }
@@ -603,34 +614,77 @@ fn native_server(
     server
 }
 
-/// The lazily connected client for `endpoint`, with the configured TLS,
-/// deadlines and compression, and the TLS settings when it is `https://`.
+type Client = proto::transport_client::TransportClient<tonic::transport::Channel>;
+
+/// The client each RPC goes out on.
+#[derive(Clone)]
+enum Clients {
+    /// One lazily dialled channel for the transport's life.
+    Kept(Client),
+    /// A channel per RPC, dialled where a caller's resolver says at the time
+    /// and closed once the RPC is dropped.
+    Fresh(Arc<dyn Fn() -> Client + Send + Sync>),
+}
+
+impl Clients {
+    fn get(&self) -> Client {
+        match self {
+            Self::Kept(client) => client.clone(),
+            Self::Fresh(dial) => dial(),
+        }
+    }
+}
+
+/// The lazily connected clients for `endpoint`, with the configured TLS,
+/// deadlines and compression, dialled where `resolver` says when one is
+/// given, and the TLS settings when it is `https://`.
 fn build_client(
     config: &GrpcConfig,
     endpoint: &str,
-) -> TransportResult<(
-    proto::transport_client::TransportClient<tonic::transport::Channel>,
-    Option<crate::tls::ProfileSettings>,
-)> {
+    resolver: Option<Arc<dyn super::ConnectResolver>>,
+) -> TransportResult<(Clients, Option<crate::tls::ProfileSettings>)> {
     let tls = build_grpc_client_tls(config, endpoint)?;
     let ep = super::tonic_channel::endpoint(endpoint, None, tls.is_some())
         .map_err(TransportError::Config)?;
     let (tls, settings) = tls.unzip();
-    let channel =
-        super::tonic_channel::lazy_channel(ep, config.send_timeout_ms, config.proxy.dialer()?, tls);
-
+    let (max_message_size, send_timeout_ms) = (config.max_message_size, config.send_timeout_ms);
+    let encoding = super::tonic_channel::encoding(config.compression.codec);
     // No encoding limit: tonic's refusal arrives as a stream reset that
     // reads as an outage, so send and send_batch check the size instead.
-    let mut client = proto::transport_client::TransportClient::new(channel)
-        .max_decoding_message_size(config.max_message_size);
+    let client = move |channel: tonic::transport::Channel| {
+        let mut client = Client::new(channel).max_decoding_message_size(max_message_size);
+        for &accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
+            client = client.accept_compressed(accepted);
+        }
+        match encoding {
+            Some(encoding) => client.send_compressed(encoding),
+            None => client,
+        }
+    };
 
-    for &accepted in super::tonic_channel::ACCEPTED_ENCODINGS {
-        client = client.accept_compressed(accepted);
-    }
-    if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
-        client = client.send_compressed(encoding);
-    }
-    Ok((client, settings))
+    let clients = match resolver {
+        None => Clients::Kept(client(super::tonic_channel::lazy_channel(
+            ep,
+            send_timeout_ms,
+            config.proxy.dialer()?,
+            tls,
+        ))),
+        // A kept channel would outlive a moved answer.
+        Some(resolver) => {
+            super::resolver::refuse_proxy(&config.proxy, "gRPC")?;
+            let dial = super::resolver::ResolvedDial::new(resolver, endpoint)
+                .map_err(TransportError::Config)?;
+            Clients::Fresh(Arc::new(move || {
+                client(super::tonic_channel::resolved_channel(
+                    ep.clone(),
+                    send_timeout_ms,
+                    dial.clone(),
+                    tls.clone(),
+                ))
+            }))
+        }
+    };
+    Ok((clients, settings))
 }
 
 impl GrpcTransport {
@@ -662,6 +716,7 @@ impl GrpcTransport {
             max_held_bytes: None,
             max_hold: pending::DEFAULT_MAX_HOLD,
             drain_deadline: DEFAULT_DRAIN_DEADLINE,
+            resolver: None,
         }
     }
 
@@ -709,7 +764,7 @@ impl GrpcTransport {
         let wire = config
             .endpoint
             .as_ref()
-            .map(|e| build_client(config, e))
+            .map(|e| build_client(config, e, options.resolver.clone()))
             .transpose()?
             .map(|client| Wire::new(client, config.send_timeout_ms));
         #[cfg(feature = "metrics")]
@@ -1061,7 +1116,7 @@ impl TransportSender for GrpcTransport {
         }
 
         let Some(Wire {
-            client,
+            clients,
             refusals,
             settings,
             ..
@@ -1100,8 +1155,7 @@ impl TransportSender for GrpcTransport {
         #[cfg(feature = "metrics")]
         let in_flight = InFlight::enter(&self.inflight);
 
-        // tonic clients are cheaply cloneable (shared channel)
-        let mut client = client.clone();
+        let mut client = clients.get();
         let result = match within_send_timeout(self.send_timeout_ms, client.push(request)).await {
             Ok(_) => {
                 refusals.clear("grpc");
@@ -1410,14 +1464,11 @@ fn coalescer(
 
 impl Wire {
     fn new(
-        (client, settings): (
-            proto::transport_client::TransportClient<tonic::transport::Channel>,
-            Option<crate::tls::ProfileSettings>,
-        ),
+        (clients, settings): (Clients, Option<crate::tls::ProfileSettings>),
         send_timeout_ms: u64,
     ) -> Self {
         Self {
-            client,
+            clients,
             settings,
             send_timeout_ms,
             refusals: Refusals::default(),
@@ -1472,7 +1523,7 @@ impl Wire {
         #[cfg(feature = "metrics")]
         let in_flight = InFlight::enter(&self.inflight);
 
-        let mut client = self.client.clone();
+        let mut client = self.clients.get();
         let rpc = client.route_batch(request);
         let mut code = None;
         let result = match within_send_timeout(self.send_timeout_ms, rpc).await {

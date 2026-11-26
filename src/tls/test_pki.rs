@@ -31,6 +31,9 @@ fn p384_key() -> KeyPair {
     KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap()
 }
 
+/// The names a leaf is valid for unless a test names its own.
+const LEAF_HOSTS: &[&str] = &["localhost", "target.test"];
+
 /// A self-signed CA that signs leaves.
 pub(crate) struct TestCa {
     issuer: CertifiedIssuer<'static, KeyPair>,
@@ -85,20 +88,36 @@ impl TestCa {
         self.leaf(name, ExtendedKeyUsagePurpose::ClientAuth)
     }
 
+    /// A server certificate named `name` for `host` alone.
+    #[cfg(any(feature = "transport-http", feature = "transport-grpc"))]
+    pub(crate) fn server_for(&self, name: &str, host: &str) -> Leaf {
+        self.leaf_on(
+            name,
+            ExtendedKeyUsagePurpose::ServerAuth,
+            p384_key(),
+            &[host],
+        )
+    }
+
     /// A `localhost` server certificate on a P-256 key, which cnsa2 refuses.
     pub(crate) fn server_p256(&self, name: &str) -> Leaf {
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        self.leaf_on(name, ExtendedKeyUsagePurpose::ServerAuth, key)
+        self.leaf_on(name, ExtendedKeyUsagePurpose::ServerAuth, key, LEAF_HOSTS)
     }
 
     fn leaf(&self, name: &str, usage: ExtendedKeyUsagePurpose) -> Leaf {
-        self.leaf_on(name, usage, p384_key())
+        self.leaf_on(name, usage, p384_key(), LEAF_HOSTS)
     }
 
-    fn leaf_on(&self, name: &str, usage: ExtendedKeyUsagePurpose, key: KeyPair) -> Leaf {
-        let mut params =
-            CertificateParams::new(vec!["localhost".to_string(), "target.test".to_string()])
-                .unwrap();
+    fn leaf_on(
+        &self,
+        name: &str,
+        usage: ExtendedKeyUsagePurpose,
+        key: KeyPair,
+        hosts: &[&str],
+    ) -> Leaf {
+        let names: Vec<String> = hosts.iter().map(|h| (*h).to_string()).collect();
+        let mut params = CertificateParams::new(names).unwrap();
         params.distinguished_name.push(DnType::CommonName, name);
         params.extended_key_usages = vec![usage];
         let cert = params.signed_by(&key, &self.issuer).unwrap();

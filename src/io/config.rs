@@ -45,6 +45,20 @@ pub enum RotationPeriod {
     Never,
 }
 
+/// How rotated files are named.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RotatedNaming {
+    /// `<file>.<local YYYYMMDDTHHMMSS>`, adding `.1`, `.2` within one second.
+    #[default]
+    Stamped,
+    /// `<file>.1` newest to `<file>.<max_files>` oldest. Each rotation moves
+    /// every number up one. No compression and no age limit: their keys are
+    /// refused beside it.
+    Numbered,
+}
+
 /// A Unix permission mode, written in octal: `"0600"`, `"600"` or `"0o600"`.
 ///
 /// An integer is read by its decimal digits as octal, so `600` from an env var
@@ -145,8 +159,12 @@ pub struct FileWriteOptions {
     pub max_bytes: Option<u64>,
 
     /// Rotated files kept, newest first. Older ones are deleted at each
-    /// rotation. Unset: no count limit, only the age limit.
+    /// rotation. Unset: no count limit, only the age limit. Under `numbered`,
+    /// the highest number kept, and `0` deletes the file at each rotation.
     pub max_files: Option<u32>,
+
+    /// How rotated files are named: `stamped` (default) or `numbered`.
+    pub naming: RotatedNaming,
 
     /// Sync the file's data to disk after each write, and its directory after
     /// the file is created or rotated, so a write that returned `Ok` survives
@@ -215,6 +233,38 @@ impl Default for FileWriterConfig {
     }
 }
 
+/// The `max_age_days` that sets no age limit.
+pub(crate) const NO_AGE_LIMIT: u32 = u32::MAX;
+
+impl FileWriterConfig {
+    /// Refuse what `naming: numbered` can't apply.
+    ///
+    /// # Errors
+    ///
+    /// Under `numbered`, a `compress_rotated` codec, or an age limit, since
+    /// numbered names carry no date.
+    pub(crate) fn check_naming(&self) -> Result<(), String> {
+        if self.write.naming != RotatedNaming::Numbered {
+            return Ok(());
+        }
+        if !self.compress_rotated.is_none() {
+            return Err(format!(
+                "naming: numbered rotates without compression, so compress_rotated {} \
+                 can't apply; set compress_rotated: none",
+                self.compress_rotated.codec
+            ));
+        }
+        if self.max_age_days != NO_AGE_LIMIT {
+            return Err(format!(
+                "naming: numbered names carry no date, so max_age_days {} can't apply; \
+                 leave max_age_days unset and keep files by max_files",
+                self.max_age_days
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +320,7 @@ mod tests {
             write: FileWriteOptions {
                 max_bytes: Some(1024),
                 max_files: Some(3),
+                naming: RotatedNaming::Numbered,
                 durable: true,
                 file_mode: FileMode::new(0o640).ok(),
                 dir_mode: FileMode::new(0o750).ok(),
@@ -277,6 +328,7 @@ mod tests {
         };
         let json = serde_json::to_string(&config).expect("serialise");
         assert!(json.contains(r#""file_mode":"0640""#), "{json}");
+        assert!(json.contains(r#""naming":"numbered""#), "{json}");
         let parsed: FileWriterConfig = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(parsed.path, PathBuf::from("/tmp/test"));
         assert_eq!(parsed.rotation, RotationPeriod::Daily);
@@ -298,11 +350,61 @@ mod tests {
         assert_eq!(parsed.write, FileWriteOptions::default());
 
         let flat = r#"{"path":"/x","rotation":"never","max_age_days":1,"compress_rotated":{"codec":"none"},
-            "max_bytes":10,"max_files":2,"durable":true}"#;
+            "max_bytes":10,"max_files":2,"naming":"numbered","durable":true}"#;
         let parsed: FileWriterConfig = serde_json::from_str(flat).expect("deserialise");
         assert_eq!(parsed.write.max_bytes, Some(10));
         assert_eq!(parsed.write.max_files, Some(2));
+        assert_eq!(parsed.write.naming, RotatedNaming::Numbered);
         assert!(parsed.write.durable);
+        assert!(serde_json::from_str::<RotatedNaming>(r#""dated""#).is_err());
+    }
+
+    /// `numbered` refuses a rotated-file codec and an age limit, naming the
+    /// key, and `stamped` takes both.
+    #[test]
+    fn numbered_naming_refuses_compression_and_an_age_limit() {
+        let numbered = FileWriteOptions {
+            naming: RotatedNaming::Numbered,
+            ..FileWriteOptions::default()
+        };
+        let plain = FileWriterConfig {
+            max_age_days: NO_AGE_LIMIT,
+            compress_rotated: Compression::NONE,
+            write: numbered,
+            ..FileWriterConfig::default()
+        };
+        let cases = [
+            ("numbered, plain, no age limit", plain.clone(), None),
+            (
+                "numbered with gzip",
+                FileWriterConfig {
+                    compress_rotated: Compression::new(Codec::Gzip),
+                    ..plain.clone()
+                },
+                Some("compress_rotated gzip"),
+            ),
+            (
+                "numbered with an age limit",
+                FileWriterConfig {
+                    max_age_days: 30,
+                    ..plain.clone()
+                },
+                Some("max_age_days 30"),
+            ),
+            ("stamped takes both", FileWriterConfig::default(), None),
+        ];
+        for (name, config, refused) in cases {
+            match (config.check_naming(), refused) {
+                (Ok(()), None) => {}
+                (Err(e), Some(key)) => {
+                    assert!(
+                        e.contains("naming: numbered") && e.contains(key),
+                        "{name}: {e}"
+                    );
+                }
+                (got, want) => panic!("{name}: got {got:?}, want {want:?}"),
+            }
+        }
     }
 
     #[cfg(feature = "serde_json")]

@@ -97,4 +97,15 @@ Each body goes to `endpoint`, then each `failover` endpoint in order, starting f
 - `warn` per endpoint that fails a body, `error` when no endpoint takes it for a reason a retry won't fix, `debug` per body delivered, `trace` per record framed.
 - `transport_sent_total` counts records, `transport_sent_bytes_total` bytes on the wire, `transport_backpressured_total` and `transport_send_errors_total` endpoint answers, and `transport_send_duration_seconds` each request.
 
-Source: [../../src/transport/http/send.rs](../../src/transport/http/send.rs).
+## Connect resolver
+
+`HttpTransport::builder(&config).resolver(Arc::new(routes)).start()` takes a `ConnectResolver`, asked at every connect where to dial an endpoint's host in place of DNS. It's code, not config, because the address is the app's runtime state. TLS still sends and checks the endpoint's host name, and `Host` names it.
+
+- An endpoint that names its port is dialled at that port, otherwise at the answer's port, or the scheme's default when that is 0. An IP address host is dialled as written.
+- A host the resolver has no answer for fails that endpoint, and the batch is sent again.
+- The sender keeps no idle connection, so a changed answer takes the next request, at the cost of a TCP and TLS handshake each.
+- A `proxy` other than `none` fails the build, since the proxy looks the name up itself.
+
+The gRPC transport's builder takes the same resolver ([backends.md](backends.md#sending-over-grpc)).
+
+Source: [../../src/transport/http/send.rs](../../src/transport/http/send.rs), [../../src/transport/resolver.rs](../../src/transport/resolver.rs).

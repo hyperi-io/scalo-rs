@@ -185,6 +185,7 @@ An `https://` endpoint runs TLS with the `tls` section every transport reads ([.
 - Send deadline: `send_timeout_ms` (default 30 s, `0` for none) bounds the whole of each `send`, and of each request of a `send_batch`, DNS, connect and TLS handshake included, and a send past it is `Backpressured`. A dial whose DNS lookup, TCP connect or TLS handshake has not finished by nine tenths of the limit is abandoned, so the send that started it reports the failure and the next send dials afresh.
 - Send failures: `Unavailable`, `ResourceExhausted`, `DeadlineExceeded` (`send_timeout_ms`), `Cancelled` (a server cutting the RPC at its deadline), and a connection that fails before the server answers are `Backpressured`, so an absent, restarting or overrun receiver is waited out. A failed TLS handshake (the server's certificate, name or key, or no version, suite or group in common) is `Fatal(Config)` naming the `TlsFailure`. A server turning our client certificate away under TLS 1.3 reaches the client as a closed connection, so it stays `Backpressured`. Any other status the server returns is `Fatal`. A send answered `Unavailable` with the `scalo-hold-expired` trailer, or ended by `DeadlineExceeded` or `Cancelled`, may still be delivered by the receiver, so the retry can duplicate it: it counts in `transport_redelivered_total{reason="hold_expired"|"deadline"}`.
 - Dead connections: the client sends an HTTP/2 PING once a connection has read nothing for `send_timeout_ms` (30 s when it is `0`), and closes the connection when the PING goes unanswered for as long again. A receiver that stays connected but stops answering is dropped that way, and the next send dials afresh.
+- Connect resolver: `GrpcTransport::builder(&config).resolver(Arc::new(routes))` dials the endpoint where a `ConnectResolver` says, under the port rule in [http.md](http.md#connect-resolver), with TLS and `:authority` on the endpoint's host. Each RPC then goes out on a connection of its own, closed once it is answered, so a changed answer takes the next call. A host the resolver has no answer for is `Backpressured`, and a `proxy` other than `none` beside a resolver fails the build.
 - Message-size ceiling: `max_message_size` bounds the encoded request, measured uncompressed, as the receiver's decoder measures it. `send` returns `FilteredDlq` for a record over it without making the RPC, and for a record the receiver rejects with `OutOfRange` (its limit is lower, or compression grew the frame past it). `send_batch` sends a block over it as several `RouteBatch` requests, in order, each within the limit. A failure after the first leaves the earlier ones accepted, and the retry of the whole block sends them again. A record over the limit on its own is left out and counted in `transport_message_too_large_total`. The rest of the block is sent and the result is `FilteredDlq`, never `Ok`, and it names no record. An outbound `dlq` filter match in the block answers the same way. The record left out is DROPPED: it is counted in `pipeline_dead_letters_dropped_total{reason="too_large"}`, once the rest of the block is sent when there is a rest. To dead-letter it instead, take out every record `dead_letter_reason` names before the call, as the pipeline's `.sender(&sender)` does.
 
 ### Receiving
@@ -330,6 +331,7 @@ transport:
       rotation: never           # never (default) | hourly | daily, by local time
       max_bytes: 104857600      # rotate before a write that would pass this; unset: no size rotation
       max_files: 5              # rotated files kept; unset: no count limit
+      naming: stamped           # stamped (default) | numbered: <path>.1 newest to <path>.<max_files>
       max_age_days: 30          # unset (default): no age limit
       compress_rotated: {codec: none}  # gzip or zstd compresses all but the six newest rotated files
       durable: false            # true: sync the file after each block, the folder after a create or rotation
@@ -345,6 +347,8 @@ say) is logged at warn, the block goes into the current file, and rotation is tr
 30 s. A reader of the same path does not follow a rotation, so rotate only a
 file nothing reads through this transport. Each rotation is logged at info and
 counted in `file_writer_rotations_total{writer, trigger}`.
+
+`naming: numbered` names rotated files by number, newest first: each rotation moves `<path>.1` onwards up one, renames the file to `<path>.1` and deletes numbers past `max_files` (`0` keeps none, unset keeps all). Numbered files carry no date and stay uncompressed, so `max_age_days` or a `compress_rotated` codec beside it fails the build. Rotated files of the other naming are left alone.
 
 `durable: true` makes a block that returned `Ok` survive power loss, at the
 cost of a disk flush per block. Without it a block is in the kernel page

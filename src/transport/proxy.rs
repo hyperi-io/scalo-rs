@@ -605,14 +605,16 @@ fn bracketed(host: &str) -> String {
     }
 }
 
-/// tonic's connector: each dial goes through [`ProxyDialer`], and the channel
-/// runs its TLS over the stream.
+/// tonic's connector: each dial goes through [`ProxyDialer`], or to where a
+/// caller's resolver says, and the channel runs its TLS over the stream.
 #[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
 #[derive(Clone)]
 pub(crate) struct Connector {
     dialer: ProxyDialer,
     direct: hyper_util::client::legacy::connect::HttpConnector,
     tls: bool,
+    #[cfg(feature = "transport-grpc")]
+    resolved: Option<crate::transport::resolver::ResolvedDial>,
 }
 
 #[cfg(any(feature = "transport-grpc", feature = "transport-otlp"))]
@@ -626,7 +628,19 @@ impl Connector {
             dialer,
             direct,
             tls: false,
+            #[cfg(feature = "transport-grpc")]
+            resolved: None,
         }
+    }
+
+    /// Dial every host where `resolved` says, ahead of the proxy and DNS.
+    #[cfg(feature = "transport-grpc")]
+    pub(crate) fn resolved_by(
+        mut self,
+        resolved: crate::transport::resolver::ResolvedDial,
+    ) -> Self {
+        self.resolved = Some(resolved);
+        self
     }
 
     /// Route every dial as a TLS one, whatever its URI's scheme, for a channel
@@ -653,6 +667,13 @@ impl Service<http::Uri> for Connector {
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
+        #[cfg(feature = "transport-grpc")]
+        if let Some(resolved) = self.resolved.clone() {
+            return Box::pin(async move {
+                let stream = resolved.connect(&uri).await?;
+                Ok(hyper_util::rt::TokioIo::new(stream))
+            });
+        }
         let scheme = if self.tls || uri.scheme_str() == Some("https") {
             Scheme::Tls
         } else {
