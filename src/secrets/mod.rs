@@ -149,6 +149,8 @@ pub struct SecretsManager {
     #[cfg(any(feature = "secrets-vault", feature = "secrets-aws"))]
     health_log: HealthLog,
     rotation_tx: broadcast::Sender<RotationEvent>,
+    /// Each configured source's cache key, from [`source_cache_key`].
+    source_keys: HashMap<String, String>,
     /// One lock per cache key, held across a fetch, so a slow read of an old
     /// value never lands after a newer one. An entry lives only while a fetch
     /// holds it or waits on it.
@@ -216,8 +218,14 @@ impl SecretsManager {
         let aws_provider = config.aws.as_ref().map(AwsProvider::new).transpose()?;
 
         let (rotation_tx, _) = broadcast::channel(16);
+        let source_keys = config
+            .sources
+            .iter()
+            .map(|(name, source)| (name.clone(), source_cache_key(&config, name, source)))
+            .collect();
 
         Ok(Self {
+            source_keys,
             config,
             cache: Arc::new(RwLock::new(cache)),
             file_provider: FileProvider::new(),
@@ -249,7 +257,14 @@ impl SecretsManager {
             .ok_or_else(|| SecretsError::NotFound(format!("unknown secret source: {name}")))?
             .clone();
 
-        self.get_from_source(name, &source).await
+        self.get_from_source(name, self.source_key(name), &source)
+            .await
+    }
+
+    /// The cache key of configured source `name`, or the name itself for one
+    /// that isn't configured.
+    fn source_key<'a>(&'a self, name: &'a str) -> &'a str {
+        self.source_keys.get(name).map_or(name, String::as_str)
     }
 
     /// Get a secret directly from a file path.
@@ -296,6 +311,7 @@ impl SecretsManager {
     /// provider, else a stale entry within the grace period.
     async fn get_from_source(
         &self,
+        name: &str,
         cache_key: &str,
         source: &SecretSource,
     ) -> SecretsResult<SecretValue> {
@@ -317,7 +333,7 @@ impl SecretsManager {
             return Ok(cached);
         }
 
-        match self.fetch(cache_key, source).await {
+        match self.fetch(name, cache_key, source).await {
             Ok(value) => Ok(value),
             Err(e) => {
                 // Try stale cache on provider failure
@@ -335,9 +351,15 @@ impl SecretsManager {
     }
 
     /// Fetch `source` from its provider, skipping the cache, cache the value
-    /// on success, and send a [`RotationEvent`] when its version differs from
-    /// the one the cache last held for `cache_key`, expired or not.
-    async fn fetch(&self, cache_key: &str, source: &SecretSource) -> SecretsResult<SecretValue> {
+    /// under `cache_key` on success, and send a [`RotationEvent`] for `name`
+    /// when its version differs from the one the cache last held, expired or
+    /// not.
+    async fn fetch(
+        &self,
+        name: &str,
+        cache_key: &str,
+        source: &SecretSource,
+    ) -> SecretsResult<SecretValue> {
         let old_version = self.last_version(cache_key).await;
         let result = match source {
             SecretSource::File { path } => self.file_provider.get(path).await,
@@ -386,13 +408,13 @@ impl SecretsManager {
             && &old_version != new_version
         {
             info!(
-                name = %cache_key,
+                name = %name,
                 old_version = %old_version,
                 new_version = %new_version,
                 "Secret rotated"
             );
             let event = RotationEvent {
-                name: cache_key.to_string(),
+                name: name.to_string(),
                 old_version: Some(old_version),
                 new_version: new_version.clone(),
                 rotated_at: std::time::SystemTime::now(),
@@ -514,8 +536,9 @@ impl SecretsManager {
         let mut errors = Vec::new();
 
         for (name, source) in &self.config.sources {
-            let _fetching = Fetching::acquire(&self.in_flight, name).await;
-            if let Err(e) = self.fetch(name, source).await {
+            let key = self.source_key(name);
+            let _fetching = Fetching::acquire(&self.in_flight, key).await;
+            if let Err(e) = self.fetch(name, key, source).await {
                 warn!(name = %name, error = %e, "Failed to refresh secret");
                 errors.push(format!("{name}: {e}"));
             }
@@ -688,6 +711,58 @@ async fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) 
     tokio::task::spawn_blocking(f).await.ok()
 }
 
+/// The cache key for configured source `name`: the name and a digest of what
+/// it reads. Two apps sharing a cache directory with a same-named source that
+/// points elsewhere never read each other's entry, and an identical definition
+/// still shares one.
+#[cfg_attr(
+    not(any(feature = "secrets-vault", feature = "secrets-aws")),
+    allow(unused_variables, reason = "only the provider configs read it")
+)]
+fn source_cache_key(config: &SecretsConfig, name: &str, source: &SecretSource) -> String {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    match source {
+        SecretSource::File { path } => {
+            // A relative path names a different file from each working directory.
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+            hasher.update(b"file\0");
+            hasher.update(path.to_string_lossy().as_bytes());
+        }
+        SecretSource::OpenBao { path, key } => {
+            hasher.update(b"openbao\0");
+            #[cfg(feature = "secrets-vault")]
+            if let Some(openbao) = &config.openbao {
+                hasher.update(openbao.address.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(openbao.namespace.as_deref().unwrap_or("").as_bytes());
+            }
+            hasher.update(b"\0");
+            hasher.update(path.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(key.as_bytes());
+        }
+        SecretSource::Aws { secret_id, key } => {
+            hasher.update(b"aws\0");
+            #[cfg(feature = "secrets-aws")]
+            if let Some(aws) = &config.aws {
+                hasher.update(aws.region.as_deref().unwrap_or("").as_bytes());
+                hasher.update(b"\0");
+                hasher.update(aws.endpoint_url.as_deref().unwrap_or("").as_bytes());
+            }
+            hasher.update(b"\0");
+            hasher.update(secret_id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(key.as_deref().unwrap_or("").as_bytes());
+        }
+    }
+    let digest = hasher.finalize();
+    let tag = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&digest[..16]);
+    format!("source:{name}:{tag}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +779,67 @@ mod tests {
     fn test_secrets_manager_new() {
         let manager = SecretsManager::new(SecretsConfig::default());
         assert!(manager.is_ok());
+    }
+
+    /// The disk-cache file name of configured source `name`.
+    #[cfg(unix)]
+    fn disk_file_name(config: &SecretsConfig, name: &str) -> String {
+        use base64::Engine;
+        let key = source_cache_key(config, name, &config.sources[name]);
+        format!(
+            "{}.json",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+        )
+    }
+
+    /// A config with one source, `api_token`, reading `path`, caching under `cache_dir`.
+    fn one_file_source(cache_dir: &std::path::Path, path: &std::path::Path) -> SecretsConfig {
+        SecretsConfig {
+            cache: CacheConfig {
+                directory: Some(cache_dir.to_path_buf()),
+                ttl_secs: 3600,
+                allow_plaintext_disk_cache: true,
+                ..Default::default()
+            },
+            sources: HashMap::from([(
+                "api_token".to_string(),
+                SecretSource::File {
+                    path: path.to_str().unwrap().to_string(),
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    /// Two apps sharing a cache directory, each with a source called
+    /// `api_token` that reads a different file.
+    #[tokio::test]
+    async fn same_named_sources_over_one_cache_directory_never_share_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        std::fs::write(&first, "first app's token").unwrap();
+        std::fs::write(&second, "second app's token").unwrap();
+
+        let app_one = SecretsManager::new(one_file_source(&cache_dir, &first)).unwrap();
+        assert_eq!(
+            app_one.get("api_token").await.unwrap().data,
+            b"first app's token"
+        );
+        let app_two = SecretsManager::new(one_file_source(&cache_dir, &second)).unwrap();
+        assert_eq!(
+            app_two.get("api_token").await.unwrap().data,
+            b"second app's token",
+            "the second app reads its own file, not the first app's cache entry"
+        );
+
+        // An identical definition still shares the cached entry.
+        std::fs::remove_file(&first).unwrap();
+        let app_three = SecretsManager::new(one_file_source(&cache_dir, &first)).unwrap();
+        assert_eq!(
+            app_three.get("api_token").await.unwrap().data,
+            b"first app's token"
+        );
     }
 
     #[tokio::test]
@@ -831,8 +967,8 @@ mod tests {
             sources,
             ..Default::default()
         };
-        // The disk-cache file for "a" (its key, base64url, `.json`).
-        let fifo = cache_dir.join("YQ.json");
+        // The disk-cache file for "a": its cache key, base64url, `.json`.
+        let fifo = cache_dir.join(disk_file_name(&config, "a"));
         let made = std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
