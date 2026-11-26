@@ -10,6 +10,7 @@
 //! so a call allocates no label.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use metrics::{Counter, Gauge, Histogram};
@@ -28,27 +29,21 @@ pub(super) const CALL_OUTCOMES: [&str; 9] = [
     "poisoned",
 ];
 
-/// One plugin's metric handles. Dropping them sets its info gauge to 0.
+/// One plugin's metric handles.
 pub(super) struct PluginMetrics {
-    info: Gauge,
     calls: [Counter; CALL_OUTCOMES.len()],
     duration: Histogram,
     instantiations: Counter,
     memory: Gauge,
-    peak_memory: AtomicU64,
+    /// The high-water mark, read without the lock to skip a call that sets
+    /// no new one.
+    peak_seen: AtomicU64,
+    peak: Mutex<u64>,
 }
 
 impl PluginMetrics {
-    pub(super) fn new(plugin: &str, digest: &str, signer: &str) -> Self {
-        let info = ::metrics::gauge!(
-            "wasm_plugin_info",
-            "plugin" => plugin.to_string(),
-            "digest" => digest.to_string(),
-            "signer" => signer.to_string()
-        );
-        info.set(1.0);
+    pub(super) fn new(plugin: &str) -> Self {
         Self {
-            info,
             calls: CALL_OUTCOMES.map(|outcome| {
                 ::metrics::counter!(
                     "wasm_plugin_calls_total",
@@ -68,7 +63,8 @@ impl PluginMetrics {
                 "wasm_plugin_memory_bytes",
                 "plugin" => plugin.to_string()
             ),
-            peak_memory: AtomicU64::new(0),
+            peak_seen: AtomicU64::new(0),
+            peak: Mutex::new(0),
         }
     }
 
@@ -83,19 +79,32 @@ impl PluginMetrics {
         self.instantiations.increment(1);
     }
 
-    /// Raise the memory high-water mark to `bytes` if it is higher.
+    /// Raise the memory high-water mark to `bytes` if it is higher. The gauge
+    /// is set under the lock, so it never moves down.
     pub(super) fn memory(&self, bytes: usize) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
-        if self.peak_memory.fetch_max(bytes, Ordering::Relaxed) < bytes {
+        if bytes <= self.peak_seen.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut peak = self.peak.lock().unwrap_or_else(PoisonError::into_inner);
+        if bytes > *peak {
+            *peak = bytes;
+            self.peak_seen.store(bytes, Ordering::Relaxed);
             self.memory.set(bytes as f64);
         }
     }
 }
 
-impl Drop for PluginMetrics {
-    fn drop(&mut self) {
-        self.info.set(0.0);
-    }
+/// Set `wasm_plugin_info` for `labels` (plugin, digest, signer) to `value`.
+pub(super) fn info(labels: &[String; 3], value: f64) {
+    let [plugin, digest, signer] = labels;
+    ::metrics::gauge!(
+        "wasm_plugin_info",
+        "plugin" => plugin.clone(),
+        "digest" => digest.clone(),
+        "signer" => signer.clone()
+    )
+    .set(value);
 }
 
 /// Count one load by `plugin` under `outcome`.

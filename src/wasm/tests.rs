@@ -586,6 +586,78 @@ fn one_wasm_compiles_once_while_a_plugin_holds_it() {
     assert_eq!(engine.cached_components(), 1, "the second plugin holds it");
     drop(second);
     assert_eq!(engine.cached_components(), 0);
+
+    let sockets =
+        wat::parse_str(r#"(component (import "wasi:sockets/tcp@0.2.6" (instance)))"#).unwrap();
+    assert!(
+        engine
+            .load::<FixtureWorld>(unsigned("sockets", &sockets), &UNSIGNED_OK)
+            .is_err()
+    );
+    assert_eq!(
+        engine.cached_components(),
+        0,
+        "a refused load holds nothing"
+    );
+}
+
+#[test]
+fn the_info_gauge_has_one_owner_per_live_plugin_with_its_labels() {
+    let engine = WasmEngine::new(test_config()).unwrap();
+    let bytes = guest();
+    let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
+    let labels = [
+        "fixture".to_string(),
+        super::engine::hex(&digest),
+        "unsigned".to_string(),
+    ];
+    let old = engine
+        .load::<FixtureWorld>(unsigned("fixture", &bytes), &UNSIGNED_OK)
+        .unwrap();
+    let new = engine
+        .load::<FixtureWorld>(unsigned("fixture", &bytes), &UNSIGNED_OK)
+        .unwrap();
+    assert_eq!(engine.info_owners(&labels), 2);
+    drop(old);
+    assert_eq!(
+        engine.info_owners(&labels),
+        1,
+        "the same-digest reload is still live"
+    );
+    drop(new);
+    assert_eq!(engine.info_owners(&labels), 0);
+}
+
+/// A guest whose start function traps, so every instantiation fails.
+const TRAPS_AT_START: &str = r#"
+(component
+  (import "tick" (func $tick))
+  (core module $m
+    (func $boom (unreachable))
+    (start $boom)
+    (func (export "run") (param i32 i32) (result i32) (i32.const 0)))
+  (core instance $i (instantiate $m))
+  (func $run (param "op" u32) (param "n" u32) (result u32)
+    (canon lift (core func $i "run")))
+  (export "run" (func $run)))
+"#;
+
+#[test]
+fn a_guest_that_traps_at_start_up_counts_toward_unhealthy() {
+    let config = WasmConfig {
+        unhealthy_after_traps: 3,
+        ..test_config()
+    };
+    let engine = WasmEngine::new(config).unwrap();
+    let bytes = wat::parse_str(TRAPS_AT_START).unwrap();
+    let plugin = engine
+        .load::<FixtureWorld>(unsigned("boom", &bytes), &UNSIGNED_OK)
+        .unwrap();
+    for _ in 0..3 {
+        assert!(matches!(plugin.instance(()), Err(CallError::Trap(_))));
+    }
+    assert!(!plugin.is_healthy());
+    assert!(matches!(plugin.instance(()), Err(CallError::Unhealthy(3))));
 }
 
 #[test]

@@ -16,7 +16,7 @@ use arc_swap::ArcSwap;
 use wasmtime::component::{InstancePre, Linker};
 use wasmtime::{PoolConcurrencyLimitError, Store, Trap};
 
-use super::engine::{EngineInner, hex};
+use super::engine::{EngineInner, InfoLabels, Lease, hex};
 use super::host::{HostCtx, LimitHit};
 use super::metrics::PluginMetrics;
 
@@ -136,6 +136,8 @@ pub struct Plugin<W: World> {
     digest: [u8; 32],
     signer: String,
     pre: W::Pre,
+    _lease: Lease,
+    info: InfoLabels,
     engine: Arc<EngineInner>,
     health: Health,
     metrics: PluginMetrics,
@@ -147,13 +149,16 @@ impl<W: World> Plugin<W> {
         digest: [u8; 32],
         signer: String,
         pre: W::Pre,
+        lease: Lease,
         engine: Arc<EngineInner>,
     ) -> Self {
         let limit = engine.config.unhealthy_after_traps;
-        engine.retain(&digest);
-        let metrics = PluginMetrics::new(&name, &hex(&digest), &signer);
+        let info = [name.to_string(), hex(&digest), signer.clone()];
+        engine.info_acquire(&info);
         Self {
-            metrics,
+            metrics: PluginMetrics::new(&name),
+            _lease: lease,
+            info,
             name,
             digest,
             signer,
@@ -209,7 +214,8 @@ impl<W: World> Plugin<W> {
     ) -> Result<Instance<W>, CallError> {
         self.health.check()?;
         let mut store = self.new_store(data);
-        let bindings = W::instantiate(&self.pre, &mut store).map_err(CallError::from_wasmtime)?;
+        let bindings = W::instantiate(&self.pre, &mut store)
+            .map_err(|error| self.instantiate_failed(error))?;
         self.metrics.instantiated();
         Ok(Instance {
             plugin: Arc::clone(self),
@@ -232,11 +238,21 @@ impl<W: World> Plugin<W> {
     fn renew(&self, old: Store<HostCtx<W::Data>>) -> Store<HostCtx<W::Data>> {
         self.new_store(old.into_data().into_data())
     }
+
+    /// A guest whose start-up traps counts toward `unhealthy_after_traps`. A
+    /// full pool doesn't: it's the host's, and passes.
+    fn instantiate_failed(&self, error: wasmtime::Error) -> CallError {
+        let error = CallError::from_wasmtime(error);
+        if !matches!(error, CallError::Capacity) {
+            self.health.record(true);
+        }
+        error
+    }
 }
 
 impl<W: World> Drop for Plugin<W> {
     fn drop(&mut self) {
-        self.engine.release(&self.digest);
+        self.engine.info_release(&self.info);
     }
 }
 
@@ -328,7 +344,7 @@ impl<W: World> Instance<W> {
                     }
                     Err(error) => {
                         self.state = State::Idle(self.plugin.renew(store));
-                        return Err(CallError::from_wasmtime(error));
+                        return Err(self.plugin.instantiate_failed(error));
                     }
                 }
             }

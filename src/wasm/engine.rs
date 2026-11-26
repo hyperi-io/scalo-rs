@@ -252,11 +252,14 @@ impl Drop for Ticker {
     }
 }
 
-/// A compiled component and the live plugins built from it.
+/// A compiled component and the leases on it.
 struct Compiled {
     component: Component,
-    plugins: usize,
+    leases: usize,
 }
+
+/// `wasm_plugin_info`'s labels: plugin, digest, signer.
+pub(super) type InfoLabels = [String; 3];
 
 pub(super) struct EngineInner {
     pub(super) engine: Engine,
@@ -264,20 +267,58 @@ pub(super) struct EngineInner {
     pub(super) deadline_ticks: u64,
     trusted_root: TrustedRoot,
     components: Mutex<HashMap<[u8; 32], Compiled>>,
+    infos: Mutex<HashMap<InfoLabels, usize>>,
     _ticker: Ticker,
+}
+
+/// A hold on one cached component. The entry goes when its last lease drops,
+/// including a lease a failed load took.
+pub(super) struct Lease {
+    engine: Arc<EngineInner>,
+    digest: [u8; 32],
+    pub(super) component: Component,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut components = self.engine.components();
+        if let Some(compiled) = components.get_mut(&self.digest) {
+            compiled.leases = compiled.leases.saturating_sub(1);
+            if compiled.leases == 0 {
+                components.remove(&self.digest);
+            }
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl EngineInner {
     fn components(&self) -> MutexGuard<'_, HashMap<[u8; 32], Compiled>> {
-        self.components
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        lock(&self.components)
     }
 
-    /// The component for `digest`, compiled once while any plugin uses it.
-    fn compile(&self, name: &str, digest: [u8; 32], bytes: &[u8]) -> Result<Component, LoadError> {
-        if let Some(compiled) = self.components().get(&digest) {
-            return Ok(compiled.component.clone());
+    /// A lease on the component for `digest`, compiled once while any lease
+    /// holds it. Two loads that miss together both compile, and one copy is
+    /// kept.
+    fn lease(
+        self: &Arc<Self>,
+        name: &str,
+        digest: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<Lease, LoadError> {
+        let lease = |compiled: &mut Compiled| {
+            compiled.leases += 1;
+            Lease {
+                engine: Arc::clone(self),
+                digest,
+                component: compiled.component.clone(),
+            }
+        };
+        if let Some(compiled) = self.components().get_mut(&digest) {
+            return Ok(lease(compiled));
         }
         let started = Instant::now();
         let component =
@@ -287,26 +328,32 @@ impl EngineInner {
             })?;
         metrics::compiled(name, started.elapsed());
         let mut components = self.components();
-        components.retain(|_, compiled| compiled.plugins > 0);
-        components.entry(digest).or_insert(Compiled {
-            component: component.clone(),
-            plugins: 0,
+        let compiled = components.entry(digest).or_insert(Compiled {
+            component,
+            leases: 0,
         });
-        Ok(component)
+        Ok(lease(compiled))
     }
 
-    pub(super) fn retain(&self, digest: &[u8; 32]) {
-        if let Some(compiled) = self.components().get_mut(digest) {
-            compiled.plugins += 1;
+    /// Count one more live plugin under `labels`, setting the info gauge on
+    /// the first.
+    pub(super) fn info_acquire(&self, labels: &InfoLabels) {
+        let mut infos = lock(&self.infos);
+        let owners = infos.entry(labels.clone()).or_insert(0);
+        *owners += 1;
+        if *owners == 1 {
+            metrics::info(labels, 1.0);
         }
     }
 
-    pub(super) fn release(&self, digest: &[u8; 32]) {
-        let mut components = self.components();
-        if let Some(compiled) = components.get_mut(digest) {
-            compiled.plugins = compiled.plugins.saturating_sub(1);
-            if compiled.plugins == 0 {
-                components.remove(digest);
+    /// Count one fewer, clearing the info gauge when the last one goes.
+    pub(super) fn info_release(&self, labels: &InfoLabels) {
+        let mut infos = lock(&self.infos);
+        if let Some(owners) = infos.get_mut(labels) {
+            *owners = owners.saturating_sub(1);
+            if *owners == 0 {
+                infos.remove(labels);
+                metrics::info(labels, 0.0);
             }
         }
     }
@@ -335,6 +382,7 @@ impl WasmEngine {
                 deadline_ticks,
                 trusted_root,
                 components: Mutex::new(HashMap::new()),
+                infos: Mutex::new(HashMap::new()),
                 _ticker: ticker,
             }),
         })
@@ -350,11 +398,12 @@ impl WasmEngine {
     /// compiles once.
     #[must_use]
     pub fn cached_components(&self) -> usize {
-        self.inner
-            .components()
-            .values()
-            .filter(|compiled| compiled.plugins > 0)
-            .count()
+        self.inner.components().len()
+    }
+
+    #[cfg(all(test, feature = "wasm-test-support"))]
+    pub(super) fn info_owners(&self, labels: &InfoLabels) -> usize {
+        lock(&self.inner.infos).get(labels).copied().unwrap_or(0)
     }
 
     /// Check, compile and link a plugin for world `W`.
@@ -452,14 +501,14 @@ impl WasmEngine {
         };
 
         let engine = &self.inner.engine;
-        let component = self.inner.compile(&name, digest, bytes)?;
-        self.check_imports(&name, &component)?;
-        self.check_resources(&name, &component)?;
+        let lease = self.inner.lease(&name, digest, bytes)?;
+        self.check_imports(&name, &lease.component)?;
+        self.check_resources(&name, &lease.component)?;
 
         let mut linker: Linker<HostCtx<W::Data>> = Linker::new(engine);
         let pre = wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .and_then(|()| W::link(&mut linker))
-            .and_then(|()| linker.instantiate_pre(&component))
+            .and_then(|()| linker.instantiate_pre(&lease.component))
             .and_then(W::pre)
             .map_err(|e| LoadError::Compile {
                 name: name.clone(),
@@ -470,6 +519,7 @@ impl WasmEngine {
             digest,
             signer,
             pre,
+            lease,
             Arc::clone(&self.inner),
         )))
     }

@@ -91,8 +91,8 @@ Bare names, labelled by `plugin`.
 | `wasm_plugin_loads_total` | counter | `plugin`, `outcome`: `ok`, `unsigned`, `bad_signature`, `untrusted_signer`, `digest_mismatch`, `precompiled`, `not_wasm`, `too_large`, `forbidden_import`, `over_limits`, `compile_error`, `bad_policy`, `read_error` |
 | `wasm_plugin_compile_duration_seconds` | histogram | `plugin` |
 | `wasm_plugin_instantiations_total` | counter | `plugin` |
-| `wasm_plugin_memory_bytes` | gauge | `plugin`, the high-water mark |
-| `wasm_plugin_info` | gauge, 1 | `plugin`, `digest`, `signer` |
+| `wasm_plugin_memory_bytes` | gauge | `plugin`, the high-water mark since the plugin was loaded |
+| `wasm_plugin_info` | gauge, 1 while a plugin with these labels is loaded, then 0 | `plugin`, `digest`, `signer` |
 | `wasm_pool_component_instances`, `wasm_pool_core_instances`, `wasm_pool_memories`, `wasm_pool_tables` | gauge | none, updated each second |
 
 ## Weight
