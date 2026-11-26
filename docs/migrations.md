@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.41
 
+### The secret cache keys each source on what it reads (BEHAVIOUR CHANGE)
+
+A configured source's cache entry is keyed on its name and a digest of what it reads, not the name alone. Before, two apps sharing a cache directory, each with a source called `api_token`, read each other's secret from the disk tier until its TTL ran out.
+
+**Consumer adjustment** -- none. Disk entries written by an earlier release are no longer found, so each source is read from its backend once after the upgrade, then cached under the new key. Old files stay in the cache directory until it is cleared.
+
 ### Kafka `send_batch` sets the message timestamp from the record (BEHAVIOUR CHANGE)
 
 A record's `timestamp_ms` is the Kafka message timestamp, so a record read from one hop keeps its time through the next. Before, the producer set it, as CreateTime, when the record was sent. A record with no `timestamp_ms`, or one before the epoch, still gets the producer's time, and `send(destination, payload)` has no record and sets none.
