@@ -53,6 +53,15 @@ if let Some(level) = scalo::logger::level_handle() {
 }
 ```
 
+`logger::setup_with_layers(opts, layers)` is `setup(opts)` with extra `tracing-subscriber` layers. The level, the `rdkafka=warn` floor and `RUST_LOG` filter only the printed output and the span export, so an extra layer sees every event at every level and `level_handle()` never changes it. Throttling and masking stay on the printed output: wrap an extra layer's writer in `MaskingWriter::new` to redact.
+
+```rust
+let warnings = event_log_layer.with_filter(LevelFilter::WARN);
+scalo::logger::setup_with_layers(LoggerOptions::default(), vec![warnings.boxed()])?;
+```
+
+Give each layer its own filter, as above. An unfiltered one makes every `tracing` call in the process build its event. With any extra layer, each call up to the most verbose level a layer wants runs every filter, because a cached callsite verdict drops the next event after an `enabled!` query ([tokio-rs/tracing#2519](https://github.com/tokio-rs/tracing/issues/2519)). `setup(opts)` keeps one level filter on the whole subscriber, which that bug can't reach.
+
 ---
 
 ## Format and colour
@@ -195,9 +204,10 @@ collapse into one.
 | --- | --- |
 | `logger::setup_default()` | Env-driven install -- `ServiceApp` calls this |
 | `logger::setup(opts)` | Explicit install |
+| `logger::setup_with_layers(opts, layers)` | `setup` with extra `Box<dyn Layer<Registry> + Send + Sync>` layers, each seeing every level. See [Setup](#setup) |
 | `LoggerOptions` | `level`, `format`, `add_source`, `enable_masking`, `sensitive_fields`, `span_events`, `throttle`, `service_name`, `service_version` |
 | `LogFormat::{Json, Text, Auto}` | Format. `Auto` resolves on `setup` |
-| `logger::level_handle() -> Option<LevelHandle>` | `set(level)` and `current()` on the running level |
+| `logger::level_handle() -> Option<LevelHandle>` | `set(level)` and `current()` on the running level of the printed output and the span export |
 | `LoggerSettings` | `level`, `format`, `color` under the `logger` config key, read by `LoggerSettings::from_cascade()` |
 | `ThrottleConfig` | `enabled`, `burst`, `rate`, `max_signatures`, `excluded_fields` |
 | `logger::default_sensitive_fields() -> Vec<String>` | Baseline mask list -- extend, don't replace |
