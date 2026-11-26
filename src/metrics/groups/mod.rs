@@ -39,6 +39,7 @@
 //! sink.record_duration("clickhouse", 0.015);
 //! cb.record_transition("db.events", "open");
 //! bp.record_event();
+//! UsageMetrics.record("acme", 100);
 //! ```
 
 mod app;
@@ -49,6 +50,7 @@ mod consumer;
 mod enrichment;
 mod schema_cache;
 mod sink;
+mod usage;
 
 pub use app::AppMetrics;
 pub use backpressure::BackpressureMetrics;
@@ -60,3 +62,4 @@ pub(crate) use consumer::series as consumer_series;
 pub use enrichment::EnrichmentMetrics;
 pub use schema_cache::SchemaCacheMetrics;
 pub use sink::SinkMetrics;
+pub use usage::UsageMetrics;
