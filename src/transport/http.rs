@@ -21,12 +21,13 @@
 //! ## Receive (requires `http-server` feature)
 //!
 //! Starts an embedded axum HTTP server that accepts POST requests on a
-//! configurable path. Incoming payloads are queued into a bounded
-//! `tokio::sync::mpsc` channel. `recv()` drains from this channel.
+//! configurable path. Each body is split into records by `framing`, and its
+//! records are queued together into a bounded `tokio::sync::mpsc` channel.
+//! `recv()` drains from this channel.
 //!
 //! ## Shutdown
 //!
-//! The server answers 200 once a record is queued for `recv`, so a receiving
+//! The server answers 200 once a body's records are queued for `recv`, so a receiving
 //! service shuts down in this order: `close()`, then `recv` until it returns
 //! `TransportError::Closed`, then its final flush. `close()` answers new POSTs
 //! with 503, which senders retry.
@@ -48,8 +49,13 @@
 mod send;
 #[cfg(test)]
 mod send_tests;
+#[cfg(feature = "http-server")]
+mod split;
 
 pub use send::{HttpAuth, HttpEndpoint};
+
+/// The receive-only `framing`: a JSON array or NDJSON, told apart by the body.
+const JSON_FRAMING: &str = "json";
 
 /// The codecs an HTTP request body takes.
 pub const HTTP_ACCEPTS: Accepts = Accepts::new(
@@ -188,8 +194,12 @@ pub struct HttpTransportConfig {
     #[serde(default)]
     pub user_agent: Option<String>,
 
-    /// How records share a request body. Default `single`, one record per
-    /// request. Any [`crate::framing`] name, an app's own included.
+    /// How records share a request body, sent and received. Default `single`,
+    /// one record per request. Any [`crate::framing`] name, an app's own
+    /// included, or `json`, which receives a JSON array or NDJSON and can't
+    /// send. The receive side refuses a body of more than
+    /// [`DEFAULT_MAX_RECORDS`](crate::framing::DecodeLimits::DEFAULT_MAX_RECORDS)
+    /// records with 413, and takes one that does not frame as one record.
     #[serde(default = "default_framing")]
     pub framing: crate::framing::FramingConfig,
 
@@ -225,7 +235,8 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_recv_path")]
     pub recv_path: String,
 
-    /// Receive buffer size (bounded channel capacity). Default: 10000.
+    /// Requests queued for `recv` at once, each with all its records
+    /// (bounded channel capacity). Default: 10000.
     #[serde(default = "default_buffer_size")]
     pub recv_buffer_size: usize,
 
@@ -435,7 +446,7 @@ pub struct HttpTransport {
     /// Receiver channel populated by the embedded HTTP server.
     /// Only available when `http-server` feature is enabled AND `listen` is configured.
     #[cfg(feature = "http-server")]
-    receiver: Option<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Message<HttpToken>>>>,
+    receiver: Option<tokio::sync::Mutex<Inbox>>,
 
     /// Address the embedded server bound, with any port-0 request resolved.
     #[cfg(feature = "http-server")]
@@ -624,6 +635,7 @@ impl HttpTransport {
                 .parse()
                 .map_err(|e| TransportError::Config(format!("invalid listen address: {e}")))?;
             let in_flight = Arc::new(in_flight_budget(config)?);
+            let split = split::BodySplit::new(&config.framing)?;
 
             let (tx, rx) = tokio::sync::mpsc::channel(config.recv_buffer_size);
             let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
@@ -637,6 +649,7 @@ impl HttpTransport {
                     sequence,
                     in_flight: Arc::clone(&in_flight),
                     max_body_bytes: config.max_body_bytes,
+                    split,
                     decoders: Arc::new(BodyDecoders::new()?),
                     #[cfg(feature = "governor")]
                     pressure: pressure.clone(),
@@ -663,7 +676,10 @@ impl HttpTransport {
             });
 
             (
-                Some(tokio::sync::Mutex::new(rx)),
+                Some(tokio::sync::Mutex::new(Inbox {
+                    queue: rx,
+                    partial: None,
+                })),
                 Some(bound),
                 Some(in_flight),
                 Some(sd_tx),
@@ -788,15 +804,32 @@ fn build_receiver_router(state: ReceiverState, recv_path: &str) -> axum::Router 
         .with_state(state)
 }
 
+/// The receive queue, and the rest of the request `recv` last took part of.
+#[cfg(feature = "http-server")]
+struct Inbox {
+    queue: tokio::sync::mpsc::Receiver<Queued>,
+    partial: Option<Queued>,
+}
+
+/// One request's records, queued as one so a body is taken whole or not at all.
+#[cfg(feature = "http-server")]
+struct Queued {
+    messages: std::vec::IntoIter<Message<HttpToken>>,
+    /// In-flight bytes the request holds, returned as `recv` takes its last record.
+    held: usize,
+}
+
 /// Shared state for the receive handler.
 #[cfg(feature = "http-server")]
 #[derive(Clone)]
 struct ReceiverState {
-    sender: tokio::sync::mpsc::Sender<Message<HttpToken>>,
+    sender: tokio::sync::mpsc::Sender<Queued>,
     sequence: Arc<AtomicU64>,
     /// Body bytes read or queued, see [`HttpTransportConfig::max_in_flight_bytes`].
     in_flight: Arc<tokio::sync::Semaphore>,
     max_body_bytes: usize,
+    /// How a body splits into records, from `framing`.
+    split: split::BodySplit,
     /// Decoding contexts for a compressed request body, kept between requests.
     decoders: Arc<BodyDecoders>,
     /// Optional pressure governor (`governor` feature). `None` by default
@@ -876,7 +909,7 @@ async fn decode_body(
     .map_err(std::io::Error::other)?
 }
 
-/// POST handler that accepts raw bytes and queues them into the mpsc channel.
+/// POST handler that accepts raw bytes and queues their records into the mpsc channel.
 ///
 /// A `Content-Encoding` of gzip or zstd is decoded first, to at most
 /// `max_body_bytes`, and the decoded bytes are what the in-flight budget
@@ -884,7 +917,7 @@ async fn decode_body(
 ///
 /// The pressure check and the byte reservation come before the body is read,
 /// so a held governor or a spent budget costs no body buffer. Answers 200 once
-/// the record is queued. A full queue, a held inbound gate, a spent byte budget
+/// the records are queued. A full queue, a held inbound gate, a spent byte budget
 /// and a closed receiver answer 503, which a sender retries.
 #[cfg(feature = "http-server")]
 async fn ingest_handler(
@@ -925,14 +958,8 @@ async fn ingest_handler(
     }
     // A body with no Content-Length can run to max_body_bytes.
     let reserved = declared.unwrap_or(state.max_body_bytes);
-    let Some(mut permit) = u32::try_from(reserved)
-        .ok()
-        .and_then(|n| Arc::clone(&state.in_flight).try_acquire_many_owned(n).ok())
-    else {
-        #[cfg(feature = "metrics")]
-        metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "in_flight_bytes")
-            .increment(1);
-        return shed_503();
+    let Some(mut permit) = reserve(&state.in_flight, reserved) else {
+        return budget_spent();
     };
 
     // Extract W3C traceparent from incoming HTTP headers for distributed tracing
@@ -961,14 +988,8 @@ async fn ingest_handler(
         body
     } else {
         // Decoding holds the body and up to `max_body_bytes` decoded at once.
-        let Some(decoding) = u32::try_from(state.max_body_bytes)
-            .ok()
-            .and_then(|n| Arc::clone(&state.in_flight).try_acquire_many_owned(n).ok())
-        else {
-            #[cfg(feature = "metrics")]
-            metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "in_flight_bytes")
-                .increment(1);
-            return shed_503();
+        let Some(decoding) = reserve(&state.in_flight, state.max_body_bytes) else {
+            return budget_spent();
         };
         permit.merge(decoding);
         let decoded = match decode_body(
@@ -993,28 +1014,80 @@ async fn ingest_handler(
         bytes::Bytes::from(decoded)
     };
 
-    let seq = state.sequence.fetch_add(1, Ordering::Relaxed);
-    let format = PayloadFormat::detect(&body);
-    let timestamp_ms = crate::clock::epoch_millis();
+    queue(&state, permit, body, addr)
+}
 
-    // Capture wire size before `body` moves into the message.
-    let body_len = body.len();
+/// Split `body` into its records by `framing` and queue them together,
+/// answering 200 once they are queued. `permit` holds the body's bytes of the
+/// in-flight budget.
+///
+/// A body over the record cap is 413, naming the cap, and nothing of it is
+/// queued, so its sender can retry it smaller.
+#[cfg(feature = "http-server")]
+fn queue(
+    state: &ReceiverState,
+    mut permit: tokio::sync::OwnedSemaphorePermit,
+    body: bytes::Bytes,
+    addr: std::net::SocketAddr,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
 
-    // `body` is `bytes::Bytes`, the request's or the decoded one, moved in.
-    let msg = Message {
+    let source = addr.to_string();
+    let timestamp_ms = Some(crate::clock::epoch_millis());
+    let message = |payload: bytes::Bytes, seq: u64| Message {
         key: None,
-        payload: body,
-        token: HttpToken::with_source(seq, addr.to_string()),
-        timestamp_ms: Some(timestamp_ms),
-        format,
+        format: PayloadFormat::detect(&payload),
+        payload,
+        token: HttpToken::with_source(seq, source.clone()),
+        timestamp_ms,
         headers: Vec::new(),
     };
+    let body_len = body.len();
+    let messages: Vec<Message<HttpToken>> = match state.split.parts(&body) {
+        split::BodyParts::Whole => {
+            vec![message(
+                body,
+                state.sequence.fetch_add(1, Ordering::Relaxed),
+            )]
+        }
+        // An empty array: nothing to queue, and its bytes return as the permit drops.
+        split::BodyParts::Each(records) if records.is_empty() => {
+            return axum::http::StatusCode::OK.into_response();
+        }
+        split::BodyParts::Each(records) => {
+            // Each record's message and source address are memory the body's bytes do not count.
+            let overhead = records
+                .len()
+                .saturating_mul(size_of::<Message<HttpToken>>() + source.len());
+            let Some(more) = reserve(&state.in_flight, overhead) else {
+                return budget_spent();
+            };
+            permit.merge(more);
+            let first = state
+                .sequence
+                .fetch_add(records.len() as u64, Ordering::Relaxed);
+            records
+                .iter()
+                .zip(first..)
+                .map(|(record, seq)| message(split::slice_of(&body, record), seq))
+                .collect()
+        }
+        split::BodyParts::TooMany(max) => {
+            let answer = format!("the body holds more than {max} records: send fewer per request");
+            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, answer).into_response();
+        }
+    };
 
-    match state.sender.try_send(msg) {
+    let records = messages.len();
+    let queued = Queued {
+        messages: messages.into_iter(),
+        held: permit.num_permits(),
+    };
+    match state.sender.try_send(queued) {
         Ok(()) => {
-            // The queued record holds its bytes until `recv` hands it over.
+            // The queued records hold their bytes until `recv` takes the last of them.
             permit.forget();
-            HttpTransport::count_received(1, body_len as u64);
+            HttpTransport::count_received(records as u64, body_len as u64);
             axum::http::StatusCode::OK.into_response()
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -1027,6 +1100,26 @@ async fn ingest_handler(
             shed_503()
         }
     }
+}
+
+/// `bytes` more of the in-flight budget, or `None` when they do not fit.
+#[cfg(feature = "http-server")]
+fn reserve(
+    in_flight: &Arc<tokio::sync::Semaphore>,
+    bytes: usize,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    u32::try_from(bytes)
+        .ok()
+        .and_then(|n| Arc::clone(in_flight).try_acquire_many_owned(n).ok())
+}
+
+/// The 503 for a spent in-flight budget, counted.
+#[cfg(feature = "http-server")]
+fn budget_spent() -> axum::response::Response {
+    #[cfg(feature = "metrics")]
+    metrics::counter!("transport_backpressured_total", "transport" => "http", "reason" => "in_flight_bytes")
+        .increment(1);
+    shed_503()
 }
 
 /// 503 shed response with a `Retry-After: 1` hint, so a well-behaved sender
@@ -1057,7 +1150,7 @@ impl TransportBase for HttpTransport {
         #[cfg(feature = "http-server")]
         {
             if let Some(receiver) = &self.receiver {
-                receiver.lock().await.close();
+                receiver.lock().await.queue.close();
             }
             self.stop_server().await;
         }
@@ -1184,36 +1277,41 @@ impl TransportReceiver for HttpTransport {
                 ));
             };
 
-            let mut rx = receiver.lock().await;
+            let mut inbox = receiver.lock().await;
+            let inbox = &mut *inbox;
             let mut messages = Vec::with_capacity(max.min(100));
 
-            for _ in 0..max {
-                // The first record waits up to recv_timeout_ms. The rest only take
-                // what is already queued.
-                let msg = if self.recv_timeout_ms == 0 || !messages.is_empty() {
-                    match rx.try_recv() {
-                        Ok(msg) => msg,
-                        Err(TryRecvError::Disconnected) if messages.is_empty() => {
-                            return Err(TransportError::Closed);
+            while messages.len() < max {
+                let mut queued = match inbox.partial.take() {
+                    Some(queued) => queued,
+                    // The first record waits up to recv_timeout_ms. The rest only
+                    // take what is already queued.
+                    None if self.recv_timeout_ms == 0 || !messages.is_empty() => {
+                        match inbox.queue.try_recv() {
+                            Ok(queued) => queued,
+                            Err(TryRecvError::Disconnected) if messages.is_empty() => {
+                                return Err(TransportError::Closed);
+                            }
+                            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                         }
-                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                     }
-                } else {
-                    match tokio::time::timeout(
+                    None => match tokio::time::timeout(
                         std::time::Duration::from_millis(self.recv_timeout_ms),
-                        rx.recv(),
+                        inbox.queue.recv(),
                     )
                     .await
                     {
-                        Ok(Some(msg)) => msg,
+                        Ok(Some(queued)) => queued,
                         Ok(None) => return Err(TransportError::Closed),
                         Err(_elapsed) => break,
-                    }
+                    },
                 };
-                if let Some(in_flight) = &self.in_flight {
-                    in_flight.add_permits(msg.payload.len());
+                messages.extend(queued.messages.by_ref().take(max - messages.len()));
+                if !queued.messages.as_slice().is_empty() {
+                    inbox.partial = Some(queued);
+                } else if let Some(in_flight) = &self.in_flight {
+                    in_flight.add_permits(queued.held);
                 }
-                messages.push(msg);
             }
 
             // Apply inbound filters via the shared partition helper. DLQ
@@ -1863,6 +1961,276 @@ mod tests {
         receiver.close().await.unwrap();
     }
 
+    /// What a POST in a split row is answered, and what `recv` then takes.
+    #[cfg(feature = "http-server")]
+    enum SplitWant {
+        /// 200, and these records.
+        Records(Vec<String>),
+        /// 200, and the body as one record.
+        Whole,
+        /// 413 naming the cap, and nothing queued.
+        Refused,
+    }
+
+    /// A split row: (case, framing, body, want).
+    #[cfg(feature = "http-server")]
+    type SplitRow = (&'static str, &'static str, String, SplitWant);
+
+    /// `1` nested in `depth` arrays.
+    #[cfg(feature = "http-server")]
+    fn nested(depth: usize) -> String {
+        format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    /// `n` ones with `between` between them.
+    #[cfg(feature = "http-server")]
+    fn ones(n: usize, between: &str) -> String {
+        vec!["1"; n].join(between)
+    }
+
+    /// 200, and `items` as the records.
+    #[cfg(feature = "http-server")]
+    fn split_records(items: &[&str]) -> SplitWant {
+        SplitWant::Records(items.iter().map(|i| (*i).into()).collect())
+    }
+
+    /// Rows for `json_array` and `single`.
+    #[cfg(feature = "http-server")]
+    fn array_split_rows() -> Vec<SplitRow> {
+        use crate::parse_guard::MAX_PARSE_DEPTH;
+        use SplitWant::{Records, Refused, Whole};
+
+        let cap = crate::framing::DecodeLimits::DEFAULT_MAX_RECORDS;
+        let wide = r#"{"id":123456789012345678901234}"#;
+        vec![
+            (
+                "array elements as sent",
+                "json_array",
+                format!(r#"[{wide}, {{"n":1.0e2}} ,"a,]"]"#),
+                split_records(&[wide, r#"{"n":1.0e2}"#, r#""a,]""#]),
+            ),
+            (
+                "the deepest array that splits",
+                "json_array",
+                format!("[{}]", nested(MAX_PARSE_DEPTH)),
+                split_records(&[&nested(MAX_PARSE_DEPTH)]),
+            ),
+            (
+                "an array too deep to split",
+                "json_array",
+                format!("[{}]", nested(MAX_PARSE_DEPTH + 1)),
+                Whole,
+            ),
+            (
+                "an element that does not parse",
+                "json_array",
+                r#"[{"a":1},{"b":}]"#.into(),
+                Whole,
+            ),
+            (
+                "bytes after the closing bracket",
+                "json_array",
+                r#"[{"a":1}] and then some"#.into(),
+                Whole,
+            ),
+            (
+                "a second array after the first",
+                "json_array",
+                "[1][2]".into(),
+                Whole,
+            ),
+            (
+                "an object, not an array",
+                "json_array",
+                r#"{"a":1}"#.into(),
+                Whole,
+            ),
+            (
+                "an array cut short",
+                "json_array",
+                r#"[{"a":1},"#.into(),
+                Whole,
+            ),
+            (
+                "an empty array",
+                "json_array",
+                " [ ] ".into(),
+                split_records(&[]),
+            ),
+            (
+                "cap - 1 elements",
+                "json_array",
+                format!("[{}]", ones(cap - 1, ",")),
+                Records(vec!["1".into(); cap - 1]),
+            ),
+            (
+                "cap elements",
+                "json_array",
+                format!("[{}]", ones(cap, ",")),
+                Records(vec!["1".into(); cap]),
+            ),
+            (
+                "cap + 1 elements",
+                "json_array",
+                format!("[{}]", ones(cap + 1, ",")),
+                Refused,
+            ),
+            (
+                "single keeps an array whole",
+                "single",
+                "[1,2]".into(),
+                Whole,
+            ),
+        ]
+    }
+
+    /// Rows for `ndjson`, and for `json`, which takes an array or NDJSON.
+    #[cfg(feature = "http-server")]
+    fn line_split_rows() -> Vec<SplitRow> {
+        use crate::parse_guard::MAX_PARSE_DEPTH;
+        use SplitWant::{Records, Refused, Whole};
+
+        let cap = crate::framing::DecodeLimits::DEFAULT_MAX_RECORDS;
+        let wide = r#"{"id":123456789012345678901234}"#;
+        let pretty = "{\n  \"a\": 1\n}";
+        vec![
+            (
+                "ndjson lines as sent, a bad later line included",
+                "ndjson",
+                format!("{{\"a\":1}}\r\n\n  {wide}  \nnot json\n"),
+                split_records(&[r#"{"a":1}"#, wide, "not json"]),
+            ),
+            ("a pretty-printed object", "ndjson", pretty.into(), Whole),
+            (
+                "a first line that is not JSON",
+                "ndjson",
+                "not json\n{\"a\":1}".into(),
+                Whole,
+            ),
+            (
+                "a first line too deep to parse",
+                "ndjson",
+                format!("{}\n1", nested(MAX_PARSE_DEPTH + 1)),
+                Whole,
+            ),
+            ("one line", "ndjson", "{\"a\":1}\n".into(), Whole),
+            (
+                "cap lines",
+                "ndjson",
+                ones(cap, "\n"),
+                Records(vec!["1".into(); cap]),
+            ),
+            ("cap + 1 lines", "ndjson", ones(cap + 1, "\n"), Refused),
+            (
+                "json: an array",
+                "json",
+                format!(" [{wide},{{\"a\":2}}]"),
+                split_records(&[wide, r#"{"a":2}"#]),
+            ),
+            (
+                "json: ndjson",
+                "json",
+                format!("{wide}\n{{\"a\":2}}\n"),
+                split_records(&[wide, r#"{"a":2}"#]),
+            ),
+            (
+                "json: ndjson of arrays",
+                "json",
+                "[1]\n[2,3]".into(),
+                split_records(&["[1]", "[2,3]"]),
+            ),
+            (
+                "json: an element that does not parse",
+                "json",
+                r#"[{"a":1},{"b":}]"#.into(),
+                Whole,
+            ),
+            (
+                "json: a pretty-printed object",
+                "json",
+                pretty.into(),
+                Whole,
+            ),
+            (
+                "json: cap + 1 elements",
+                "json",
+                format!("[{}]", ones(cap + 1, ",")),
+                Refused,
+            ),
+        ]
+    }
+
+    /// A body splits by `framing` into records holding its own bytes. An array
+    /// too deep to split, holding an element that does not parse, or with bytes
+    /// after its `]` stays one record, as does NDJSON whose first line is not a
+    /// JSON value. `json` takes either shape on one path. A body of more than
+    /// 100000 records is refused whole with 413 naming the cap. The in-flight
+    /// budget is whole again once `recv` has taken every record.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn a_body_splits_by_framing_and_one_over_the_cap_is_refused_whole() {
+        let cap = crate::framing::DecodeLimits::DEFAULT_MAX_RECORDS.to_string();
+        for (case, framing, body, want) in array_split_rows().into_iter().chain(line_split_rows()) {
+            let (status, answer, got, budget_whole) = post_split(framing, &body).await;
+            let (want_status, want): (u16, Vec<&[u8]>) = match &want {
+                SplitWant::Records(records) => {
+                    (200, records.iter().map(String::as_bytes).collect())
+                }
+                SplitWant::Whole => (200, vec![body.as_bytes()]),
+                SplitWant::Refused => {
+                    assert!(answer.contains(&cap), "{case}: {answer:?}");
+                    (413, Vec::new())
+                }
+            };
+            assert_eq!(status, want_status, "{case}: {answer:?}");
+            assert!(
+                got.iter().map(AsRef::as_ref).eq(want.iter().copied()),
+                "{case}: {} records, want {}, first different at {:?}",
+                got.len(),
+                want.len(),
+                got.iter().zip(&want).position(|(g, w)| g.as_ref() != *w),
+            );
+            assert!(budget_whole, "{case}: in-flight bytes not returned");
+        }
+    }
+
+    /// POST `body` to a receiver splitting by `framing`. Returns the answer's
+    /// status and text, every record `recv` then takes, over several calls so
+    /// a request is taken across them, and whether the in-flight budget is
+    /// whole again.
+    #[cfg(feature = "http-server")]
+    async fn post_split(framing: &str, body: &str) -> (u16, String, Vec<bytes::Bytes>, bool) {
+        let config = HttpTransportConfig {
+            framing: crate::framing::FramingConfig {
+                framing_type: framing.into(),
+                ..crate::framing::FramingConfig::default()
+            },
+            ..receiver_config(50)
+        };
+        let receiver = HttpTransport::new(&config).await.unwrap();
+        let addr = receiver.local_addr().expect("receiver bound");
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/ingest"))
+            .body(body.to_owned())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let answer = response.text().await.unwrap();
+        let mut got = Vec::new();
+        loop {
+            let batch = receiver.recv(40_000).await.unwrap();
+            if batch.records.is_empty() {
+                break;
+            }
+            got.extend(batch.records.into_iter().map(|r| r.payload));
+        }
+        let in_flight = receiver.in_flight.as_ref().expect("receiving");
+        let budget_whole = in_flight.available_permits() == config.max_in_flight_bytes;
+        receiver.close().await.unwrap();
+        (status, answer, got, budget_whole)
+    }
+
     /// Test recv without listen returns config error.
     #[cfg(feature = "http-server")]
     #[tokio::test]
@@ -2226,6 +2594,7 @@ mod tests {
             sequence: Arc::new(AtomicU64::new(0)),
             in_flight: Arc::new(tokio::sync::Semaphore::new(1024)),
             max_body_bytes: 1024,
+            split: split::BodySplit::Single,
             decoders: Arc::new(BodyDecoders::new().expect("decoders")),
             #[cfg(feature = "governor")]
             pressure: None,

@@ -550,14 +550,22 @@ async fn each_framing_shapes_the_body_and_compression_compresses_it() {
         }
     }
 
-    let unknown = HttpTransportConfig {
-        framing: FramingConfig {
-            framing_type: "no_such_framing".into(),
-            ..FramingConfig::default()
-        },
-        ..HttpTransportConfig::sender("http://127.0.0.1:9")
-    };
-    assert!(build_error(&unknown).await.contains("no_such_framing"));
+    // (framing a sender can't build, what the refusal says)
+    let refused = [
+        ("no_such_framing", "no_such_framing"),
+        ("json", "`json` is receive-only"),
+    ];
+    for (framing, want) in refused {
+        let config = HttpTransportConfig {
+            framing: FramingConfig {
+                framing_type: framing.into(),
+                ..FramingConfig::default()
+            },
+            ..HttpTransportConfig::sender("http://127.0.0.1:9")
+        };
+        let error = build_error(&config).await;
+        assert!(error.contains(want), "{framing}: {error}");
+    }
 }
 
 /// Each status maps to stored, sent again (after `Retry-After`, capped),

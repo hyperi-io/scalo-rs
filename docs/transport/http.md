@@ -1,6 +1,6 @@
-# HTTP -- sending
+# HTTP -- sending and body framing
 
-The HTTP sender POSTs records to `endpoint`, and to `failover` endpoints in order when it can't. Every key is opt-in. The defaults post one record per request as `application/octet-stream`, refuse redirects and use no proxy. The receive side and the shared keys are in [backends.md](backends.md#http).
+The HTTP sender POSTs records to `endpoint`, and to `failover` endpoints in order when it can't. Every key is opt-in. The defaults post one record per request as `application/octet-stream`, refuse redirects and use no proxy. The receive side splits bodies by the same `framing` ([below](#receiving-body-framing)). Its other keys, and the shared ones, are in [backends.md](backends.md#http).
 
 ```yaml
 transport:
@@ -70,6 +70,17 @@ register_framing("counted", Arc::new(Counted))?;
 
 `compression` compresses each body and sends the codec as `Content-Encoding`: `gzip` (level 6 unless `level` is set) or `zstd` (level 3). The receiver must decode it, as scalo's own HTTP receive side does ([backends.md](backends.md#http)). LZ4 and snappy have no HTTP content coding, so they are refused at build. See [../compression.md](../compression.md).
 
+## Receiving: body framing
+
+On the receive side `framing` splits each body into records. `single`, the default, queues the body as one record. Each record is a slice of the body as sent, never parsed and written back, so an integer wider than `u64` arrives intact. A body's records are queued together or not at all, and each holds the memory of its queued message in `max_in_flight_bytes` too.
+
+- `json_array`: one record per element, when every element parses. An array nested deeper than 65, one holding an element that doesn't parse or anything after its `]`, and a body that is not an array stay one record, for the consumer's parser to refuse. `[]` is answered 200 and queues nothing.
+- `ndjson`: one record per non-blank line, trimmed, when there are two or more and the first is a whole JSON value. A pretty-printed object, a first line that is not JSON or nests deeper than 64, and a single line stay one record. A later bad line is a record of its own.
+- `json`: receive only, for a path that takes both shapes. A body splits as `json_array`, and one that doesn't splits as `ndjson`, so lines that are each an array split too. A sender built with it is refused.
+- Any other framing, an app's own included: the records it decodes. A body it can't decode stays one record.
+
+A body of more than 100000 records is 413, with a text body naming the cap, and nothing of it is queued, so its sender retries it smaller. A scalo sender reads that 413 as `MessageTooLarge`.
+
 ## Answers, failover and the deadline
 
 | Status | Answer | The caller |
@@ -108,4 +119,4 @@ Each body goes to `endpoint`, then each `failover` endpoint in order, starting f
 
 The gRPC and syslog transports' builders take the same resolver ([backends.md](backends.md#sending-over-grpc), [syslog.md](syslog.md#connect-resolver)).
 
-Source: [../../src/transport/http/send.rs](../../src/transport/http/send.rs), [../../src/transport/resolver.rs](../../src/transport/resolver.rs).
+Source: [../../src/transport/http/send.rs](../../src/transport/http/send.rs), [../../src/transport/http/split.rs](../../src/transport/http/split.rs), [../../src/transport/resolver.rs](../../src/transport/resolver.rs).

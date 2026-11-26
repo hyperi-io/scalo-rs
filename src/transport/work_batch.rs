@@ -37,7 +37,7 @@
 use super::filter::FilteredDlqEntry;
 use super::traits::CommitToken;
 use super::types::PayloadFormat;
-use crate::framing::{DecodeLimits, Framing, FramingError, JsonArray, Ndjson};
+use crate::framing::{DecodeLimits, Decoded, Framing, FramingError, JsonArray, Ndjson};
 use bytes::Bytes;
 use std::sync::Arc;
 use thiserror::Error;
@@ -424,31 +424,39 @@ impl<T: CommitToken> WorkBatch<T> {
     ///
     /// Each line is trimmed of ASCII whitespace, a trailing `\r` included, and
     /// blank lines are skipped, as [`Ndjson`] decodes. A line that is not JSON
-    /// is still a record: the parser downstream refuses it. The format is
-    /// [`PayloadFormat::Json`].
-    #[must_use]
-    pub fn from_ndjson(blob: Bytes) -> Self {
-        let records = Ndjson
-            .decode(&blob, &DecodeLimits::UNBOUNDED)
-            .map_or_default(|decoded| decoded.records);
-        Self::json_records(&blob, records)
+    /// is still a record: the parser downstream refuses it. A line over
+    /// `limits.max_record_bytes` is a dead letter holding its first
+    /// `max_record_bytes`. The format is [`PayloadFormat::Json`].
+    ///
+    /// # Errors
+    ///
+    /// [`FramingError`] when the blob is over `limits.max_decoded_bytes` or
+    /// holds more than `limits.max_records` lines.
+    pub fn from_ndjson(blob: Bytes, limits: &DecodeLimits) -> Result<Self, FramingError> {
+        let decoded = Ndjson.decode(&blob, limits)?;
+        Ok(Self::json_records(&blob, decoded, limits))
     }
 
     /// One record per element of a top-level JSON array blob, each a zero-copy
     /// view of it. Elements are framed, not parsed, as [`JsonArray`] decodes,
-    /// and `[]` yields no records.
+    /// and `[]` yields no records. An element over `limits.max_record_bytes`
+    /// is a dead letter holding its first `max_record_bytes`.
     ///
     /// # Errors
     ///
-    /// [`FramingError`] when the blob is not one well-framed array.
-    pub fn from_json_array(blob: Bytes) -> Result<Self, FramingError> {
-        let records = JsonArray.decode(&blob, &DecodeLimits::UNBOUNDED)?.records;
-        Ok(Self::json_records(&blob, records))
+    /// [`FramingError`] when the blob is not one well-framed array, is over
+    /// `limits.max_decoded_bytes`, or holds more than `limits.max_records`
+    /// elements.
+    pub fn from_json_array(blob: Bytes, limits: &DecodeLimits) -> Result<Self, FramingError> {
+        let decoded = JsonArray.decode(&blob, limits)?;
+        Ok(Self::json_records(&blob, decoded, limits))
     }
 
-    /// `records`, slices of `blob`, as JSON records sharing its allocation.
-    fn json_records(blob: &Bytes, records: Vec<&[u8]>) -> Self {
-        let records = records
+    /// `decoded`, slices of `blob`, as JSON records sharing its allocation,
+    /// and its oversize records as dead letters.
+    fn json_records(blob: &Bytes, decoded: Decoded<'_>, limits: &DecodeLimits) -> Self {
+        let records = decoded
+            .records
             .into_iter()
             .map(|record| Record {
                 payload: blob.slice_ref(record),
@@ -460,10 +468,24 @@ impl<T: CommitToken> WorkBatch<T> {
                 },
             })
             .collect();
+        let max = limits.max_record_bytes;
+        let dlq_entries = decoded
+            .oversize
+            .into_iter()
+            .map(|record| FilteredDlqEntry {
+                payload: record.get(..max).unwrap_or(record).to_vec(),
+                key: None,
+                reason: format!(
+                    "record of {} bytes exceeds max_record_bytes {max}; the first {max} bytes \
+                     are kept",
+                    record.len()
+                ),
+            })
+            .collect();
         Self {
             records,
             commit_tokens: Vec::new(),
-            dlq_entries: Vec::new(),
+            dlq_entries,
         }
     }
 }
@@ -988,32 +1010,141 @@ mod tests {
     // --- from_ndjson() and from_json_array() -------------------------------
     // How each blob splits is tested with the framings in crate::framing.
 
+    /// A framed blob becomes JSON records sharing it, a record over
+    /// `max_record_bytes` a dead letter holding its head, and a blob over
+    /// `max_records` or not framed an error, never an empty batch.
     #[test]
     fn framed_blobs_become_json_records_sharing_the_blob() {
-        let ndjson = Bytes::from_static(b"{\"a\":1}\r\n\n  {\"b\":2}  ");
-        let array = Bytes::from_static(b"[{\"a\":1}, {\"b\":2}]");
-        let batches = [
-            (ndjson.clone(), WorkBatch::<TestToken>::from_ndjson(ndjson)),
-            (array.clone(), WorkBatch::from_json_array(array).unwrap()),
+        type Decode = fn(Bytes, &DecodeLimits) -> Result<WorkBatch<TestToken>, FramingError>;
+        type Records = Result<&'static [&'static [u8]], FramingError>;
+        type DeadLetters = &'static [(&'static [u8], &'static str)];
+        let ndjson: Decode = WorkBatch::from_ndjson;
+        let array: Decode = WorkBatch::from_json_array;
+        let any = DecodeLimits::UNBOUNDED;
+        let limits = |max_record_bytes, max_records| DecodeLimits {
+            max_record_bytes,
+            max_records,
+            ..any
+        };
+        // (case, decode, blob, limits, records or the error, dead letters as (head, reason))
+        let rows: [(&str, Decode, &[u8], DecodeLimits, Records, DeadLetters); 11] = [
+            (
+                "ndjson",
+                ndjson,
+                b"{\"a\":1}\r\n\n  {\"b\":2}  ",
+                any,
+                Ok(&[b"{\"a\":1}", b"{\"b\":2}"]),
+                &[],
+            ),
+            (
+                "array",
+                array,
+                b"[{\"a\":1}, {\"b\":2}]",
+                any,
+                Ok(&[b"{\"a\":1}", b"{\"b\":2}"]),
+                &[],
+            ),
+            ("empty ndjson", ndjson, b"", any, Ok(&[]), &[]),
+            (
+                "an oversize line",
+                ndjson,
+                b"{\"a\":1}\n{\"long\":1}\n2",
+                limits(7, 3),
+                Ok(&[b"{\"a\":1}", b"2"]),
+                &[(
+                    b"{\"long\"",
+                    "record of 10 bytes exceeds max_record_bytes 7",
+                )],
+            ),
+            (
+                "an oversize element",
+                array,
+                b"[1,\"long\"]",
+                limits(3, 2),
+                Ok(&[b"1"]),
+                &[(b"\"lo", "record of 6 bytes exceeds max_record_bytes 3")],
+            ),
+            (
+                "max_records lines",
+                ndjson,
+                b"1\n2\n",
+                limits(usize::MAX, 2),
+                Ok(&[b"1", b"2"]),
+                &[],
+            ),
+            (
+                "max_records elements",
+                array,
+                b"[1,2]",
+                limits(usize::MAX, 2),
+                Ok(&[b"1", b"2"]),
+                &[],
+            ),
+            (
+                "a line past max_records",
+                ndjson,
+                b"1\n2\n3",
+                limits(usize::MAX, 2),
+                Err(FramingError::TooManyRecords { max: 2 }),
+                &[],
+            ),
+            (
+                "an element past max_records",
+                array,
+                b"[1,2,3]",
+                limits(usize::MAX, 2),
+                Err(FramingError::TooManyRecords { max: 2 }),
+                &[],
+            ),
+            (
+                "ndjson over max_decoded_bytes",
+                ndjson,
+                b"1\n2",
+                DecodeLimits {
+                    max_decoded_bytes: 2,
+                    ..any
+                },
+                Err(FramingError::TooLarge { len: 3, max: 2 }),
+                &[],
+            ),
+            (
+                "not an array",
+                array,
+                b"nope",
+                any,
+                Err(FramingError::NotAnArray("byte 0x6e ('n')".into())),
+                &[],
+            ),
         ];
-        for (blob, batch) in batches {
-            let payloads: Vec<&[u8]> = batch.records.iter().map(|r| r.payload.as_ref()).collect();
-            assert_eq!(payloads, [&b"{\"a\":1}"[..], b"{\"b\":2}"]);
+        for (case, decode, blob, limits, want, dead) in rows {
+            let blob = Bytes::from_static(blob);
+            let batch = match (decode(blob.clone(), &limits), want) {
+                (Ok(batch), Ok(records)) => {
+                    let payloads: Vec<&[u8]> =
+                        batch.records.iter().map(|r| r.payload.as_ref()).collect();
+                    assert_eq!(payloads, records, "{case}");
+                    batch
+                }
+                (got, want) => {
+                    assert_eq!(got.err(), want.err(), "{case}");
+                    continue;
+                }
+            };
             for record in &batch.records {
-                assert_eq!(record.metadata.format, PayloadFormat::Json);
+                assert_eq!(record.metadata.format, PayloadFormat::Json, "{case}");
                 assert_within(&record.payload, &blob);
             }
-            assert!(batch.commit_tokens.is_empty() && batch.dlq_entries.is_empty());
+            let letters: Vec<(&[u8], &str)> = batch
+                .dlq_entries
+                .iter()
+                .map(|entry| (&entry.payload[..], entry.reason.as_str()))
+                .collect();
+            assert_eq!(letters.len(), dead.len(), "{case}: {letters:?}");
+            for ((head, reason), (want_head, want_reason)) in letters.iter().zip(dead) {
+                assert_eq!(head, want_head, "{case}");
+                assert!(reason.starts_with(want_reason), "{case}: {reason}");
+            }
+            assert!(batch.commit_tokens.is_empty(), "{case}");
         }
-        assert_eq!(
-            WorkBatch::<TestToken>::from_ndjson(Bytes::new()).record_count(),
-            0
-        );
-    }
-
-    #[test]
-    fn a_blob_that_is_not_an_array_is_refused() {
-        let refused = WorkBatch::<TestToken>::from_json_array(Bytes::from_static(b"nope"));
-        assert!(matches!(refused, Err(FramingError::NotAnArray(_))));
     }
 }
