@@ -171,12 +171,10 @@ pub struct ConfigOptions {
     /// Turn it off for a service that must read only the files it was pointed
     /// at, such as one running with privileges, so nothing in the working
     /// directory or a user's home reaches its config. `config_paths` is
-    /// searched either way. [`CommonArgs::to_config_options`] and
+    /// searched either way. `cli::CommonArgs::to_config_options` and
     /// [`load_typed`] turn it off when a file is named, as they do `.env`.
     ///
     /// Default: true
-    ///
-    /// [`CommonArgs::to_config_options`]: crate::cli::CommonArgs::to_config_options
     pub search_standard_paths: bool,
 
     /// Whether to load `.env` files.
