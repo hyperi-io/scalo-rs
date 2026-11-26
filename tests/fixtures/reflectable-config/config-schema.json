@@ -7,10 +7,26 @@
     "store": {
       "description": "The record store the app writes to.",
       "$ref": "#/$defs/StoreConfig"
+    },
+    "tables": {
+      "description": "Lookup tables loaded at startup.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TableConfig"
+      }
+    },
+    "outputs": {
+      "description": "Outputs, by name.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/OutputConfig"
+      }
     }
   },
   "required": [
-    "store"
+    "store",
+    "tables",
+    "outputs"
   ],
   "$defs": {
     "StoreConfig": {
@@ -89,6 +105,57 @@
           "type": "string",
           "const": "verify"
         }
+      ]
+    },
+    "TableConfig": {
+      "description": "One lookup table.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Path of the table file.",
+          "type": "string"
+        },
+        "format": {
+          "description": "File format of the table.",
+          "$ref": "#/$defs/TableFormat"
+        }
+      },
+      "required": [
+        "path",
+        "format"
+      ]
+    },
+    "TableFormat": {
+      "description": "Table file format.",
+      "type": "string",
+      "enum": [
+        "csv",
+        "json"
+      ]
+    },
+    "OutputConfig": {
+      "description": "One output.",
+      "type": "object",
+      "properties": {
+        "levels": {
+          "description": "Log levels sent to this output.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Level"
+          }
+        }
+      },
+      "required": [
+        "levels"
+      ]
+    },
+    "Level": {
+      "description": "Log level.",
+      "type": "string",
+      "enum": [
+        "debug",
+        "info",
+        "warn"
       ]
     }
   }

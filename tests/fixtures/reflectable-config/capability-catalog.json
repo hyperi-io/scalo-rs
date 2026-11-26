@@ -55,5 +55,49 @@
         ]
       }
     ]
+  },
+  {
+    "kind": "source",
+    "name": "lookup_table",
+    "description": "A lookup table loaded from a file at startup.",
+    "fields": [
+      {
+        "name": "path",
+        "type": "string",
+        "required": true,
+        "description": "Path of the table file.",
+        "schema_path": "tables[].path"
+      },
+      {
+        "name": "format",
+        "type": "enum",
+        "required": true,
+        "description": "File format of the table.",
+        "enum_values": [
+          "csv",
+          "json"
+        ],
+        "schema_path": "tables[].format"
+      }
+    ]
+  },
+  {
+    "kind": "sink",
+    "name": "output",
+    "description": "A named output.",
+    "fields": [
+      {
+        "name": "levels",
+        "type": "enum",
+        "required": true,
+        "description": "Log levels sent to this output.",
+        "enum_values": [
+          "debug",
+          "info",
+          "warn"
+        ],
+        "schema_path": "outputs{}.levels[]"
+      }
+    ]
   }
 ]

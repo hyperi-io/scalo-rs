@@ -91,9 +91,11 @@ Serialisation rules (identical in both languages):
 
 ## Joining the catalogue to the schema
 
-A catalogue field that describes a config option names it in `schema_path`, the dotted path of property names from the schema root. A consumer joins the two halves on it, to put a field's `enum_values` on the schema option it belongs to. The catalogue `name` stays free-form, because it is often runtime data (a source type like `aws`).
+A catalogue field that describes a config option names it in `schema_path`, a dotted path from the schema root. A consumer joins the two halves on it, to put a field's `enum_values` on the schema option it belongs to. The catalogue `name` stays free-form, because it is often runtime data (a source type like `aws`).
 
-A path resolves one segment at a time. Each segment is looked up in the node's `properties`. Where that misses, the lookup follows the node's `$ref` and then each arm of `allOf`, `anyOf` and `oneOf`, first match wins. A `$ref` is a `#` JSON pointer into the same document (`#/$defs/Name`, `#/definitions/Name`). That covers a nested struct, an `Option<T>` (`anyOf: [T, {"type": "null"}]`) and a flattened struct. A path never steps into `items` or `additionalProperties`, so array elements and map values have no address.
+A segment is a property name, then any run of `[]` for an array's items and `{}` for a map's values: `tables[].format`, `outputs{}.levels[]`, `matrix[][]`. `[]` walks `items`, and a tuple's `prefixItems` is refused. `{}` walks `additionalProperties`, else a map's one `patternProperties` value. A `[]` on a non-array, a `{}` on a non-map, or anything else after the name is a finding.
+
+At every step a lookup that misses follows the node's `$ref`, then each arm of `allOf`, `anyOf` and `oneOf`, first match wins. A `$ref` is a `#` JSON pointer into the same document (`#/$defs/Name`, `#/definitions/Name`). That covers a nested struct, an `Option<T>` (`anyOf: [T, {"type": "null"}]`) and a flattened struct.
 
 The values an option allows are its `enum` or its `const`, behind any `$ref`, the union of its `anyOf` / `oneOf` arms or the intersection of its `allOf` arms, `null` left out. A Rust enum emits `enum` when its variants are undocumented and `oneOf` of `const` when they are documented, and both count. One arm with no closed set makes the option open.
 
@@ -106,7 +108,7 @@ The drift check fails, one line per field, when:
 
 A field with neither key isn't checked: a knob read from a free-form map has no schema option to name. Rust runs this as `check_catalogue_against_schema`.
 
-`tests/fixtures/reflectable-config/` is a reference pair emitted from a small config: an undocumented enum (`enum`), a documented enum (`oneOf` of `const`), an `Option` of an enum and a nested struct, with every catalogue field joined.
+`tests/fixtures/reflectable-config/` is a reference pair emitted from a small config: an undocumented enum (`enum`), a documented enum (`oneOf` of `const`), an `Option` of an enum, a nested struct, an array of structs and a map of structs holding an array of enums, with every catalogue field joined.
 
 ## Secret marker
 

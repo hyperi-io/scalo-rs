@@ -332,6 +332,42 @@ fn listed(values: &BTreeSet<String>) -> String {
     format!("{values:?}")
 }
 
+/// A step a path segment takes after its name.
+#[derive(Clone, Copy)]
+enum Step {
+    /// `[]`: into an array's `items`.
+    Items,
+    /// `{}`: into a map's value schema.
+    Values,
+}
+
+impl Step {
+    fn token(self) -> &'static str {
+        match self {
+            Step::Items => "[]",
+            Step::Values => "{}",
+        }
+    }
+}
+
+/// A segment's name and the `[]` / `{}` steps after it, or `None` when it
+/// is not a name followed only by those.
+fn parse_segment(segment: &str) -> Option<(&str, Vec<Step>)> {
+    let (name, mut rest) = segment.split_at(segment.find(['[', '{']).unwrap_or(segment.len()));
+    if name.is_empty() {
+        return None;
+    }
+    let mut steps = Vec::new();
+    while !rest.is_empty() {
+        let step = [Step::Items, Step::Values]
+            .into_iter()
+            .find(|step| rest.starts_with(step.token()))?;
+        rest = &rest[step.token().len()..];
+        steps.push(step);
+    }
+    Some((name, steps))
+}
+
 /// The schema node at dotted `path` under `root`, or why there is none.
 fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
     let mut node = root;
@@ -340,32 +376,78 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
         if segment.is_empty() {
             return Err("the path has an empty segment".to_string());
         }
-        node = property(root, node, segment, 0).ok_or_else(|| {
+        let Some((name, steps)) = parse_segment(segment) else {
+            return Err(format!(
+                "segment \"{segment}\" is not a name followed by any of [] and {{}}"
+            ));
+        };
+        let parent = node;
+        node = find(root, parent, &|n| n.get("properties")?.get(name), 0).ok_or_else(|| {
             if walked.is_empty() {
-                format!("no \"{segment}\" at the top level")
+                format!("no \"{name}\" at the top level")
             } else {
-                format!("no \"{segment}\" under \"{walked}\"")
+                format!("no \"{name}\" under \"{walked}\"")
             }
         })?;
         if !walked.is_empty() {
             walked.push('.');
         }
-        walked.push_str(segment);
+        walked.push_str(name);
+        for step in steps {
+            let parent = node;
+            node = take_step(root, parent, step).ok_or_else(|| match step {
+                Step::Items if find(root, parent, &|n| n.get("prefixItems"), 0).is_some() => {
+                    format!("\"{walked}\" is a tuple (prefixItems), which [] can't step into (segment \"{segment}\")")
+                }
+                Step::Items => format!("\"{walked}\" is not an array (segment \"{segment}\")"),
+                Step::Values => format!("\"{walked}\" is not a map (segment \"{segment}\")"),
+            })?;
+            walked.push_str(step.token());
+        }
     }
     Ok(node)
 }
 
-/// The subschema of property `name` on `node`, looked up through `$ref` and
-/// every `allOf` / `anyOf` / `oneOf` arm.
-fn property<'a>(root: &'a Value, node: &'a Value, name: &str, depth: usize) -> Option<&'a Value> {
+/// The schema `step` leads to from `node`: an array's object `items`, or a
+/// map's object `additionalProperties`, else its one `patternProperties` value.
+fn take_step<'a>(root: &'a Value, node: &'a Value, step: Step) -> Option<&'a Value> {
+    match step {
+        Step::Items => find(root, node, &|n| n.get("items").filter(|i| i.is_object()), 0),
+        Step::Values => find(
+            root,
+            node,
+            &|n| {
+                n.get("additionalProperties")
+                    .filter(|v| v.is_object())
+                    .or_else(|| {
+                        n.get("patternProperties")?
+                            .as_object()
+                            .filter(|patterns| patterns.len() == 1)?
+                            .values()
+                            .next()
+                    })
+            },
+            0,
+        ),
+    }
+}
+
+/// The first subschema `select` picks from `node`, looked up through `$ref`
+/// and every `allOf` / `anyOf` / `oneOf` arm.
+fn find<'a>(
+    root: &'a Value,
+    node: &'a Value,
+    select: &dyn Fn(&'a Value) -> Option<&'a Value>,
+    depth: usize,
+) -> Option<&'a Value> {
     if depth > MAX_SCHEMA_DEPTH {
         return None;
     }
-    if let Some(found) = node.get("properties").and_then(|p| p.get(name)) {
+    if let Some(found) = select(node) {
         return Some(found);
     }
     if let Some(found) =
-        follow_ref(root, node).and_then(|target| property(root, target, name, depth + 1))
+        follow_ref(root, node).and_then(|target| find(root, target, select, depth + 1))
     {
         return Some(found);
     }
@@ -373,7 +455,7 @@ fn property<'a>(root: &'a Value, node: &'a Value, name: &str, depth: usize) -> O
         .iter()
         .filter_map(|key| node.get(*key).and_then(Value::as_array))
         .flatten()
-        .find_map(|arm| property(root, arm, name, depth + 1))
+        .find_map(|arm| find(root, arm, select, depth + 1))
 }
 
 /// The closed set of values `node` allows, from `enum` or `const`, through
@@ -575,23 +657,54 @@ mod tests {
         contract
     }
 
+    /// One row of a catalogue check table: the schema, the field's schema_path
+    /// and enum_values, and a piece of the one finding expected, or `None` for
+    /// no finding.
+    struct Case<'a> {
+        name: &'a str,
+        schema: Option<&'a serde_json::Value>,
+        path: Option<&'a str>,
+        values: &'a [&'a str],
+        want: Option<&'a str>,
+    }
+
+    const BOTH: &[&str] = &["http", "native"];
+
+    /// The closed set every table schema gives its `protocol` option.
+    fn protocol_enum() -> serde_json::Value {
+        serde_json::json!({ "type": "string", "enum": ["http", "native"] })
+    }
+
+    /// Check a `protocol` field built from each row against the row's schema.
+    fn check_cases(cases: &[Case<'_>]) {
+        for case in cases {
+            let mut field = FieldSpec::string("protocol");
+            field.enum_values = case.values.iter().map(|v| (*v).to_string()).collect();
+            field.schema_path = case.path.map(str::to_string);
+            let findings = check_catalogue_against_schema(&joined(case.schema.cloned(), field));
+            let name = case.name;
+            match case.want {
+                None => assert!(findings.is_empty(), "{name}: {findings:?}"),
+                Some(want) => {
+                    assert_eq!(findings.len(), 1, "{name}: {findings:?}");
+                    assert!(
+                        findings[0].starts_with("capability store, field protocol: "),
+                        "{name}: {}",
+                        findings[0]
+                    );
+                    assert!(findings[0].contains(want), "{name}: {}", findings[0]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn catalogue_check_follows_each_schema_shape() {
         use serde_json::json;
 
-        /// One row: the schema, the field's schema_path and enum_values, and a
-        /// piece of the one finding expected, or `None` for no finding.
-        struct Case<'a> {
-            name: &'a str,
-            schema: Option<&'a serde_json::Value>,
-            path: Option<&'a str>,
-            values: &'a [&'a str],
-            want: Option<&'a str>,
-        }
-        const BOTH: &[&str] = &["http", "native"];
         const AT: Option<&str> = Some("store.protocol");
 
-        let protocol = json!({ "type": "string", "enum": ["http", "native"] });
+        let protocol = protocol_enum();
         let plain = json!({ "properties": { "protocol": protocol } });
         let nested = json!({
             "properties": { "store": { "type": "object", "properties": { "protocol": protocol } } }
@@ -669,26 +782,73 @@ mod tests {
             Case { name: "enum_values without schema_path", schema: Some(&nested), path: None, values: BOTH, want: Some("enum_values [\"http\", \"native\"] but no schema_path") },
             Case { name: "schema absent", schema: None, path: AT, values: BOTH, want: Some("schema_path \"store.protocol\" is set but the contract has no config_schema") },
         ];
+        check_cases(&cases);
+    }
 
-        for case in cases {
-            let mut field = FieldSpec::string("protocol");
-            field.enum_values = case.values.iter().map(|v| (*v).to_string()).collect();
-            field.schema_path = case.path.map(str::to_string);
-            let findings = check_catalogue_against_schema(&joined(case.schema.cloned(), field));
-            let name = case.name;
-            match case.want {
-                None => assert!(findings.is_empty(), "{name}: {findings:?}"),
-                Some(want) => {
-                    assert_eq!(findings.len(), 1, "{name}: {findings:?}");
-                    assert!(
-                        findings[0].starts_with("capability store, field protocol: "),
-                        "{name}: {}",
-                        findings[0]
-                    );
-                    assert!(findings[0].contains(want), "{name}: {}", findings[0]);
-                }
+    #[test]
+    fn catalogue_check_steps_into_arrays_and_maps() {
+        use serde_json::json;
+
+        let protocol = protocol_enum();
+        let nested = json!({
+            "properties": { "store": { "type": "object", "properties": { "protocol": protocol } } }
+        });
+        let array_of_objects = json!({
+            "properties": { "tables": { "$ref": "#/$defs/Tables" } },
+            "$defs": {
+                "Tables": { "type": ["array", "null"], "items": { "$ref": "#/$defs/Table" } },
+                "Table": { "properties": { "source": { "properties": { "protocol": protocol } } } }
             }
-        }
+        });
+        let array_of_enum = json!({ "properties": {
+            "protocols": { "type": "array", "items": protocol }
+        } });
+        let array_of_arrays = json!({ "properties": {
+            "matrix": { "type": "array", "items": { "type": "array", "items": protocol } }
+        } });
+        let tuple = json!({ "properties": {
+            "pair": { "type": "array", "prefixItems": [protocol, protocol], "items": false }
+        } });
+        let map_of_objects = json!({ "properties": { "stores": {
+            "type": "object",
+            "additionalProperties": { "anyOf": [{ "$ref": "#/$defs/Store" }, { "type": "null" }] }
+        } }, "$defs": { "Store": { "properties": { "protocol": protocol } } } });
+        let map_of_arrays = json!({ "properties": { "routes": {
+            "type": "object",
+            "additionalProperties": { "type": "array", "items": protocol }
+        } } });
+        let pattern_map = json!({ "properties": { "stores": {
+            "type": "object",
+            "additionalProperties": false,
+            "patternProperties": { "^[a-z]+$": { "properties": { "protocol": protocol } } }
+        } } });
+        let two_patterns = json!({ "properties": { "stores": {
+            "type": "object",
+            "patternProperties": {
+                "^a": { "properties": { "protocol": protocol } },
+                "^b": { "properties": { "protocol": protocol } }
+            }
+        } } });
+
+        #[rustfmt::skip]
+        let cases = [
+            Case { name: "array of objects behind $ref", schema: Some(&array_of_objects), path: Some("tables[].source.protocol"), values: BOTH, want: None },
+            Case { name: "array of enum", schema: Some(&array_of_enum), path: Some("protocols[]"), values: BOTH, want: None },
+            Case { name: "array of arrays", schema: Some(&array_of_arrays), path: Some("matrix[][]"), values: BOTH, want: None },
+            Case { name: "map of objects behind anyOf", schema: Some(&map_of_objects), path: Some("stores{}.protocol"), values: BOTH, want: None },
+            Case { name: "map of arrays", schema: Some(&map_of_arrays), path: Some("routes{}[]"), values: BOTH, want: None },
+            Case { name: "map by one patternProperties", schema: Some(&pattern_map), path: Some("stores{}.protocol"), values: BOTH, want: None },
+            Case { name: "an array without [] has no enum", schema: Some(&array_of_enum), path: Some("protocols"), values: BOTH, want: Some("\"protocols\" in the schema has no enum") },
+            Case { name: "name missing after []", schema: Some(&array_of_objects), path: Some("tables[].sink"), values: &[], want: Some("(no \"sink\" under \"tables[]\")") },
+            Case { name: "[] on an object", schema: Some(&nested), path: Some("store[].protocol"), values: BOTH, want: Some("(\"store\" is not an array (segment \"store[]\"))") },
+            Case { name: "{} on an array", schema: Some(&array_of_enum), path: Some("protocols{}"), values: BOTH, want: Some("(\"protocols\" is not a map (segment \"protocols{}\"))") },
+            Case { name: "second step on the wrong kind", schema: Some(&map_of_arrays), path: Some("routes{}{}"), values: BOTH, want: Some("(\"routes{}\" is not a map (segment \"routes{}{}\"))") },
+            Case { name: "{} on several patternProperties", schema: Some(&two_patterns), path: Some("stores{}.protocol"), values: BOTH, want: Some("(\"stores\" is not a map (segment \"stores{}\"))") },
+            Case { name: "[] on a tuple", schema: Some(&tuple), path: Some("pair[]"), values: BOTH, want: Some("(\"pair\" is a tuple (prefixItems), which [] can't step into (segment \"pair[]\"))") },
+            Case { name: "segment with an index", schema: Some(&array_of_enum), path: Some("protocols[0]"), values: BOTH, want: Some("(segment \"protocols[0]\" is not a name followed by any of [] and {})") },
+            Case { name: "segment with no name", schema: Some(&array_of_enum), path: Some("[]"), values: BOTH, want: Some("(segment \"[]\" is not a name followed by any of [] and {})") },
+        ];
+        check_cases(&cases);
     }
 
     #[test]
@@ -747,6 +907,43 @@ mod tests {
         pub struct ExampleConfig {
             /// The record store the app writes to.
             pub store: StoreConfig,
+            /// Lookup tables loaded at startup.
+            pub tables: Vec<TableConfig>,
+            /// Outputs, by name.
+            pub outputs: std::collections::BTreeMap<String, OutputConfig>,
+        }
+
+        /// One lookup table.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        pub struct TableConfig {
+            /// Path of the table file.
+            pub path: String,
+            /// File format of the table.
+            pub format: TableFormat,
+        }
+
+        /// Table file format.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum TableFormat {
+            Csv,
+            Json,
+        }
+
+        /// One output.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        pub struct OutputConfig {
+            /// Log levels sent to this output.
+            pub levels: Vec<Level>,
+        }
+
+        /// Log level.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum Level {
+            Debug,
+            Info,
+            Warn,
         }
 
         /// How the app reaches its store.
@@ -832,6 +1029,28 @@ mod tests {
                                 .schema_path("store.tls.mode"),
                         ),
                 ),
+            Capability::source("lookup_table")
+                .description("A lookup table loaded from a file at startup.")
+                .field(
+                    FieldSpec::string("path")
+                        .required()
+                        .description("Path of the table file.")
+                        .schema_path("tables[].path"),
+                )
+                .field(
+                    FieldSpec::enumeration("format", ["csv", "json"])
+                        .required()
+                        .description("File format of the table.")
+                        .schema_path("tables[].format"),
+                ),
+            Capability::sink("output")
+                .description("A named output.")
+                .field(
+                    FieldSpec::enumeration("levels", ["debug", "info", "warn"])
+                        .required()
+                        .description("Log levels sent to this output.")
+                        .schema_path("outputs{}.levels[]"),
+                ),
         ];
         contract
     }
@@ -860,6 +1079,9 @@ mod tests {
             "/$defs/Protocol/enum",
             "/$defs/TlsMode/oneOf/0/const",
             "/$defs/StoreConfig/properties/codec/anyOf/1/type",
+            "/properties/tables/items/$ref",
+            "/properties/outputs/additionalProperties/$ref",
+            "/$defs/OutputConfig/properties/levels/items/$ref",
         ] {
             assert!(
                 schema.pointer(pointer).is_some(),
