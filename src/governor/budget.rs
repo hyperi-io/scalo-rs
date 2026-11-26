@@ -142,6 +142,8 @@ pub struct ByteBudgetController {
     pressure: Arc<UnifiedPressure>,
     /// Current byte budget.
     budget: AtomicU64,
+    /// The latch's expired-hold count when a block last brought records in.
+    windows_served: AtomicU64,
 }
 
 impl ByteBudgetController {
@@ -155,6 +157,7 @@ impl ByteBudgetController {
         publish_budget(cfg.start_bytes);
         Self {
             budget: AtomicU64::new(cfg.start_bytes),
+            windows_served: AtomicU64::new(pressure.expired_holds()),
             cfg,
             pressure,
         }
@@ -168,7 +171,11 @@ impl ByteBudgetController {
     /// to process, and the gap since the previous receive) and do not move
     /// the budget.
     pub fn observe(&self, batch_bytes: u64, process_time: Duration, ingest_interval: Duration) {
-        let _ = (batch_bytes, process_time, ingest_interval);
+        let _ = (process_time, ingest_interval);
+        if batch_bytes > 0 {
+            self.windows_served
+                .store(self.pressure.expired_holds(), Ordering::Release);
+        }
 
         // The budget admits nothing, so it leaves an expired hold's window to the gates.
         if self.pressure.should_hold_without_admitting() {
@@ -203,10 +210,22 @@ impl ByteBudgetController {
         publish_budget(next);
     }
 
-    /// Current byte budget. Always `>= min_bytes`, never `0`.
+    /// The bytes the next receive may retain. Always `>= min_bytes`, never `0`.
+    ///
+    /// The shrunk budget, except across the release window a hold past
+    /// `max_hold` opens: from the moment the hold is due until a block brings
+    /// records in, a receive gets at least `start_bytes`, so one window drains
+    /// a block rather than the few records the floor holds.
     #[must_use]
     pub fn byte_budget(&self) -> u64 {
-        self.budget.load(Ordering::Relaxed)
+        let budget = self.budget.load(Ordering::Relaxed);
+        let window = self.pressure.hold_reached_max()
+            || self.pressure.expired_holds() != self.windows_served.load(Ordering::Acquire);
+        if window {
+            budget.max(self.cfg.start_bytes)
+        } else {
+            budget
+        }
     }
 
     /// Poll-safety record cap (recv max count), independent of the byte
@@ -416,6 +435,70 @@ mod tests {
         assert_eq!(ctl.byte_budget(), 100_000, "recovers to the cap");
     }
 
+    /// A latch over one HARD source at 0.85, timed on a clock the test sets,
+    /// with a controller and a gate on it. The gate starts held.
+    fn held_at_floor() -> (
+        ByteBudgetController,
+        crate::governor::InboundGate,
+        Arc<StdAtomicU64>,
+    ) {
+        use crate::governor::{Admit, InboundGate, NoopActuator};
+
+        let src = Arc::new(MockSource::new(0.85));
+        let now = Arc::new(StdAtomicU64::new(0));
+        let pressure = Arc::new(
+            UnifiedPressure::new(
+                vec![Arc::clone(&src) as Arc<dyn PressureSource>],
+                Hysteresis::new(0.80, 0.65).expect("valid band"),
+            )
+            .with_manual_clock(Arc::clone(&now)),
+        );
+        let ctl = ByteBudgetController::new(test_cfg(), Arc::clone(&pressure));
+        let gate = InboundGate::new(pressure, Box::new(NoopActuator));
+        assert_eq!(gate.evaluate(), Admit::Hold);
+        for _ in 0..10 {
+            ctl.observe(500, Duration::ZERO, ms(100));
+        }
+        assert_eq!(ctl.byte_budget(), 1_000, "held at the floor");
+        (ctl, gate, now)
+    }
+
+    /// A release window gets the start budget, not the floor: from the moment
+    /// the hold is due, through an empty first receive, until a block brings
+    /// records in. The next hold is back at the floor until it is due.
+    #[test]
+    fn a_release_window_receives_the_start_budget() {
+        use crate::governor::Admit;
+
+        let (ctl, gate, now) = held_at_floor();
+        now.store(29_000_000_000, Ordering::Relaxed);
+        assert_eq!(ctl.byte_budget(), 1_000, "not yet due");
+
+        now.store(30_000_000_000, Ordering::Relaxed);
+        assert_eq!(
+            ctl.byte_budget(),
+            10_000,
+            "due: the receive is sized for the window"
+        );
+        assert_eq!(gate.evaluate(), Admit::Yes, "the gate opens the window");
+        ctl.observe(0, Duration::ZERO, ms(100));
+        assert_eq!(ctl.byte_budget(), 10_000, "an empty first receive keeps it");
+
+        gate.note_received(9);
+        ctl.observe(9_000, Duration::ZERO, ms(100));
+        assert_eq!(gate.evaluate(), Admit::Hold, "the latch re-armed");
+        assert_eq!(
+            ctl.byte_budget(),
+            1_000,
+            "records came in, so the window is spent"
+        );
+
+        now.store(59_000_000_000, Ordering::Relaxed);
+        assert_eq!(ctl.byte_budget(), 1_000, "the next hold, not yet due");
+        now.store(60_000_000_000, Ordering::Relaxed);
+        assert_eq!(ctl.byte_budget(), 10_000, "the next window");
+    }
+
     /// A driver folds a block between two receives. When the hold expires
     /// there, the budget still shrinks as held and the next receive's gate
     /// gets the window, so the paused source resumes.
@@ -438,7 +521,11 @@ mod tests {
 
         now.store(30_000_000_000, Ordering::Relaxed);
         ctl.observe(0, Duration::ZERO, ms(100));
-        assert_eq!(ctl.byte_budget(), 5_000, "held: 10_000 halved");
+        assert_eq!(
+            ctl.budget.load(Ordering::Relaxed),
+            5_000,
+            "held: 10_000 halved"
+        );
         assert_eq!(gate.evaluate(), Admit::Yes, "the gate gets the window");
         gate.note_received(1);
         assert_eq!(gate.evaluate(), Admit::Hold);

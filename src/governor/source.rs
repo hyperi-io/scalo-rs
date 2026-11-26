@@ -426,6 +426,15 @@ impl UnifiedPressure {
         self.evaluate(false)
     }
 
+    /// Whether the hold in force has lasted `max_hold`, so the next admitting
+    /// caller ends it. Reads the latch word and the clock, never the level.
+    pub(crate) fn hold_reached_max(&self) -> bool {
+        let hold = self.hold.load(Ordering::Acquire);
+        hold != 0
+            && self.max_hold_nanos != 0
+            && self.clock.now_nanos().saturating_sub(hold - 1) >= self.max_hold_nanos
+    }
+
     /// Holds that `max_hold` has ended since the latch was built.
     pub(crate) fn expired_holds(&self) -> u64 {
         self.expired_holds.load(Ordering::Acquire)
