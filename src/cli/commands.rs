@@ -63,6 +63,17 @@ pub enum StandardCommand {
     #[command(name = "config-schema")]
     ConfigSchema(ConfigSchemaArgs),
 
+    /// Measure the service's memory under the standard load and exit.
+    ///
+    /// Runs the app's `ServiceApp::bench_pipeline` between an in-memory source
+    /// offering the load and a sink that discards what arrives, samples the
+    /// process's memory over the window, and writes the profile JSON that
+    /// `generate-artefacts --memory-profile` puts in the contract. Needs the
+    /// `bench-memory` feature, and exits non-zero for an app with no bench
+    /// pipeline: `my-service bench-memory --output ci/memory-profile.json`
+    #[command(name = "bench-memory")]
+    BenchMemory(BenchMemoryArgs),
+
     /// Live metrics dashboard in the terminal: a sortable table polled from the
     /// service's Prometheus `/metrics` endpoint.
     #[cfg(feature = "top")]
@@ -75,6 +86,65 @@ pub struct GenerateArtefactsArgs {
     /// Output directory for generated artefacts.
     #[arg(long = "output-dir", default_value = "docs")]
     pub output_dir: String,
+
+    /// A profile `bench-memory` wrote, put in the contract as its `memory`
+    /// block. Without it the contract has none.
+    #[arg(long = "memory-profile")]
+    pub memory_profile: Option<String>,
+}
+
+/// Arguments for the `bench-memory` subcommand. The defaults are the standard
+/// load, and the profile records whatever a run used.
+#[derive(Debug, Clone, clap::Args)]
+pub struct BenchMemoryArgs {
+    /// JSON records a second offered to the pipeline, across all sources.
+    #[arg(
+        long = "records-per-second",
+        default_value_t = 5000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub records_per_second: u64,
+
+    /// Bytes in each record, 16 to 16 MiB.
+    #[arg(
+        long = "record-bytes",
+        default_value_t = 1024,
+        value_parser = clap::value_parser!(u64).range(16..=16_777_216)
+    )]
+    pub record_bytes: u64,
+
+    /// Producers feeding the source at once, each offering an even share of
+    /// the rate. No more than the records a second.
+    #[arg(
+        long = "sources",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=1024)
+    )]
+    pub sources: u32,
+
+    /// Seconds the load runs before the first sample.
+    #[arg(long = "warmup-seconds", default_value_t = 30)]
+    pub warmup_seconds: u32,
+
+    /// Seconds the samples span.
+    #[arg(
+        long = "window-seconds",
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub window_seconds: u32,
+
+    /// Milliseconds between samples, no more than the window.
+    #[arg(
+        long = "sample-interval-ms",
+        default_value_t = 1000,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub sample_interval_ms: u64,
+
+    /// File the profile JSON is written to.
+    #[arg(long = "output", default_value = "memory-profile.json")]
+    pub output: String,
 }
 
 /// Arguments for the `config-schema` subcommand.

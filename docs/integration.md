@@ -224,7 +224,7 @@ async fn main() -> Result<(), CliError> {
 
 That's the whole `main.rs`. `run_app` handles the subcommand dispatch
 (`run`, `version`, `config-check`, `metrics-manifest`,
-`generate-artefacts`), initialises the logger, loads config, builds the
+`generate-artefacts`, `bench-memory`), initialises the logger, loads config, builds the
 runtime, and calls your `run_service`.
 
 ---

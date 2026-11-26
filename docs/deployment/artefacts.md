@@ -64,6 +64,8 @@ know what to validate against, and a chart assembler turns it into a thin chart
 on the [scalo-service](../../charts/scalo-service/README.md) library chart. Its
 JSON Schema is `charts/scalo-service/schema/deployment-contract.v4.schema.json`,
 derived from the contract types -- see [contract.md](contract.md#the-json-schema).
+With `--memory-profile <file>` it carries the `memory` block a `bench-memory`
+run wrote, and without it none -- see [contract.md](contract.md#memory).
 
 ### `container-manifest.json`
 

@@ -65,6 +65,8 @@ mod version;
 // clap types.
 #[cfg(feature = "cli-service")]
 mod app;
+#[cfg(feature = "bench-memory")]
+mod bench;
 #[cfg(feature = "cli-service")]
 mod runtime;
 #[cfg(all(test, feature = "cli-service"))]
@@ -77,6 +79,8 @@ pub use version::VersionInfo;
 
 #[cfg(feature = "cli-service")]
 pub use app::{ServiceApp, run_app};
+#[cfg(feature = "bench-memory")]
+pub use bench::BenchPipeline;
 #[cfg(feature = "cli-service")]
 pub use runtime::ServiceRuntime;
 

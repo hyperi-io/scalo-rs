@@ -199,6 +199,26 @@ pub trait ServiceApp: Sized {
         None
     }
 
+    /// The service's own pipeline for `bench-memory`, reading from
+    /// `bench.source` and sending to `bench.sink` until `runtime.shutdown` is
+    /// cancelled.
+    ///
+    /// `bench-memory` builds the runtime as `run` does, feeds the source the
+    /// standard load, samples the process's memory over the window, then
+    /// cancels the shutdown token and waits for the future. Build the same
+    /// stages `run_service` builds, with these two transports in place of the
+    /// configured ones. The default is `None`, and `bench-memory` then exits
+    /// non-zero.
+    #[cfg(feature = "bench-memory")]
+    fn bench_pipeline(
+        &self,
+        _config: Self::Config,
+        _runtime: super::ServiceRuntime,
+        _bench: super::BenchPipeline,
+    ) -> Option<impl std::future::Future<Output = Result<(), CliError>> + Send> {
+        None::<std::future::Ready<Result<(), CliError>>>
+    }
+
     /// Default version-check configuration for this service.
     ///
     /// The runtime overlays the `version_check` config cascade on this, so
@@ -325,43 +345,24 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             }
         }
 
+        StandardCommand::BenchMemory(ref bench_args) => {
+            #[cfg(feature = "bench-memory")]
+            {
+                let result = super::bench::run(&app, bench_args, config_file.as_deref()).await;
+                crate::shutdown::flush_telemetry();
+                result
+            }
+            #[cfg(not(feature = "bench-memory"))]
+            {
+                let _ = bench_args;
+                output::print_error("bench-memory feature not enabled -- no bench available");
+                Err(CliError::Service("bench-memory feature not enabled".into()))
+            }
+        }
+
         StandardCommand::Run => {
-            let version_info = app.version_info();
             let config_path = config_file.as_deref();
-
-            // Config loads before the logger: logger setup composes the OTLP
-            // span exporter, whose settings live in the cascade. `load_typed`
-            // holds its lines until logger setup emits them. Anything else the
-            // cascade logs while it loads has no subscriber and is lost.
-            let loaded = app.load_config(config_path);
-            #[cfg(feature = "logger")]
-            init_logger_for_service(args, app.name(), &version_info.version)?;
-            let config = loaded?;
-
-            tracing::info!(
-                service = app.name(),
-                version = version_info.version,
-                config = config_path.unwrap_or("(defaults)"),
-                "starting service"
-            );
-
-            tracing::debug!(?config, "configuration loaded");
-            app.on_config_loaded(&config);
-
-            // Build ServiceRuntime -- all common infrastructure for free
-            let runtime = super::ServiceRuntime::build(
-                app.name(),
-                app.env_prefix(),
-                &args.effective_metrics_addr(),
-                &version_info.version,
-                build_commit(&version_info),
-                termination_grace(&app),
-                #[cfg(feature = "scaling")]
-                app.scaling_components(&config),
-                #[cfg(feature = "version-check")]
-                app.version_check_defaults(),
-            )
-            .await?;
+            let (config, runtime) = start_service(&app, config_path).await?;
 
             // Idle until configured. Evaluated HERE -- after the runtime, so
             // /livez and /readyz are already serving -- and not before, or an
@@ -397,6 +398,47 @@ fn termination_grace<A: ServiceApp>(app: &A) -> std::time::Duration {
     #[cfg(not(feature = "deployment"))]
     let _ = app;
     crate::shutdown::default_termination_grace()
+}
+
+/// Load the config, start the logger, and build the runtime the way `run`
+/// does before it hands over to the app.
+pub(super) async fn start_service<A: ServiceApp>(
+    app: &A,
+    config_path: Option<&str>,
+) -> Result<(A::Config, super::ServiceRuntime), CliError> {
+    let args = app.common_args();
+    let version_info = app.version_info();
+
+    // Config loads first because the logger's OTLP span exporter reads the cascade.
+    let loaded = app.load_config(config_path);
+    #[cfg(feature = "logger")]
+    init_logger_for_service(args, app.name(), &version_info.version)?;
+    let config = loaded?;
+
+    tracing::info!(
+        service = app.name(),
+        version = version_info.version,
+        config = config_path.unwrap_or("(defaults)"),
+        "starting service"
+    );
+
+    tracing::debug!(?config, "configuration loaded");
+    app.on_config_loaded(&config);
+
+    let runtime = super::ServiceRuntime::build(
+        app.name(),
+        app.env_prefix(),
+        &args.effective_metrics_addr(),
+        &version_info.version,
+        build_commit(&version_info),
+        termination_grace(app),
+        #[cfg(feature = "scaling")]
+        app.scaling_components(&config),
+        #[cfg(feature = "version-check")]
+        app.version_check_defaults(),
+    )
+    .await?;
+    Ok((config, runtime))
 }
 
 /// Hand control to the app: install its readiness check, then let `/readyz`
@@ -585,7 +627,10 @@ fn build_metrics_manifest<A: ServiceApp>(
 /// Pretty JSON ending in one newline, the form every artefact scalo writes
 /// takes, so `metrics-manifest` on stdout and the file `generate-artefacts`
 /// writes are the same bytes.
-fn artefact_json<T: serde::Serialize>(value: &T, what: &str) -> Result<String, CliError> {
+pub(super) fn artefact_json<T: serde::Serialize>(
+    value: &T,
+    what: &str,
+) -> Result<String, CliError> {
     serde_json::to_string_pretty(value)
         .map(ending_in_newline)
         .map_err(|e| CliError::Service(format!("{what} JSON failed: {e}")))
@@ -620,6 +665,44 @@ fn refuse_undeclared_listeners(
     )))
 }
 
+/// The app's contract with the `memory` block read from `profile_path`.
+///
+/// The profile file is the only source of the block, so a contract that sets
+/// `memory` itself is rejected, and so is a profile with no contract to go in.
+#[cfg(feature = "deployment")]
+fn with_memory_profile(
+    contract: Option<crate::deployment::DeploymentContract>,
+    profile_path: Option<&str>,
+) -> Result<Option<crate::deployment::DeploymentContract>, CliError> {
+    let Some(mut contract) = contract else {
+        return match profile_path {
+            Some(path) => Err(CliError::InvalidArgument(format!(
+                "--memory-profile {path}: the app builds no deployment contract to carry it"
+            ))),
+            None => Ok(None),
+        };
+    };
+    if contract.memory.is_some() {
+        return Err(CliError::Service(format!(
+            "{app}: the contract sets `memory` in code, so no artefacts were written -- the \
+             figures come only from a `bench-memory` profile passed as --memory-profile",
+            app = contract.app_name,
+        )));
+    }
+    if let Some(path) = profile_path {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| CliError::InvalidArgument(format!("--memory-profile {path}: {e}")))?;
+        let profile: crate::deployment::MemoryProfile =
+            serde_json::from_str(&text).map_err(|e| {
+                CliError::InvalidArgument(format!(
+                    "--memory-profile {path}: not a bench-memory profile: {e}"
+                ))
+            })?;
+        contract.memory = Some(profile);
+    }
+    Ok(Some(contract))
+}
+
 /// Generate all CI artefacts for this service.
 ///
 /// Loads the app's config once, best-effort, before the contract is built, so
@@ -637,7 +720,14 @@ fn generate_artefacts<A: ServiceApp>(
     load_config_for_artefacts(app);
 
     #[cfg(feature = "deployment")]
-    let deployment_contract = app.deployment_contract();
+    let deployment_contract =
+        with_memory_profile(app.deployment_contract(), args.memory_profile.as_deref())?;
+    #[cfg(not(feature = "deployment"))]
+    if let Some(path) = &args.memory_profile {
+        return Err(CliError::InvalidArgument(format!(
+            "--memory-profile {path}: the deployment feature is off, so there is no contract to carry it"
+        )));
+    }
     #[cfg(feature = "deployment")]
     if let Some(contract) = &deployment_contract {
         contract.validate().map_err(|e| {
@@ -1184,16 +1274,84 @@ mod tests {
                 service_account: crate::deployment::ServiceAccount::Own,
                 hot_paths: vec![],
                 openssl_conf: crate::deployment::DEFAULT_OPENSSL_CONF.to_string(),
+                memory: None,
             },
         }
     }
 
     #[cfg(feature = "deployment")]
     fn generate_into(app: &ContractApp, dir: &std::path::Path) -> Result<(), CliError> {
+        generate_with_profile(app, dir, None)
+    }
+
+    #[cfg(feature = "deployment")]
+    fn generate_with_profile<A: ServiceApp>(
+        app: &A,
+        dir: &std::path::Path,
+        memory_profile: Option<&std::path::Path>,
+    ) -> Result<(), CliError> {
+        let utf8 = |path: &std::path::Path| path.to_str().expect("a UTF-8 tempdir").to_owned();
         let args = crate::cli::commands::GenerateArtefactsArgs {
-            output_dir: dir.to_str().expect("a UTF-8 tempdir").to_owned(),
+            output_dir: utf8(dir),
+            memory_profile: memory_profile.map(utf8),
         };
         generate_artefacts(app, &args)
+    }
+
+    /// A bench profile lands in the contract as `memory`. A file that is not
+    /// one, a profile that does not add up, a contract that sets `memory` in
+    /// code, and an app with no contract are each rejected before anything is
+    /// written.
+    #[cfg(feature = "deployment")]
+    #[test]
+    fn generate_artefacts_takes_memory_only_from_a_bench_profile() {
+        let push = crate::deployment::PortContract::tcp("push", 50051)
+            .when_equals("config.transport", "grpc")
+            .bound_from("grpc.listen");
+        let profile = serde_json::json!({
+            "min_bytes": 100, "avg_bytes": 200, "max_bytes": 300,
+            "load": { "records_per_second": 5000, "record_bytes": 1024, "sources": 1 },
+            "warmup_seconds": 30, "window_seconds": 120, "samples": 120,
+            "reading": "proc-status",
+        });
+        let mut falling = profile.clone();
+        falling["max_bytes"] = 150.into();
+        let cases = [
+            (profile.to_string(), false, None),
+            (falling.to_string(), false, Some("memory.avg_bytes")),
+            ("{}".to_string(), false, Some("not a bench-memory profile")),
+            (profile.to_string(), true, Some("sets `memory` in code")),
+        ];
+        for (text, set_in_code, refusal) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (out, file) = (dir.path().join("out"), dir.path().join("profile.json"));
+            std::fs::write(&file, &text).unwrap();
+            let mut app = push_gated_app(vec![push.clone()]);
+            if set_in_code {
+                app.contract.memory = Some(serde_json::from_value(profile.clone()).unwrap());
+            }
+            let result = generate_with_profile(&app, &out, Some(&file));
+            if let Some(part) = refusal {
+                let err = result.expect_err(part);
+                assert!(
+                    err.to_string().contains(part),
+                    "{part:?} missing from: {err}"
+                );
+                assert!(!out.exists(), "{part}: written before the refusal");
+            } else {
+                result.expect("a bench profile passes");
+                let json = std::fs::read_to_string(out.join("deployment-contract.json")).unwrap();
+                let written: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(written["memory"], profile);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("profile.json");
+        std::fs::write(&file, profile.to_string()).unwrap();
+        let err = generate_with_profile(&BareApp { common: common() }, dir.path(), Some(&file))
+            .expect_err("no contract to carry the profile");
+        assert!(err.to_string().contains("no deployment contract"), "{err}");
     }
 
     #[cfg(feature = "deployment")]
