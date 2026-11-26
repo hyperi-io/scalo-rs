@@ -6,6 +6,20 @@ release and the target before bumping.
 
 ---
 
+## 2.14.41
+
+### `OctetCounting` carries a carriage-return choice, and a stream record is `Bytes` (API CHANGE)
+
+`framing::OctetCounting` is a struct with a private field, built by `OctetCounting::default()` (strip the `\r`s before an LF line's `\n`, as before) or `OctetCounting::new(CarriageReturns::Keep)`. `framing::Frame::Record` holds `bytes::Bytes`, a slice of the buffer it arrived in, where it held a `Vec<u8>`. `StreamDecoder` and `Frame` need the `bytes` feature, which every transport feature pulls.
+
+**Consumer adjustment** -- write `OctetCounting::default()` where `OctetCounting` was a value. A match on `Frame::Record(v)` that needs a `Vec<u8>` calls `v.to_vec()`, and one that converted it with `Bytes::from(v)` drops the conversion.
+
+### `type: syslog` builds a receiver, and `SyslogConfig` has a `listen` field (API and BEHAVIOUR CHANGE)
+
+`SyslogConfig` has a public `listen: Option<SyslogListenConfig>` field. `AnyReceiver` and `AnyToken` have a `Syslog` variant. `AnyReceiver::from_transport_config` with `TransportType::Syslog` builds a `SyslogReceiver` from `syslog.listen`, where it returned a "sends only" `Config` error, and returns a `Config` error naming `syslog.listen` when the section is missing.
+
+**Consumer adjustment** -- a `SyslogConfig` struct literal ends in `..SyslogConfig::default()`. A `match` on `AnyReceiver` adds a `Syslog` arm or a wildcard. A caller that relied on the "sends only" error to refuse a syslog source checks for a `listen` section instead.
+
 ## 2.14.40
 
 ### One TLS section on named profiles (API, CONFIG and BEHAVIOUR CHANGE)

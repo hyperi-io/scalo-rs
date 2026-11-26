@@ -157,7 +157,7 @@ impl StreamPeer {
 /// The messages in one connection's bytes, decoded by scalo's stream framing.
 fn decode(framing: SyslogFraming, bytes: &[u8]) -> Vec<String> {
     let framing: Arc<dyn Framing> = match framing {
-        SyslogFraming::OctetCounting => Arc::new(OctetCounting),
+        SyslogFraming::OctetCounting => Arc::new(OctetCounting::default()),
         SyslogFraming::Lf => Arc::new(Lf),
     };
     let mut decoder = StreamDecoder::new(framing, DecodeLimits::UNBOUNDED);
@@ -166,7 +166,7 @@ fn decode(framing: SyslogFraming, bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     while let Some(frame) = decoder.next_frame().unwrap() {
         if let Frame::Record(record) = frame {
-            out.push(String::from_utf8(record).unwrap());
+            out.push(String::from_utf8(record.to_vec()).unwrap());
         }
     }
     out
@@ -976,6 +976,7 @@ fn every_key_reaches_the_config_through_the_cascade() {
             ..ClientTlsConfig::default()
         }),
         filters_out: cfg.filters_out.clone(),
+        listen: None,
     };
     assert_eq!(cfg, want);
     assert_eq!(cfg.filters_out.len(), 1);
@@ -1043,7 +1044,11 @@ async fn the_factory_builds_syslog_and_holds_it_to_the_delivery_key() {
         .await
         .err()
         .map(|e| e.to_string());
-    assert!(err.is_some_and(|e| e.contains("sends only")));
+    assert!(
+        err.as_deref()
+            .is_some_and(|e| e.contains("set syslog.listen")),
+        "a receiver needs the listen section: {err:?}"
+    );
     let missing = TransportConfig {
         transport_type: TransportType::Syslog,
         ..TransportConfig::default()

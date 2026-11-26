@@ -32,6 +32,8 @@ Appends means two units back to back decode as the records of both, so a file ca
 
 `octet_counting` is for syslog. A frame is counted only when it is a count starting 1 to 9, one space, then the `<` of the PRI. Anything else is an LF line, so one stream can carry both, and a line such as `2026 Oct 11 ...` never swallows what follows it. A space at the end of the input so far waits for the next byte, and at the end of input it is a line.
 
+An LF line under `octet_counting` loses the `\r`s before its `\n`. `OctetCounting::new(CarriageReturns::Keep)` keeps them, so `a\r\n` is the record `a\r` and a line of one `\r` is a record, as a syslog listener that hands on the line as sent needs.
+
 At the end of input `octet_counting` drops a counted frame cut short, or reports it as oversize when its count is over `max_record_bytes`. A last line with no `\n` loses its ASCII whitespace and is dropped when nothing is left. `lf` keeps a last line as it keeps every other, spaces and all, which is what the pipe transport reads at EOF.
 
 A framing that streams decodes a byte stream as it arrives:
@@ -41,7 +43,7 @@ use std::sync::Arc;
 use scalo::framing::{DecodeLimits, Frame, OctetCounting, StreamDecoder};
 
 let limits = DecodeLimits { max_decoded_bytes: usize::MAX, max_record_bytes: 64 * 1024, max_frame_bytes: 1024 * 1024 };
-let mut decoder = StreamDecoder::new(Arc::new(OctetCounting), limits);
+let mut decoder = StreamDecoder::new(Arc::new(OctetCounting::default()), limits);
 while let Some(frame) = decoder.read(&mut reader).await? {
     match frame {
         Frame::Record(record) => handle(record),
@@ -51,6 +53,8 @@ while let Some(frame) = decoder.read(&mut reader).await? {
 ```
 
 `read` takes any `AsyncBufRead` and is cancel-safe. At the end of input it answers `None` and keeps a last line with no `\n`: `finish()` then lets it out, as the pipe transport does at EOF. The file transport never calls `finish`, so a line still being written waits for its newline. `taken()` is the offset just past the last frame.
+
+A record is `Bytes`, a slice of the buffer it arrived in, so taking one copies nothing. `read_from` reads a socket once straight into that buffer, for a caller that runs its own loop. `mid_frame()` says a frame has begun and not ended, an oversize one being read past included, so a listener can close a connection whose frame trickles in. `StreamDecoder` and `Frame` need the `bytes` feature, which every transport pulls.
 
 ---
 

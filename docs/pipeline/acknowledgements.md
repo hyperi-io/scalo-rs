@@ -57,6 +57,7 @@ The key sits beside the transport's own section: `AnyReceiver::from_config(key)`
 | HTTP | No. The server answers 200 once a request is queued, so a crash loses what it answered but had not delivered | No effect, one WARN |
 | File, as a source | No. It saves the highest read position released: a restart reads again what was not released, but a block released `Errored` is skipped once a later block is delivered | No effect, one WARN |
 | Pipe, memory | No: there is no acknowledgement to hold | No effect, one WARN |
+| Syslog | No: no syslog protocol it listens on answers the sender | No effect, one WARN |
 
 A pipeline over an HTTP or file source reports `best_effort` / `source_cannot_ack`. An HTTP endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([below](#a-hand-rolled-loop)).
 

@@ -232,7 +232,7 @@ Source: [../../src/transport/](../../src/transport/) -- particularly
 ## Related
 
 - [backends.md](backends.md) -- seven concrete backends, config and deps
-- [syslog.md](syslog.md) -- syslog over TCP, TLS, UDP and RELP, send only
+- [syslog.md](syslog.md) -- syslog sent over TCP, TLS, UDP and RELP, received over TCP, TLS and UDP
 - [grpc.md](grpc.md) -- gRPC `send_batch` blocks joined into one call
 - [http.md](http.md) -- HTTP sending: credentials, framing, failover, proxy, status answers
 - [otlp.md](otlp.md) -- OTLP log records to a collector, send only

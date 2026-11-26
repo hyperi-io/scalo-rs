@@ -390,12 +390,26 @@ impl Framing for Lf {
     }
 }
 
+/// What a line ended by `\n` keeps of the `\r`s before the `\n`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum CarriageReturns {
+    /// Drop them: `a\r\n` is the record `a`, and a line of `\r`s is no record.
+    #[default]
+    Strip,
+    /// Keep them: `a\r\n` is the record `a\r`, and `\r\n` is the record `\r`.
+    Keep,
+}
+
 /// RFC 6587 octet counting: each syslog record as its length in ASCII digits,
 /// a space, then the record, which starts with its `<PRI>`.
 ///
 /// Decoding reads a frame as counted only when it is a count starting 1 to 9,
 /// one space, then `<`. Anything else is an LF line, so a stream can mix the
 /// two, and a line such as `2026 Oct 11 ...` never swallows what follows it.
+/// An LF line keeps or strips the `\r`s before its `\n` as
+/// [`CarriageReturns`] says, stripping by default.
 /// A record that is empty or does not start with `<` encodes, but decodes as
 /// an LF line. A counted frame over `max_record_bytes` but within
 /// `max_frame_bytes` is skipped whole. A count over `max_frame_bytes` is not
@@ -406,7 +420,17 @@ impl Framing for Lf {
 /// oversize when its count is over `max_record_bytes`. A last line with no
 /// `\n` loses its ASCII whitespace, and is dropped when nothing is left.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct OctetCounting;
+pub struct OctetCounting {
+    carriage_returns: CarriageReturns,
+}
+
+impl OctetCounting {
+    /// Octet counting whose LF lines keep or strip the `\r`s before their `\n`.
+    #[must_use]
+    pub const fn new(carriage_returns: CarriageReturns) -> Self {
+        Self { carriage_returns }
+    }
+}
 
 impl Framing for OctetCounting {
     fn content_type(&self) -> &'static str {
@@ -440,13 +464,17 @@ impl Framing for OctetCounting {
         if let Some(split) = split_counted(buf, limits, at_end) {
             return Ok(split);
         }
-        Ok(split_line(buf, seen, limits, at_end, |line, ended| {
-            if ended {
-                without_carriage_returns(line)
-            } else {
-                without_whitespace(line)
-            }
-        }))
+        Ok(split_line(
+            buf,
+            seen,
+            limits,
+            at_end,
+            |line, ended| match (ended, self.carriage_returns) {
+                (true, CarriageReturns::Strip) => without_carriage_returns(line),
+                (true, CarriageReturns::Keep) => 0..line.len(),
+                (false, _) => without_whitespace(line),
+            },
+        ))
     }
 }
 
@@ -774,7 +802,7 @@ impl FramingConfig {
         Ok(match self.framing_type.as_str() {
             "ndjson" => Arc::new(Ndjson),
             "lf" => Arc::new(Lf),
-            "octet_counting" => Arc::new(OctetCounting),
+            "octet_counting" => Arc::new(OctetCounting::default()),
             "json_concat" => Arc::new(JsonConcat),
             "json_array" => Arc::new(JsonArray),
             "json_wrapped" => Arc::new(JsonWrapped::new(&self.key)),
@@ -789,10 +817,11 @@ impl FramingConfig {
 }
 
 /// A frame taken off a stream by a [`StreamDecoder`].
+#[cfg(feature = "bytes")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// A record.
-    Record(Vec<u8>),
+    /// A record, a slice of the buffer it arrived in.
+    Record(bytes::Bytes),
     /// A record over `max_record_bytes`, read past without being held.
     Oversize {
         /// Its first `max_record_bytes` or fewer.
@@ -805,27 +834,33 @@ pub enum Frame {
 /// Takes records off a byte stream as it arrives, through a framing that
 /// [streams](Framing::streams).
 ///
-/// [`push`](Self::push) the bytes read, then call [`next_frame`](Self::next_frame)
-/// until it answers `None`. It holds the part of a frame still waiting for its end,
-/// never more than `max_record_bytes` of one, plus what was pushed last. Once
+/// [`push`](Self::push) the bytes read, or [`read_from`](Self::read_from) a
+/// socket, then call [`next_frame`](Self::next_frame) until it answers `None`.
+/// Each record is a slice of the buffer the bytes arrived in, so taking one
+/// copies nothing. It holds the part of a frame still waiting for its end,
+/// never more than `max_record_bytes` of one, plus what was read last. Once
 /// the input ends, [`finish`](Self::finish) lets `next_frame` take a last line that
 /// has no `\n`.
+#[cfg(feature = "bytes")]
 #[derive(Debug)]
 pub struct StreamDecoder {
     framing: Arc<dyn Framing>,
     limits: DecodeLimits,
-    buf: Vec<u8>,
-    /// Where the next frame starts in `buf`.
-    start: usize,
-    /// Bytes of that frame the last split saw, when it answered `More`.
+    /// The bytes after the last frame taken.
+    buf: bytes::BytesMut,
+    /// Bytes of the next frame the last split saw, when it answered `More`.
     seen: usize,
     /// The oversize frame being read past.
     skipping: Option<Skipping>,
     taken: u64,
     at_end: bool,
+    /// Whether the last [`read_from`](Self::read_from) filled the room it had.
+    #[cfg(feature = "tokio")]
+    read_filled: bool,
 }
 
 /// An oversize frame partly read past.
+#[cfg(feature = "bytes")]
 #[derive(Debug)]
 struct Skipping {
     head: Vec<u8>,
@@ -833,6 +868,17 @@ struct Skipping {
     rest: Rest,
 }
 
+/// The least room [`StreamDecoder::read_from`] reads into, and what it makes
+/// on a stream whose reads come in under it.
+#[cfg(all(feature = "bytes", feature = "tokio"))]
+const READ_SIZE: usize = 8 * 1024;
+
+/// The room [`StreamDecoder::read_from`] makes once a read filled the last,
+/// so a busy stream's records share one allocation per block, not per read.
+#[cfg(all(feature = "bytes", feature = "tokio"))]
+const READ_BLOCK: usize = 64 * 1024;
+
+#[cfg(feature = "bytes")]
 impl StreamDecoder {
     /// A decoder of `framing` under `limits`. Given a framing that does not
     /// stream, [`next_frame`](Self::next_frame) answers [`FramingError::NotAStream`].
@@ -841,12 +887,13 @@ impl StreamDecoder {
         Self {
             framing,
             limits,
-            buf: Vec::new(),
-            start: 0,
+            buf: bytes::BytesMut::new(),
             seen: 0,
             skipping: None,
             taken: 0,
             at_end: false,
+            #[cfg(feature = "tokio")]
+            read_filled: false,
         }
     }
 
@@ -867,6 +914,15 @@ impl StreamDecoder {
         self.taken
     }
 
+    /// Whether a frame has begun and not ended: bytes are held past the last
+    /// frame taken, or an oversize frame is still being read past. Once
+    /// [`next_frame`](Self::next_frame) answers `None`, blank lines between
+    /// frames no longer count, so a connection idle between frames is not mid-frame.
+    #[must_use]
+    pub fn mid_frame(&self) -> bool {
+        self.skipping.is_some() || !self.buf.is_empty()
+    }
+
     /// The next frame, or `None` until more bytes arrive.
     ///
     /// # Errors
@@ -876,35 +932,29 @@ impl StreamDecoder {
     pub fn next_frame(&mut self) -> Result<Option<Frame>, FramingError> {
         loop {
             if self.skipping.is_some() {
-                let frame = self.skip();
-                if frame.is_none() {
-                    self.compact();
-                }
-                return Ok(frame);
+                return Ok(self.skip());
             }
-            let pending = &self.buf[self.start..];
-            if pending.is_empty() {
-                self.compact();
+            if self.buf.is_empty() {
                 return Ok(None);
             }
             match self
                 .framing
-                .split(pending, self.seen, &self.limits, self.at_end)?
+                .split(&self.buf, self.seen, &self.limits, self.at_end)?
             {
                 Split::More if self.at_end => return Err(FramingError::UnexpectedEof),
                 Split::More => {
-                    self.seen = pending.len();
-                    self.compact();
+                    self.seen = self.buf.len();
                     return Ok(None);
                 }
                 Split::Skip { len } => self.advance(len),
                 Split::Record { record, len } => {
-                    let record = pending[record].to_vec();
-                    self.advance(len);
-                    return Ok(Some(Frame::Record(record)));
+                    let frame = self.buf.split_to(len).freeze();
+                    self.taken += len as u64;
+                    self.seen = 0;
+                    return Ok(Some(Frame::Record(frame.slice(record))));
                 }
                 Split::Oversize { record, len, rest } => {
-                    let record = &pending[record];
+                    let record = &self.buf[record];
                     let head = record[..record.len().min(self.limits.max_record_bytes)].to_vec();
                     self.advance(len);
                     let Some(rest) = rest else {
@@ -926,7 +976,7 @@ impl StreamDecoder {
     /// Read on past the oversize frame: `Some` once it ends or the input does,
     /// `None` when the buffer is spent first.
     fn skip(&mut self) -> Option<Frame> {
-        let pending = &self.buf[self.start..];
+        let pending = &self.buf[..];
         let skipping = self.skipping.as_mut()?;
         // (frame bytes taken, record bytes among them, whether the frame ends)
         let (len, record, done) = match skipping.rest {
@@ -989,16 +1039,38 @@ impl StreamDecoder {
         }
     }
 
-    fn advance(&mut self, len: usize) {
-        self.start += len;
-        self.taken += len as u64;
-        self.seen = 0;
+    /// Read once from `reader` straight into the buffer, and return how many
+    /// bytes came: 0 at the end of the input. Cancel-safe.
+    ///
+    /// The buffer starts at 8 KiB and grows to 64 KiB only once a read fills
+    /// it, so an idle connection holds no more than 8 KiB.
+    ///
+    /// # Errors
+    ///
+    /// The reader's error.
+    #[cfg(feature = "tokio")]
+    pub async fn read_from<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt as _;
+        if self.buf.capacity() - self.buf.len() < READ_SIZE {
+            self.buf.reserve(if self.read_filled {
+                READ_BLOCK
+            } else {
+                READ_SIZE
+            });
+        }
+        let room = self.buf.capacity() - self.buf.len();
+        let read = reader.read_buf(&mut self.buf).await?;
+        self.read_filled = read == room;
+        Ok(read)
     }
 
-    /// Drop the frames already taken from the front of the buffer.
-    fn compact(&mut self) {
-        self.buf.drain(..self.start);
-        self.start = 0;
+    fn advance(&mut self, len: usize) {
+        bytes::Buf::advance(&mut self.buf, len);
+        self.taken += len as u64;
+        self.seen = 0;
     }
 }
 
@@ -1238,6 +1310,8 @@ fn string_end(bytes: &[u8], open: usize) -> Result<usize, FramingError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "bytes")]
+    use bytes::Bytes;
 
     fn wrapped() -> JsonWrapped {
         JsonWrapped::new("records")
@@ -1252,6 +1326,8 @@ mod tests {
 
     const ANY: DecodeLimits = DecodeLimits::UNBOUNDED;
 
+    const OCTET: OctetCounting = OctetCounting::new(CarriageReturns::Strip);
+
     #[test]
     fn each_framing_encodes_these_bytes() {
         let quoted_key = JsonWrapped::new("a\"b");
@@ -1259,7 +1335,7 @@ mod tests {
         let cases: [(&dyn Framing, &[&[u8]], &[u8], usize); 11] = [
             (&Ndjson, &[b"a", b"b\n", b""], b"a\nb\n\n", 3),
             (&Lf, &[b"a", b"b\n", b""], b"a\nb\n\n\n", 3),
-            (&OctetCounting, &[b"<1>a", b"<2>bc"], b"4 <1>a5 <2>bc", 2),
+            (&OCTET, &[b"<1>a", b"<2>bc"], b"4 <1>a5 <2>bc", 2),
             (&JsonConcat, &[br#"{"a":1}"#, b"[2]"], br#"{"a":1}[2]"#, 2),
             (&JsonArray, &[b"1", b"{}"], b"[1,{}]", 2),
             (&JsonArray, &[], b"[]", 0),
@@ -1297,29 +1373,29 @@ mod tests {
                 &[b"a", b"b", b" c ", b"last"],
             ),
             (
-                &OctetCounting,
+                &OCTET,
                 b"4 <1>a5 <2>bc\n6 <3>def<4>lf line\r\n",
                 &[b"<1>a", b"<2>bc", b"<3>def", b"<4>lf line"],
             ),
             // A count starts 1 to 9: a leading 0 makes the frame an LF line.
-            (&OctetCounting, b"05 <1>ab\n0 \n", &[b"05 <1>ab", b"0 "]),
+            (&OCTET, b"05 <1>ab\n0 \n", &[b"05 <1>ab", b"0 "]),
             // A count needs a space then `<` after it, or the frame is an LF line.
             (
-                &OctetCounting,
+                &OCTET,
                 b"2026 Oct 11 10:00:00 host msg\n4 <1>a",
                 &[b"2026 Oct 11 10:00:00 host msg", b"<1>a"],
             ),
             // The input ends after the space: an LF line, its whitespace trimmed.
-            (&OctetCounting, b"4 ", &[b"4"]),
+            (&OCTET, b"4 ", &[b"4"]),
             // A line keeps its spaces, and the last one with no \n loses them.
-            (&OctetCounting, b"<1>a \n  x  ", &[b"<1>a ", b"x"]),
+            (&OCTET, b"<1>a \n  x  ", &[b"<1>a ", b"x"]),
             // Whitespace left at the end of input is no record.
-            (&OctetCounting, b"4 <1>a \t ", &[b"<1>a"]),
+            (&OCTET, b"4 <1>a \t ", &[b"<1>a"]),
             // A counted frame the end of input cut short is dropped.
-            (&OctetCounting, b"<1>a\n10 <short", &[b"<1>a"]),
+            (&OCTET, b"<1>a\n10 <short", &[b"<1>a"]),
             // lf keeps the spaces of its last line, as of every other.
             (&Lf, b"a\n \t ", &[b"a", b" \t "]),
-            (&OctetCounting, b"", &[]),
+            (&OCTET, b"", &[]),
             (
                 &JsonConcat,
                 b" {\"a\":\"}\"} [1,2]\n{}",
@@ -1478,17 +1554,12 @@ mod tests {
                 &[b" abcdef "],
             ),
             (&Lf, b"abc\nabcd\r\nxy", &[b"abc", b"xy"], &[b"abcd\r"]),
-            (
-                &OctetCounting,
-                b"3 <ab6 <abcde2 <x",
-                &[b"<ab", b"<x"],
-                &[b"<abcde"],
-            ),
+            (&OCTET, b"3 <ab6 <abcde2 <x", &[b"<ab", b"<x"], &[b"<abcde"]),
             // A frame over the limit the end of input cut short reports as oversize.
-            (&OctetCounting, b"2 <x6 <ab", &[b"<x"], &[b"<ab"]),
+            (&OCTET, b"2 <x6 <ab", &[b"<x"], &[b"<ab"]),
             // A count over max_frame_bytes reads as an LF line, and counting resumes after it.
             (
-                &OctetCounting,
+                &OCTET,
                 b"20 <abcdefghi\n2 <o",
                 &[b"<o"],
                 &[b"20 <abcdefghi"],
@@ -1515,6 +1586,7 @@ mod tests {
     }
 
     /// Records, then the oversize heads, with lengths left out.
+    #[cfg(feature = "bytes")]
     fn sorted(frames: Vec<Frame>) -> Vec<Frame> {
         let (mut records, oversize): (Vec<Frame>, Vec<Frame>) = frames
             .into_iter()
@@ -1528,13 +1600,14 @@ mod tests {
 
     /// Fed in pieces of every size, a stream gives the records and oversize
     /// heads a whole-unit decode does, and accounts for every byte.
+    #[cfg(feature = "bytes")]
     #[test]
     fn a_stream_in_any_pieces_decodes_as_the_whole_unit() {
         let cases: [(Arc<dyn Framing>, &[u8]); 3] = [
             (Arc::new(Ndjson), b"ab\r\n\n  cd \nabcdefgh\nxy"),
             (Arc::new(Lf), b"ab\r\n\ncdefghij\n\nk"),
             (
-                Arc::new(OctetCounting),
+                Arc::new(OCTET),
                 b"2 <a6 <abcde\n20 <abcdefghi\n1 <<5>lf\n3 ab\n0 x\n4 <1>a6 <ab",
             ),
         ];
@@ -1544,7 +1617,7 @@ mod tests {
                 whole
                     .records
                     .iter()
-                    .map(|record| Frame::Record(record.to_vec()))
+                    .map(|record| Frame::Record(Bytes::copy_from_slice(record)))
                     .chain(whole.oversize.iter().map(|record| Frame::Oversize {
                         head: record[..record.len().min(4)].to_vec(),
                         len: 0,
@@ -1574,6 +1647,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bytes")]
     #[test]
     fn a_stream_decoder_reports_cut_frames_and_unit_framings() {
         let mut lines = StreamDecoder::new(Arc::new(Lf), ANY);
@@ -1582,13 +1656,13 @@ mod tests {
         lines.finish();
         assert_eq!(
             lines.next_frame(),
-            Ok(Some(Frame::Record(b"held".to_vec())))
+            Ok(Some(Frame::Record(Bytes::from_static(b"held"))))
         );
         assert_eq!(lines.taken(), 4);
 
         // At the end of input a cut oversize frame reports, and a cut frame
         // within the limit is dropped, its bytes counted as taken.
-        let mut counted = StreamDecoder::new(Arc::new(OctetCounting), SMALL);
+        let mut counted = StreamDecoder::new(Arc::new(OCTET), SMALL);
         counted.push(b"6 <ab");
         assert_eq!(counted.next_frame(), Ok(None));
         counted.finish();
@@ -1597,16 +1671,16 @@ mod tests {
             counted.next_frame(),
             Ok(Some(Frame::Oversize { head, len: 5 }))
         );
-        let mut cut = StreamDecoder::new(Arc::new(OctetCounting), ANY);
+        let mut cut = StreamDecoder::new(Arc::new(OCTET), ANY);
         cut.push(b"10 <short");
         assert_eq!(cut.next_frame(), Ok(None));
         cut.finish();
         assert_eq!((cut.next_frame(), cut.taken()), (Ok(None), 9));
 
         // A space at the end of what arrived waits for the byte after it.
-        let mut split = StreamDecoder::new(Arc::new(OctetCounting), ANY);
+        let mut split = StreamDecoder::new(Arc::new(OCTET), ANY);
         let record = |bytes: &[u8]| -> Result<Option<Frame>, FramingError> {
-            Ok(Some(Frame::Record(bytes.to_vec())))
+            Ok(Some(Frame::Record(Bytes::copy_from_slice(bytes))))
         };
         split.push(b"4 ");
         assert_eq!(split.next_frame(), Ok(None));
@@ -1626,6 +1700,86 @@ mod tests {
         let mut whole = StreamDecoder::new(Arc::new(JsonArray), SMALL);
         whole.push(b"[1]");
         assert_eq!(whole.next_frame(), Err(FramingError::NotAStream));
+    }
+
+    /// Kept carriage returns stay in an LF line's record, and a line of only
+    /// `\r` is a record. A last line with no `\n` still loses its whitespace.
+    #[test]
+    fn octet_counting_keeps_carriage_returns_when_asked() {
+        let unit = b"<1>a\r\n\r\n\n4 <2>b<3>c\r\r\n <4>d\r";
+        let keep = OctetCounting::new(CarriageReturns::Keep);
+        // (framing, records)
+        let cases: [(&dyn Framing, &[&[u8]]); 2] = [
+            (&keep, &[b"<1>a\r", b"\r", b"<2>b", b"<3>c\r\r", b"<4>d"]),
+            (&OCTET, &[b"<1>a", b"<2>b", b"<3>c", b"<4>d"]),
+        ];
+        for (framing, records) in cases {
+            assert_eq!(
+                framing.decode(unit, &ANY).map(|d| d.records),
+                Ok(records.to_vec()),
+                "{framing:?}"
+            );
+        }
+    }
+
+    /// A fresh decoder reads into 8 KiB, and grows to 64 KiB once a read
+    /// fills the room it had.
+    #[cfg(all(feature = "bytes", feature = "tokio"))]
+    #[tokio::test]
+    async fn read_from_starts_small_and_grows_once_reads_fill_it() {
+        let mut decoder = StreamDecoder::new(Arc::new(Lf), ANY);
+        let mut small: &[u8] = b"<14>one\n";
+        assert_eq!(decoder.read_from(&mut small).await.unwrap(), 8);
+        assert!(
+            decoder.buf.capacity() <= READ_SIZE,
+            "{}",
+            decoder.buf.capacity()
+        );
+
+        let mut decoder = StreamDecoder::new(Arc::new(Lf), ANY);
+        let big = vec![b'x'; 3 * READ_SIZE];
+        let mut reader: &[u8] = &big;
+        assert_eq!(decoder.read_from(&mut reader).await.unwrap(), READ_SIZE);
+        let _ = decoder.read_from(&mut reader).await.unwrap();
+        assert!(
+            decoder.buf.capacity() >= READ_BLOCK,
+            "{}",
+            decoder.buf.capacity()
+        );
+    }
+
+    /// Records come out as slices of the buffer they arrived in, back to back,
+    /// and a frame part way in, or an oversize one being read past, is mid-frame.
+    #[cfg(feature = "bytes")]
+    #[test]
+    fn a_stream_hands_out_slices_and_says_when_a_frame_is_part_way_in() {
+        let mut decoder = StreamDecoder::new(Arc::new(Lf), ANY);
+        decoder.push(b"ab\ncd\n\nef");
+        let mut records = Vec::new();
+        while let Some(Frame::Record(record)) = decoder.next_frame().unwrap() {
+            records.push(record);
+        }
+        assert_eq!(records, [&b"ab"[..], b"cd"]);
+        assert_eq!(
+            records[1].as_ptr() as usize - records[0].as_ptr() as usize,
+            3
+        );
+        assert!(decoder.mid_frame(), "`ef` waits for its newline");
+        decoder.push(b"\n\n");
+        assert!(decoder.next_frame().unwrap().is_some());
+        assert_eq!(decoder.next_frame(), Ok(None));
+        assert!(!decoder.mid_frame(), "a blank line is no frame");
+
+        let mut skipping = StreamDecoder::new(Arc::new(OCTET), SMALL);
+        skipping.push(b"7 <abcd");
+        assert_eq!(skipping.next_frame(), Ok(None));
+        assert!(skipping.mid_frame(), "an oversize frame read past");
+        skipping.push(b"ef");
+        assert!(matches!(
+            skipping.next_frame(),
+            Ok(Some(Frame::Oversize { .. }))
+        ));
+        assert!(!skipping.mid_frame());
     }
 
     /// Each built-in name builds its framing. Two units of one that appends,
@@ -1655,10 +1809,13 @@ mod tests {
                 framing.appends(),
                 "{name}"
             );
-            let streams = StreamDecoder::new(framing.clone(), ANY)
-                .next_frame()
-                .is_ok();
-            assert!(streams || !framing.streams(), "{name}");
+            #[cfg(feature = "bytes")]
+            {
+                let streams = StreamDecoder::new(framing.clone(), ANY)
+                    .next_frame()
+                    .is_ok();
+                assert!(streams || !framing.streams(), "{name}");
+            }
         }
     }
 

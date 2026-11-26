@@ -61,6 +61,7 @@ pub(crate) trait Meter {
         feature = "transport-pipe",
         feature = "transport-grpc",
         feature = "transport-kafka",
+        feature = "transport-syslog",
         all(feature = "transport-http", feature = "http-server")
     ))]
     fn count_received(records: u64, bytes: u64) {
