@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::transport::ack::{AckControl, AckKind, HeldAcks};
+use crate::transport::ack::{AckControl, AckKind, HeldAcks, HeldBytes};
 use crate::transport::finalizer::DeliveryStatus;
 use crate::transport::hold::{HoldLadder, hold_budget};
 
@@ -117,30 +117,28 @@ pub(crate) struct PendingRegistry {
     /// Records not yet released across every entry, changed under the lock.
     records: AtomicU64,
     /// Bytes held across every entry, shared with the pressure source.
-    held_bytes: Arc<AtomicU64>,
+    held_bytes: HeldBytes,
     enabled: AtomicBool,
     armed: AtomicBool,
-    max_held_bytes: u64,
     max_hold: Duration,
     label: &'static str,
-    #[cfg(feature = "memory")]
-    guard: Option<Arc<crate::memory::MemoryGuard>>,
 }
 
 impl PendingRegistry {
     pub(crate) fn new(settings: HoldSettings) -> Self {
+        #[cfg_attr(not(feature = "memory"), allow(unused_mut))]
+        let mut held_bytes = HeldBytes::new(settings.max_held_bytes);
+        #[cfg(feature = "memory")]
+        held_bytes.set_guard(settings.guard);
         Self {
             entries: parking_lot::Mutex::new(BTreeMap::new()),
             count: AtomicUsize::new(0),
             records: AtomicU64::new(0),
-            held_bytes: Arc::new(AtomicU64::new(0)),
+            held_bytes,
             enabled: AtomicBool::new(settings.enabled),
             armed: AtomicBool::new(settings.armed),
-            max_held_bytes: settings.max_held_bytes,
             max_hold: settings.max_hold,
             label: settings.label,
-            #[cfg(feature = "memory")]
-            guard: settings.guard,
         }
     }
 
@@ -157,13 +155,13 @@ impl PendingRegistry {
     /// The held-byte counter, for a pressure source reading it.
     #[cfg(feature = "governor")]
     pub(crate) fn held_bytes(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.held_bytes)
+        self.held_bytes.counter()
     }
 
     /// Held bytes past which a request is refused.
     #[cfg(feature = "governor")]
     pub(crate) fn max_held_bytes(&self) -> u64 {
-        self.max_held_bytes
+        self.held_bytes.max()
     }
 
     /// The hold budget for a request whose sender set `sender_deadline`.
@@ -176,16 +174,8 @@ impl PendingRegistry {
     /// Always admits while nothing is held, so a request over the ceiling on
     /// its own is not refused forever.
     pub(crate) fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
-        let ceiling = self.max_held_bytes;
-        self.held_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                (held == 0 || held.saturating_add(bytes) <= ceiling)
-                    .then(|| held.saturating_add(bytes))
-            })
-            .ok()?;
-        #[cfg(feature = "memory")]
-        if let Some(guard) = &self.guard {
-            guard.add_bytes(bytes);
+        if !self.held_bytes.reserve(bytes) {
+            return None;
         }
         // Built before the gauges, so a panic there still returns the bytes.
         let reservation = Reservation {
@@ -262,7 +252,7 @@ impl PendingRegistry {
         let now = Instant::now();
         HeldAcks::new(
             entries.values().map(|e| e.remaining).sum(),
-            self.held_bytes.load(Ordering::Acquire),
+            self.held_bytes.held(),
             entries
                 .values()
                 .map(|e| e.admitted)
@@ -364,15 +354,7 @@ impl PendingRegistry {
     /// Return `bytes` to the ceiling and the memory guard: atomics only, so it
     /// cannot panic.
     fn return_bytes(&self, bytes: u64) {
-        let _ = self
-            .held_bytes
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                Some(held.saturating_sub(bytes))
-            });
-        #[cfg(feature = "memory")]
-        if let Some(guard) = &self.guard {
-            guard.release(bytes);
-        }
+        self.held_bytes.release(bytes);
     }
 
     /// Record the held gauges, never while unwinding: a recorder that panics
@@ -383,7 +365,7 @@ impl PendingRegistry {
             metrics::gauge!("transport_ack_held", "transport" => self.label)
                 .set(self.records.load(Ordering::Relaxed) as f64);
             metrics::gauge!("transport_ack_held_bytes", "transport" => self.label)
-                .set(self.held_bytes.load(Ordering::Acquire) as f64);
+                .set(self.held_bytes.held() as f64);
         }
         #[cfg(not(feature = "metrics"))]
         let _ = self.label;
