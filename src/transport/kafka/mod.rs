@@ -158,13 +158,17 @@ fn trace_headers() -> Option<OwnedHeaders> {
     }
 }
 
-/// Build one produce record for `destination`, carrying `headers` when set.
+/// Build one produce record for `destination`, carrying `headers` when set and
+/// `timestamp_ms` as the message timestamp. A time before the epoch is left
+/// unset, since a broker rejects a negative timestamp other than -1.
 fn produce_record<'a>(
     destination: &'a str,
     payload: &'a [u8],
     headers: Option<&OwnedHeaders>,
+    timestamp_ms: Option<i64>,
 ) -> FutureRecord<'a, str, [u8]> {
-    let record = FutureRecord::to(destination).payload(payload);
+    let mut record = FutureRecord::to(destination).payload(payload);
+    record.timestamp = timestamp_ms.filter(|ms| *ms >= 0);
     match headers {
         Some(h) => record.headers(h.clone()),
         None => record,
@@ -2120,10 +2124,12 @@ impl KafkaTransport {
         destination: &str,
         payload: &[u8],
         headers: Option<&OwnedHeaders>,
+        timestamp_ms: Option<i64>,
     ) -> Result<DeliveryFuture, SendResult> {
         let mut queue_full_since: Option<std::time::Instant> = None;
         loop {
-            match producer.send_result(produce_record(destination, payload, headers)) {
+            match producer.send_result(produce_record(destination, payload, headers, timestamp_ms))
+            {
                 Ok(delivery) => return Ok(delivery),
                 Err((err, _)) => {
                     let queue_full =
@@ -2316,7 +2322,7 @@ impl TransportSender for KafkaTransport {
         };
 
         let headers = trace_headers();
-        let record = produce_record(destination, &payload, headers.as_ref());
+        let record = produce_record(destination, &payload, headers.as_ref(), None);
 
         let timer = Self::send_timer();
 
@@ -2342,7 +2348,8 @@ impl TransportSender for KafkaTransport {
     /// record. Here the whole block is queued first, so librdkafka fills its
     /// MessageSets from it and the block costs roughly one linger window plus
     /// the broker round-trip. Records keep the default's routing: each goes to
-    /// its own `key` (empty when `None`), payload only, headers not sent.
+    /// its own `key` (empty when `None`), payload and `timestamp_ms` as the
+    /// message timestamp, headers not sent.
     ///
     /// ## Result -- never `Ok` unless every record is handled
     ///
@@ -2396,6 +2403,7 @@ impl TransportSender for KafkaTransport {
                     destination,
                     &record.payload,
                     headers.as_ref(),
+                    record.metadata.timestamp_ms,
                 )
                 .await
             {
@@ -3666,6 +3674,23 @@ mod tests {
             .build()
             .expect("a current-thread runtime")
             .block_on(async { client_gate::config_refusal(KafkaTransport::new(config).await) })
+    }
+
+    /// A record's time is the produce record's timestamp, except where a
+    /// broker would refuse it.
+    #[test]
+    fn a_produce_record_takes_the_record_time() {
+        // (case, timestamp_ms, produce record timestamp)
+        let cases: [(&str, Option<i64>, Option<i64>); 4] = [
+            ("set", Some(1_791_756_855_003), Some(1_791_756_855_003)),
+            ("the epoch", Some(0), Some(0)),
+            ("unset", None, None),
+            ("before the epoch", Some(-5), None),
+        ];
+        for (case, timestamp_ms, want) in cases {
+            let record = produce_record("topic", b"x", None, timestamp_ms);
+            assert_eq!(record.timestamp, want, "{case}");
+        }
     }
 
     #[test]

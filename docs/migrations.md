@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.41
 
+### Kafka `send_batch` sets the message timestamp from the record (BEHAVIOUR CHANGE)
+
+A record's `timestamp_ms` is the Kafka message timestamp, so a record read from one hop keeps its time through the next. Before, the producer set it, as CreateTime, when the record was sent. A record with no `timestamp_ms`, or one before the epoch, still gets the producer's time, and `send(destination, payload)` has no record and sets none.
+
+**Consumer adjustment** -- none for the data. A reader that took the message timestamp as the send time reads the record's time instead, and a topic set to `message.timestamp.type=LogAppendTime` still stamps the broker's time.
+
 ### `DecodeLimits` has a `max_records` field (API CHANGE)
 
 `framing::DecodeLimits` has a public `max_records: usize`. `Framing::decode` refuses a unit holding more records with `FramingError::TooManyRecords { max }`, at the first record past it. `DecodeLimits::UNBOUNDED` sets it to `usize::MAX`, and `DecodeLimits::DEFAULT_MAX_RECORDS` is 100000.
