@@ -28,6 +28,7 @@
 
 mod config;
 mod engine;
+mod guest_log;
 mod host;
 mod metrics;
 mod plugin;
