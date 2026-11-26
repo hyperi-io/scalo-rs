@@ -49,7 +49,7 @@
 //! ```
 //!
 //! Generic over the config type, so a component need not define its own
-//! `SharedConfig`. Methods are `read`/`get`/`with`/`update`/`version`/`subscribe`.
+//! `SharedConfig`. Methods are `read`/`get`/`with`/`snapshot`/`update`/`version`/`subscribe`.
 //! The type is inferred from the argument. Clone the `SharedConfig` itself to
 //! share it.
 
@@ -112,6 +112,17 @@ impl<T: Clone + Send + Sync + 'static> SharedConfig<T> {
         self.inner.read().clone()
     }
 
+    /// Get the current version and a clone of the configuration, read under one lock.
+    ///
+    /// Prefer this to `version()` followed by `get()`: a reload between those two
+    /// calls pairs the new config with the old version.
+    #[must_use]
+    pub fn snapshot(&self) -> (u64, T) {
+        let guard = self.inner.read();
+        let version = self.version.load(Ordering::Acquire);
+        (version, guard.clone())
+    }
+
     /// Access configuration via a closure (avoids cloning).
     ///
     /// The closure receives a reference to the current config while holding
@@ -139,18 +150,18 @@ impl<T: Clone + Send + Sync + 'static> SharedConfig<T> {
     ///
     /// This will:
     /// 1. Acquire write lock and replace the config
-    /// 2. Increment the version counter
-    /// 3. Notify all subscribers via the watch channel
+    /// 2. Increment the version counter, still under the lock
+    /// 3. Notify all subscribers via the watch channel, still under the lock
     pub fn update(&self, new_config: T) {
-        {
+        let new_version = {
             let mut guard = self.inner.write();
             *guard = new_config;
-        }
-
-        let new_version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
-
-        // Notify subscribers (ignore error if no receivers)
-        let _ = self.watch_tx.send(new_version);
+            // Under the lock, so `snapshot` never pairs a config with another reload's version.
+            let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
+            // Notify subscribers (ignore error if no receivers)
+            let _ = self.watch_tx.send(version);
+            version
+        };
 
         debug!(version = new_version, "Configuration updated");
     }
@@ -353,6 +364,54 @@ mod tests {
         let shared: SharedConfig<TestConfig> = SharedConfig::default();
         assert_eq!(shared.version(), 0);
         assert_eq!(shared.read().name, "");
+    }
+
+    #[test]
+    fn test_snapshot_returns_version_with_its_config() {
+        let shared = SharedConfig::new(TestConfig::default());
+        assert_eq!(shared.snapshot(), (0, TestConfig::default()));
+
+        shared.update(TestConfig {
+            name: "one".into(),
+            value: 1,
+        });
+        assert_eq!(
+            shared.snapshot(),
+            (
+                1,
+                TestConfig {
+                    name: "one".into(),
+                    value: 1,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn test_snapshot_never_pairs_a_config_with_another_reloads_version() {
+        const RELOADS: u64 = 50_000;
+
+        // Each config's value is the version it was stored under, so a mixed pair fails the assert.
+        let shared = SharedConfig::new(TestConfig::default());
+        let writer = shared.clone();
+        let reloader = std::thread::spawn(move || {
+            for generation in 1..=RELOADS {
+                writer.update(TestConfig {
+                    name: String::new(),
+                    value: generation,
+                });
+            }
+        });
+
+        while !reloader.is_finished() {
+            let (version, config) = shared.snapshot();
+            assert_eq!(
+                config.value, version,
+                "config from one reload paired with another reload's version"
+            );
+        }
+        reloader.join().expect("reloader thread panicked");
+        assert_eq!(shared.snapshot().0, RELOADS);
     }
 
     #[tokio::test]

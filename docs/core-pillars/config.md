@@ -259,6 +259,7 @@ inside the cluster. See [http_server/config.rs](../../src/http_server/config.rs)
 | `scalo::SensitiveString` | Redacted-on-serialise wrapper, `.expose()` to read |
 | `ConfigReloader::new(...).start() -> JoinHandle<()>` | Hot-reload driver (builder-style) |
 | `SharedConfig<T>::get()` / `read()` | Reader for the reloader's current value, behind a `parking_lot` read lock |
+| `SharedConfig<T>::snapshot()` | The version and a clone of the config, read under one lock, so the pair never straddles a reload |
 
 ---
 
