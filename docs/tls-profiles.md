@@ -46,7 +46,7 @@ A client sends a key share for its first group. A server that prefers another gr
 
 `strong` follows culvert's stance: TLS 1.3 only, AES-256-GCM first, P-384 certificates ([culvert README, "Cryptography and CNSA 2.0"](https://github.com/hyperi-io/culvert#cryptography-and-cnsa-20)). It goes further on key exchange: culvert's OpenSSL base had no ML-KEM, and `strong` leads with the X25519MLKEM768 hybrid, so a peer that has it gets harvest-now-decrypt-later protection and one that lacks it falls back to a classical group. AES-128-GCM sits last because RFC 8446 section 9.1 makes it mandatory to implement.
 
-TLS 1.2 is off by default because what it costs depends on the whole set of peers a deployment talks to, not on one link. Turn it on for the profile when a peer needs it, and every connection on that profile can then fall back. With it on, `strong` still offers only its own AES-256-GCM suites and classical groups.
+TLS 1.2 is off by default because what it costs depends on the whole set of peers a deployment talks to, not on one link. Turn it on for the profile when a peer needs it, and every connection on that profile can then fall back. With it on, `strong` still offers only its own AES-256-GCM suites and classical groups. A sink to a peer that answers TLS 1.2 only fails on the default `strong` profile: name `commercial`, or set `allow_tls12` on `strong`.
 
 `commercial` offers every ECDHE AEAD suite with TLS 1.2 on, for the widest reach that is still current. NIST deprecates classical key exchange after 2030, which is when this profile ages out. `cnsa2` is the CNSA 2.0 shape, the same as AWS's CNSA2-INTEROP1 policy.
 
