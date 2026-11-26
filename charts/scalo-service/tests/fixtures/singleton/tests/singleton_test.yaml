@@ -20,6 +20,8 @@ tests:
           path: spec.strategy
           value:
             type: Recreate
+      - notExists:
+          path: spec.template.spec.affinity
 
   - it: binds the persistent path to its claim and caps the ephemeral one
     template: deployment.yaml
