@@ -20,6 +20,12 @@ A record with a `time_unix_nano` header, decimal nanoseconds since the epoch, ge
 
 **Consumer adjustment** -- none unless a record already carries a header of that name that disagrees with its `timestamp_ms`. The syslog sender then writes the header's time, as the OTLP sender does.
 
+### Kafka carries record headers both ways (BEHAVIOUR CHANGE)
+
+`send_record` and `send_batch` put a record's headers on the message as Kafka headers, and `recv` puts every Kafka header on `Message::headers`. Before, a send dropped them and a receive kept none, so `time_unix_nano`, the syslog `hostname_header` and `msg_id_header` values and an application's own headers were lost across a hop. A record carries at most 64 headers and 64 KiB of names and values each way, and the rest are left off, counted in `transport_dropped_total{reason="headers_over_cap"}`. A received header whose key is not UTF-8 is left off and counted under `reason="header_key_not_utf8"`, where before it panicked the receive.
+
+**Consumer adjustment** -- none for the data. A reader that took `Message::headers` as empty from Kafka now sees the headers the producer set, `traceparent` included, and a sink that writes every header (OTLP attributes, a Kafka forward) writes them all.
+
 ### `DecodeLimits` has a `max_records` field (API CHANGE)
 
 `framing::DecodeLimits` has a public `max_records: usize`. `Framing::decode` refuses a unit holding more records with `FramingError::TooManyRecords { max }`, at the first record past it. `DecodeLimits::UNBOUNDED` sets it to `usize::MAX`, and `DecodeLimits::DEFAULT_MAX_RECORDS` is 100000.

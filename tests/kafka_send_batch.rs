@@ -37,7 +37,8 @@ use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use scalo::transport::kafka::test_support::require_docker;
 use scalo::transport::kafka::{KafkaAdmin, KafkaConfig, KafkaTransport};
 use scalo::transport::{
-    PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportResult, TransportSender,
+    PayloadFormat, Record, RecordMeta, SendResult, TransportBase, TransportReceiver,
+    TransportResult, TransportSender,
 };
 
 use common::kafka::shared_bootstrap;
@@ -374,4 +375,70 @@ async fn send_batch_sets_the_message_timestamp_from_the_record() {
             "{payload}: {producer_time:?} is the producer's time"
         );
     }
+}
+
+/// Every header a record carries survives a hop through the broker, whether it
+/// is sent in a block or alone, and scalo's own receive hands it back. The
+/// values include bytes that are not UTF-8 and an empty one, and the order and a
+/// repeated name are kept.
+#[tokio::test]
+async fn record_headers_survive_a_hop_through_the_broker() {
+    if !require_docker() {
+        return;
+    }
+    let bootstrap = shared_bootstrap().await;
+    let topic = common::unique("headers");
+    create_topics(&bootstrap, &[topic.as_str()]).await;
+    let transport = KafkaTransport::new(&producer_config(&bootstrap))
+        .await
+        .expect("kafka transport");
+
+    let key: Arc<str> = Arc::from(topic.as_str());
+    let with_headers = |payload: &str, headers: Vec<(String, Vec<u8>)>| Record {
+        headers,
+        ..record(&key, payload.to_string())
+    };
+    let sent: Vec<Record> = vec![
+        with_headers("none", Vec::new()),
+        with_headers(
+            "several",
+            vec![
+                (
+                    "time_unix_nano".to_string(),
+                    b"1791756855003000000".to_vec(),
+                ),
+                ("hostname".to_string(), b"web-1".to_vec()),
+                ("bin".to_string(), vec![0xff, 0xfe, 0x00, 0x80]),
+                ("empty".to_string(), Vec::new()),
+                ("hostname".to_string(), b"web-2".to_vec()),
+            ],
+        ),
+    ];
+    let result = transport.send_batch(&sent).await;
+    assert!(result.is_ok(), "block failed: {result:?}");
+    let one_by_one = with_headers("alone", vec![("tenant".to_string(), b"t9".to_vec())]);
+    let result = transport.send_record(&one_by_one).await;
+    assert!(result.is_ok(), "send_record failed: {result:?}");
+
+    let receiver = KafkaTransport::new(&KafkaConfig {
+        brokers: vec![bootstrap.clone()],
+        group: format!("headers-{topic}"),
+        topics: vec![topic.clone()],
+        ..Default::default()
+    })
+    .await
+    .expect("kafka receiver");
+    let want: HashMap<Vec<u8>, Vec<(String, Vec<u8>)>> = sent
+        .iter()
+        .chain([&one_by_one])
+        .map(|r| (r.payload.to_vec(), r.headers.clone()))
+        .collect();
+    let mut got: HashMap<Vec<u8>, Vec<(String, Vec<u8>)>> = HashMap::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while got.len() < want.len() && Instant::now() < deadline {
+        for record in receiver.recv(100).await.expect("receive").records {
+            got.insert(record.payload.to_vec(), record.headers);
+        }
+    }
+    assert_eq!(got, want, "headers read back as they were sent");
 }

@@ -22,6 +22,8 @@ counter transport_coalesced_records_total transport="grpc"
 counter transport_coalesced_timeouts_total transport="grpc"
 counter transport_connections_closed_total transport="syslog" reason=<self.as_str()>
 counter transport_consumer_rebuilds_total transport="kafka" protocol=<protocol.as_str()>
+counter transport_dropped_total transport="kafka" reason="header_key_not_utf8"
+counter transport_dropped_total transport="kafka" reason="headers_over_cap"
 counter transport_dropped_total transport="syslog" reason="kernel"
 counter transport_dropped_total transport="syslog" reason=<reason>
 counter transport_filter_cel_payload_skip_total
