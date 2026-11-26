@@ -179,6 +179,68 @@ pub trait AcknowledgingReceiver: TransportReceiver {
     fn acknowledgements(&self) -> AcknowledgementsConfig;
 }
 
+/// What one source holds unreleased, as it last published it, so the shutdown
+/// path can report what a drain leaves behind. Counted until it drops.
+#[derive(Debug)]
+pub(crate) struct HeldSlot(Arc<HeldCounts>);
+
+#[derive(Debug, Default)]
+struct HeldCounts {
+    records: AtomicU64,
+    bytes: AtomicU64,
+}
+
+/// The counts of every source, a dropped one's pruned as each slot is added.
+static HELD_SLOTS: std::sync::Mutex<Vec<std::sync::Weak<HeldCounts>>> =
+    std::sync::Mutex::new(Vec::new());
+
+impl Default for HeldSlot {
+    fn default() -> Self {
+        let counts = Arc::new(HeldCounts::default());
+        let mut slots = HELD_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slots.retain(|slot| slot.strong_count() > 0);
+        slots.push(Arc::downgrade(&counts));
+        Self(counts)
+    }
+}
+
+impl HeldSlot {
+    /// Publish what the source labelled `transport` holds: to this slot, and
+    /// to the held gauges unless the thread is unwinding, when a recorder that
+    /// panics would abort the process.
+    pub(crate) fn publish(&self, transport: &'static str, records: u64, bytes: u64) {
+        self.0.records.store(records, Ordering::Relaxed);
+        self.0.bytes.store(bytes, Ordering::Relaxed);
+        #[cfg(feature = "metrics")]
+        if !std::thread::panicking() {
+            metrics::gauge!("transport_ack_held", "transport" => transport).set(records as f64);
+            metrics::gauge!("transport_ack_held_bytes", "transport" => transport).set(bytes as f64);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = transport;
+    }
+}
+
+/// The records and bytes every live source holds unreleased.
+#[cfg(feature = "shutdown")]
+pub(crate) fn held_by_sources() -> HeldAcks {
+    let slots = HELD_SLOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (count, bytes) = slots.iter().filter_map(std::sync::Weak::upgrade).fold(
+        (0_u64, 0_u64),
+        |(count, bytes), slot| {
+            (
+                count.saturating_add(slot.records.load(Ordering::Relaxed)),
+                bytes.saturating_add(slot.bytes.load(Ordering::Relaxed)),
+            )
+        },
+    );
+    HeldAcks::new(count, bytes, None, None)
+}
+
 /// What a sink's `Ok` proves about delivery.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -739,20 +801,15 @@ struct TicketsInner {
     next_id: AtomicU64,
     /// Admission instant and deadline of every live ticket, for [`Tickets::held`].
     live: parking_lot::Mutex<HashMap<u64, (Instant, Instant)>>,
+    held_slot: HeldSlot,
 }
 
 impl TicketsInner {
-    /// Record the held gauges, never while unwinding: a ticket drops then, and
-    /// a recorder that panics would abort the process.
+    /// Publish what is held. A ticket drops while unwinding, which the slot
+    /// allows for.
     fn publish_held(&self, count: usize) {
-        #[cfg(feature = "metrics")]
-        if !std::thread::panicking() {
-            metrics::gauge!("transport_ack_held", "transport" => self.transport).set(count as f64);
-            metrics::gauge!("transport_ack_held_bytes", "transport" => self.transport)
-                .set(self.held_bytes.held() as f64);
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = (self, count);
+        self.held_slot
+            .publish(self.transport, count as u64, self.held_bytes.held());
     }
 }
 
@@ -783,6 +840,7 @@ impl Tickets {
                 closed: AtomicBool::new(false),
                 next_id: AtomicU64::new(0),
                 live: parking_lot::Mutex::new(HashMap::new()),
+                held_slot: HeldSlot::default(),
             }),
         }
     }

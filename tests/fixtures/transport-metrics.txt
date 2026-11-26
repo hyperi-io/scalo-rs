@@ -81,12 +81,8 @@ gauge <name>
 gauge kafka_partition_limited
 gauge pipeline_delivery_guarantee guarantee=<self.guarantee.as_str()> reason=<self.reason.as_str()>
 gauge pipeline_delivery_guarantee guarantee=<self.guarantee.as_str()> reason=<self.reason.as_str()> listener=<listener.to_owned()>
-gauge transport_ack_held transport="kafka"
-gauge transport_ack_held transport=<self.label>
-gauge transport_ack_held transport=<self.transport>
-gauge transport_ack_held_bytes transport="kafka"
-gauge transport_ack_held_bytes transport=<self.label>
-gauge transport_ack_held_bytes transport=<self.transport>
+gauge transport_ack_held transport=<transport>
+gauge transport_ack_held_bytes transport=<transport>
 gauge transport_ack_withheld transport="kafka"
 gauge transport_healthy transport="grpc"
 gauge transport_inflight transport="grpc"

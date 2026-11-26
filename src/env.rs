@@ -300,6 +300,12 @@ pub fn runtime_context() -> &'static RuntimeContext {
     RUNTIME_CONTEXT.get_or_init(RuntimeContext::detect)
 }
 
+/// Seconds between SIGTERM and SIGKILL for a pod whose deployment contract
+/// names none: a 5 s pre-stop pause, up to 20 s of gRPC drain, then the final
+/// commit.
+#[cfg(any(feature = "shutdown", feature = "deployment"))]
+pub(crate) const DEFAULT_TERMINATION_GRACE_SECONDS: u32 = 45;
+
 // =============================================================================
 // cgroup resource limit helpers
 // =============================================================================

@@ -105,7 +105,9 @@ Step by step inside `run_app` for the default `run` subcommand:
 
    Then it starts what runs:
 
-   - Install signal handler -- returns `CancellationToken`.
+   - Install signal handler -- returns `CancellationToken`, with the
+     [drain deadline](../core-pillars/shutdown.md#drain-deadline-and-a-second-signal)
+     taken from the app's contract.
    - Start the worker pool scaling loop.
    - With `service-metrics`, start a task that writes the value
      `/scaling/pressure` serves into the `scaling_pressure` gauge once a

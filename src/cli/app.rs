@@ -355,6 +355,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
                 &args.effective_metrics_addr(),
                 &version_info.version,
                 build_commit(&version_info),
+                termination_grace(&app),
                 #[cfg(feature = "scaling")]
                 app.scaling_components(&config),
                 #[cfg(feature = "version-check")]
@@ -373,12 +374,7 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             #[cfg(not(feature = "lifecycle"))]
             let result = hand_over(&app, config, runtime).await;
 
-            // Flush what is queued before the process goes away. Both calls
-            // are bounded and safe when nothing was ever wired up.
-            #[cfg(feature = "otel-metrics")]
-            crate::metrics::shutdown_otel_export();
-            #[cfg(feature = "otel-tracing")]
-            crate::otel_tracing::shutdown();
+            crate::shutdown::flush_telemetry();
 
             result
         }
@@ -389,6 +385,18 @@ pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
             crate::top::run_top(&top_config).map_err(|e| CliError::Service(e.to_string()))
         }
     }
+}
+
+/// The termination grace the app's deployment contract gives its pod, which
+/// sets the default drain deadline, else the contract default.
+fn termination_grace<A: ServiceApp>(app: &A) -> std::time::Duration {
+    #[cfg(feature = "deployment")]
+    if let Some(contract) = app.deployment_contract() {
+        return std::time::Duration::from_secs(u64::from(contract.termination_grace_seconds));
+    }
+    #[cfg(not(feature = "deployment"))]
+    let _ = app;
+    crate::shutdown::default_termination_grace()
 }
 
 /// Hand control to the app: install its readiness check, then let `/readyz`

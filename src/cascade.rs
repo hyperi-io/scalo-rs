@@ -89,12 +89,15 @@ pub fn check_runtime_sections() -> Vec<CascadeError> {
         || crate::expression::evaluator::profile_from_cascade().map(drop),
         #[cfg(feature = "sink-stack")]
         || section::<crate::sink_stack::SinkStackConfig>("sink_stack").map(drop),
+        #[cfg(feature = "shutdown")]
+        || crate::shutdown::ShutdownConfig::from_cascade().map(drop),
     ];
     checks.iter().filter_map(|check| check().err()).collect()
 }
 
 #[cfg(all(
     test,
+    feature = "shutdown",
     feature = "config",
     feature = "http",
     feature = "otel-tracing",
@@ -127,6 +130,7 @@ self_regulation: nope
 expression: nope
 worker_pool: nope
 sink_stack: nope
+shutdown: nope
 ";
 
     /// Every `from_cascade()` refuses its section when it does not parse,
@@ -143,7 +147,7 @@ sink_stack: nope
         })
         .unwrap();
 
-        let refused: [(&str, bool); 12] = [
+        let refused: [(&str, bool); 13] = [
             (
                 "http_client",
                 crate::http_client::HttpClientConfig::from_cascade().is_err(),
@@ -192,6 +196,10 @@ sink_stack: nope
                 "worker_pool",
                 crate::worker::WorkerPoolConfig::from_cascade("worker_pool").is_err(),
             ),
+            (
+                "shutdown",
+                crate::shutdown::ShutdownConfig::from_cascade().is_err(),
+            ),
         ];
         let swallowed: Vec<&str> = refused
             .iter()
@@ -215,6 +223,7 @@ sink_stack: nope
                 "otel_tracing",
                 "scaling",
                 "self_regulation",
+                "shutdown",
                 "sink_stack",
                 "transport.filter_tiers"
             ]

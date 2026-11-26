@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use crate::transport::ack::{AckControl, AckKind, HeldAcks, HeldBytes};
+use crate::transport::ack::{AckControl, AckKind, HeldAcks, HeldBytes, HeldSlot};
 use crate::transport::finalizer::DeliveryStatus;
 use crate::transport::hold::{HoldLadder, hold_budget};
 
@@ -122,6 +122,7 @@ pub(crate) struct PendingRegistry {
     armed: AtomicBool,
     max_hold: Duration,
     label: &'static str,
+    held_slot: HeldSlot,
 }
 
 impl PendingRegistry {
@@ -139,6 +140,7 @@ impl PendingRegistry {
             armed: AtomicBool::new(settings.armed),
             max_hold: settings.max_hold,
             label: settings.label,
+            held_slot: HeldSlot::default(),
         }
     }
 
@@ -357,18 +359,13 @@ impl PendingRegistry {
         self.held_bytes.release(bytes);
     }
 
-    /// Record the held gauges, never while unwinding: a recorder that panics
-    /// then would abort the process.
+    /// Publish what is held, which the slot does safely while unwinding.
     fn publish(&self) {
-        #[cfg(feature = "metrics")]
-        if !std::thread::panicking() {
-            metrics::gauge!("transport_ack_held", "transport" => self.label)
-                .set(self.records.load(Ordering::Relaxed) as f64);
-            metrics::gauge!("transport_ack_held_bytes", "transport" => self.label)
-                .set(self.held_bytes.held() as f64);
-        }
-        #[cfg(not(feature = "metrics"))]
-        let _ = self.label;
+        self.held_slot.publish(
+            self.label,
+            self.records.load(Ordering::Relaxed),
+            self.held_bytes.held(),
+        );
     }
 
     /// Count one answered or abandoned request, never while unwinding.
