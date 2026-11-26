@@ -6,7 +6,13 @@ release and the target before bumping.
 
 ---
 
-## 2.14.41
+## 2.14.40: syslog receiver and metric units
+
+### Twelve byte and time metrics report their unit over OTLP (BEHAVIOUR CHANGE)
+
+`spool_*_bytes`, `spool_*_bytes_total`, `transport_ack_held_bytes`, `spool_codec_microseconds_total`, `spool_disk_full_wait_milliseconds_total`, `spool_oldest_age_seconds` and `pipeline_stall_seconds_total` carried their unit in the manifest only, so OTLP exported them with unit `1`. They now export `By`, `s`, `ms` or `us`. Metric names and the Prometheus scrape are unchanged. `spool_oldest_age_seconds` is described only in a build with `tiered-sink`, the one store that sets it.
+
+**Consumer adjustment** -- a query or alert that filters OTLP data on unit `1` for these metrics reads the new unit.
 
 ### `OctetCounting` carries a carriage-return choice, and a stream record is `Bytes` (API CHANGE)
 
@@ -20,7 +26,7 @@ release and the target before bumping.
 
 **Consumer adjustment** -- a `SyslogConfig` struct literal ends in `..SyslogConfig::default()`. A `match` on `AnyReceiver` adds a `Syslog` arm or a wildcard. A caller that relied on the "sends only" error to refuse a syslog source checks for a `listen` section instead.
 
-## 2.14.40
+## 2.14.40: TLS, Kafka floor and spool
 
 ### One TLS section on named profiles (API, CONFIG and BEHAVIOUR CHANGE)
 

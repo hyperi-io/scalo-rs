@@ -119,13 +119,6 @@ impl<'a> Series<'a> {
         self
     }
 
-    /// The unit in the manifest alone. The recorder hears none, so the OTLP
-    /// stream keeps the unit `1`.
-    pub(crate) fn manifest_unit(mut self, unit: &'a str) -> Self {
-        self.unit = unit;
-        self
-    }
-
     /// Histogram bucket bounds for the manifest. The recorder's buckets are
     /// set when it is installed.
     pub(crate) fn buckets(mut self, buckets: Option<&'a [f64]>) -> Self {
