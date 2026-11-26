@@ -80,6 +80,45 @@ signers:
 
 The same `.wasm` loaded twice compiles once. `PluginSlot` swaps a plugin under load: each instance taken from the slot moves to the new plugin at its next call, keeping its host data, so a reload drops no call.
 
+## Pulling from a registry
+
+`wasm-oci` pulls a plugin from an OCI registry over HTTPS. Nothing in scalo calls the pull by default, because k8s image volumes are the default way plugins arrive.
+
+```rust,ignore
+let pulled = scalo::wasm::oci::pull(
+    "registry.example.com/plugins/enrich@sha256:3f1c...",
+    OciAuth::Anonymous,
+    64 * 1024 * 1024,
+)
+.await?;
+let plugin = engine.load::<EnrichWorld>(
+    PluginSource::Bytes {
+        name: "enrich",
+        bytes: &pulled.wasm,
+        bundle: pulled.bundle.as_deref(),
+        signature: pulled.signature.as_deref(),
+    },
+    &policy,
+)?;
+```
+
+The pull returns bytes and no verdict. `load` runs every check in the section above on them.
+
+| Layer media type | Carries | Field of `Pulled` |
+|---|---|---|
+| `application/wasm` | the `.wasm` | `wasm`, exactly one layer |
+| `application/vnd.dev.sigstore.bundle.v0.3+json` | a keyless Sigstore bundle | `bundle`, at most one |
+| `application/vnd.scalo.wasm.signature.v1` | a key signature, the bytes of a `name.wasm.sig` file | `signature`, at most one |
+
+A manifest with no wasm layer, or with two, is refused. Layers of other media types are ignored.
+
+- Each layer is capped at `max_bytes` while it streams in, and its bytes must hash to the digest its manifest gives.
+- A tag can move to other bytes. Pull by digest, or rely on a signer.
+- `pull_insecure_http` speaks plain HTTP for a local registry or a test, and logs a warning on every call.
+- `OciAuth::Basic` holds its password in `SensitiveString`, which `Debug` and logs redact.
+- Each pull builds its own client, so one caller's credentials never reach the next.
+- A connect that takes over 10 s fails, and so does a read that stalls for 30 s.
+
 ## Metrics
 
 Bare names, labelled by `plugin`.
@@ -97,4 +136,4 @@ Bare names, labelled by `plugin`.
 
 ## Weight
 
-`wasm` pulls wasmtime and Cranelift, `wasmtime-wasi` (whose `p2` compiles wasmtime's async support, which the sync calls never use), `sigstore-verify` pinned exactly at 0.17.0 with no TLS or TUF, `sha2` and `arc-swap`. It adds second copies of `jiff` 0.2 and the RustCrypto 0.10 line (`digest`, `const-oid`, `block-buffer`) beside scalo's own, through sigstore's X.509 stack. `wasm-test-support` adds `wat`, for WAT test guests, and is never in a shipping build.
+`wasm` pulls wasmtime and Cranelift, `wasmtime-wasi` (whose `p2` compiles wasmtime's async support, which the sync calls never use), `sigstore-verify` pinned exactly at 0.17.0 with no TLS or TUF, `sha2` and `arc-swap`. It adds second copies of `jiff` 0.2 and the RustCrypto 0.10 line (`digest`, `const-oid`, `block-buffer`) beside scalo's own, through sigstore's X.509 stack. `wasm-test-support` adds `wat`, for WAT test guests, and is never in a shipping build. `wasm-oci` adds `oci-client`, which brings `oci-spec` and `chrono`, and reqwest's `query` and `stream` features.

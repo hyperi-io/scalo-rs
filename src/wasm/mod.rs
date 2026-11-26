@@ -31,6 +31,8 @@ mod engine;
 mod guest_log;
 mod host;
 mod metrics;
+#[cfg(feature = "wasm-oci")]
+pub mod oci;
 mod plugin;
 mod trust;
 
