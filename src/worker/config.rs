@@ -121,7 +121,7 @@ impl WorkerPoolConfig {
     pub fn from_cascade(key: &str) -> Result<Self, crate::config::ConfigError> {
         let (mut pool_cfg, min_explicit) = if let Some(cfg) = crate::config::try_get() {
             let parsed: Self = if cfg.contains(key) {
-                cfg.unmarshal_key(key)?
+                cfg.unmarshal_key_registered(key)?
             } else {
                 Self::default()
             };
