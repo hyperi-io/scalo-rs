@@ -661,16 +661,84 @@ impl TicketOutcome {
     }
 }
 
+/// Bytes a listener holds for unanswered requests, bounded by a ceiling and
+/// leased on the memory guard while held.
+pub(crate) struct HeldBytes {
+    held: Arc<AtomicU64>,
+    max: u64,
+    #[cfg(feature = "memory")]
+    guard: Option<Arc<crate::memory::MemoryGuard>>,
+}
+
+impl HeldBytes {
+    pub(crate) fn new(max: u64) -> Self {
+        Self {
+            held: Arc::new(AtomicU64::new(0)),
+            max,
+            #[cfg(feature = "memory")]
+            guard: None,
+        }
+    }
+
+    /// Lease held bytes on `guard` too.
+    #[cfg(feature = "memory")]
+    pub(crate) fn set_guard(&mut self, guard: Option<Arc<crate::memory::MemoryGuard>>) {
+        self.guard = guard;
+    }
+
+    /// Take `bytes` unless that passes the ceiling while something is held, so
+    /// a request over the ceiling on its own is never refused forever.
+    pub(crate) fn reserve(&self, bytes: u64) -> bool {
+        let max = self.max;
+        let taken = self
+            .held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held == 0 || held.saturating_add(bytes) <= max).then(|| held.saturating_add(bytes))
+            })
+            .is_ok();
+        #[cfg(feature = "memory")]
+        if taken && let Some(guard) = &self.guard {
+            guard.add_bytes(bytes);
+        }
+        taken
+    }
+
+    /// Give `bytes` back to the ceiling and the guard: atomics only, so it
+    /// cannot panic.
+    pub(crate) fn release(&self, bytes: u64) {
+        let _ = self
+            .held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+        #[cfg(feature = "memory")]
+        if let Some(guard) = &self.guard {
+            guard.release(bytes);
+        }
+    }
+
+    pub(crate) fn held(&self) -> u64 {
+        self.held.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn max(&self) -> u64 {
+        self.max
+    }
+
+    /// The counter itself, for a pressure source reading it.
+    #[cfg(all(feature = "governor", feature = "transport-grpc"))]
+    pub(crate) fn counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.held)
+    }
+}
+
 struct TicketsInner {
     transport: &'static str,
-    max_held_bytes: u64,
-    held_bytes: AtomicU64,
+    held_bytes: HeldBytes,
     closed: AtomicBool,
     next_id: AtomicU64,
     /// Admission instant and deadline of every live ticket, for [`Tickets::held`].
     live: parking_lot::Mutex<HashMap<u64, (Instant, Instant)>>,
-    #[cfg(feature = "memory")]
-    memory_guard: Option<Arc<crate::memory::MemoryGuard>>,
 }
 
 impl TicketsInner {
@@ -681,7 +749,7 @@ impl TicketsInner {
         if !std::thread::panicking() {
             metrics::gauge!("transport_ack_held", "transport" => self.transport).set(count as f64);
             metrics::gauge!("transport_ack_held_bytes", "transport" => self.transport)
-                .set(self.held_bytes.load(Ordering::Relaxed) as f64);
+                .set(self.held_bytes.held() as f64);
         }
         #[cfg(not(feature = "metrics"))]
         let _ = (self, count);
@@ -711,13 +779,10 @@ impl Tickets {
         Self {
             inner: Arc::new(TicketsInner {
                 transport,
-                max_held_bytes,
-                held_bytes: AtomicU64::new(0),
+                held_bytes: HeldBytes::new(max_held_bytes),
                 closed: AtomicBool::new(false),
                 next_id: AtomicU64::new(0),
                 live: parking_lot::Mutex::new(HashMap::new()),
-                #[cfg(feature = "memory")]
-                memory_guard: None,
             }),
         }
     }
@@ -728,7 +793,7 @@ impl Tickets {
     #[must_use]
     pub fn with_memory_guard(mut self, guard: Arc<crate::memory::MemoryGuard>) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.memory_guard = Some(guard);
+            inner.held_bytes.set_guard(Some(guard));
         } else {
             tracing::warn!(
                 transport = self.inner.transport,
@@ -749,15 +814,7 @@ impl Tickets {
         let refused = if inner.closed.load(Ordering::Acquire) {
             Some(Refused::Closed)
         } else {
-            let max = inner.max_held_bytes;
-            inner
-                .held_bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                    (held == 0 || held.saturating_add(bytes) <= max)
-                        .then(|| held.saturating_add(bytes))
-                })
-                .err()
-                .map(|_| Refused::Ceiling)
+            (!inner.held_bytes.reserve(bytes)).then_some(Refused::Ceiling)
         };
         if let Some(reason) = refused {
             #[cfg(feature = "metrics")]
@@ -770,10 +827,6 @@ impl Tickets {
             return Err(reason);
         }
 
-        #[cfg(feature = "memory")]
-        if let Some(guard) = &inner.memory_guard {
-            guard.add_bytes(bytes);
-        }
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
         let admitted = Instant::now();
         let count = {
@@ -810,7 +863,7 @@ impl Tickets {
         let earliest = live.values().map(|(_, deadline)| *deadline).min();
         HeldAcks {
             count: live.len() as u64,
-            bytes: self.inner.held_bytes.load(Ordering::Relaxed),
+            bytes: self.inner.held_bytes.held(),
             oldest_age: oldest.map(|t| now.saturating_duration_since(t)),
             earliest_deadline: earliest,
         }
@@ -821,7 +874,7 @@ impl std::fmt::Debug for Tickets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tickets")
             .field("transport", &self.inner.transport)
-            .field("max_held_bytes", &self.inner.max_held_bytes)
+            .field("max_held_bytes", &self.inner.held_bytes.max())
             .field("held", &self.held())
             .finish_non_exhaustive()
     }
@@ -899,11 +952,7 @@ impl Ticket {
 impl Drop for Ticket {
     fn drop(&mut self) {
         let inner = &self.inner;
-        inner.held_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
-        #[cfg(feature = "memory")]
-        if let Some(guard) = &inner.memory_guard {
-            guard.release(self.bytes);
-        }
+        inner.held_bytes.release(self.bytes);
         let count = {
             let mut live = inner.live.lock();
             live.remove(&self.id);
