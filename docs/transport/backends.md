@@ -352,6 +352,7 @@ transport:
       path: "/var/log/myapp/events.ndjson"
       append: true              # false empties the file at the first send
       max_line_bytes: 16777216
+      recv_timeout_ms: 100      # as a source: longest recv waits at the end for a line; 0 returns at once
       rotation: never           # never (default) | hourly | daily, by local time
       max_bytes: 104857600      # rotate before a write that would pass this; unset: no size rotation
       max_files: 5              # rotated files kept; unset: no count limit
