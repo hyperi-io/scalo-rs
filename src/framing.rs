@@ -12,7 +12,7 @@
 //! A [`Framing`] takes records the record codec already turned into bytes and
 //! never looks inside one. Each framing says whether its units append (two
 //! units back to back decode as the records of both, so a file can grow) and
-//! whether it decodes as a stream (a [`StreamDecoder`] hands records out before
+//! whether it decodes as a stream (a `StreamDecoder` hands records out before
 //! the input ends).
 //!
 //! | Name | One unit | Appends | Streams |
@@ -104,7 +104,7 @@ pub enum FramingError {
         max: usize,
     },
 
-    /// [`StreamDecoder`] was given a framing that decodes whole units only.
+    /// `StreamDecoder` was given a framing that decodes whole units only.
     #[error("framing: this framing decodes whole units, not a stream")]
     NotAStream,
 
@@ -143,7 +143,7 @@ pub struct DecodeLimits {
     /// Most records [`Framing::decode`] takes from one unit, those over
     /// `max_record_bytes` included. A unit with more is refused whole at the
     /// first record past the limit, so its sender can retry it smaller and
-    /// nothing past the limit is held. A [`StreamDecoder`] has no unit and
+    /// nothing past the limit is held. A `StreamDecoder` has no unit and
     /// does not read it.
     pub max_records: usize,
 }

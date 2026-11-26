@@ -13,8 +13,8 @@
 //! - **Both:** Fanout recorder sends to both Prometheus AND OTel
 //!
 //! OTLP push runs with or without the `/metrics` server, through its own
-//! exporter or, with `transport-otlp`, through an [`OtlpTransport`](crate::transport::OtlpTransport)
-//! ([`MetricsManager::with_otlp_transport`], `metrics.otel.via_transport`).
+//! exporter or, with `transport-otlp`, through an `OtlpTransport`
+//! (`MetricsManager::with_otlp_transport`, `metrics.otel.via_transport`).
 //!
 //! Counter/Gauge/Histogram types, automatic process + cgroup container metrics,
 //! built-in HTTP server, liveness/readiness probes, optional scaling-pressure and

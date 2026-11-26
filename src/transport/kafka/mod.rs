@@ -2368,7 +2368,8 @@ impl TransportSender for KafkaTransport {
     /// MessageSets from it and the block costs roughly one linger window plus
     /// the broker round-trip. Records keep the default's routing: each goes to
     /// its own `key` (empty when `None`), payload, headers and `timestamp_ms`
-    /// as the message timestamp. Headers are bounded as [`headers`] bounds them.
+    /// as the message timestamp. A record carries at most 64 headers and 64 KiB
+    /// of header names and values.
     ///
     /// ## Result -- never `Ok` unless every record is handled
     ///

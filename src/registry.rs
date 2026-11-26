@@ -12,7 +12,7 @@
 //! [`Registry<C>`] is generic over what it holds. Each kind of pluggable piece
 //! keeps one `static` registry of its constructor type, and its factory looks a
 //! config's `type` up there when the name is not a built-in one. The transport
-//! senders use it through [`register_sender`](crate::transport::register_sender).
+//! senders use it through `transport::register_sender`.
 //!
 //! ```
 //! use std::sync::Arc;

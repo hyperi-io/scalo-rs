@@ -8,8 +8,8 @@
 
 //! The `tls:` sections, as plain data.
 //!
-//! Every TLS client reads a [`ClientTlsConfig`] and every TLS server a
-//! [`ServerTlsConfig`]. They compile without rustls, so a build that parses
+//! Every TLS client reads a `ClientTlsConfig` and every TLS server a
+//! `ServerTlsConfig`. They compile without rustls, so a build that parses
 //! Kafka or HTTP-server config with no TLS stack still reads and refuses the
 //! same keys. `scalo::tls` re-exports them and builds the configs.
 //!
