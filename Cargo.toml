@@ -201,6 +201,8 @@ tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", 
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha2", "dep:sigstore-verify", "dep:arc-swap", "metrics-core", "tokio", "tracing"]
 # Test guests written as WAT. Never in a shipping build, so production never parses text.
 wasm-test-support = ["wasm", "dep:wat"]
+# Pulls a plugin from an OCI registry. Off by default and out of `full`: nothing calls the pull unless the app does.
+wasm-oci = ["wasm", "dep:oci-client", "dep:futures-util"]
 
 # Can leak secrets: not in `full`, off in every shipping build.
 dangerous-diagnostics = []
@@ -375,6 +377,8 @@ wasmtime-wasi = { version = ">=48.0.10, <49", default-features = false, features
 # Verify-only Sigstore, pinned exactly: a 0.x minor every few weeks, each read before it is taken.
 # No `rustls` or `tuf`, so verification never reaches the network. aws-lc-rs is rustls's provider here too.
 sigstore-verify = { version = "=0.17.0", default-features = false, features = ["aws-lc-rs"], optional = true }
+# The OCI client behind `wasm-oci`. Its `rustls-tls` is reqwest's aws-lc-rs provider, the one `http` takes, so no ring arrives.
+oci-client = { version = ">=0.18.0, <0.19", default-features = false, features = ["rustls-tls"], optional = true }
 # WAT to .wasm for test guests.
 wat = { version = ">=1.263.0, <2", optional = true }
 

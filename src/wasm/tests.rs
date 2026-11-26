@@ -704,3 +704,138 @@ fn a_plugin_loads_from_a_path_named_after_its_file() {
         .map(|e| e.outcome());
     assert_eq!(err, Some("read_error"));
 }
+
+/// A pull from a real registry, through the shared test containers.
+#[cfg(all(feature = "wasm-oci", feature = "deployment-test-support"))]
+mod registry {
+    use std::time::Duration;
+
+    use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
+    use oci_client::secrets::RegistryAuth;
+    use oci_client::{Client, Reference};
+
+    use super::{FixtureWorld, guest, operator_key, run, sign};
+    use crate::deployment::test_support::shared_service::{self, Ready, ServiceSpec, Suite};
+    use crate::wasm::oci::{
+        OciAuth, PullError, SIGNATURE_MEDIA_TYPE, WASM_MEDIA_TYPE, pull_insecure_http,
+    };
+    use crate::wasm::{PluginSource, TrustPolicy, WasmConfig, WasmEngine};
+
+    /// renovate: datasource=docker depName=registry
+    const REGISTRY_IMAGE: &str =
+        "registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373";
+
+    const REGISTRY_PORT: u16 = 5000;
+
+    const SUITE: Suite = Suite {
+        repo: "scalo-rs",
+        manifest_dir: env!("CARGO_MANIFEST_DIR"),
+        tmp_dir: option_env!("CARGO_TARGET_TMPDIR"),
+    };
+
+    fn registry_spec() -> ServiceSpec {
+        ServiceSpec {
+            ports: vec![REGISTRY_PORT],
+            ready: Ready::Http {
+                port: REGISTRY_PORT,
+                path: "/v2/",
+                body: "{}",
+            },
+            ..ServiceSpec::new("registry", REGISTRY_IMAGE, Duration::from_secs(60))
+        }
+    }
+
+    /// Pushes the `.wasm` and its key signature as one artefact.
+    async fn push(reference: &str, wasm: &[u8], signature: &[u8]) {
+        let client = Client::new(ClientConfig {
+            protocol: ClientProtocol::Http,
+            ..ClientConfig::default()
+        });
+        let reference: Reference = reference.parse().expect("a reference");
+        let layers = [
+            ImageLayer::new(wasm.to_vec(), WASM_MEDIA_TYPE.to_string(), None),
+            ImageLayer::new(signature.to_vec(), SIGNATURE_MEDIA_TYPE.to_string(), None),
+        ];
+        let config = Config::new(
+            b"{}".to_vec(),
+            "application/vnd.oci.empty.v1+json".to_string(),
+            None,
+        );
+        client
+            .push(&reference, &layers, config, &RegistryAuth::Anonymous, None)
+            .await
+            .expect("push the plugin");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs Docker for a registry:2 container -- run: cargo nextest run --run-ignored all --ignore-default-filter"]
+    async fn a_plugin_pulled_from_a_registry_loads_only_under_its_signer() {
+        if !crate::deployment::test_support::docker_available() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "no Docker daemon answers in CI, which provides a container runtime"
+            );
+            eprintln!("skipping: no Docker daemon answers");
+            return;
+        }
+        let container =
+            tokio::task::spawn_blocking(|| shared_service::acquire(&SUITE, &registry_spec()))
+                .await
+                .expect("start the registry");
+        let reference = format!("{}/plugins/fixture:1.0.0", container.addr(REGISTRY_PORT));
+
+        let bytes = guest();
+        let (pair, signer) = operator_key();
+        let signature = sign(&pair, &bytes);
+        push(&reference, &bytes, &signature).await;
+
+        let pulled = pull_insecure_http(&reference, OciAuth::Anonymous, 1024 * 1024)
+            .await
+            .expect("pull the plugin");
+        assert_eq!(pulled.wasm, bytes);
+        assert!(pulled.bundle.is_none());
+        assert_eq!(pulled.signature.as_deref(), Some(signature.as_slice()));
+
+        let engine = WasmEngine::new(WasmConfig::default()).expect("an engine");
+        let trusted = TrustPolicy {
+            allow_unsigned: false,
+            sha256: None,
+            signers: vec![signer],
+        };
+        let plugin = engine
+            .load::<FixtureWorld>(
+                PluginSource::Bytes {
+                    name: "fixture",
+                    bytes: &pulled.wasm,
+                    bundle: pulled.bundle.as_deref(),
+                    signature: pulled.signature.as_deref(),
+                },
+                &trusted,
+            )
+            .expect("the pulled plugin loads under its signer");
+        let mut instance = plugin.instance(()).expect("an instance");
+        assert_eq!(run(&mut instance, 0, 7).expect("a call"), 7);
+
+        let (_, stranger) = operator_key();
+        let refused = engine.load::<FixtureWorld>(
+            PluginSource::Bytes {
+                name: "fixture",
+                bytes: &pulled.wasm,
+                bundle: None,
+                signature: pulled.signature.as_deref(),
+            },
+            &TrustPolicy {
+                allow_unsigned: false,
+                sha256: None,
+                signers: vec![stranger],
+            },
+        );
+        assert_eq!(refused.err().map(|e| e.outcome()), Some("untrusted_signer"));
+
+        let capped = pull_insecure_http(&reference, OciAuth::Anonymous, 16).await;
+        assert!(
+            matches!(capped, Err(PullError::TooLarge { .. })),
+            "a layer over the cap is refused"
+        );
+    }
+}
