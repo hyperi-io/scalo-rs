@@ -416,10 +416,7 @@ async fn send_taken(
     #[cfg(feature = "metrics")]
     count_call(&taken);
     #[cfg(feature = "transport-trace")]
-    let context = taken
-        .first()
-        .map(|item| item.context.clone())
-        .unwrap_or_default();
+    let context = taken.first().map_or_default(|item| item.context.clone());
     let mut replies = Vec::with_capacity(taken.len());
     let mut blocks = Vec::with_capacity(taken.len());
     for item in taken {

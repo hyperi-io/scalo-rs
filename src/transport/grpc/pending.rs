@@ -483,7 +483,7 @@ impl Reservation {
         // A budget too large to add is a year, not a panic per request.
         let deadline = admitted
             .checked_add(budget)
-            .unwrap_or_else(|| admitted + Duration::from_secs(365 * 24 * 3_600));
+            .unwrap_or_else(|| admitted + Duration::from_hours(8760));
         let words = usize::try_from(len.div_ceil(64)).unwrap_or(usize::MAX);
         let entry = Entry {
             len,

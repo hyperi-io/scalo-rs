@@ -428,7 +428,7 @@ const fn case(
 const GRPC: OtlpProtocol = OtlpProtocol::Grpc;
 const HTTP: OtlpProtocol = OtlpProtocol::Http;
 const SECS_7: Option<Duration> = Some(Duration::from_secs(7));
-const A_DAY: Option<Duration> = Some(Duration::from_secs(86_400));
+const A_DAY: Option<Duration> = Some(Duration::from_hours(24));
 
 const CASES: &[Case] = &[
     case("grpc accepted", GRPC, Answer::Accept, "Ok"),

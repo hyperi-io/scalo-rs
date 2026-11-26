@@ -26,15 +26,15 @@ use std::time::Duration;
 
 use metrics::counter;
 use scalo::metrics::{MetricsConfig, MetricsManager};
-use testcontainers_modules::testcontainers::core::{ContainerPort, Host, WaitFor};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::core::{ContainerPort, Host, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 /// Prometheus to test against.
 ///
 /// Pinned in our own source so dependency review can see it.
 // renovate: datasource=docker depName=prom/prometheus
-const PROMETHEUS_TAG: &str = "v3.15.0";
+const PROMETHEUS_TAG: &str = "v3.16.0";
 
 const PROMETHEUS_PORT: u16 = 9090;
 

@@ -171,8 +171,7 @@ fn every_evaluate_case_gives_its_outcome_from_bytes_and_from_a_value() {
         let allowed: HashSet<String> = case
             .clamp
             .as_ref()
-            .map(|c| c.allowed.iter().cloned().collect())
-            .unwrap_or_default();
+            .map_or_default(|c| c.allowed.iter().cloned().collect());
         let clamp = case.clamp.as_ref().map(|c| {
             let target = set
                 .target(&c.target)

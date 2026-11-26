@@ -492,15 +492,12 @@ impl<'a> Source<'a> {
         secret: Option<&'a String>,
         part: Part,
     ) -> Result<Self, TlsError> {
-        Self::of(
-            file.map(std::slice::from_ref).unwrap_or_default(),
-            secret,
-            part,
-        )?
-        .ok_or(TlsError::MissingSource {
-            file: part.file_field(),
-            secret: part.secret_field(),
-        })
+        Self::of(file.map_or_default(std::slice::from_ref), secret, part)?.ok_or(
+            TlsError::MissingSource {
+                file: part.file_field(),
+                secret: part.secret_field(),
+            },
+        )
     }
 
     async fn read(self) -> Result<Vec<u8>, TlsError> {

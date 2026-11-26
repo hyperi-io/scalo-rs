@@ -19,11 +19,11 @@ use scalo::deployment::test_support::shared_service::{self, Ready, ServiceSpec, 
 use super::{SUITE, docker_answers, skip_or_fail};
 
 /// renovate: datasource=docker depName=openbao/openbao
-pub const OPENBAO_TAG: &str = "2.6.1";
+pub const OPENBAO_TAG: &str = "2.6.6";
 
 /// The multi-arch index digest of [`OPENBAO_TAG`].
 const OPENBAO_DIGEST: &str =
-    "sha256:5b2486ab0fb90bbc788cc345b0a08616dfb375873ee8be5df3a2fd4d378a67e0";
+    "sha256:91f37e006ca5a1ea274b146c5406e2abfb67e5338267ce56c0874285879d9e2d";
 
 pub const ROOT_TOKEN: &str = "root";
 

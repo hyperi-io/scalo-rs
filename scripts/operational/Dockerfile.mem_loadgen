@@ -8,12 +8,12 @@
 #
 # Run by scripts/operational-mem-test.sh under `docker run --memory`: docs/self-regulation.md
 
-FROM rust:1-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
+FROM rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254 AS builder
 WORKDIR /build
 COPY . .
 RUN cargo build --release --example mem_loadgen --features memory
 
-FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0
 RUN useradd --create-home --uid 1000 appuser
 COPY --from=builder /build/target/release/examples/mem_loadgen /usr/local/bin/mem_loadgen
 USER 1000

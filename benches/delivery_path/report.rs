@@ -481,8 +481,7 @@ fn group_tails(out: &mut String, args: &Args, results: &[CellResult], load: Load
         let cells = cells_of(results, load, mode, &spec.label);
         let groups: Vec<String> = cells
             .first()
-            .map(|c| c.groups.iter().map(|g| g.group.clone()).collect())
-            .unwrap_or_default();
+            .map_or_default(|c| c.groups.iter().map(|g| g.group.clone()).collect());
         for group in groups {
             let pick = |f: fn(&GroupResult) -> f64| {
                 stat(&cells, |c| {

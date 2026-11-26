@@ -61,10 +61,10 @@
       "minimumReleaseAge": "7 days"
     },
     {
-      "description": "testcontainers-modules 0.15.0 requires testcontainers ^0.27, so testcontainers 0.28 does not resolve. Lift this once a testcontainers-modules release requires testcontainers 0.28, and move both in one pull request.",
+      "description": "system-configuration stays on the 0.7 line hyper-util's client-proxy-system takes, so a macOS build compiles one copy. Lift it when a hyper-util release requires 0.8.",
       "matchManagers": ["cargo"],
-      "matchPackageNames": ["testcontainers"],
-      "allowedVersions": "<0.28",
+      "matchPackageNames": ["system-configuration"],
+      "allowedVersions": "<0.8",
       "minimumReleaseAge": "7 days"
     },
     {

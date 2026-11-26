@@ -869,8 +869,7 @@ impl BatchEngine {
                 recv_result = receiver.recv_limited(recv_limits) => {
                     let now = std::time::Instant::now();
                     let ingest_interval = last_recv
-                        .map(|prev| now.saturating_duration_since(prev))
-                        .unwrap_or_default();
+                        .map_or_default(|prev| now.saturating_duration_since(prev));
                     last_recv = Some(now);
 
                     let Some(work_batch) =

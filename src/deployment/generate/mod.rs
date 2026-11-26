@@ -817,8 +817,7 @@ mod tests {
                 serde_json::from_str(&contract.to_json().unwrap()).unwrap();
             let rendered: Vec<&str> = json["writable_paths"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|w| w["path"].as_str()).collect())
-                .unwrap_or_default();
+                .map_or_default(|a| a.iter().filter_map(|w| w["path"].as_str()).collect());
             assert_eq!(rendered, want, "{case}: the chart's contract JSON");
             for (name, text) in [
                 ("dockerfile", generate_dockerfile(&contract, None).unwrap()),

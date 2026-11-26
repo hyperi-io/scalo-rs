@@ -12,7 +12,6 @@
 //! was bound on rather than dropping it to hand the port over, so no second
 //! process can take the address between bind and serve. Every request is
 //! recorded, so an assertion is what went over the wire.
-#![allow(unknown_lints)] // the next line's lint is newer than the MSRV toolchain
 #![allow(clippy::unused_async_trait_impl)] // the trait contract stays async fn
 
 use std::net::SocketAddr;

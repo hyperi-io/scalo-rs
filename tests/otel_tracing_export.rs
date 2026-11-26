@@ -27,12 +27,12 @@
 
 use std::time::Duration;
 
-use testcontainers_modules::testcontainers::core::{ContainerPort, WaitFor};
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use testcontainers_modules::testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::core::{ContainerPort, WaitFor};
+use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 // renovate: datasource=docker depName=otel/opentelemetry-collector
-const COLLECTOR_TAG: &str = "0.162.0";
+const COLLECTOR_TAG: &str = "0.163.2";
 
 const OTLP_GRPC_PORT: u16 = 4317;
 

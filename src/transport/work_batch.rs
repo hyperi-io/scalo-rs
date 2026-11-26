@@ -430,8 +430,7 @@ impl<T: CommitToken> WorkBatch<T> {
     pub fn from_ndjson(blob: Bytes) -> Self {
         let records = Ndjson
             .decode(&blob, &DecodeLimits::UNBOUNDED)
-            .map(|decoded| decoded.records)
-            .unwrap_or_default();
+            .map_or_default(|decoded| decoded.records);
         Self::json_records(&blob, records)
     }
 

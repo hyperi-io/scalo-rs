@@ -590,10 +590,7 @@ impl StatsContext {
     /// Get the latest metrics snapshot (clone).
     #[must_use]
     pub fn get_metrics(&self) -> KafkaMetrics {
-        self.latest_metrics
-            .read()
-            .map(|m| m.clone())
-            .unwrap_or_default()
+        self.latest_metrics.read().map_or_default(|m| m.clone())
     }
 
     /// Get the raw librdkafka statistics.

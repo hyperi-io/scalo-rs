@@ -17,8 +17,8 @@
 
 set -euo pipefail
 
-# helm v4.3.0 (2026-09-09), helm-unittest v1.2.1 (2026-10-03), kubeconform v0.8.0 (2026-06-04).
-HELM_VERSION="v4.3.0"
+# helm v4.3.2 (2026-11-13), helm-unittest v1.2.1 (2026-10-03), kubeconform v0.8.0 (2026-06-04).
+HELM_VERSION="v4.3.2"
 UNITTEST_VERSION="1.2.1"
 KUBECONFORM_VERSION="v0.8.0"
 versions="helm=$HELM_VERSION helm-unittest=$UNITTEST_VERSION kubeconform=$KUBECONFORM_VERSION"
@@ -40,8 +40,8 @@ if [[ "$(uname -s)" != Linux ]]; then
 fi
 
 declare -A sums=(
-  [helm-amd64]=86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
-  [helm-arm64]=31c5794dd55c66a51e6b7d2e2ac7a114ae8b1de41ff1d9ba51748ac973b06a08
+  [helm-amd64]=d1c0278d46beab79582d7e50f5b3dc206944ba8e577cde618513fd07daa53983
+  [helm-arm64]=df31cb61680ef728f82c770e5280dd565617bee6b039d37e85c677288be4bbb0
   [unittest-amd64]=48e86ecc1467b009630e5954375e5d8494139f73b466df5fe8c04fa45b634939
   [unittest-arm64]=c66062713cd3cbb1a80d7098bd1d4a48db8438f56b43fb6377df65447f93f8de
   [kubeconform-amd64]=9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883

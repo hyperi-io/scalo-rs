@@ -624,10 +624,7 @@ impl HttpTransport {
             &crate::transport::filter::TransportFilterTierConfig::from_cascade()?,
         )?;
 
-        let refusals = sender
-            .as_ref()
-            .map(send::Sender::refusals)
-            .unwrap_or_default();
+        let refusals = sender.as_ref().map_or_default(send::Sender::refusals);
 
         Ok(Self {
             sender,

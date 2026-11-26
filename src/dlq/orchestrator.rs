@@ -1015,7 +1015,7 @@ mod tests {
             .open(svc.join("dlq.ndjson"))
             .and_then(|file| {
                 file.set_modified(
-                    std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86_400),
+                    std::time::SystemTime::now() - std::time::Duration::from_hours(48),
                 )
             })
             .expect("age the file");
