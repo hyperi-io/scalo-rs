@@ -109,9 +109,18 @@ The `-no-tls` keys are the same self-hosted brokers on a TLS-off listener. Only 
   of the block may be on the broker -- retry it whole (at-least-once).
   A record's `key` is its topic. Its `timestamp_ms` is the message timestamp,
   left to the producer's own time when it is unset or before the epoch, and
-  `send` sets none. Its own headers are not sent, and with `transport-trace`
-  it has the active span's `traceparent`.
-- Sink confirmation: `confirms_delivery()` is `Remote`. `dead_letter_reason` names a record over `message.max.bytes` less 128 bytes of framing, and an outbound `dlq` filter match, so the pipeline dead-letters them itself instead of taking the `FilteredDlq` answer as handled.
+  `send` sets none. Its headers go on as Kafka headers, name to key and bytes
+  to value, in order, and with `transport-trace` the active span's
+  `traceparent` goes first and replaces a record header of that name.
+  `send_record` carries them as `send_batch` does, and `send` has none.
+- Header caps: a record carries at most 64 headers and 64 KiB of header names
+  and values each way. The first header past either cap and every one after
+  it is left off, counted in `transport_dropped_total{reason="headers_over_cap"}`
+  and logged once per direction. `recv` puts every Kafka header on the
+  record's `headers`, a header with no value as empty. A received header
+  whose key is not UTF-8 is left off and counted under
+  `reason="header_key_not_utf8"`.
+- Sink confirmation: `confirms_delivery()` is `Remote`. `dead_letter_reason` names a record whose payload and headers are over `message.max.bytes` less 128 bytes of framing, and an outbound `dlq` filter match, so the pipeline dead-letters them itself instead of taking the `FilteredDlq` answer as handled.
 - Topic creation: scalo's producers (the transport's, `KafkaProducer` and the Kafka DLQ's) set `allow.auto.create.topics: false`, where librdkafka's own producer default is `true`. A send to a missing topic backpressures until the topic exists, even on a broker with `auto.create.topics.enable` on. A producer that once wrote to a topic does not bring it back after a delete, which librdkafka's metadata refresh would otherwise do, idle or not. `allow_auto_create_topics: true` gives the broker's auto-create back, and a raw `librdkafka_overrides` or `sizing.producer_librdkafka` value wins over both. Consumers and admin clients are untouched, and librdkafka's consumer default is already `false`.
 
 ### Lag and statistics

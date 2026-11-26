@@ -52,6 +52,7 @@
 mod acks;
 mod admin;
 mod classify;
+mod headers;
 mod metrics;
 mod openssl_floor;
 mod producer;
@@ -141,16 +142,11 @@ const COMMIT_RETRY_WINDOW: Duration = Duration::from_secs(60);
 /// [`tuning::MAX_DRAIN_MS`] bounds the time they take.
 const ERROR_DRAIN_MAX_POLLS: usize = 1_000;
 
-/// W3C traceparent headers for the active span, when propagation is built in.
-fn trace_headers() -> Option<OwnedHeaders> {
+/// The W3C traceparent of the active span, when propagation is built in.
+fn active_traceparent() -> Option<String> {
     #[cfg(feature = "transport-trace")]
     {
-        super::propagation::current_traceparent().map(|tp| {
-            OwnedHeaders::new().insert(rdkafka::message::Header {
-                key: super::propagation::TRACEPARENT_HEADER,
-                value: Some(tp.as_str()),
-            })
-        })
+        super::propagation::current_traceparent()
     }
     #[cfg(not(feature = "transport-trace"))]
     {
@@ -2309,20 +2305,28 @@ impl Meter for KafkaTransport {
     const TRANSPORT: &'static str = "kafka";
 }
 
-impl TransportSender for KafkaTransport {
-    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
+impl KafkaTransport {
+    /// Send one payload to `destination` with `record_headers` as its Kafka
+    /// headers, bounded as [`headers`] bounds them.
+    async fn send_with_headers(
+        &self,
+        destination: &str,
+        payload: &bytes::Bytes,
+        record_headers: &[(String, Vec<u8>)],
+    ) -> SendResult {
         if self.closed.load(Ordering::Relaxed) {
             return SendResult::Fatal(TransportError::Closed);
         }
-        if let Some(settled) = self.filter_engine.outbound_one(&payload) {
+        if let Some(settled) = self.filter_engine.outbound_one(payload) {
             return settled;
         }
         let Some(producer) = self.current_producer() else {
             return SendResult::Fatal(receive_only());
         };
 
-        let headers = trace_headers();
-        let record = produce_record(destination, &payload, headers.as_ref(), None);
+        let traceparent = active_traceparent();
+        let headers = headers::for_send(record_headers, traceparent.as_deref());
+        let record = produce_record(destination, payload, headers.as_ref(), None);
 
         let timer = Self::send_timer();
 
@@ -2339,6 +2343,21 @@ impl TransportSender for KafkaTransport {
         timer.record();
         result
     }
+}
+
+impl TransportSender for KafkaTransport {
+    async fn send(&self, destination: &str, payload: bytes::Bytes) -> SendResult {
+        self.send_with_headers(destination, &payload, &[]).await
+    }
+
+    /// Sends the record's payload to its `key` with its headers as Kafka
+    /// headers. Like [`send`](TransportSender::send), it sets no message
+    /// timestamp.
+    async fn send_record(&self, record: &Record) -> SendResult {
+        let destination = record.key.as_deref().unwrap_or("");
+        self.send_with_headers(destination, &record.payload, &record.headers)
+            .await
+    }
 
     /// Offer every record of the block to the producer, then await all the
     /// delivery reports.
@@ -2348,8 +2367,8 @@ impl TransportSender for KafkaTransport {
     /// record. Here the whole block is queued first, so librdkafka fills its
     /// MessageSets from it and the block costs roughly one linger window plus
     /// the broker round-trip. Records keep the default's routing: each goes to
-    /// its own `key` (empty when `None`), payload and `timestamp_ms` as the
-    /// message timestamp, headers not sent.
+    /// its own `key` (empty when `None`), payload, headers and `timestamp_ms`
+    /// as the message timestamp. Headers are bounded as [`headers`] bounds them.
     ///
     /// ## Result -- never `Ok` unless every record is handled
     ///
@@ -2385,7 +2404,8 @@ impl TransportSender for KafkaTransport {
             return SendResult::Fatal(receive_only());
         };
 
-        let headers = trace_headers();
+        let traceparent = active_traceparent();
+        let block_headers = headers::for_send(&[], traceparent.as_deref());
         let timer = Self::send_timer();
 
         let mut offered = Vec::with_capacity(records.len());
@@ -2397,12 +2417,20 @@ impl TransportSender for KafkaTransport {
                 continue;
             }
             let destination = record.key.as_deref().unwrap_or("");
+            // A record with no headers of its own shares the block's trace header.
+            let own_headers;
+            let headers = if record.headers.is_empty() {
+                block_headers.as_ref()
+            } else {
+                own_headers = headers::for_send(&record.headers, traceparent.as_deref());
+                own_headers.as_ref()
+            };
             match self
                 .enqueue(
                     &producer.client,
                     destination,
                     &record.payload,
-                    headers.as_ref(),
+                    headers,
                     record.metadata.timestamp_ms,
                 )
                 .await
@@ -2454,15 +2482,13 @@ impl TransportSender for KafkaTransport {
         SinkConfirmation::Remote
     }
 
-    /// A record over `message.max.bytes`, less the framing librdkafka adds,
-    /// or one an outbound `dlq` filter matches.
+    /// A record whose payload and headers are over `message.max.bytes`, less
+    /// the framing librdkafka adds, or one an outbound `dlq` filter matches.
     fn dead_letter_reason(&self, record: &Record) -> Option<DeadLetterReason> {
         let limit = self.message_max_bytes.saturating_sub(RECORD_WIRE_OVERHEAD);
-        if record.payload.len() > limit {
-            return Some(DeadLetterReason::TooLarge {
-                bytes: record.payload.len(),
-                limit,
-            });
+        let bytes = record.payload.len() + headers::wire_len(&record.headers);
+        if bytes > limit {
+            return Some(DeadLetterReason::TooLarge { bytes, limit });
         }
         self.filter_engine
             .outbound_dead_letter(&record.payload)
@@ -3063,6 +3089,8 @@ struct Span {
     /// Ownership changes served before the poll that returned this record
     /// returned, which orders the record against a revoke in the same job.
     rebalances: u64,
+    /// The Kafka headers, owned, within the caps of [`headers`].
+    headers: Vec<(String, Vec<u8>)>,
 }
 
 /// Rebuild a batch of `Message`s from a frozen recv-arena and its spans.
@@ -3086,7 +3114,7 @@ fn build_batch_from_spans(arena: bytes::Bytes, spans: Vec<Span>) -> Vec<Message<
             token: span.token,
             timestamp_ms: span.timestamp_ms,
             format: span.format,
-            headers: Vec::new(),
+            headers: span.headers,
         })
         .collect()
 }
@@ -3212,7 +3240,7 @@ impl PollJob {
         if let Some(headers) = msg.headers() {
             use rdkafka::message::Headers;
             for idx in 0..headers.count() {
-                if let Some(Ok(header)) = headers.try_get_as::<[u8]>(idx)
+                if let Ok(Some(header)) = headers::header_at(headers, idx)
                     && header.key == super::propagation::TRACEPARENT_HEADER
                 {
                     if let Some(value) = header.value
@@ -3245,6 +3273,7 @@ impl PollJob {
             format: PayloadFormat::Auto,
             range: start..end,
             rebalances: self.consumer.context().rebalances(),
+            headers: headers::from_message(msg.headers()),
         });
         drop(msg);
 
@@ -3290,6 +3319,7 @@ impl PollJob {
                         format: PayloadFormat::Auto,
                         range: start..end,
                         rebalances: self.consumer.context().rebalances(),
+                        headers: headers::from_message(msg.headers()),
                     });
                 }
                 Some(Err(e)) => match classify::classify_recv_failure(&e, ctx) {
@@ -4728,6 +4758,7 @@ mod tests {
                     format: PayloadFormat::Auto,
                     range: 0..2,
                     rebalances: 0,
+                    headers: Vec::new(),
                 }],
                 stopped_by: Some(DrainStop::Permanent(
                     fatal(),
@@ -6010,9 +6041,25 @@ mod tests {
                 format: PayloadFormat::Auto,
                 range: start..end,
                 rebalances: 0,
+                headers: Vec::new(),
             });
         }
         (bytes::Bytes::from(arena), spans)
+    }
+
+    /// A span's headers reach its message, each message its own.
+    #[test]
+    fn build_batch_gives_each_message_its_own_headers() {
+        let (arena, mut spans) = arena_with(&[b"a", b"b", b"c"]);
+        spans[0].headers = vec![("tenant".to_string(), b"t1".to_vec())];
+        spans[2].headers = vec![
+            ("bin".to_string(), vec![0xff, 0x00]),
+            ("tenant".to_string(), Vec::new()),
+        ];
+        let want: Vec<Vec<(String, Vec<u8>)>> = spans.iter().map(|s| s.headers.clone()).collect();
+        let msgs = build_batch_from_spans(arena, spans);
+        let got: Vec<_> = msgs.into_iter().map(|m| m.headers).collect();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -6427,6 +6474,7 @@ mod tests {
             format: PayloadFormat::Auto,
             range: 0..0,
             rebalances: transport.consumer().context().rebalances(),
+            headers: Vec::new(),
         }
     }
 
