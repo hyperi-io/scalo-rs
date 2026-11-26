@@ -200,7 +200,7 @@ impl ServiceMetrics {
                     "pipeline_stall_seconds_total",
                     "Cumulative seconds the pipeline was stalled",
                 )
-                .manifest_unit("seconds"),
+                .unit(Unit::Seconds),
                 // --- Source acknowledgements ---
                 Series::gauge(
                     "pipeline_delivery_guarantee",
@@ -223,7 +223,7 @@ impl ServiceMetrics {
                     "transport_ack_held_bytes",
                     "Payload bytes whose source acknowledgement is held until delivery",
                 )
-                .manifest_unit("bytes")
+                .unit(Unit::Bytes)
                 .labels(&transport),
                 Series::gauge(
                     "transport_ack_withheld",
@@ -325,12 +325,12 @@ impl ServiceMetrics {
                     "spool_disk_available_bytes",
                     "Bytes free to unprivileged users on the tiered sink spool's filesystem",
                 )
-                .manifest_unit("bytes"),
+                .unit(Unit::Bytes),
                 Series::gauge(
                     "spool_disk_total_bytes",
                     "Size of the tiered sink spool's filesystem in bytes",
                 )
-                .manifest_unit("bytes"),
+                .unit(Unit::Bytes),
                 Series::counter(
                     "spool_dropped_without_shutdown_total",
                     "Tiered sinks dropped with records spooled and no completed shutdown",
@@ -361,43 +361,43 @@ impl ServiceMetrics {
                         "spool_bytes_in_total",
                         "Bytes a spool took in, before compression",
                     )
-                    .manifest_unit("bytes")
+                    .unit(Unit::Bytes)
                     .labels(&store_codec),
                     Series::counter(
                         "spool_bytes_written_total",
                         "Bytes a spool appended to its segment files",
                     )
-                    .manifest_unit("bytes")
+                    .unit(Unit::Bytes)
                     .labels(&store_codec),
                     Series::counter(
                         "spool_codec_microseconds_total",
                         "Time a spool spent in its codec",
                     )
-                    .manifest_unit("microseconds")
+                    .unit(Unit::Microseconds)
                     .labels(&["store", "codec", "op"]),
                     Series::gauge(
                         "spool_disk_bytes",
                         "Bytes a spool's segment files hold on disk",
                     )
-                    .manifest_unit("bytes")
+                    .unit(Unit::Bytes)
                     .labels(&store),
                     Series::counter(
                         "spool_disk_full_refused_bytes_total",
                         "Bytes a spool refused because its disk was full",
                     )
-                    .manifest_unit("bytes")
+                    .unit(Unit::Bytes)
                     .labels(&store),
                     Series::counter(
                         "spool_disk_full_wait_milliseconds_total",
                         "Time a spool waited for its full disk to have room again",
                     )
-                    .manifest_unit("milliseconds")
+                    .unit(Unit::Milliseconds)
                     .labels(&store),
                     Series::gauge(
                         "spool_memory_reserved_bytes",
                         "Bytes a spool's read holds reserved with the memory guard",
                     )
-                    .manifest_unit("bytes")
+                    .unit(Unit::Bytes)
                     .labels(&store),
                     Series::counter(
                         "spool_drain_cut_short_total",
@@ -408,12 +408,6 @@ impl ServiceMetrics {
                         "spool_damaged_entries_total",
                         "Spooled records dropped because they failed their CRC",
                     )
-                    .labels(&store),
-                    Series::gauge(
-                        "spool_oldest_age_seconds",
-                        "Age of the oldest record a spool holds, 0 when it holds none",
-                    )
-                    .manifest_unit("seconds")
                     .labels(&store),
                     Series::histogram(
                         "spool_sync_seconds",
@@ -438,6 +432,17 @@ impl ServiceMetrics {
                 ],
             );
         }
+        // Only the tiered sink reports the age of what it holds.
+        #[cfg(feature = "tiered-sink")]
+        reg.describe(
+            "platform",
+            &[Series::gauge(
+                "spool_oldest_age_seconds",
+                "Age of the oldest record a spool holds, 0 when it holds none",
+            )
+            .unit(Unit::Seconds)
+            .labels(&["store"])],
+        );
         #[cfg(feature = "spool")]
         reg.describe(
             "platform",

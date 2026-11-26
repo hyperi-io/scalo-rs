@@ -26,6 +26,10 @@ impl PanickingRecorder {
     };
 
     /// Counters panic, gauges and histograms are no-ops.
+    #[cfg_attr(
+        not(feature = "transport-grpc"),
+        allow(dead_code, reason = "only the gRPC registry's tests use it")
+    )]
     pub(crate) const COUNTERS: Self = Self {
         counters: true,
         gauges: false,

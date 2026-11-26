@@ -806,7 +806,7 @@ pub(crate) struct StoreMetrics {
     cut_short: ::metrics::Counter,
     #[cfg(feature = "metrics")]
     damaged: ::metrics::Counter,
-    #[cfg(feature = "metrics")]
+    #[cfg(all(feature = "metrics", feature = "tiered-sink"))]
     oldest_age: ::metrics::Gauge,
     store: &'static str,
 }
@@ -831,7 +831,7 @@ impl StoreMetrics {
             cut_short: ::metrics::counter!("spool_drain_cut_short_total", "store" => store),
             #[cfg(feature = "metrics")]
             damaged: ::metrics::counter!("spool_damaged_entries_total", "store" => store),
-            #[cfg(feature = "metrics")]
+            #[cfg(all(feature = "metrics", feature = "tiered-sink"))]
             oldest_age: ::metrics::gauge!("spool_oldest_age_seconds", "store" => store),
             store,
         }
