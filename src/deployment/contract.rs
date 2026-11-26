@@ -326,11 +326,8 @@ impl ServiceAccount {
     }
 }
 
-/// Default grace: 5 s pre-stop pause, up to 20 s gRPC drain, then the final commit.
-const DEFAULT_TERMINATION_GRACE_SECONDS: u32 = 45;
-
 fn default_termination_grace_seconds() -> u32 {
-    DEFAULT_TERMINATION_GRACE_SECONDS
+    crate::env::DEFAULT_TERMINATION_GRACE_SECONDS
 }
 
 /// A directory the app writes at run time.

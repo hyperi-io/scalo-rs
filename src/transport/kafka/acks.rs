@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::transport::ack::{AckControl, AckKind, AcknowledgementsConfig, HeldAcks};
+use crate::transport::ack::{AckControl, AckKind, AcknowledgementsConfig, HeldAcks, HeldSlot};
 use crate::transport::finalizer::DeliveryStatus;
 
 use super::KafkaToken;
@@ -178,6 +178,7 @@ pub(super) struct KafkaAcks {
     partitions: parking_lot::Mutex<HashMap<PartitionKey, PartitionHold>>,
     /// Serialises commits so a lower target never lands after a higher one.
     commit_serial: tokio::sync::Mutex<()>,
+    held_slot: HeldSlot,
 }
 
 impl KafkaAcks {
@@ -404,19 +405,16 @@ impl KafkaAcks {
         let _ = (count, outcome, oldest);
     }
 
-    /// Record the held gauges, never while unwinding, as `note_released`.
+    /// Publish what is held, and the withheld gauge never while unwinding, as
+    /// `note_released`.
     fn publish_held(&self) {
+        let held = self.held();
+        self.held_slot.publish("kafka", held.count, held.bytes);
         #[cfg(feature = "metrics")]
         if !std::thread::panicking() {
-            let held = self.held();
-            ::metrics::gauge!("transport_ack_held", "transport" => "kafka").set(held.count as f64);
-            ::metrics::gauge!("transport_ack_held_bytes", "transport" => "kafka")
-                .set(held.bytes as f64);
             ::metrics::gauge!("transport_ack_withheld", "transport" => "kafka")
                 .set(self.withheld() as f64);
         }
-        #[cfg(not(feature = "metrics"))]
-        let _ = self;
     }
 }
 

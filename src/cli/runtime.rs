@@ -73,7 +73,8 @@ pub struct ServiceRuntime {
     pub memory_guard: Arc<MemoryGuard>,
 
     /// Shutdown token. Cancelled on SIGTERM/SIGINT (with K8s pre-stop delay).
-    /// Clone and pass to your pipeline loops.
+    /// Clone and pass to your pipeline loops. A drain still running at
+    /// `shutdown.drain_deadline_secs`, or at a second signal, exits the process.
     pub shutdown: CancellationToken,
 
     /// Runtime context -- K8s/Docker/BareMetal metadata (pod_name, namespace, etc.).
@@ -113,17 +114,23 @@ impl ServiceRuntime {
     /// Build the service runtime from app configuration.
     ///
     /// This is called by `run_app()` -- apps don't call it directly.
+    /// `termination_grace` is the pod's, which sets the default drain deadline.
     ///
     /// # Errors
     ///
     /// Returns `CliError` if the metrics server fails to start, or
     /// `CliError::Config` if the `batch_processing` section is invalid.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each is an input run_app takes from the app, and run_app is the one caller"
+    )]
     pub(crate) async fn build(
         app_name: &str,
         env_prefix: &str,
         metrics_addr: &str,
         version: &str,
         commit: &str,
+        termination_grace: std::time::Duration,
         #[cfg(feature = "scaling")] scaling_components: Vec<crate::ScalingComponent>,
         #[cfg(feature = "version-check")] version_check_defaults: crate::VersionCheckConfig,
     ) -> Result<Self, CliError> {
@@ -230,7 +237,7 @@ impl ServiceRuntime {
         };
 
         // --- Shutdown ---
-        let shutdown = crate::shutdown::install_signal_handler();
+        let shutdown = crate::shutdown::install_signal_handler_with_grace(termination_grace);
 
         // Start worker pool scaling loop after shutdown token exists
         #[cfg(feature = "worker-pool")]
@@ -465,6 +472,7 @@ mod tests {
             "127.0.0.1:0",
             "1.2.3",
             "probe",
+            crate::shutdown::default_termination_grace(),
             #[cfg(feature = "scaling")]
             Vec::new(),
             #[cfg(feature = "version-check")]
@@ -615,6 +623,7 @@ mod tests {
             &addr,
             "1.2.3",
             "probe",
+            crate::shutdown::default_termination_grace(),
             vec![crate::ScalingComponent::new("probe", 1.0, 100.0)],
             #[cfg(feature = "version-check")]
             crate::VersionCheckConfig::default(),
@@ -896,6 +905,7 @@ mod tests {
             addr,
             "1.2.3",
             "probe",
+            crate::shutdown::default_termination_grace(),
             vec![crate::ScalingComponent::new("probe", 1.0, 100.0)],
             #[cfg(feature = "version-check")]
             crate::VersionCheckConfig::default(),
