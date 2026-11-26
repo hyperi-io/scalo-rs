@@ -128,7 +128,7 @@ tokio::spawn(async move {
 | `tls_certificate_reloads_total` | `result` (`success`, `failure`) |
 | `tls_tls12_handshakes_total` | `role` (`client`, `server`), `profile` |
 
-A failed handshake logs at debug and emits a `tls.event` security event with the peer address. A TLS 1.2 handshake, on either side, logs at warn.
+A failed handshake logs at debug and emits a `tls.event` security event with the peer address. A TLS 1.2 handshake, on either side, logs at warn once an hour for each side and profile, and `tls_tls12_handshakes_total` counts every one.
 
 For axum, `scalo::http_server::TlsListener` wraps a `TcpListener` and a `ServerTls`, runs each handshake in its own task, and hands axum the finished streams. `HttpServer` uses it, see [http-server.md](http-server.md#tls).
 

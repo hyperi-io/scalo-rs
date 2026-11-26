@@ -45,13 +45,21 @@ pub(super) fn checked(
     })
 }
 
-/// Log and count one TLS 1.2 handshake on `profile`, from the side `role`.
+/// How often the TLS 1.2 warning repeats for one role and profile. A client
+/// that reconnects per send would otherwise log one line per batch.
+const TLS12_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Count one TLS 1.2 handshake on `profile`, from the side `role`, and warn
+/// at most once per [`TLS12_WARN_INTERVAL`] for that role and profile.
 pub(super) fn note_tls12(role: &'static str, profile: CryptoProfile) {
-    tracing::warn!(
-        role,
-        profile = profile.as_str(),
-        "TLS 1.2 negotiated: the peer has no TLS 1.3, and allow_tls12 is on for this profile"
-    );
+    if tls12_warn_due(role, profile, std::time::Instant::now()) {
+        tracing::warn!(
+            role,
+            profile = profile.as_str(),
+            "TLS 1.2 negotiated: the peer has no TLS 1.3, and allow_tls12 is on for this \
+             profile. Repeats are counted in tls_tls12_handshakes_total and logged once an hour"
+        );
+    }
     #[cfg(feature = "metrics-core")]
     metrics::counter!(
         "tls_tls12_handshakes_total",
@@ -59,6 +67,28 @@ pub(super) fn note_tls12(role: &'static str, profile: CryptoProfile) {
         "profile" => profile.as_str()
     )
     .increment(1);
+}
+
+/// Whether the TLS 1.2 warning for `role` and `profile` is due at `now`,
+/// recording `now` as its last time when it is.
+fn tls12_warn_due(role: &'static str, profile: CryptoProfile, now: std::time::Instant) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static LAST: OnceLock<Mutex<HashMap<(&'static str, &'static str), std::time::Instant>>> =
+        OnceLock::new();
+    let mut last = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let key = (role, profile.as_str());
+    match last.get(&key) {
+        Some(at) if now.saturating_duration_since(*at) < TLS12_WARN_INTERVAL => false,
+        _ => {
+            last.insert(key, now);
+            true
+        }
+    }
 }
 
 /// A verifier that accepts a chain only when `inner` does and, with pins set,
@@ -134,5 +164,52 @@ impl ServerCertVerifier for CheckedVerifier {
 
     fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
         self.inner.root_hint_subjects()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The warning goes once per role and profile until the interval passes.
+    /// Each case uses its own role so tests sharing the process don't collide.
+    #[test]
+    fn the_tls12_warning_repeats_once_an_interval_per_role_and_profile() {
+        let start = std::time::Instant::now();
+        let later = start + TLS12_WARN_INTERVAL;
+        let cases: [(&str, &'static str, CryptoProfile, std::time::Instant, bool); 5] = [
+            ("first", "warn-a", CryptoProfile::Commercial, start, true),
+            (
+                "same key, same instant",
+                "warn-a",
+                CryptoProfile::Commercial,
+                start,
+                false,
+            ),
+            (
+                "another profile",
+                "warn-a",
+                CryptoProfile::Strong,
+                start,
+                true,
+            ),
+            (
+                "another role",
+                "warn-b",
+                CryptoProfile::Commercial,
+                start,
+                true,
+            ),
+            (
+                "a full interval later",
+                "warn-a",
+                CryptoProfile::Commercial,
+                later,
+                true,
+            ),
+        ];
+        for (name, role, profile, now, want) in cases {
+            assert_eq!(tls12_warn_due(role, profile, now), want, "{name}");
+        }
     }
 }
