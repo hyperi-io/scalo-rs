@@ -15,5 +15,6 @@
     { "name": "http", "port": 8080, "protocol": "TCP" }
   ],
   "keda": null,
-  "service_account": "none"
+  "service_account": "none",
+  "openssl_conf": ""
 }

@@ -69,6 +69,27 @@ fn tls13_suites(profile: CryptoProfile) -> &'static str {
     }
 }
 
+/// OpenSSL's TLS 1.3 suites when no config sets them: strong's three, in
+/// strong's order.
+const OPENSSL_TLS13_DEFAULT: &str =
+    "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256";
+
+/// What Kafka takes beyond the profile while the floor file is not written,
+/// or `None` when the difference is only suite order.
+fn unenforced(profile: CryptoProfile, tls12: bool) -> Option<String> {
+    let mut gaps = Vec::new();
+    if !tls12 {
+        gaps.push("TLS 1.2, on the profile's TLS 1.2 suites".to_string());
+    }
+    if tls13_suites(profile).split(':').count() < OPENSSL_TLS13_DEFAULT.split(':').count() {
+        gaps.push(format!(
+            "OpenSSL's TLS 1.3 suites {OPENSSL_TLS13_DEFAULT}, where the profile allows {}",
+            tls13_suites(profile)
+        ));
+    }
+    (!gaps.is_empty()).then(|| gaps.join(", and "))
+}
+
 /// An OpenSSL config setting the floor and the TLS 1.3 suites, which OpenSSL
 /// applies to every context it creates.
 fn config_text(profile: CryptoProfile, tls12: bool) -> String {
@@ -155,19 +176,33 @@ fn report(profile: CryptoProfile, tls12: bool, held: &Held) {
             "kafka: OPENSSL_CONF names a file scalo did not write, so its TLS floor is the \
              operator's"
         ),
-        Held::Unset if !tls12 => tracing::warn!(
-            profile = profile.as_str(),
-            "kafka: the TLS 1.3 floor is not enforced: OPENSSL_CONF is unset, so librdkafka's \
-             OpenSSL also takes TLS 1.2, on the profile's TLS 1.2 suites. Set OPENSSL_CONF to a \
-             writable path in the deployment, or call \
-             scalo::transport::kafka::set_openssl_conf first thing in main"
-        ),
-        Held::Unset => {}
-        Held::Failed(why) => tracing::warn!(
-            error = %why,
-            "kafka: the OpenSSL TLS floor file could not be written, so the floor is not \
-             enforced"
-        ),
+        Held::Unset => {
+            if let Some(gaps) = unenforced(profile, tls12) {
+                tracing::warn!(
+                    profile = profile.as_str(),
+                    "kafka: OPENSSL_CONF is unset, so librdkafka's OpenSSL also takes {gaps}. \
+                     Set OPENSSL_CONF to a writable path in the deployment, or call \
+                     scalo::transport::kafka::set_openssl_conf first thing in main"
+                );
+            }
+        }
+        Held::Failed(why) => {
+            if let Some(gaps) = unenforced(profile, tls12) {
+                tracing::warn!(
+                    error = %why,
+                    profile = profile.as_str(),
+                    "kafka: the OpenSSL TLS floor file could not be written, so librdkafka's \
+                     OpenSSL also takes {gaps}"
+                );
+            } else {
+                tracing::warn!(
+                    error = %why,
+                    profile = profile.as_str(),
+                    "kafka: the OpenSSL TLS floor file could not be written, so TLS 1.3 \
+                     suites run in OpenSSL's order"
+                );
+            }
+        }
     }
 }
 
@@ -258,6 +293,36 @@ mod tests {
             assert!(text.starts_with(FIRST_LINE), "{profile}");
             assert!(text.contains("system_default = scalo_tls"), "{profile}");
             assert!(text.ends_with(tail), "{profile}: {text}");
+        }
+    }
+
+    /// With no floor file, the warning names what Kafka takes beyond the
+    /// profile: TLS 1.2 unless it is allowed, and OpenSSL's TLS 1.3 suites
+    /// for cnsa2, whose one suite they widen.
+    #[test]
+    fn an_unwritten_floor_names_what_kafka_takes_beyond_the_profile() {
+        let tls12 = "TLS 1.2, on the profile's TLS 1.2 suites";
+        let suites = "OpenSSL's TLS 1.3 suites TLS_AES_256_GCM_SHA384:\
+                      TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256, where the profile \
+                      allows TLS_AES_256_GCM_SHA384";
+        let cases = [
+            (CryptoProfile::Strong, false, Some(tls12.to_string())),
+            (CryptoProfile::Strong, true, None),
+            (CryptoProfile::Commercial, false, Some(tls12.to_string())),
+            (CryptoProfile::Commercial, true, None),
+            (
+                CryptoProfile::Cnsa2,
+                false,
+                Some(format!("{tls12}, and {suites}")),
+            ),
+            (CryptoProfile::Cnsa2, true, Some(suites.to_string())),
+        ];
+        for (profile, allow_tls12, expected) in cases {
+            assert_eq!(
+                unenforced(profile, allow_tls12),
+                expected,
+                "{profile} allow_tls12={allow_tls12}"
+            );
         }
     }
 

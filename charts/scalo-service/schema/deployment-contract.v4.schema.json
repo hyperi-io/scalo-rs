@@ -203,6 +203,11 @@
         "type": "string",
         "pattern": "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$"
       }
+    },
+    "openssl_conf": {
+      "description": "The file `OPENSSL_CONF` names in the image and the pod, where a Kafka\nclient writes its OpenSSL TLS floor (`docs/tls-profiles.md`). Empty\nsets no `OPENSSL_CONF`, for an app with no Kafka client whose child\nprocesses should read the distro's OpenSSL config. Left out of the\nserialised contract at its default.",
+      "type": "string",
+      "default": "/tmp/scalo-openssl.cnf"
     }
   },
   "required": [

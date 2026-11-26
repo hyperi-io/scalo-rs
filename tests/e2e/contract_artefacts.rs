@@ -100,6 +100,7 @@ fn test_contract() -> DeploymentContract {
         singleton: false,
         service_account: scalo::deployment::ServiceAccount::Own,
         hot_paths: vec![],
+        openssl_conf: scalo::deployment::DEFAULT_OPENSSL_CONF.to_string(),
         keda: None,
         default_config: None,
         depends_on: vec![],

@@ -111,6 +111,7 @@ mod tests {
             singleton: false,
             service_account: crate::deployment::ServiceAccount::Own,
             hot_paths: vec![],
+            openssl_conf: crate::deployment::DEFAULT_OPENSSL_CONF.to_string(),
         }
     }
 
@@ -606,6 +607,36 @@ mod tests {
         ] {
             assert!(image.contains("useradd --create-home --uid 1000 appuser\n"));
             assert!(image.contains("\nUSER 1000\n"), "{image}");
+        }
+    }
+
+    /// An image names the Kafka TLS floor file in the env of its first
+    /// process, so no app sets it before its runtime starts. An empty
+    /// `openssl_conf` leaves `OPENSSL_CONF` unset.
+    #[test]
+    fn an_image_names_the_kafka_tls_floor_file_unless_opted_out() {
+        let mut contract = test_contract();
+        for (openssl_conf, line) in [
+            (
+                super::super::DEFAULT_OPENSSL_CONF,
+                Some("\nENV OPENSSL_CONF=/tmp/scalo-openssl.cnf\n"),
+            ),
+            (
+                "/var/run/app/openssl.cnf",
+                Some("\nENV OPENSSL_CONF=/var/run/app/openssl.cnf\n"),
+            ),
+            ("", None),
+        ] {
+            contract.openssl_conf = openssl_conf.to_string();
+            for image in [
+                generate_dockerfile(&contract, None).unwrap(),
+                generate_runtime_stage(&contract).unwrap(),
+            ] {
+                match line {
+                    Some(line) => assert!(image.contains(line), "{image}"),
+                    None => assert!(!image.contains("OPENSSL_CONF"), "{image}"),
+                }
+            }
         }
     }
 

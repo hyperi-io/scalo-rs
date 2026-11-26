@@ -223,10 +223,38 @@ pub struct DeploymentContract {
         schemars(inner(regex(pattern = r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$")))
     )]
     pub hot_paths: Vec<String>,
+
+    /// The file `OPENSSL_CONF` names in the image and the pod, where a Kafka
+    /// client writes its OpenSSL TLS floor (`docs/tls-profiles.md`). Empty
+    /// sets no `OPENSSL_CONF`, for an app with no Kafka client whose child
+    /// processes should read the distro's OpenSSL config. Left out of the
+    /// serialised contract at its default.
+    #[serde(
+        default = "default_openssl_conf",
+        skip_serializing_if = "is_default_openssl_conf"
+    )]
+    #[cfg_attr(
+        feature = "config-schema",
+        schemars(extend("default" = DEFAULT_OPENSSL_CONF))
+    )]
+    pub openssl_conf: String,
 }
 
 /// The metrics and health port a contract names when it sets none.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;
+
+/// The file `OPENSSL_CONF` names when a contract sets none: under /tmp, which
+/// the image and the chart keep writable. OpenSSL ignores it until a Kafka
+/// TLS client writes it.
+pub const DEFAULT_OPENSSL_CONF: &str = "/tmp/scalo-openssl.cnf";
+
+fn default_openssl_conf() -> String {
+    DEFAULT_OPENSSL_CONF.to_string()
+}
+
+fn is_default_openssl_conf(path: &str) -> bool {
+    path == DEFAULT_OPENSSL_CONF
+}
 
 /// Every field at its documented default, so a consumer writes
 /// `..DeploymentContract::default()` and a field added later does not break
@@ -267,6 +295,7 @@ impl Default for DeploymentContract {
             singleton: false,
             service_account: ServiceAccount::default(),
             hot_paths: Vec::new(),
+            openssl_conf: default_openssl_conf(),
         }
     }
 }
@@ -1072,6 +1101,7 @@ mod tests {
             singleton: false,
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
+            openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
         };
         let json = contract.to_json().unwrap();
         assert!(json.contains("test-app"));
@@ -1182,6 +1212,7 @@ mod tests {
             singleton: false,
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
+            openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
         };
         assert_eq!(contract.binary(), "my-app");
     }
@@ -1219,6 +1250,7 @@ mod tests {
             singleton: false,
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
+            openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
         assert_eq!(contract.config_dir(), "/etc/dfe");
@@ -1257,6 +1289,7 @@ mod tests {
             singleton: false,
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
+            openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
         }
     }
 

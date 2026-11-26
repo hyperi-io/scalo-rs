@@ -57,8 +57,9 @@ impl DeploymentContract {
     /// it is persistent. Each hot path is a unique dotted path of letters,
     /// digits, `_` and `-` segments, and needs a config file. Each added
     /// capability is an upper-case Linux capability name such as `NET_ADMIN`.
-    /// Every `x-scalo-dial` marker in `config_schema` is `big` or `small`, and
-    /// every `$ref` the dial search follows resolves.
+    /// `openssl_conf` is empty or an absolute path a Dockerfile ENV line takes
+    /// unquoted. Every `x-scalo-dial` marker in `config_schema` is `big` or
+    /// `small`, and every `$ref` the dial search follows resolves.
     ///
     /// # Errors
     ///
@@ -92,6 +93,22 @@ impl DeploymentContract {
         }
         self.check_writable_paths()?;
         self.check_hot_paths()?;
+        if !self.openssl_conf.is_empty()
+            && (!self.openssl_conf.starts_with('/')
+                || self
+                    .openssl_conf
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '$' | '\\')))
+        {
+            return Err(invalid(
+                "openssl_conf".to_string(),
+                format!(
+                    "{:?} must be empty or an absolute path with no space, quote, `$` or `\\`, \
+                     because it is written into a Dockerfile ENV line",
+                    self.openssl_conf
+                ),
+            ));
+        }
         self.check_security()?;
         if let Some(schema) = &self.config_schema {
             super::dials(schema)
@@ -425,6 +442,7 @@ mod tests {
             singleton: false,
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
+            openssl_conf: crate::deployment::DEFAULT_OPENSSL_CONF.to_string(),
         }
     }
 
@@ -456,6 +474,26 @@ mod tests {
         c.hot_paths = vec!["rules".into()];
         c.config_mount_path = String::new();
         assert_eq!(refused_field(&c), "hot_paths");
+    }
+
+    /// `openssl_conf` is empty or a path a Dockerfile ENV line takes unquoted.
+    #[test]
+    fn openssl_conf_is_empty_or_a_plain_absolute_path() {
+        let mut c = contract();
+        for good in ["", "/tmp/scalo-openssl.cnf", "/var/run/app/openssl.cnf"] {
+            c.openssl_conf = good.into();
+            c.validate().unwrap();
+        }
+        for bad in [
+            "tmp/openssl.cnf",
+            "/tmp/open ssl.cnf",
+            "/tmp/$HOME.cnf",
+            "/tmp/\"x\".cnf",
+            "/tmp/a\\b.cnf",
+        ] {
+            c.openssl_conf = bad.into();
+            assert_eq!(refused_field(&c), "openssl_conf", "{bad:?}");
+        }
     }
 
     #[test]

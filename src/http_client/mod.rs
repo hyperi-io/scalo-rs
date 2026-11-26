@@ -239,9 +239,10 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// [`HttpClientError::Tls`] when the `tls` section can't be built, which
-    /// needs a root store unless it names its CA files, and
-    /// [`HttpClientError::BuildError`] when reqwest refuses the client.
+    /// [`HttpClientError::Tls`] when the `tls` section can't be built, and
+    /// [`HttpClientError::BuildError`] when reqwest refuses the client. An
+    /// empty OS root store is not an error: every `https://` call then fails
+    /// as untrusted, and `http://` calls work.
     pub fn new(config: HttpClientConfig) -> Result<Self, HttpClientError> {
         Self::with_redirect_policy(config, reqwest::redirect::Policy::default())
     }
@@ -255,9 +256,10 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// [`HttpClientError::Tls`] when the `tls` section can't be built, which
-    /// needs a root store unless it names its CA files, and
-    /// [`HttpClientError::BuildError`] when reqwest refuses the client.
+    /// [`HttpClientError::Tls`] when the `tls` section can't be built, and
+    /// [`HttpClientError::BuildError`] when reqwest refuses the client. An
+    /// empty OS root store is not an error: every `https://` call then fails
+    /// as untrusted, and `http://` calls work.
     pub fn with_redirect_policy(
         config: HttpClientConfig,
         redirects: reqwest::redirect::Policy,
@@ -275,10 +277,14 @@ impl HttpClient {
                 "tls.server_name is not taken: the URL's host is the name checked".to_string(),
             ));
         }
+        // The client also serves http:// calls, so an empty OS store refuses
+        // https:// at the handshake rather than failing here.
         let tls = config
             .tls
             .client_tls()
-            .and_then(|tls| crate::tls::build_client_tls(&tls))
+            .and_then(|tls| {
+                crate::tls::build_client_tls_with(&tls, crate::tls::NoRoots::RefuseEveryServer)
+            })
             .map_err(|e| HttpClientError::Tls(e.to_string()))?;
         builder = builder.use_preconfigured_tls((*tls).clone());
 
@@ -694,6 +700,46 @@ mod tests {
             matches!(&named, Err(HttpClientError::Tls(m)) if m.contains("server_name")),
             "{:?}",
             named.err()
+        );
+    }
+
+    /// An empty OS root store still builds the client, and an https:// call
+    /// is then refused as untrusted. `SSL_CERT_FILE` replaces the OS store.
+    #[tokio::test]
+    async fn an_empty_os_store_builds_and_refuses_https() {
+        use crate::tls::test_pki::{TestCa, tls12_https_server};
+        use crate::tls::{ClientTlsConfig, CryptoProfile};
+
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        let client = temp_env::with_vars(
+            [
+                ("SSL_CERT_FILE", Some(empty.as_os_str())),
+                ("SSL_CERT_DIR", None),
+            ],
+            || {
+                HttpClient::new(HttpClientConfig {
+                    max_retries: 0,
+                    tls: ClientTlsConfig {
+                        profile: CryptoProfile::Commercial,
+                        ..ClientTlsConfig::default()
+                    },
+                    ..HttpClientConfig::default()
+                })
+            },
+        )
+        .expect("built with no roots");
+
+        let ca = TestCa::new("unknown ca");
+        let url = format!(
+            "https://localhost:{}/",
+            tls12_https_server(&ca).await.port()
+        );
+        let refused = client.get(&url).await.expect_err("an untrusted server");
+        assert!(
+            format!("{refused:?}").contains("UnknownIssuer"),
+            "{refused:?}"
         );
     }
 

@@ -247,6 +247,30 @@ tests:
             name: OTEL_SERVICE_NAME
             value: overridden
 
+  - it: points OPENSSL_CONF at the Kafka TLS floor file under /tmp
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSSL_CONF
+            value: /tmp/scalo-openssl.cnf
+
+  - it: leaves OPENSSL_CONF to an operator's extraEnv
+    set:
+      extraEnv:
+        OPENSSL_CONF: /etc/ssl/site.cnf
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSSL_CONF
+            value: /etc/ssl/site.cnf
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSSL_CONF
+            value: /tmp/scalo-openssl.cnf
+
   - it: renders commonLabels values and a secret group's existingSecret through tpl
     release:
       namespace: apps

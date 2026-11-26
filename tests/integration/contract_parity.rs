@@ -216,6 +216,7 @@ fn parity_contract() -> DeploymentContract {
         singleton: false,
         service_account: ServiceAccount::None,
         hot_paths: vec!["rules".into(), "routing.source_rules".into()],
+        openssl_conf: String::new(),
     }
 }
 
@@ -276,6 +277,7 @@ fn contract_parity_fixture_carries_every_optional_key() {
         "/singleton",
         "/service_account",
         "/hot_paths",
+        "/openssl_conf",
         "/config_schema/$defs/SourceSection/properties/batch_size/x-scalo-dial",
     ] {
         assert!(
