@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use thiserror::Error;
 use tracing::Level;
-use tracing_subscriber::Layer as _;
+use tracing_subscriber::Layer;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::layer::SubscriberExt;
@@ -65,7 +65,8 @@ static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 /// The level handle of the logger [`setup`] started.
 static LEVEL_HANDLE: OnceLock<LevelHandle> = OnceLock::new();
 
-/// Changes the level of a running logger.
+/// Changes the level of a running logger: what it prints and the spans it
+/// exports. Layers passed to [`setup_with_layers`] filter for themselves.
 ///
 /// The `rdkafka=warn` floor and the `RUST_LOG` directives read at [`setup`]
 /// stay layered over the new level, as they are at start.
@@ -79,22 +80,30 @@ static LEVEL_HANDLE: OnceLock<LevelHandle> = OnceLock::new();
 /// ```
 #[derive(Clone)]
 pub struct LevelHandle {
-    filter: reload::Handle<EnvFilter, Registry>,
+    filters: Vec<reload::Handle<EnvFilter, Registry>>,
     rust_log: Option<String>,
     level: Arc<Mutex<Level>>,
 }
 
 impl LevelHandle {
-    /// A filter at `level`, with `rust_log` layered over it, and the handle
-    /// that changes it.
-    fn new(level: Level, rust_log: Option<String>) -> (reload::Layer<EnvFilter, Registry>, Self) {
-        let (filter, handle) = reload::Layer::new(env_filter(level, rust_log.as_deref()));
-        let handle = Self {
-            filter: handle,
+    /// A handle at `level`, with `rust_log` layered over it, that changes no
+    /// filter until [`filter`](Self::filter) hands one out.
+    fn new(level: Level, rust_log: Option<String>) -> Self {
+        Self {
+            filters: Vec::new(),
             rust_log,
             level: Arc::new(Mutex::new(level)),
-        };
-        (filter, handle)
+        }
+    }
+
+    /// A filter at the current level, which [`set`](Self::set) changes from
+    /// then on. Each filtered layer takes its own, since a filter keeps
+    /// per-span state.
+    fn filter(&mut self) -> reload::Layer<EnvFilter, Registry> {
+        let (filter, handle) =
+            reload::Layer::new(env_filter(self.current(), self.rust_log.as_deref()));
+        self.filters.push(handle);
+        filter
     }
 
     /// Run at `level`, written as `LOG_LEVEL` takes it: a `tracing` name or
@@ -109,9 +118,11 @@ impl LevelHandle {
         let wanted =
             parse_level(level).ok_or_else(|| LoggerError::InvalidLevel(level.to_string()))?;
         let mut current = self.level.lock().unwrap_or_else(PoisonError::into_inner);
-        self.filter
-            .reload(env_filter(wanted, self.rust_log.as_deref()))
-            .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
+        for filter in &self.filters {
+            filter
+                .reload(env_filter(wanted, self.rust_log.as_deref()))
+                .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
+        }
         let previous = std::mem::replace(&mut *current, wanted);
         drop(current);
         tracing::info!(from = %previous, to = %wanted, "log level changed");
@@ -365,6 +376,42 @@ impl LoggerSettings {
 ///
 /// Returns an error if the logger is already initialised.
 pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
+    setup_with_layers(opts, Vec::new())
+}
+
+/// [`setup`], with `layers` added beside the printed output.
+///
+/// The level filter sits on the printed output and the span export, so each
+/// of `layers` sees every event and span whatever the level, and filters for
+/// itself. Give a layer its own filter (`layer.with_filter(LevelFilter::WARN)`)
+/// rather than dropping events inside it: an unfiltered layer is handed every
+/// event at every level, so every `tracing` call in the process builds one.
+///
+/// With any layer here, each `tracing` call up to the most verbose level a
+/// layer wants runs every layer's filter, because a cached callsite verdict
+/// drops events after an `enabled!` query (tokio-rs/tracing#2519).
+///
+/// ```rust,no_run
+/// use tracing_subscriber::Layer;
+/// use tracing_subscriber::filter::LevelFilter;
+///
+/// let warnings = tracing_subscriber::fmt::layer()
+///     .with_writer(std::io::stdout)
+///     .with_filter(LevelFilter::WARN);
+/// scalo::logger::setup_with_layers(
+///     scalo::logger::LoggerOptions::default(),
+///     vec![warnings.boxed()],
+/// )?;
+/// # Ok::<(), scalo::logger::LoggerError>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if the logger is already initialised.
+pub fn setup_with_layers(
+    opts: LoggerOptions,
+    layers: Vec<Box<dyn Layer<Registry> + Send + Sync>>,
+) -> Result<(), LoggerError> {
     if LOGGER_INIT.get().is_some() {
         return Err(LoggerError::AlreadyInitialised);
     }
@@ -374,7 +421,7 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     let rust_log = std::env::var("RUST_LOG")
         .ok()
         .filter(|rust_log| !rust_log.trim().is_empty());
-    let (filter, level_handle) = LevelHandle::new(opts.level, rust_log);
+    let mut level_handle = LevelHandle::new(opts.level, rust_log);
 
     // RFC 3339 timestamp format
     let timer = UtcTime::rfc_3339();
@@ -411,12 +458,12 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
                 .or_else(|| std::env::var("SERVICE_NAME").ok())
                 .unwrap_or_default();
         }
-        crate::otel_tracing::layer_if_active(&config)
+        crate::otel_tracing::layer_if_active::<Registry>(&config)
     };
     #[cfg(not(feature = "otel-tracing"))]
     let otel: Option<tracing_subscriber::layer::Identity> = None;
 
-    match format {
+    let stack = match format {
         LogFormat::Json => {
             let writer = masking::make_masking_writer(
                 sensitive,
@@ -424,7 +471,7 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
                 opts.service_name.clone(),
                 opts.service_version.clone(),
             );
-            let layer = tracing_subscriber::fmt::layer()
+            let printed = tracing_subscriber::fmt::layer()
                 .json()
                 .with_timer(timer)
                 .with_file(opts.add_source)
@@ -432,22 +479,7 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
                 .with_target(true)
                 .with_span_events(span_events)
                 .with_writer(writer);
-
-            if let Some(throttle) = throttle_filter {
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(otel)
-                    .with(layer.with_filter(throttle))
-                    .try_init()
-                    .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
-            } else {
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(otel)
-                    .with(layer)
-                    .try_init()
-                    .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
-            }
+            layer_stack(printed, throttle_filter, otel, layers, &mut level_handle)
         }
         LogFormat::Text => {
             let writer = masking::make_masking_writer(sensitive, false, None, None);
@@ -460,30 +492,17 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
             let formatter = format::ColouredFormatter::new(ansi)
                 .with_file(opts.add_source)
                 .with_line_number(opts.add_source);
-            let layer = tracing_subscriber::fmt::layer()
+            let printed = tracing_subscriber::fmt::layer()
                 .with_ansi(ansi)
                 .with_span_events(span_events)
                 .event_format(formatter)
                 .with_writer(writer);
-
-            if let Some(throttle) = throttle_filter {
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(otel)
-                    .with(layer.with_filter(throttle))
-                    .try_init()
-                    .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
-            } else {
-                tracing_subscriber::registry()
-                    .with(filter)
-                    .with(otel)
-                    .with(layer)
-                    .try_init()
-                    .map_err(|e| LoggerError::SetGlobalError(e.to_string()))?;
-            }
+            layer_stack(printed, throttle_filter, otel, layers, &mut level_handle)
         }
         LogFormat::Auto => unreachable!("Auto should be resolved"),
-    }
+    };
+
+    install(stack)?;
 
     let _ = LOGGER_INIT.set(());
     let _ = LEVEL_HANDLE.set(level_handle);
@@ -495,6 +514,95 @@ pub fn setup(opts: LoggerOptions) -> Result<(), LoggerError> {
     crate::config::log_deferred();
 
     Ok(())
+}
+
+/// Has every callsite ask the per-layer filters on each call.
+///
+/// A per-layer filter's verdict waits in a thread-local until the event is
+/// recorded. `tracing::enabled!` and `log::log_enabled!` ask without
+/// recording, so the next event whose callsite skips the filters reads that
+/// verdict and a layer drops it (tokio-rs/tracing#2519). Asking every call
+/// overwrites it.
+struct AskEveryCall;
+
+impl<S> tracing_subscriber::layer::Filter<S> for AskEveryCall {
+    fn enabled(
+        &self,
+        _: &tracing::Metadata<'_>,
+        _: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn callsite_enabled(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    /// Adds no level to the most verbose one the other layers want.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::OFF)
+    }
+}
+
+/// The layers [`setup_with_layers`] installs on the registry.
+///
+/// With no `extra` layer, one filter from `level` wraps `otel` and `printed`
+/// and rejects an event before either sees it, as `setup` always has. That
+/// clears the per-layer state a query leaves behind (see [`AskEveryCall`]).
+/// With `extra` layers, `otel` and `printed` each sit behind their own filter
+/// from `level`, then `extra` as given, then [`AskEveryCall`].
+///
+/// The throttle sits inside the level filter, so it counts only events the
+/// level lets through.
+fn layer_stack<P, O>(
+    printed: P,
+    throttle: Option<TracingRateLimitLayer>,
+    otel: Option<O>,
+    extra: Vec<Box<dyn Layer<Registry> + Send + Sync>>,
+    level: &mut LevelHandle,
+) -> Vec<Box<dyn Layer<Registry> + Send + Sync>>
+where
+    P: Layer<Registry> + Send + Sync + 'static,
+    O: Layer<Registry> + Send + Sync + 'static,
+{
+    if extra.is_empty() {
+        // Outermost, because an `and_then` on `Registry` takes its hint from
+        // the outer layer alone and turns an inner `never` into `sometimes`.
+        let filter = level.filter();
+        return vec![match throttle {
+            Some(throttle) => Layer::and_then(otel, printed.with_filter(throttle))
+                .and_then(filter)
+                .boxed(),
+            None => Layer::and_then(otel, printed).and_then(filter).boxed(),
+        }];
+    }
+    let printed = match throttle {
+        Some(throttle) => printed
+            .with_filter(throttle)
+            .with_filter(level.filter())
+            .boxed(),
+        None => printed.with_filter(level.filter()).boxed(),
+    };
+    let otel = otel.map(|otel| otel.with_filter(level.filter()).boxed());
+    let ask_every_call = tracing_subscriber::layer::Identity::new()
+        .with_filter(AskEveryCall)
+        .boxed();
+    otel.into_iter()
+        .chain([printed])
+        .chain(extra)
+        .chain([ask_every_call])
+        .collect()
+}
+
+/// Install `stack` as the global subscriber.
+fn install(stack: Vec<Box<dyn Layer<Registry> + Send + Sync>>) -> Result<(), LoggerError> {
+    tracing_subscriber::registry()
+        .with(stack)
+        .try_init()
+        .map_err(|e| LoggerError::SetGlobalError(e.to_string()))
 }
 
 /// A log level as an operator writes it: the `tracing` names or `1`-`5`, and
@@ -642,6 +750,7 @@ fn is_no_color() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_subscriber::filter::LevelFilter;
 
     #[test]
     fn test_log_format_from_str() {
@@ -818,62 +927,407 @@ mod tests {
         }
     }
 
-    /// The handle changes what a running subscriber writes and keeps the
-    /// rdkafka floor. Text it cannot read leaves the level as it was.
-    #[test]
-    fn the_level_handle_changes_the_level_live() {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let (filter, handle) = LevelHandle::new(Level::INFO, None);
-        let subscriber = tracing_subscriber::registry().with(filter).with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(move || writer.clone()),
-        );
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::debug!("first debug line");
-            handle.set("debug").unwrap();
-            tracing::debug!("second debug line");
-            tracing::info!(target: "rdkafka", "rdkafka info line");
-            for bad in ["loud", "", "debug,my_app=trace"] {
-                assert!(
-                    matches!(handle.set(bad), Err(LoggerError::InvalidLevel(_))),
-                    "{bad:?} must not parse"
-                );
-            }
-            assert_eq!(handle.current(), Level::DEBUG);
-            tracing::debug!("third debug line");
-            handle.set("Warning").unwrap();
-            tracing::info!("info line at warn");
-        });
-        assert_eq!(handle.current(), Level::WARN);
-
-        let text = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        for (line, written) in [
-            ("first debug line", false),
-            ("second debug line", true),
-            ("rdkafka info line", false),
-            ("third debug line", true),
-            ("info line at warn", false),
-        ] {
-            assert_eq!(text.contains(line), written, "{line}:\n{text}");
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
         }
     }
 
-    /// `setup` hands out the handle on the logger it starts.
+    /// A plain text layer writing every event it is handed to `captured`.
+    fn printing_to<S>(captured: Captured) -> impl Layer<S> + Send + Sync + 'static
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + 'static,
+    {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || captured.clone())
+    }
+
+    /// A stand-in for span export, with a per-layer filter as the real one has.
+    fn exporting_to<S>(captured: Captured) -> impl Layer<S> + Send + Sync + 'static
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + 'static,
+    {
+        printing_to(captured).with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            meta.target() != "rdkafka"
+        }))
+    }
+
+    /// No span export, for a stack built without one.
+    const NO_OTEL: Option<tracing_subscriber::layer::Identity> = None;
+
+    const LEVELS: [Level; 5] = [
+        Level::ERROR,
+        Level::WARN,
+        Level::INFO,
+        Level::DEBUG,
+        Level::TRACE,
+    ];
+
+    /// What `tracing::enabled!` says of each level, then one event at each
+    /// level, a warning inside a debug span, and an rdkafka info line.
+    fn emit_each_level() -> [bool; 5] {
+        let enabled = [
+            tracing::enabled!(Level::ERROR),
+            tracing::enabled!(Level::WARN),
+            tracing::enabled!(Level::INFO),
+            tracing::enabled!(Level::DEBUG),
+            tracing::enabled!(Level::TRACE),
+        ];
+        tracing::error!("error event");
+        tracing::warn!("warn event");
+        tracing::info!("info event");
+        tracing::debug!("debug event");
+        tracing::trace!("trace event");
+        tracing::debug_span!("debug_span").in_scope(|| tracing::warn!("warn in a span"));
+        tracing::info!(target: "rdkafka", "rdkafka info event");
+        enabled
+    }
+
+    /// With no extra layers the stack prints, exports and enables exactly what
+    /// the registry-wide level filter did, a `RUST_LOG` span directive
+    /// included. Its hint is the level filter's, where the registry-wide stack
+    /// gave none once span export had a per-layer filter.
     #[test]
-    fn setup_hands_out_the_level_handle() {
+    fn no_extra_layers_filter_as_a_registry_wide_level_did() {
+        let cases = LEVELS.map(|level| (level, None)).into_iter().chain([
+            (Level::WARN, Some("rdkafka=info")),
+            (Level::INFO, Some("[probe]=debug")),
+        ]);
+        for (level, rust_log) in cases {
+            let (printed_before, exported_before) = (Captured::default(), Captured::default());
+            let subscriber = tracing_subscriber::registry()
+                .with(env_filter(level, rust_log))
+                .with(exporting_to(exported_before.clone()))
+                .with(printing_to(printed_before.clone()));
+            let enabled_before = tracing::subscriber::with_default(subscriber, emit_each_level);
+            let filter_hint =
+                <EnvFilter as Layer<Registry>>::max_level_hint(&env_filter(level, rust_log));
+
+            let (printed, exported) = (Captured::default(), Captured::default());
+            let mut handle = LevelHandle::new(level, rust_log.map(str::to_string));
+            let stack = layer_stack(
+                printing_to(printed.clone()),
+                None,
+                Some(exporting_to(exported.clone())),
+                Vec::new(),
+                &mut handle,
+            );
+            let subscriber = tracing_subscriber::registry().with(stack);
+            let hint = tracing::Subscriber::max_level_hint(&subscriber);
+            let enabled = tracing::subscriber::with_default(subscriber, emit_each_level);
+
+            let case = format!("{level} {rust_log:?}");
+            assert_eq!(printed.text(), printed_before.text(), "printed, {case}");
+            assert_eq!(exported.text(), exported_before.text(), "exported, {case}");
+            assert_eq!(enabled, enabled_before, "enabled, {case}");
+            assert_eq!(hint, filter_hint, "hint, {case}");
+        }
+    }
+
+    /// An extra layer sees every event at every level, while the printed
+    /// layer and the span export see only what the level lets through.
+    #[test]
+    fn extra_layers_see_every_level_and_the_level_filters_the_rest() {
+        let events = [
+            (Level::ERROR, "error event"),
+            (Level::WARN, "warn event"),
+            (Level::INFO, "info event"),
+            (Level::DEBUG, "debug event"),
+            (Level::TRACE, "trace event"),
+        ];
+        for level in LEVELS {
+            let (printed, exported, extra) = (
+                Captured::default(),
+                Captured::default(),
+                Captured::default(),
+            );
+            let mut handle = LevelHandle::new(level, None);
+            let stack = layer_stack(
+                printing_to(printed.clone()),
+                None,
+                Some(printing_to(exported.clone())),
+                vec![printing_to(extra.clone()).boxed()],
+                &mut handle,
+            );
+            let enabled = tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(stack),
+                emit_each_level,
+            );
+            assert_eq!(enabled, [true; 5], "an extra layer enables every level");
+
+            let (printed, exported, extra) = (printed.text(), exported.text(), extra.text());
+            for (at, line) in events {
+                let shown = at <= level;
+                assert_eq!(printed.contains(line), shown, "printed {line} at {level}");
+                assert_eq!(exported.contains(line), shown, "exported {line} at {level}");
+                assert!(extra.contains(line), "extra {line} at {level}:\n{extra}");
+            }
+        }
+    }
+
+    /// A query that records nothing, such as `tracing::enabled!` or
+    /// `log::log_enabled!`, costs no layer the next event.
+    #[test]
+    fn an_enabled_query_costs_no_layer_the_next_event() {
+        /// The level, the extra layer's filter, the query, the next event.
+        type Case = (Level, Option<LevelFilter>, fn() -> bool, fn());
+        let cases: [Case; 2] = [
+            (
+                Level::ERROR,
+                None,
+                || tracing::enabled!(Level::WARN),
+                || tracing::error!("next event"),
+            ),
+            (
+                Level::INFO,
+                Some(LevelFilter::WARN),
+                || tracing::enabled!(Level::INFO),
+                || tracing::warn!("next event"),
+            ),
+        ];
+        for (level, extra_filter, query, next_event) in cases {
+            let (printed, extra) = (Captured::default(), Captured::default());
+            let extra_layer = match extra_filter {
+                Some(filter) => printing_to(extra.clone()).with_filter(filter).boxed(),
+                None => printing_to(extra.clone()).boxed(),
+            };
+            let mut handle = LevelHandle::new(level, None);
+            let stack = layer_stack(
+                printing_to(printed.clone()),
+                None,
+                NO_OTEL,
+                vec![extra_layer],
+                &mut handle,
+            );
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(stack), || {
+                assert!(query(), "one layer wants it, so the query says yes");
+                next_event();
+            });
+            let case = format!("{level} {extra_filter:?}");
+            assert!(printed.text().contains("next event"), "printed, {case}");
+            assert!(extra.text().contains("next event"), "extra, {case}");
+        }
+    }
+
+    /// The throttle holds back repeats on the printed layer only, with or
+    /// without an extra layer.
+    #[test]
+    fn the_throttle_holds_back_printed_repeats_only() {
+        for with_extra in [false, true] {
+            let throttle = build_throttle_filter(&ThrottleConfig {
+                enabled: true,
+                burst: 1.0,
+                rate: 1.0,
+                ..ThrottleConfig::default()
+            });
+            assert!(throttle.is_some());
+            let (printed, extra) = (Captured::default(), Captured::default());
+            let extra_layers = if with_extra {
+                vec![printing_to(extra.clone()).boxed()]
+            } else {
+                Vec::new()
+            };
+            let mut handle = LevelHandle::new(Level::INFO, None);
+            let stack = layer_stack(
+                printing_to(printed.clone()),
+                throttle,
+                NO_OTEL,
+                extra_layers,
+                &mut handle,
+            );
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(stack), || {
+                for _ in 0..5 {
+                    tracing::warn!("repeated line");
+                }
+            });
+            let repeats = |captured: &Captured| captured.text().matches("repeated line").count();
+            assert_eq!(repeats(&printed), 1, "printed, extra layer {with_extra}");
+            assert_eq!(repeats(&extra), if with_extra { 5 } else { 0 });
+        }
+    }
+
+    /// The handle changes what the printed layer and the span export write,
+    /// live, with or without an extra layer, and keeps the rdkafka floor. An
+    /// extra layer sees every line throughout. Text it cannot read leaves the
+    /// level as it was.
+    #[test]
+    fn the_level_handle_changes_the_level_live() {
+        for with_extra in [false, true] {
+            let (printed, exported, extra) = (
+                Captured::default(),
+                Captured::default(),
+                Captured::default(),
+            );
+            let extra_layers = if with_extra {
+                vec![printing_to(extra.clone()).boxed()]
+            } else {
+                Vec::new()
+            };
+            let mut handle = LevelHandle::new(Level::INFO, None);
+            let stack = layer_stack(
+                printing_to(printed.clone()),
+                None,
+                Some(exporting_to(exported.clone())),
+                extra_layers,
+                &mut handle,
+            );
+            let subscriber = tracing_subscriber::registry().with(stack);
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!("first debug line");
+                handle.set("debug").unwrap();
+                tracing::debug!("second debug line");
+                tracing::info!(target: "rdkafka", "rdkafka info line");
+                for bad in ["loud", "", "debug,my_app=trace"] {
+                    assert!(
+                        matches!(handle.set(bad), Err(LoggerError::InvalidLevel(_))),
+                        "{bad:?} must not parse"
+                    );
+                }
+                assert_eq!(handle.current(), Level::DEBUG);
+                tracing::debug!("third debug line");
+                handle.set("Warning").unwrap();
+                tracing::info!("info line at warn");
+            });
+            assert_eq!(handle.current(), Level::WARN);
+
+            let (printed, exported, extra) = (printed.text(), exported.text(), extra.text());
+            for (line, written) in [
+                ("first debug line", false),
+                ("second debug line", true),
+                ("rdkafka info line", false),
+                ("third debug line", true),
+                ("info line at warn", false),
+            ] {
+                let case = format!("{line}, extra layer {with_extra}");
+                assert_eq!(printed.contains(line), written, "{case}:\n{printed}");
+                assert_eq!(exported.contains(line), written, "{case}:\n{exported}");
+                assert_eq!(extra.contains(line), with_extra, "{case}:\n{extra}");
+            }
+        }
+    }
+
+    /// `setup_with_layers` hands out the handle on the logger it starts, and
+    /// a filtered extra layer keeps callsites no layer wants switched off.
+    #[test]
+    fn setup_hands_out_the_level_handle_and_adds_extra_layers() {
+        let extra = Captured::default();
         temp_env::with_var("RUST_LOG", None::<&str>, || {
-            setup(LoggerOptions {
-                format: LogFormat::Json,
-                ..LoggerOptions::default()
-            })
+            setup_with_layers(
+                LoggerOptions {
+                    format: LogFormat::Json,
+                    ..LoggerOptions::default()
+                },
+                vec![
+                    printing_to(extra.clone())
+                        .with_filter(LevelFilter::WARN)
+                        .boxed(),
+                ],
+            )
             .unwrap();
         });
         let handle = level_handle().unwrap();
         assert_eq!(handle.current(), Level::INFO);
         assert!(!tracing::enabled!(Level::DEBUG));
+        tracing::info!("info line");
+        tracing::warn!("warn line");
         handle.set("debug").unwrap();
         assert!(tracing::enabled!(Level::DEBUG));
+
+        let extra = extra.text();
+        assert!(extra.contains("warn line"), "{extra}");
+        assert!(!extra.contains("info line"), "{extra}");
+    }
+
+    /// The `log` crate's max level `try_init` gives `subscriber`: the `tracing`
+    /// max level once `subscriber` is the one registered dispatcher.
+    #[cfg(feature = "otel-tracing")]
+    fn log_max_level_at_install<S>(subscriber: S) -> log::LevelFilter
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let level: log::LevelFilter = LevelFilter::current().to_string().parse().unwrap();
+        drop(dispatch);
+        level
+    }
+
+    /// A runtime to build span export in, which is off outside one.
+    #[cfg(feature = "otel-tracing")]
+    fn export_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    /// The `log` crate's max level at install is the level filter's, with the
+    /// real span export and the throttle each on and off. The reload handle
+    /// moves it on each level change (tracing-subscriber reload.rs).
+    #[cfg(feature = "otel-tracing")]
+    #[test]
+    fn install_starts_the_log_max_level_at_the_filter_level() {
+        let runtime = export_runtime();
+        let _entered = runtime.enter();
+        let config = crate::otel_tracing::OtelTracingConfig::default();
+        let mut rows = Vec::new();
+        for (otel, throttle) in [(false, false), (true, false), (false, true), (true, true)] {
+            let throttle_config = ThrottleConfig {
+                enabled: throttle,
+                ..ThrottleConfig::default()
+            };
+            let export = otel
+                .then(|| crate::otel_tracing::layer_if_active::<Registry>(&config))
+                .flatten();
+            assert_eq!(export.is_some(), otel, "span export builds");
+            let mut handle = LevelHandle::new(Level::INFO, None);
+            let stack = layer_stack(
+                printing_to(Captured::default()),
+                build_throttle_filter(&throttle_config),
+                export,
+                Vec::new(),
+                &mut handle,
+            );
+            let level = log_max_level_at_install(tracing_subscriber::registry().with(stack));
+            rows.push(((otel, throttle), level));
+        }
+        assert!(
+            rows.iter()
+                .all(|(_, level)| *level == log::LevelFilter::Info),
+            "((span export, throttle), log max level): {rows:?}"
+        );
+    }
+
+    /// With span export on, the real install starts `log` at the filter's
+    /// level, and the reload behind a raise moves it, so the raise reaches
+    /// `log` records below the start level.
+    #[cfg(feature = "otel-tracing")]
+    #[test]
+    fn a_live_raise_reaches_log_records_with_span_export_on() {
+        let runtime = export_runtime();
+        let _entered = runtime.enter();
+        let export = crate::otel_tracing::layer_if_active::<Registry>(
+            &crate::otel_tracing::OtelTracingConfig::default(),
+        );
+        assert!(export.is_some(), "span export builds");
+        let printed = Captured::default();
+        let mut handle = LevelHandle::new(Level::INFO, None);
+        let stack = layer_stack(
+            printing_to(printed.clone()),
+            None,
+            export,
+            Vec::new(),
+            &mut handle,
+        );
+        install(stack).unwrap();
+        assert_eq!(log::max_level(), log::LevelFilter::Info);
+        log::debug!("log record at info");
+        handle.set("debug").unwrap();
+        assert_eq!(log::max_level(), log::LevelFilter::Debug);
+        log::debug!("log record at debug");
+
+        let printed = printed.text();
+        assert!(!printed.contains("log record at info"), "{printed}");
+        assert!(printed.contains("log record at debug"), "{printed}");
     }
 }

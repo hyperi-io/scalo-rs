@@ -395,6 +395,8 @@ pretty_assertions = ">=1.4.1, <2"
 # async test that needs a scoped variable has no other route.
 temp-env = { version = ">=0.3.6, <0.4", features = ["async_closure"] }
 async-trait = ">=0.1.92, <0.2"
+# Reads the `log` facade's max level in the logger tests. Already in the graph through tracing-log.
+log = ">=0.4.35, <0.5"
 git2 = ">=0.21.0, <0.22"
 rcgen = ">=0.14.10, <0.15"
 # Builds msgpack test fixtures. The library decodes with rmpv.
