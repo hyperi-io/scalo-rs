@@ -197,7 +197,7 @@ ways:
 - A refusal. The broker rejects the member with a FATAL error:
   `GROUP_ID_NOT_FOUND` from a group whose classic cooperative-sticky member has
   been through a rebalance, `UNKNOWN` from one whose other member has just moved
-  to classic, or `UNSUPPORTED_VERSION`, `_UNSUPPORTED_FEATURE` or
+  to classic (librdkafka 2.15.1, where 2.16.0 gets `GROUP_ID_NOT_FOUND`), or `UNSUPPORTED_VERSION`, `_UNSUPPORTED_FEATURE` or
   `UNSUPPORTED_ASSIGNOR` from a broker without KIP-848. The next `recv`
   rebuilds the consumer as `classic`, with a warning naming the brokers and the
   reason, and carries on.
@@ -207,14 +207,9 @@ still parsed and has no effect. A transport with no consumer joins no group.
 
 ### A fatal client is rebuilt, unless it was fenced
 
-librdkafka marks a client fatal when it can never be used again, and every
-poll after that fails. The next `recv` replaces it with a new client subscribed
-to the same topics and returns an empty batch: `classic` after a refusal above,
-the same protocol after any other fatal. A rebuild that follows another with no
-record between them fails `/readyz` until a record arrives, and the poll after
-it waits a backoff (100 ms doubling to 2 s). The first rebuild of a run logs a
-warning and the first record after it logs the recovery.
-`transport_consumer_rebuilds_total{protocol}` counts every one.
+librdkafka marks a client fatal when it can never be used again, and every poll after that fails. The next `recv` replaces it with a new client subscribed to the same topics and returns an empty batch: `classic` after a refusal above, the same protocol after any other fatal. A rebuild that follows another within 5 minutes with no record between them fails `/readyz`, and the poll after it waits a backoff (100 ms doubling to 2 s). `/readyz` comes back when a record arrives, or once the rebuilt client has run 5 minutes with no fatal error, so a quiet topic is not held down. A rebuild 5 minutes or more after the last starts a new run, as a record does. The first rebuild of a run logs a warning and the first record after it logs the recovery. `transport_consumer_rebuilds_total{protocol}` counts every one.
+
+The new client is built on the blocking pool, and the replaced one is closed there once nothing still uses it. A rebuild while the inbound gate holds pauses the new client's first assignment as it arrives.
 
 A fenced static member (`FENCED_INSTANCE_ID`: another consumer holds its
 `group.instance.id`) is not rebuilt, because the new client would fence that
