@@ -371,7 +371,7 @@ pub enum TlsFailure {
     /// offers.
     #[error(
         "the peer refused every suite and group profile `{profile}` offers{}",
-        wider.map(|p| format!(": try profile `{p}`")).unwrap_or_default()
+        wider.map_or_default(|p| format!(": try profile `{p}`"))
     )]
     NoSharedParameters {
         /// The profile in use.

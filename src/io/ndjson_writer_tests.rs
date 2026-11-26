@@ -171,7 +171,7 @@ fn rotation_by_size_time_and_both() {
                 .write(true)
                 .open(&file)
                 .and_then(|f| {
-                    f.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
+                    f.set_modified(std::time::SystemTime::now() - Duration::from_hours(48))
                 })
                 .expect("age the file");
         }
@@ -800,7 +800,7 @@ fn writer_due_to_rotate(config: &FileWriterConfig, subdir: &str) -> NdjsonWriter
     let dir = config.path.join(subdir);
     std::fs::create_dir_all(&dir).expect("create dir");
     let file = std::fs::File::create(dir.join("out.ndjson")).expect("create file");
-    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
+    file.set_modified(std::time::SystemTime::now() - Duration::from_hours(48))
         .expect("age the file");
     drop(file);
     NdjsonWriter::new(config, subdir, "out.ndjson", "dlq").expect("create")

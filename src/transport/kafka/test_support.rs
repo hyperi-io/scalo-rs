@@ -56,7 +56,7 @@ use crate::deployment::test_support::shared_service::{
 ///
 /// renovate: datasource=docker depName=alpine/openssl
 const OPENSSL_IMAGE: &str =
-    "alpine/openssl:3.5.9@sha256:1c361a204e9791bec6202bccbd1065eafaa65cb5a1a9a06ae000238569fba6a2";
+    "alpine/openssl:3.5.9@sha256:9698e7956c08e713265da24c4587205beba3eaa6af2b319d73575d30a6ff033e";
 
 /// The broker image every Kafka test starts, as `image:tag@digest`.
 ///

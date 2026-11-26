@@ -64,7 +64,7 @@ const POLL: Duration = Duration::from_millis(250);
 
 /// How long a container stays another host's after its owner labels it: past
 /// the longest full run, so a sweep from elsewhere never takes a live one.
-pub const LEASE: Duration = Duration::from_secs(4 * 3600);
+pub const LEASE: Duration = Duration::from_hours(4);
 
 /// The repo whose suite starts the containers, for names, labels, the run log
 /// and the `HYPERI_TEST_*` lookup.
@@ -830,7 +830,7 @@ fi
         .arg(owner.to_string())
         .arg(container.unwrap_or(""))
         .arg(suite.log_path())
-        .arg(process.map(|p| p.to_string()).unwrap_or_default())
+        .arg(process.map_or_default(|p| p.to_string()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -961,8 +961,7 @@ fn wait_reachable(container: &SharedContainer, deadline: Instant) {
 fn resolve(host: &str, port: u16) -> Vec<SocketAddr> {
     (host, port)
         .to_socket_addrs()
-        .map(Iterator::collect)
-        .unwrap_or_default()
+        .map_or_default(Iterator::collect)
 }
 
 /// The first of `addrs` that accepts a connection, tried in order, so a name

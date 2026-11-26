@@ -61,7 +61,7 @@ use super::native_deps::BaseDistro;
 /// gets the same bytes on amd64 and arm64. Renovate refreshes the digest.
 // renovate: datasource=docker depName=debian
 pub const DEFAULT_BASE_IMAGE: &str =
-    "debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad";
+    "debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0";
 
 /// Default distro release the generated runtime package names target.
 ///

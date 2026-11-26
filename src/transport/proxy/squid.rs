@@ -38,7 +38,7 @@ use crate::deployment::test_support::shared_service::{
 /// Canonical's Squid, as `image:tag@digest`.
 ///
 /// renovate: datasource=docker depName=ubuntu/squid
-pub const SQUID_IMAGE: &str = "docker.io/ubuntu/squid:7.2-26.04_edge@sha256:42decc7f79b4e1044f4fe9b3a855af2cbfc76652f3191694726e21058443edc9";
+pub const SQUID_IMAGE: &str = "docker.io/ubuntu/squid:7.2-26.04_edge@sha256:0f1f416ce714f39f439532fb32cc5cd45cf285d56824662a0bd0ea3d6b8e3317";
 
 /// The name only Squid resolves, to the machine running the tests.
 pub const TARGET_HOST: &str = "target.test";

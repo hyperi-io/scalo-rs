@@ -53,8 +53,7 @@ pub fn generate_dockerfile(
     // Contract Identity Annotation Scheme v1 -- three LABEL lines.
     // Silent on None, so consumers not yet passing an identity keep working.
     let identity_block = identity
-        .map(|id| format!("\n{labels}", labels = id.as_dockerfile_labels(namespace)))
-        .unwrap_or_default();
+        .map_or_default(|id| format!("\n{labels}", labels = id.as_dockerfile_labels(namespace)));
 
     Ok(format!(
         r#"# Project:   {app_name}

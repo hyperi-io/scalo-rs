@@ -375,8 +375,7 @@ impl ShapedSender {
         self.inner
             .order
             .lock()
-            .map(|order| order.clone())
-            .unwrap_or_default()
+            .map_or_default(|order| order.clone())
     }
 
     fn log<'r>(&self, records: impl IntoIterator<Item = &'r Record>) {
@@ -867,7 +866,7 @@ fn nanos(ns: u128) -> Duration {
 }
 
 fn bucket(records: u64) -> usize {
-    let bits = u64::BITS - records.saturating_sub(1).leading_zeros();
+    let bits = records.saturating_sub(1).bit_width();
     usize::try_from(bits).map_or(BATCH_BUCKETS - 1, |b| b.min(BATCH_BUCKETS - 1))
 }
 

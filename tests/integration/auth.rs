@@ -438,7 +438,7 @@ async fn expires_in_as_a_string_is_accepted() {
 
     // An hour out, less the renewal margin: far enough ahead that the next
     // call is a hit, which an unparsed string expiry would not be.
-    assert!(credential.renew_at > std::time::Instant::now() + Duration::from_secs(3000));
+    assert!(credential.renew_at > std::time::Instant::now() + Duration::from_mins(50));
     let extra = credential
         .extra
         .as_deref()
@@ -955,8 +955,7 @@ async fn a_credential_field_is_never_carried_in_extra() {
     let rendered = credential
         .extra
         .as_deref()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+        .map_or_default(ToString::to_string);
     assert!(
         !rendered.contains("tok-1"),
         "the token is not exposable: {rendered}"

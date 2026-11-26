@@ -39,12 +39,12 @@ const DEFAULT_EXPIRES_IN_FALLBACK: Duration = Duration::from_secs(3600);
 const DEFAULT_RENEW_MARGIN: Duration = Duration::from_secs(60);
 
 /// How long a credential that needs no exchange is held for.
-const STATIC_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+const STATIC_LIFETIME: Duration = Duration::from_hours(8760);
 
 /// Longest lifetime taken from a token response. A provider that advertises
 /// more than a month has either made a mistake or been tampered with, and an
 /// `expires_in` near `u64::MAX` overflows the arithmetic outright.
-const MAX_CREDENTIAL_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_CREDENTIAL_LIFETIME: Duration = Duration::from_hours(720);
 
 /// Longest refusal detail kept in an error, so a provider that answers with a
 /// page cannot fill the log with it.

@@ -115,9 +115,8 @@ impl EnvText {
 /// figment's `extract_inner` appends its key to the error's path after the
 /// path inside the key.
 fn error_path(key: Option<&str>, err: &Error) -> String {
-    let outer: Vec<&str> = key
-        .map(|key| key.split('.').filter(|part| !part.is_empty()).collect())
-        .unwrap_or_default();
+    let outer: Vec<&str> =
+        key.map_or_default(|key| key.split('.').filter(|part| !part.is_empty()).collect());
     let inner = err
         .path
         .len()

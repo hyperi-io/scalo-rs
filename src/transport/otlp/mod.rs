@@ -888,9 +888,7 @@ fn retry(hint: Option<Duration>, max: Duration) -> SendResult {
 /// protobuf, the text otherwise.
 fn error_text(body: &[u8], protobuf: bool) -> String {
     if protobuf {
-        tonic_types::Status::decode(body)
-            .map(|status| truncated(&status.message))
-            .unwrap_or_default()
+        tonic_types::Status::decode(body).map_or_default(|status| truncated(&status.message))
     } else {
         truncated(&String::from_utf8_lossy(body))
     }

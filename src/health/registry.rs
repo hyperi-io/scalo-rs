@@ -196,8 +196,7 @@ impl HealthRegistry {
             .components
             .lock()
             .ok()
-            .map(|components| components.iter().map(|c| Arc::clone(&c.check)).collect())
-            .unwrap_or_default()
+            .map_or_default(|components| components.iter().map(|c| Arc::clone(&c.check)).collect())
     }
 
     /// Check if ALL components are healthy.

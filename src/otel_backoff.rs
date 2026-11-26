@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use crate::backoff::Backoff;
 
 /// Ceiling on the wait between attempts.
-const MAX_BACKOFF: Duration = Duration::from_secs(900);
+const MAX_BACKOFF: Duration = Duration::from_mins(15);
 
 /// Tracks consecutive export failures and how long to stay quiet.
 #[derive(Debug)]

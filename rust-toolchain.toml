@@ -1,0 +1,13 @@
+# Project:   scalo
+# File:      rust-toolchain.toml
+# Purpose:   Pin the Rust toolchain every build and CI job uses
+# Language:  TOML
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+# Matches `rust-version` in Cargo.toml. Moves to each new stable with the dependency update.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy", "llvm-tools-preview"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

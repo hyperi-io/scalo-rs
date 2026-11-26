@@ -1523,7 +1523,7 @@ mod tests {
 
     #[test]
     fn test_port_condition_reads_as_a_sentence() {
-        let port = |p: PortContract| p.when.map(|w| w.to_string()).unwrap_or_default();
+        let port = |p: PortContract| p.when.map_or_default(|w| w.to_string());
         assert_eq!(
             port(PortContract::tcp("g", 1).when_enabled("config.grpc.enabled")),
             "config.grpc.enabled is true"

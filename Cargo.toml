@@ -11,7 +11,7 @@ name = "scalo"
 # Placeholder: hyperi-ci stamps the release version here before it publishes and commits only VERSION back.
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 description = "The runtime layer for Rust data-plane services: config, logging, metrics, health, backpressure and transports."
 license = "Apache-2.0"
 repository = "https://github.com/hyperi-io/scalo-rs"
@@ -209,14 +209,14 @@ thiserror = ">=2.0.21, <3"
 
 dirs = { version = ">=7.0.0, <8", optional = true }
 
-uuid = { version = ">=1.29.2, <2", features = ["v4", "v5"], optional = true }
+uuid = { version = ">=1.29.3, <2", features = ["v4", "v5"], optional = true }
 
 # figment's `yaml` feature is off: it parses through unsafe-libyaml, so YAML reaches the cascade through src/config/yaml_file.rs.
 figment = { version = ">=0.10.19, <0.11", features = ["toml", "json", "env"], optional = true }
 dotenvy = { version = ">=0.15.7, <0.16", optional = true }
 
-# Floor 2.1: it rejects a null list, map or struct, as the `scalo::yaml` docs say.
-serde-saphyr = { version = ">=2.1.0, <3", optional = true }
+# Never below 2.1: it rejects a null list, map or struct, as the `scalo::yaml` docs say.
+serde-saphyr = { version = ">=2.2.0, <3", optional = true }
 serde_ignored = { version = ">=0.1.14, <0.2", optional = true }
 
 dashmap = { version = ">=6.2.1, <7", optional = true }
@@ -229,7 +229,7 @@ git2 = { version = ">=0.21.0, <0.22", optional = true }
 
 cel = { version = ">=0.14.5, <0.15", features = ["json"], optional = true }
 
-clap = { version = ">=4.6.7, <5", features = ["derive", "env"], optional = true }
+clap = { version = ">=4.6.10, <5", features = ["derive", "env"], optional = true }
 
 tracing = { version = ">=0.1.44, <0.2", optional = true }
 tracing-subscriber = { version = ">=0.3.23, <0.4", features = ["json", "env-filter", "fmt", "time"], optional = true }
@@ -254,7 +254,7 @@ metrics-exporter-prometheus = { version = ">=0.18.3, <0.19", default-features = 
 crossbeam-epoch = { version = ">=0.9.21, <0.10", optional = true }
 metrics-util = { version = ">=0.20.4, <0.21", optional = true }
 metrics-exporter-opentelemetry = { version = ">=0.2.2, <0.2.3", optional = true }
-sysinfo = { version = ">=0.40.3, <0.41", optional = true }
+sysinfo = { version = ">=0.40.4, <0.41", optional = true }
 
 tokio = { version = ">=1.54.1, <2", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "fs", "io-std", "io-util"], optional = true }
 tokio-util = { version = ">=0.7.20, <0.8", optional = true }
@@ -300,7 +300,7 @@ tokio-stream = { version = ">=0.1.19, <0.2", features = ["net"], optional = true
 # Endpoint::connect_with_connector_lazy takes it, so the connect timeout covers the TLS handshake.
 hyper-util = { version = ">=0.1.21, <0.2", features = ["client-legacy", "tokio"], optional = true }
 # The `Uri` the proxy matcher and tonic's connector take. Already in the graph through hyper.
-http = { version = ">=1.4.0, <2", optional = true }
+http = { version = ">=1.5.0, <2", optional = true }
 
 ratatui = { version = ">=0.30.2, <0.32", optional = true }
 
@@ -311,21 +311,21 @@ tar = { version = ">=0.4.46, <0.5", optional = true }
 
 # Checks the format version stamped in a spool directory.
 semver = { version = ">=1.0.28, <2", optional = true }
-zstd = { version = ">=0.14.4, <0.15", optional = true }
+zstd = { version = ">=0.14.5, <0.15", optional = true }
 crc32c = { version = ">=0.6.9, <0.7", optional = true }
 
 # Never below 0.12.1: RUSTSEC-2026-0041.
 lz4_flex = { version = ">=0.14.2, <0.15", optional = true }
 snap = { version = ">=1.1.2, <2", optional = true }
 
-sonic-rs = { version = ">=0.5.11, <1", optional = true }
+sonic-rs = { version = ">=0.5.12, <1", optional = true }
 
 # The unsafe lives in wide/safe_arch, since this crate denies unsafe_code.
 wide = { version = ">=1.7.1, <2", optional = true }
 
-regex = { version = ">=1.13.1, <2", optional = true }
-regex-automata = { version = ">=0.4.18, <0.5", optional = true }
-regex-syntax = { version = ">=0.8.11, <0.9", optional = true }
+regex = { version = ">=1.13.2, <2", optional = true }
+regex-automata = { version = ">=0.4.19, <0.5", optional = true }
+regex-syntax = { version = ">=0.8.12, <0.9", optional = true }
 aho-corasick = { version = ">=1.1.5, <2", optional = true }
 memchr = { version = ">=2.8.3, <3", optional = true }
 
@@ -341,22 +341,22 @@ base64 = { version = ">=0.23.1, <0.24", optional = true }
 # src/secrets/crypto.rs holds an envelope sealed by the 0.10 line, so an upgrade that cannot open the disk caches fails its tests.
 aes-gcm = { version = ">=0.11.1, <0.12", optional = true }
 hkdf = { version = ">=0.13.0, <0.14", optional = true }
-sha2 = { version = ">=0.11.1, <0.12", optional = true }
+sha2 = { version = ">=0.11.2, <0.12", optional = true }
 
 # FuturesUnordered for the per-record delivery approach, and AtomicWaker for src/yaque's wake.
 # Already in the graph through tonic and tower.
 futures-util = { version = ">=0.3.34, <0.4", default-features = false, features = ["std"], optional = true }
 
 # Never below 1.11.1: RUSTSEC-2026-0007.
-bytes = { version = ">=1.12.1, <2", optional = true }
+bytes = { version = ">=1.12.2, <2", optional = true }
 
-vaultrs = { version = ">=0.8, <0.9", optional = true }
+vaultrs = { version = ">=0.8.0, <0.9", optional = true }
 
 # Default features off: the aws-sdk `rustls` feature pulls rustls 0.21 (RUSTSEC-2026-0098, -0099, -0104),
 # and `default-https-client` takes rustls 0.23.
-aws-config = { version = ">=1.13.2, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
-# Floor 1.117: the first release to need aws-smithy-json 0.63.1.
-aws-sdk-secretsmanager = { version = ">=1.128.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-config = { version = ">=1.13.4, <2", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso"], optional = true }
+# Never below 1.117: the first release to need aws-smithy-json 0.63.1.
+aws-sdk-secretsmanager = { version = ">=1.130.0, <2", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 
 # One `rdkafka` per target: `dynamic-linking` and `cmake-build` must never both reach rdkafka-sys.
 # docs/deployment/native-deps.md
@@ -366,7 +366,7 @@ rdkafka = { version = ">=0.40.0, <0.41", default-features = false, features = ["
 [target.'cfg(target_os = "macos")'.dependencies]
 rdkafka = { version = ">=0.40.0, <0.41", default-features = false, features = ["cmake-build", "ssl-vendored", "zstd", "libz", "tokio"], optional = true }
 # Reads MDM managed preferences for the managed config layer.
-plist = { version = ">=1.10.3, <2", default-features = false, optional = true }
+plist = { version = ">=1.10.4, <2", default-features = false, optional = true }
 # Reads the system proxy for `proxy: system`. Held to the 0.7 line hyper-util's
 # `client-proxy-system` takes, so a consumer's macOS build compiles one copy.
 system-configuration = { version = ">=0.7.0, <0.8", optional = true }
@@ -401,8 +401,7 @@ rcgen = ">=0.14.10, <0.15"
 rmp-serde = ">=1.3.1, <2"
 proptest = ">=1.12.0, <2"
 # The real-broker tests need a Docker daemon.
-testcontainers = ">=0.27.0, <0.28"
-testcontainers-modules = { version = ">=0.15.0, <0.16", features = ["kafka"] }
+testcontainers = ">=0.28.0, <0.29"
 # Must match the optional `http` reqwest exactly: two reqwest builds in one graph is E0464 on the lib test target.
 reqwest = { version = ">=0.13.5, <0.14", default-features = false, features = ["json", "rustls"] }
 # Same declaration as the optional `http-server` dependency, for the reason above.
@@ -410,7 +409,7 @@ axum = ">=0.8.9, <0.9"
 # Mergeable latency quantiles for the delivery_path bench. Already in the graph through metrics-util.
 sketches-ddsketch = ">=0.4.2, <0.5"
 # Local refs only, so no HTTP resolver.
-jsonschema = { version = ">=0.61.2, <0.62", default-features = false }
+jsonschema = { version = ">=0.63.1, <0.64", default-features = false }
 
 # Pins the delivery_path bench to a CPU set. Already in the graph through tempfile.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -421,10 +420,6 @@ unsafe_code = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-
-# Suggests Duration::from_hours/from_mins/from_days -- all Rust 1.99+ APIs, above
-# our MSRV, so the suggestion is unsatisfiable. Allowed crate-wide.
-duration_suboptimal_units = "allow"
 
 # Allows for test/bench/example code (these don't inherit lib.rs attributes)
 doc_markdown = "allow"                    # Don't require backticks in doc comments

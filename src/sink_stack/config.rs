@@ -111,7 +111,7 @@ impl SinkStackConfig {
     #[must_use]
     pub fn attempt_timeout(&self) -> Duration {
         if self.attempt_timeout_ms == 0 {
-            Duration::from_secs(86_400)
+            Duration::from_hours(24)
         } else {
             Duration::from_millis(self.attempt_timeout_ms)
         }

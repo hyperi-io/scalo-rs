@@ -385,8 +385,7 @@ where
                     let ingest_interval = {
                         let now = std::time::Instant::now();
                         let interval = last_recv
-                            .map(|prev| now.saturating_duration_since(prev))
-                            .unwrap_or_default();
+                            .map_or_default(|prev| now.saturating_duration_since(prev));
                         last_recv = Some(now);
                         interval
                     };
