@@ -20,7 +20,7 @@
 //! committed here, and an offset handed out before the revoke commits nothing
 //! when it is released, even after the partition comes back.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -34,82 +34,336 @@ use super::metrics::Rebalanced;
 /// A partition, keyed as the tokens carry it.
 type PartitionKey = (Arc<str>, i32);
 
-/// One offset `recv` handed out.
-#[derive(Debug, Clone, Copy)]
-struct Held {
-    offset: i64,
-    bytes: u64,
-    released: bool,
-    /// Released `Errored`: still held, and its holder will not release it again.
-    withheld: bool,
+/// A set of offsets, kept as ascending half-open ranges that neither overlap
+/// nor touch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Offsets {
+    ranges: Vec<(i64, i64)>,
+    len: u64,
 }
 
-/// The offsets of one partition from one `recv`, ascending.
+/// The count of offsets in `start..end`.
+fn span_len(start: i64, end: i64) -> u64 {
+    u64::try_from(end.saturating_sub(start)).unwrap_or(0)
+}
+
+impl Offsets {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    fn first(&self) -> Option<i64> {
+        self.ranges.first().map(|r| r.0)
+    }
+
+    /// Add `start..end`, which starts at or above every offset in the set.
+    fn push(&mut self, start: i64, end: i64) {
+        if start >= end {
+            return;
+        }
+        match self.ranges.last_mut() {
+            Some(last) if last.1 == start => last.1 = end,
+            _ => self.ranges.push((start, end)),
+        }
+        self.len += span_len(start, end);
+    }
+
+    /// The index of the first range that ends above `offset`.
+    fn above(&self, offset: i64) -> usize {
+        self.ranges.partition_point(|r| r.1 <= offset)
+    }
+
+    fn contains(&self, offset: i64) -> bool {
+        self.ranges
+            .get(self.above(offset))
+            .is_some_and(|r| r.0 <= offset)
+    }
+
+    /// Add `offset`. `true` when it was not in the set.
+    fn insert(&mut self, offset: i64) -> bool {
+        let at = self.above(offset);
+        if self.ranges.get(at).is_some_and(|r| r.0 <= offset) {
+            return false;
+        }
+        let joins_below = at > 0 && self.ranges[at - 1].1 == offset;
+        let joins_above = self.ranges.get(at).is_some_and(|r| r.0 == offset + 1);
+        match (joins_below, joins_above) {
+            (true, true) => {
+                self.ranges[at - 1].1 = self.ranges[at].1;
+                self.ranges.remove(at);
+            }
+            (true, false) => self.ranges[at - 1].1 = offset + 1,
+            (false, true) => self.ranges[at].0 = offset,
+            (false, false) => self.ranges.insert(at, (offset, offset + 1)),
+        }
+        self.len += 1;
+        true
+    }
+
+    /// Take `offset` out. `true` when it was in the set.
+    fn remove(&mut self, offset: i64) -> bool {
+        let at = self.above(offset);
+        let Some(&(start, end)) = self.ranges.get(at).filter(|r| r.0 <= offset) else {
+            return false;
+        };
+        match (start == offset, end == offset + 1) {
+            (true, true) => {
+                self.ranges.remove(at);
+            }
+            (true, false) => self.ranges[at].0 = offset + 1,
+            (false, true) => self.ranges[at].1 = offset,
+            (false, false) => {
+                self.ranges[at].1 = offset;
+                self.ranges.insert(at + 1, (offset + 1, end));
+            }
+        }
+        self.len -= 1;
+        true
+    }
+
+    /// Take out every offset at or above `from`.
+    fn remove_from(&mut self, from: i64) {
+        let keep = self.ranges.partition_point(|r| r.0 < from);
+        for (start, end) in self.ranges.drain(keep..) {
+            self.len -= span_len(start, end);
+        }
+        if let Some(last) = self.ranges.last_mut()
+            && last.1 > from
+        {
+            self.len -= span_len(from, last.1);
+            last.1 = from;
+        }
+    }
+
+    /// Take out every offset below `below`.
+    fn remove_below(&mut self, below: i64) {
+        let gone = self.above(below);
+        for (start, end) in self.ranges.drain(..gone) {
+            self.len -= span_len(start, end);
+        }
+        if let Some(first) = self.ranges.first_mut()
+            && first.0 < below
+        {
+            self.len -= span_len(first.0, below);
+            first.0 = below;
+        }
+    }
+
+    /// Add every offset of `other`.
+    fn union(&mut self, other: &Self) {
+        let mut all: Vec<(i64, i64)> = self.ranges.iter().chain(&other.ranges).copied().collect();
+        all.sort_unstable();
+        let mut merged = Self::default();
+        for (start, end) in all {
+            match merged.ranges.last_mut() {
+                Some(last) if start <= last.1 => {
+                    if end > last.1 {
+                        merged.len += span_len(last.1, end);
+                        last.1 = end;
+                    }
+                }
+                _ => merged.push(start, end),
+            }
+        }
+        *self = merged;
+    }
+
+    /// The offsets of this set not in `other`.
+    fn difference(&self, other: &Self) -> Self {
+        let mut out = Self::default();
+        let mut from = 0;
+        for &(start, end) in &self.ranges {
+            while other.ranges.get(from).is_some_and(|r| r.1 <= start) {
+                from += 1;
+            }
+            let mut at = start;
+            for &(cut_start, cut_end) in other.ranges[from..].iter().take_while(|r| r.0 < end) {
+                out.push(at, cut_start.min(end));
+                at = at.max(cut_end);
+            }
+            out.push(at, end);
+        }
+        out
+    }
+}
+
+/// Offsets of one partition that `recv` handed out across one or more
+/// receives, each one starting at or above where the one before it ended.
 #[derive(Debug)]
 struct Run {
-    held: Vec<Held>,
-    unreleased: usize,
-    unreleased_bytes: u64,
-    /// Offsets released `Errored` and not released since.
-    withheld: usize,
+    start: i64,
+    /// One past the last offset handed out.
+    end: i64,
+    /// Offsets in `start..end` no receive handed out: compaction and
+    /// transaction markers leave them.
+    gaps: Offsets,
+    unreleased: Offsets,
+    /// Offsets released `Errored` and not released since, all unreleased.
+    withheld: Offsets,
+    /// Payload bytes of the offsets in `start..end` outside `gaps`.
+    bytes: u64,
+    /// When the receive that handed out `start` arrived.
     received: Instant,
+    /// Each later receive taken into the run: its first offset less `start`,
+    /// and the milliseconds it arrived after `received`.
+    merged: Vec<(u32, u32)>,
 }
 
 impl Run {
+    /// One receive's offsets of one partition, ascending and distinct, with
+    /// their payload bytes. `None` when there are none.
+    fn new(offsets: &[i64], bytes: u64, received: Instant) -> Option<Self> {
+        let (&first, &last) = (offsets.first()?, offsets.last()?);
+        let mut run = Self {
+            start: first,
+            end: last + 1,
+            gaps: Offsets::default(),
+            unreleased: Offsets::default(),
+            withheld: Offsets::default(),
+            bytes,
+            received,
+            merged: Vec::new(),
+        };
+        let mut from = first;
+        for pair in offsets.windows(2) {
+            if pair[1] != pair[0] + 1 {
+                run.unreleased.push(from, pair[0] + 1);
+                run.gaps.push(pair[0] + 1, pair[1]);
+                from = pair[1];
+            }
+        }
+        run.unreleased.push(from, last + 1);
+        Some(run)
+    }
+
     fn first(&self) -> i64 {
-        self.held.first().map_or(i64::MAX, |h| h.offset)
+        self.start
     }
 
     fn last(&self) -> i64 {
-        self.held.last().map_or(i64::MIN, |h| h.offset)
+        self.end - 1
     }
 
-    /// Mark `offset` released. `true` when this run holds it.
-    fn release(&mut self, offset: i64) -> bool {
-        let Ok(at) = self.held.binary_search_by_key(&offset, |h| h.offset) else {
-            return false;
-        };
-        let entry = &mut self.held[at];
-        if !entry.released {
-            entry.released = true;
-            self.unreleased -= 1;
-            self.unreleased_bytes = self.unreleased_bytes.saturating_sub(entry.bytes);
-            if entry.withheld {
-                self.withheld -= 1;
-            }
+    /// Offsets in `start..end` a receive handed out.
+    fn handed_out(&self) -> u64 {
+        span_len(self.start, self.end) - self.gaps.len()
+    }
+
+    /// The payload bytes still held, as the unreleased share of the run's.
+    fn unreleased_bytes(&self) -> u64 {
+        let (held, all) = (self.unreleased.len(), self.handed_out());
+        if held == all {
+            return self.bytes;
         }
-        true
+        share(self.bytes, held, all)
+    }
+
+    /// When the receive that handed out `offset` arrived.
+    fn received_at(&self, offset: i64) -> Instant {
+        let after = self
+            .merged
+            .partition_point(|&(from, _)| self.start + i64::from(from) <= offset);
+        match after.checked_sub(1).map(|at| self.merged[at].1) {
+            Some(ms) => self.received + std::time::Duration::from_millis(u64::from(ms)),
+            None => self.received,
+        }
+    }
+
+    fn release(&mut self, offset: i64) {
+        if self.unreleased.remove(offset) {
+            self.withheld.remove(offset);
+        }
     }
 
     /// Mark `offset` released `Errored`: it stays held.
     fn withhold(&mut self, offset: i64) {
-        if let Ok(at) = self.held.binary_search_by_key(&offset, |h| h.offset) {
-            let entry = &mut self.held[at];
-            if !entry.withheld && !entry.released {
-                self.withheld += 1;
-            }
-            entry.withheld = true;
+        if self.unreleased.contains(offset) {
+            self.withheld.insert(offset);
         }
     }
 
-    /// The lowest offset not yet released.
     fn first_unreleased(&self) -> Option<i64> {
-        self.held.iter().find(|h| !h.released).map(|h| h.offset)
+        self.unreleased.first()
     }
 
     /// Drop every offset at or above `from`.
     fn truncate_from(&mut self, from: i64) {
-        let keep = self.held.partition_point(|h| h.offset < from);
-        for dropped in self.held.drain(keep..) {
-            if !dropped.released {
-                self.unreleased -= 1;
-                self.unreleased_bytes = self.unreleased_bytes.saturating_sub(dropped.bytes);
-                if dropped.withheld {
-                    self.withheld -= 1;
-                }
-            }
+        if from >= self.end {
+            return;
         }
+        let before = self.handed_out();
+        self.end = from.max(self.start);
+        self.gaps.remove_from(from);
+        self.unreleased.remove_from(from);
+        self.withheld.remove_from(from);
+        self.bytes = share(self.bytes, self.handed_out(), before);
+        let start = self.start;
+        self.merged
+            .retain(|&(first, _)| start + i64::from(first) < from);
     }
+
+    /// Drop the released offsets below the first unreleased one, so a run
+    /// that keeps taking receives holds no more than what is unreleased.
+    fn trim_released(&mut self) {
+        let Some(first) = self.first_unreleased().filter(|&f| f > self.start) else {
+            return;
+        };
+        let before = self.handed_out();
+        let received = self.received_at(first);
+        let cut = first - self.start;
+        let gone = self
+            .merged
+            .partition_point(|&(from, _)| i64::from(from) <= cut);
+        let base_ms = gone.checked_sub(1).map_or(0, |at| self.merged[at].1);
+        self.merged.drain(..gone);
+        for (from, ms) in &mut self.merged {
+            *from = u32::try_from(i64::from(*from) - cut).unwrap_or(u32::MAX);
+            *ms -= base_ms;
+        }
+        self.gaps.remove_below(first);
+        self.start = first;
+        self.received = received;
+        self.bytes = share(self.bytes, self.handed_out(), before);
+    }
+
+    /// Take `next`, which starts at or above this run's end, into this run.
+    /// `Err` gives it back when its start or arrival is past what `merged`
+    /// can record.
+    fn absorb(&mut self, next: Self) -> Result<(), Self> {
+        self.trim_released();
+        let from = u32::try_from(next.start - self.start);
+        let ms = u32::try_from(
+            next.received
+                .saturating_duration_since(self.received)
+                .as_millis(),
+        );
+        let (Ok(from), Ok(ms)) = (from, ms) else {
+            return Err(next);
+        };
+        self.gaps.push(self.end, next.start);
+        for &(start, end) in &next.gaps.ranges {
+            self.gaps.push(start, end);
+        }
+        for &(start, end) in &next.unreleased.ranges {
+            self.unreleased.push(start, end);
+        }
+        self.end = next.end;
+        self.bytes = self.bytes.saturating_add(next.bytes);
+        self.merged.push((from, ms));
+        Ok(())
+    }
+}
+
+/// `total` times `part` over `whole`, rounded down: 0 when `whole` is 0.
+fn share(total: u64, part: u64, whole: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    u64::try_from(u128::from(total) * u128::from(part) / u128::from(whole)).unwrap_or(u64::MAX)
 }
 
 /// Held offsets of one partition, and where its commit stands.
@@ -125,13 +379,14 @@ struct PartitionHold {
     /// Offsets handed out before the last revoke and not released or withheld
     /// since. The next owner reads them again, so one release of each is the
     /// old copy's and commits nothing, even once the partition comes back.
-    stale: BTreeSet<i64>,
+    stale: Offsets,
 }
 
 impl PartitionHold {
     /// Record a run `recv` handed out. A run that starts at or below an offset
     /// already held means the consumer read again from there, so the held
-    /// offsets from there on are replaced.
+    /// offsets from there on are replaced. One that starts at or above the
+    /// last run's end is taken into that run.
     fn register(&mut self, run: Run) {
         let first = run.first();
         // The consumer reads from its committed offset, so nothing below the
@@ -145,7 +400,15 @@ impl PartitionHold {
         {
             back.truncate_from(first);
         }
-        self.runs.push_back(run);
+        // A released run tells the commit nothing.
+        if self.runs.back().is_some_and(|r| r.unreleased.is_empty()) {
+            self.runs.pop_back();
+        }
+        let run = match self.runs.back_mut() {
+            Some(back) => back.absorb(run).err(),
+            None => Some(run),
+        };
+        self.runs.extend(run);
     }
 
     fn release(&mut self, offset: i64) {
@@ -159,7 +422,7 @@ impl PartitionHold {
     /// The next-to-read offset every held offset below has been released
     /// for, when it is past the last commit.
     fn commit_target(&mut self) -> Option<i64> {
-        while self.runs.front().is_some_and(|r| r.unreleased == 0) {
+        while self.runs.front().is_some_and(|r| r.unreleased.is_empty()) {
             self.runs.pop_front();
         }
         let target = match self.runs.front() {
@@ -193,37 +456,30 @@ impl KafkaAcks {
     /// Hold the offsets of one `recv`: `(token, payload bytes)` per record.
     pub(super) fn register<'t>(&self, handed_out: impl IntoIterator<Item = (&'t KafkaToken, u64)>) {
         let now = Instant::now();
-        let mut by_partition: HashMap<PartitionKey, Vec<Held>> = HashMap::new();
+        let mut by_partition: HashMap<PartitionKey, Vec<(i64, u64)>> = HashMap::new();
         for (token, bytes) in handed_out {
             by_partition
                 .entry((Arc::clone(&token.topic), token.partition))
                 .or_default()
-                .push(Held {
-                    offset: token.offset,
-                    bytes,
-                    released: false,
-                    withheld: false,
-                });
+                .push((token.offset, bytes));
         }
         if by_partition.is_empty() {
             return;
         }
         let mut partitions = self.partitions.lock();
         for (key, mut held) in by_partition {
-            held.sort_unstable_by_key(|h| h.offset);
-            held.dedup_by_key(|h| h.offset);
+            held.sort_unstable_by_key(|&(offset, _)| offset);
+            held.dedup_by_key(|&mut (offset, _)| offset);
             let hold = partitions.entry(key).or_default();
             // A partition this member lost holds nothing: its next owner reads it.
             if hold.unowned {
                 continue;
             }
-            hold.register(Run {
-                unreleased: held.len(),
-                unreleased_bytes: held.iter().map(|h| h.bytes).sum(),
-                withheld: 0,
-                held,
-                received: now,
-            });
+            let bytes = held.iter().map(|&(_, bytes)| bytes).sum();
+            let offsets: Vec<i64> = held.into_iter().map(|(offset, _)| offset).collect();
+            if let Some(run) = Run::new(&offsets, bytes, now) {
+                hold.register(run);
+            }
         }
         drop(partitions);
         self.publish_held();
@@ -248,7 +504,7 @@ impl KafkaAcks {
             let key = (Arc::clone(&token.topic), token.partition);
             let hold = partitions.entry(key.clone()).or_default();
             // A lost partition commits nothing, and a stale offset's first release is the old copy's.
-            let stale = hold.stale.remove(&token.offset);
+            let stale = hold.stale.remove(token.offset);
             if hold.unowned || stale {
                 continue;
             }
@@ -257,7 +513,8 @@ impl KafkaAcks {
                 .iter()
                 .find(|r| r.first() <= token.offset && token.offset <= r.last())
             {
-                oldest = Some(oldest.map_or(run.received, |o| o.min(run.received)));
+                let received = run.received_at(token.offset);
+                oldest = Some(oldest.map_or(received, |o| o.min(received)));
             }
             hold.release(token.offset);
             if !touched.contains(&key) {
@@ -290,7 +547,7 @@ impl KafkaAcks {
                         .iter_mut()
                         .find(|r| r.first() <= t.offset && t.offset <= r.last())?;
                     run.withhold(t.offset);
-                    Some(run.received)
+                    Some(run.received_at(t.offset))
                 })
                 .min()
         };
@@ -309,7 +566,7 @@ impl KafkaAcks {
             .lock()
             .values()
             .flat_map(|p| p.runs.iter())
-            .map(|r| r.withheld as u64)
+            .map(|r| r.withheld.len())
             .sum()
     }
 
@@ -335,13 +592,9 @@ impl KafkaAcks {
                         let old = partitions.remove(&key).unwrap_or_default();
                         let mut stale = old.stale;
                         // A withheld offset's holder already released it, so only the rest await a release.
-                        stale.extend(
-                            old.runs
-                                .iter()
-                                .flat_map(|r| r.held.iter())
-                                .filter(|h| !h.released && !h.withheld)
-                                .map(|h| h.offset),
-                        );
+                        for run in &old.runs {
+                            stale.union(&run.unreleased.difference(&run.withheld));
+                        }
                         partitions.insert(
                             key.clone(),
                             PartitionHold {
@@ -376,7 +629,7 @@ impl KafkaAcks {
             let next = hold.committed_next.map_or(*next, |c| c.max(*next));
             hold.committed_next = Some(next);
             // A stale offset below the commit can no longer move it.
-            hold.stale = hold.stale.split_off(&next);
+            hold.stale.remove_below(next);
         }
     }
 
@@ -453,12 +706,13 @@ impl AckControl for KafkaAcks {
         let mut bytes = 0_u64;
         let mut oldest: Option<Instant> = None;
         for run in partitions.values().flat_map(|p| p.runs.iter()) {
-            if run.unreleased == 0 {
+            let Some(first) = run.first_unreleased() else {
                 continue;
-            }
-            count += run.unreleased as u64;
-            bytes = bytes.saturating_add(run.unreleased_bytes);
-            oldest = Some(oldest.map_or(run.received, |o| o.min(run.received)));
+            };
+            count += run.unreleased.len();
+            bytes = bytes.saturating_add(run.unreleased_bytes());
+            let received = run.received_at(first);
+            oldest = Some(oldest.map_or(received, |o| o.min(received)));
         }
         HeldAcks::new(
             count,
@@ -791,5 +1045,265 @@ mod tests {
         let acks = KafkaAcks::default();
         let tokens = [token(0, 7), token(0, 3)];
         assert_eq!(targets(&acks, &tokens), vec![8]);
+    }
+
+    /// `Offsets` against a `BTreeSet` doing the same operations.
+    #[test]
+    fn offsets_match_a_set_of_single_offsets() {
+        use std::collections::BTreeSet;
+        /// The operations a case applies, in this order, to `{0, 1, 2, 5, 6, 9}`.
+        struct Case {
+            name: &'static str,
+            insert: &'static [i64],
+            remove: &'static [i64],
+            from: i64,
+            below: i64,
+            union: &'static [i64],
+            minus: &'static [i64],
+        }
+        let of = |set: &BTreeSet<i64>| -> Offsets {
+            let mut offsets = Offsets::default();
+            for &o in set {
+                offsets.push(o, o + 1);
+            }
+            offsets
+        };
+        let start: BTreeSet<i64> = [0, 1, 2, 5, 6, 9].into();
+        let none = Case {
+            name: "",
+            insert: &[],
+            remove: &[],
+            from: 100,
+            below: -1,
+            union: &[],
+            minus: &[],
+        };
+        let cases = [
+            Case {
+                name: "joins two ranges",
+                insert: &[3, 4],
+                ..none
+            },
+            Case {
+                name: "splits a range",
+                remove: &[1, 6],
+                minus: &[0],
+                ..none
+            },
+            Case {
+                name: "cuts at both ends",
+                insert: &[7],
+                from: 6,
+                below: 1,
+                ..none
+            },
+            Case {
+                name: "already in, already out",
+                insert: &[0, 9],
+                remove: &[3, 42],
+                below: -100,
+                minus: &[42],
+                ..none
+            },
+            Case {
+                name: "union and difference",
+                union: &[3, 4, 10, 11],
+                minus: &[2, 3, 10],
+                ..none
+            },
+        ];
+        for Case {
+            name: case,
+            insert,
+            remove,
+            from,
+            below,
+            union,
+            minus,
+        } in cases
+        {
+            let (mut want, mut got) = (start.clone(), of(&start));
+            for &o in insert {
+                assert_eq!(got.insert(o), want.insert(o), "{case}: insert {o}");
+            }
+            for &o in remove {
+                assert_eq!(got.remove(o), want.remove(&o), "{case}: remove {o}");
+            }
+            got.remove_from(from);
+            want.retain(|&o| o < from);
+            got.remove_below(below);
+            want.retain(|&o| o >= below);
+            let union: BTreeSet<i64> = union.iter().copied().collect();
+            got.union(&of(&union));
+            want.extend(&union);
+            let minus: BTreeSet<i64> = minus.iter().copied().collect();
+            let got = got.difference(&of(&minus));
+            let want: BTreeSet<i64> = want.difference(&minus).copied().collect();
+            assert_eq!(got, of(&want), "{case}");
+            assert_eq!(got.len(), want.len() as u64, "{case}: len");
+            assert!(want.iter().all(|&o| got.contains(o)), "{case}: contains");
+        }
+    }
+
+    fn register_offsets(acks: &KafkaAcks, offsets: &[i64]) -> Vec<KafkaToken> {
+        let tokens: Vec<_> = offsets.iter().map(|&o| token(0, o)).collect();
+        acks.register(tokens.iter().map(|t| (t, 10)));
+        tokens
+    }
+
+    /// Compaction and transaction markers leave offsets no receive hands out,
+    /// inside one receive and between two. The commit steps over them, and
+    /// never past an offset still held.
+    #[test]
+    fn a_gap_in_the_offsets_is_never_held() {
+        let acks = KafkaAcks::default();
+        let first = register_offsets(&acks, &[0, 1, 2, 5, 6]);
+        let second = register_offsets(&acks, &[8, 9]);
+        assert_eq!(acks.held().count, 7);
+        assert_eq!(acks.held().bytes, 70);
+
+        assert_eq!(
+            targets(&acks, &first[..3]),
+            vec![5],
+            "3 and 4 were never handed out"
+        );
+        assert!(targets(&acks, &second).is_empty(), "5 and 6 are still held");
+        assert_eq!(targets(&acks, &first[3..]), vec![10]);
+        assert_eq!(acks.held().count, 0);
+    }
+
+    /// Released out of order inside one receive, with one record released
+    /// `Errored` in the middle: the commit stops below it for good.
+    #[test]
+    fn a_withheld_record_mid_run_pins_the_commit_below_it() {
+        let acks = KafkaAcks::default();
+        let block = register(&acks, 0, 0..10);
+        acks.withhold(&block[4..5]);
+        assert!(targets(&acks, &block[5..]).is_empty(), "0..5 still held");
+        assert_eq!(targets(&acks, &block[..4]), vec![4]);
+        assert_eq!(acks.held().count, 1);
+        assert_eq!(acks.withheld(), 1);
+
+        let later = register(&acks, 0, 10..20);
+        assert!(targets(&acks, &later).is_empty(), "pinned at 4");
+        acks.rebalanced(vec![change(1, true, 0)]);
+        assert_eq!(acks.withheld(), 0);
+        assert_eq!(acks.held().count, 0);
+    }
+
+    /// Receives with gaps, released in a scrambled order: after every release
+    /// the commit is at or below the lowest offset still held.
+    #[test]
+    fn the_commit_never_passes_an_unreleased_offset() {
+        let acks = KafkaAcks::default();
+        let mut tokens = Vec::new();
+        for recv in 0..8_i64 {
+            // Every seventh offset is a transaction marker.
+            let offsets: Vec<i64> = (recv * 20..recv * 20 + 20).filter(|o| o % 7 != 6).collect();
+            tokens.extend(register_offsets(&acks, &offsets));
+        }
+        // A fixed scramble: 37 is coprime to the 138 tokens, so this is a permutation.
+        let mut order: Vec<usize> = (0..tokens.len()).collect();
+        order.sort_by_key(|&i| (i * 37) % tokens.len());
+        let mut held: std::collections::BTreeSet<i64> = tokens.iter().map(|t| t.offset).collect();
+        let mut committed = 0;
+        for i in order {
+            held.remove(&tokens[i].offset);
+            if let Some(&next) = targets(&acks, &tokens[i..=i]).last() {
+                committed = next;
+            }
+            let floor = held.first().copied().unwrap_or(i64::MAX);
+            assert!(
+                committed <= floor,
+                "committed {committed} past held {floor}"
+            );
+        }
+        assert_eq!(committed, 160);
+    }
+
+    /// A run that keeps taking receives drops its released prefix, along with
+    /// the arrival times of the receives in it.
+    #[test]
+    fn a_run_keeps_only_what_is_unreleased() {
+        let at = Instant::now();
+        let ms = |n: u64| at + std::time::Duration::from_millis(n);
+        let offsets = |range: std::ops::Range<i64>| -> Vec<i64> { range.collect() };
+        let mut run = Run::new(&offsets(0..10), 100, at).expect("a run");
+        run.absorb(Run::new(&offsets(10..20), 100, ms(5)).expect("a run"))
+            .expect("fits");
+        assert_eq!(run.received_at(9), at);
+        assert_eq!(run.received_at(15), ms(5));
+
+        for offset in 0..12 {
+            run.release(offset);
+        }
+        run.absorb(Run::new(&offsets(22..30), 80, ms(9)).expect("a run"))
+            .expect("fits");
+        assert_eq!((run.start, run.end), (12, 30));
+        assert_eq!(run.received, ms(5), "12 arrived with the second receive");
+        assert_eq!(run.merged, vec![(10, 4)]);
+        assert_eq!(run.gaps.ranges, vec![(20, 22)]);
+        assert_eq!(run.unreleased.len(), 16);
+        assert_eq!(
+            run.unreleased_bytes(),
+            160,
+            "8 of 10 of the second's, all of the third's"
+        );
+    }
+
+    /// Heap and inline bytes of a partition's hold.
+    fn footprint(hold: &PartitionHold) -> usize {
+        let offsets = |o: &Offsets| o.ranges.capacity() * std::mem::size_of::<(i64, i64)>();
+        std::mem::size_of::<PartitionHold>()
+            + hold.runs.capacity() * std::mem::size_of::<Run>()
+            + hold
+                .runs
+                .iter()
+                .map(|r| {
+                    offsets(&r.gaps)
+                        + offsets(&r.unreleased)
+                        + offsets(&r.withheld)
+                        + r.merged.capacity() * std::mem::size_of::<(u32, u32)>()
+                })
+                .sum::<usize>()
+            + offsets(&hold.stale)
+    }
+
+    /// An hour at 10k records/s on one partition, received 1000 at a time and
+    /// all held, as an archiver holds an open file's records. Then the same
+    /// hour released one receive behind, as a pipeline keeps a block in flight.
+    #[test]
+    fn an_hour_of_held_offsets_costs_kilobytes() {
+        const RECEIVES: i64 = 36_000;
+        const PER_RECEIVE: i64 = 1_000;
+        let mut held = PartitionHold::default();
+        let at = Instant::now();
+        for recv in 0..RECEIVES {
+            let offsets: Vec<i64> = (recv * PER_RECEIVE..(recv + 1) * PER_RECEIVE).collect();
+            let received =
+                at + std::time::Duration::from_millis(u64::try_from(recv * 100).expect("positive"));
+            held.register(Run::new(&offsets, 1_000_000, received).expect("a run"));
+        }
+        let all_held = footprint(&held);
+        let records = RECEIVES * PER_RECEIVE;
+        eprintln!(
+            "held: {records} offsets in {} run(s), {all_held} bytes, {:.4} bytes a record",
+            held.runs.len(),
+            all_held as f64 / records as f64
+        );
+        assert!(all_held < 1024 * 1024, "{all_held} bytes for an hour held");
+
+        let mut pipelined = PartitionHold::default();
+        for recv in 0..RECEIVES / 10 {
+            let offsets: Vec<i64> = (recv * PER_RECEIVE..(recv + 1) * PER_RECEIVE).collect();
+            pipelined.register(Run::new(&offsets, 1_000_000, at).expect("a run"));
+            for offset in (recv - 1).max(0) * PER_RECEIVE..recv * PER_RECEIVE {
+                pipelined.release(offset);
+            }
+            pipelined.commit_target();
+        }
+        let in_flight = footprint(&pipelined);
+        eprintln!("one receive in flight: {in_flight} bytes");
+        assert!(in_flight < 4096, "{in_flight} bytes with one receive held");
     }
 }
