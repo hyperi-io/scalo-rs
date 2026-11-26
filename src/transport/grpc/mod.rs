@@ -65,7 +65,7 @@
 pub mod batch;
 mod coalesce;
 pub mod config;
-pub(crate) mod pending;
+pub(crate) use super::pending;
 pub mod proto;
 mod tls_incoming;
 pub mod token;
@@ -608,7 +608,9 @@ impl GrpcTransportBuilder<'_> {
             armed: self.armed,
             // A quarter of the memory guard's limit, else a fixed default.
             max_held_bytes: self.max_held_bytes.unwrap_or_else(|| {
-                guard_limit.map_or(pending::DEFAULT_MAX_HELD_BYTES, |limit| (limit / 4).max(1))
+                guard_limit.map_or(super::ack::DEFAULT_MAX_HELD_BYTES, |limit| {
+                    (limit / 4).max(1)
+                })
             }),
             max_hold: self.max_hold,
             label: "grpc",
