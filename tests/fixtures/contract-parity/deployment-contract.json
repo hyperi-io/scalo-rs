@@ -251,7 +251,8 @@
           "description": "Broker list.",
           "example": [
             "broker:9092"
-          ]
+          ],
+          "schema_path": "source.brokers"
         },
         {
           "name": "password",
