@@ -301,13 +301,13 @@ mod tests {
     fn new_accepts_localhost_registry() {
         // The local-registry pattern (kind+registry:2) commonly uses
         // localhost:5000/<repo>.
-        let id = ContractIdentity::new(VALID_SHA, "localhost:5000/dfe-loader:test").unwrap();
-        assert_eq!(id.image_ref(), "localhost:5000/dfe-loader:test");
+        let id = ContractIdentity::new(VALID_SHA, "localhost:5000/event-loader:test").unwrap();
+        assert_eq!(id.image_ref(), "localhost:5000/event-loader:test");
     }
 
     #[test]
     fn new_accepts_digest_form() {
-        let digest_ref = format!("ghcr.io/hyperi-io/dfe-loader@sha256:{VALID_SHA}");
+        let digest_ref = format!("registry.example.com/team/event-loader@sha256:{VALID_SHA}");
         let id = ContractIdentity::new(VALID_SHA, digest_ref.clone()).unwrap();
         assert_eq!(id.image_ref(), digest_ref);
     }

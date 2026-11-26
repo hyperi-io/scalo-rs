@@ -12,7 +12,7 @@
 //! standardised metrics with BARE names (e.g. `buffer_bytes`). When the
 //! [`MetricsManager`](super::MetricsManager) has a non-empty namespace, the
 //! prefix layer on the global recorder and the manifest registry add a single
-//! `{namespace}_` prefix uniformly (e.g. `dfe_buffer_bytes`).
+//! `{namespace}_` prefix uniformly (e.g. `app_buffer_bytes`).
 //!
 //! Feature-gated behind `service-metrics`. Apps outside this pipeline shape are unaffected.
 //!

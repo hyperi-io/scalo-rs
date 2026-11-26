@@ -73,15 +73,15 @@ use scalo::deployment::{
 
 fn test_contract() -> DeploymentContract {
     DeploymentContract {
-        app_name: "hyperi-contract-test".into(),
-        binary_name: "hyperi-contract-test".into(),
+        app_name: "contract-test".into(),
+        binary_name: "contract-test".into(),
         description: "Throwaway test app for scalo contract e2e".into(),
         metrics_port: 9090,
         health: HealthContract::default(),
         env_prefix: "HCT".into(),
         metric_prefix: "hct".into(),
         config_mount_path: "/etc/hct/config.yaml".into(),
-        image_registry: "ghcr.io/hyperi-io".into(),
+        image_registry: "registry.example.com/team".into(),
         extra_ports: vec![],
         unbound_listen_paths: vec![],
         entrypoint_args: vec![],
@@ -110,7 +110,7 @@ fn test_contract() -> DeploymentContract {
 fn test_identity() -> ContractIdentity {
     ContractIdentity::new(
         "0123456789abcdef0123456789abcdef01234567",
-        "ghcr.io/hyperi-io/hyperi-contract-test:test",
+        "registry.example.com/team/contract-test:test",
     )
     .expect("fixture identity must validate")
 }
@@ -126,10 +126,10 @@ fn write_mock_binary(build_ctx: &Path, binary_name: &str) -> std::io::Result<()>
           # Mock binary for scalo contract-artefact e2e test.\n\
           # The real consumer's binary is replaced by this stub during testing.\n\
           if [ \"$1\" = \"--help\" ] || [ \"$1\" = \"-h\" ]; then\n\
-          \x20 echo \"hyperi-contract-test: ok\"\n\
+          \x20 echo \"contract-test: ok\"\n\
           \x20 exit 0\n\
           fi\n\
-          echo \"hyperi-contract-test: started (mock)\"\n\
+          echo \"contract-test: started (mock)\"\n\
           exit 0\n",
     )?;
     drop(f);
@@ -180,7 +180,7 @@ impl BuiltImage {
         .expect("write empty docker config");
 
         let tag = format!(
-            "hyperi-contract-test:e2e-{suffix}-{pid}",
+            "contract-test:e2e-{suffix}-{pid}",
             suffix = tag_suffix,
             pid = std::process::id(),
         );
@@ -280,7 +280,7 @@ fn tier_a_dockerfile_builds_and_image_runs() {
         "docker run failed: stdout={stdout} stderr={stderr}",
     );
     assert!(
-        stdout.contains("hyperi-contract-test: ok"),
+        stdout.contains("contract-test: ok"),
         "container ran but did not produce expected output: stdout={stdout} stderr={stderr}",
     );
     assert_runs_as_appuser(&image);

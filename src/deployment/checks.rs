@@ -639,7 +639,7 @@ mod tests {
             "app",
             "my-app",
             "a",
-            "dfe-receiver",
+            "event-receiver",
             "app2",
             "a--b",
             &"a".repeat(63),

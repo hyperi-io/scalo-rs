@@ -1218,7 +1218,7 @@ mod tests {
     fn test_config_filename() {
         let contract = DeploymentContract {
             app_name: "test".into(),
-            config_mount_path: "/etc/dfe/loader.yaml".into(),
+            config_mount_path: "/etc/event-loader/loader.yaml".into(),
             metrics_port: 9090,
             health: HealthContract::default(),
             env_prefix: "T".into(),
@@ -1250,7 +1250,7 @@ mod tests {
             openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
-        assert_eq!(contract.config_dir(), "/etc/dfe");
+        assert_eq!(contract.config_dir(), "/etc/event-loader");
     }
 
     /// A contract with KEDA on and the given `default_config`.

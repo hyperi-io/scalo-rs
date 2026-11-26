@@ -494,8 +494,8 @@ mod tests {
         let exclude =
             compile_patterns(&crate::transport::KafkaConfig::default().topic_exclude).unwrap();
         for dropped in [
-            "dfe_loader_dlq",
-            "dfe_transform_dlq",
+            "event_loader_dlq",
+            "event_transform_dlq",
             "__consumer_offsets",
             "strimzi.cruisecontrol.metrics",
             "strimzi.cruisecontrol.partitionmetricsamples",

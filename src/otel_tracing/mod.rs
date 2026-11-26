@@ -326,7 +326,7 @@ const SELF_TELEMETRY_TARGETS: [&str; 8] = [
 ///
 /// Matches a target exactly or as a module prefix (`hyper::client::...`),
 /// never a bare `starts_with`, which would also swallow an app's own
-/// `hyperion` target.
+/// `hyperspace` target.
 fn is_self_telemetry(target: &str) -> bool {
     SELF_TELEMETRY_TARGETS.iter().any(|crate_name| {
         target
@@ -516,12 +516,12 @@ mod tests {
     fn app_targets_that_merely_share_a_prefix_are_still_exported() {
         // A bare `starts_with` would swallow all of these.
         for target in [
-            "hyperion",
-            "hyperi_thing::worker",
+            "hyperspace",
+            "other_app::worker",
             "towerbridge",
             "h2o",
             "reqwest_middleware_of_ours",
-            "dfe_receiver::ingest",
+            "event_receiver::ingest",
         ] {
             assert!(
                 !is_self_telemetry(target),

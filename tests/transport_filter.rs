@@ -460,7 +460,7 @@ fn sample_data_nested_cloud_event() {
 }
 
 #[test]
-fn sample_data_dfe_loader_routing() {
+fn sample_data_event_loader_routing() {
     // Loader uses _table field for routing -- filter out internal tables
     let engine = TransportFilterEngine::new(
         &[FilterRule {

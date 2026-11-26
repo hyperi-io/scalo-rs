@@ -547,7 +547,7 @@ mod tests {
             env_prefix: "DEMO".into(),
             metric_prefix: "demo".into(),
             config_mount_path: "/etc/demo/demo.yaml".into(),
-            image_registry: "ghcr.io/hyperi-io".into(),
+            image_registry: "registry.example.com/team".into(),
             extra_ports: vec![],
             unbound_listen_paths: vec![],
             entrypoint_args: vec![],

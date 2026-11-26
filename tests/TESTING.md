@@ -30,7 +30,7 @@ Full adds the rest of the real-broker tests (`kafka_send_batch`, `kafka_recv_run
 | Kafka | `apache/kafka` | 9092 PLAINTEXT |
 | OpenBao | `openbao/openbao` | 8200, dev mode, root token `root` |
 
-The Kafka pin is `transport::kafka::test_support::KAFKA_IMAGE`, the line the DFE stack deploys. The OpenBao pin lives in `tests/common/openbao.rs`.
+The Kafka pin is `transport::kafka::test_support::KAFKA_IMAGE`, the line the tests pin. The OpenBao pin lives in `tests/common/openbao.rs`.
 
 `deployment::test_support::shared_service` gives every test process in a run the same container per service, the way it does for every consumer of scalo's test support:
 

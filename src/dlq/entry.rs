@@ -29,7 +29,7 @@ const JSON_WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
 /// This envelope is backend-agnostic -- it carries the original payload
 /// plus metadata about why and where the failure occurred.
 ///
-/// It is written as a DFE event. A payload that is one whole JSON object, nested no deeper than 63 levels, goes under `_json` as itself, with its `_org_id`, `_source`, `_timestamp_received` and `_tags` copied beside it. Any other payload goes under `_raw`: valid UTF-8 as text unless escaping would make it longer than base64, binary or truncated bytes as base64 with `_raw_encoding: "base64"`. A deeper object keeps its header and adds `_raw_reason: "depth"`.
+/// It is written as an event with a common header. A payload that is one whole JSON object, nested no deeper than 63 levels, goes under `_json` as itself, with its `_org_id`, `_source`, `_timestamp_received` and `_tags` copied beside it. Any other payload goes under `_raw`: valid UTF-8 as text unless escaping would make it longer than base64, binary or truncated bytes as base64 with `_raw_encoding: "base64"`. A deeper object keeps its header and adds `_raw_reason: "depth"`.
 #[derive(Debug, Clone)]
 pub struct DlqEntry {
     /// When the failure occurred (epoch milliseconds).
@@ -79,7 +79,7 @@ pub struct DlqSource {
     pub offset: Option<i64>,
 }
 
-/// The DFE common-header fields an entry copies from its original event, as written there.
+/// The common-header fields an entry copies from its original event, as written there.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Header {
     #[serde(default, rename = "_org_id")]
