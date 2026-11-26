@@ -35,9 +35,10 @@ mod record;
 #[cfg(test)]
 mod tests;
 
+pub use crate::transport::TIME_UNIX_NANO_HEADER;
 pub use config::{OTLP_ACCEPTS, OtlpConfig, OtlpProtocol};
 pub use metrics::OtlpMetricExporter;
-pub use record::{SEVERITY_HEADER, TIME_UNIX_NANO_HEADER};
+pub use record::SEVERITY_HEADER;
 
 use std::time::{Duration, Instant};
 

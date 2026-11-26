@@ -57,7 +57,7 @@ RFC 3164:
 ```
 
 - PRI is `facility * 8 + severity`, from config for every message.
-- The time is the record's timestamp, else the send time. RFC 5424 writes it in UTC to the microsecond, RFC 3164 in the host's zone to the second. A record's timestamp is in milliseconds, so the last three digits are `000`.
+- The time is the record's `time_unix_nano` header, else its timestamp, else the send time. RFC 5424 writes it in UTC to the microsecond, RFC 3164 in the host's zone to the second. The header is decimal nanoseconds since the epoch, the same one the OTLP sender reads ([otlp.md](otlp.md)), and is floored to the microsecond, never rounded. A header that is not digits in a `u64` is ignored. A record's timestamp is in milliseconds, so without the header the last three digits are `000`. The header name is `TIME_UNIX_NANO_HEADER` in `scalo::transport`.
 - HOSTNAME, APP-NAME and PROCID come from config. Unset, they are the machine's host name, the executable's name and the process id. RFC 3164 keeps letters, digits, `-`, `_` and `.` in the tag, up to 32.
 - MSGID is the record's key, else `msg_id`, else `-`. `send(destination, payload)` uses the destination.
 - `hostname_header` and `msg_id_header` take HOSTNAME and MSGID from each record instead: the value of the record header they name. A record without that header gets `-`, never the configured value or the machine's host name. RFC 3164 has no MSGID, so it reads `hostname_header` only.
