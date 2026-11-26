@@ -298,6 +298,7 @@ The OTLP resource names the replica, so each pod of a service writes its own ser
 | `start_server(addr)` / `start_server_with_routes(addr, extra)` | Built-in router / merge service routes |
 | `shutdown_otel()` | Flush OTLP push, and stop the gauge refresh when no server runs |
 | `ServiceMetrics::register(&mgr)` | Canonical data-plane metric set (feature `metrics` or `otel-metrics`) |
+| `groups::UsageMetrics::record(org, bytes)` | `usage_ingested_bytes_total{org_id}`, once per org per settled batch (feature `service-metrics`, group `usage`) |
 | `latency_buckets()` / `size_buckets()` | Standard histogram bucket presets |
 
 ---

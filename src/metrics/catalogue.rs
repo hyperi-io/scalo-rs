@@ -556,6 +556,15 @@ fn kafka(registry: &MetricRegistry) {
     );
     #[cfg(all(feature = "service-metrics", feature = "metrics"))]
     registry.describe("consumer", &super::groups::consumer_series());
+    #[cfg(feature = "service-metrics")]
+    registry.describe(
+        "usage",
+        &[Series::counter(
+            "usage_ingested_bytes_total",
+            "Payload bytes accepted for delivery, by the org each record was stamped with",
+        )
+        .labels(&["org_id"])],
+    );
 }
 
 #[cfg(feature = "transport-syslog")]
