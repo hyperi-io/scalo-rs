@@ -323,6 +323,12 @@ impl Sender {
             )
             .map(|(url, auth)| Target::new(url, auth.unwrap_or(&config.auth)))
             .collect::<TransportResult<Vec<Target>>>()?;
+        if config.framing.framing_type == super::JSON_FRAMING {
+            return Err(TransportError::Config(format!(
+                "HTTP body framing: `{}` is receive-only: send with json_array or ndjson",
+                super::JSON_FRAMING
+            )));
+        }
         let framing = config
             .framing
             .build()

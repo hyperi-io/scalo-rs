@@ -423,12 +423,13 @@ transport:
       # OR for receive:
       listen: "0.0.0.0:8080"
       recv_path: "/ingest"
-      recv_buffer_size: 10000
+      recv_buffer_size: 10000       # requests queued, each with all its records
       max_body_bytes: 16777216      # one request's body, 413 above it
       max_in_flight_bytes: 67108864 # bodies read and queued at once
 ```
 
-- Admission: a POST is checked before its body is read. A held governor answers 503, then the request reserves its declared `Content-Length` (or `max_body_bytes` without one) from `max_in_flight_bytes`, and answers 503 with `Retry-After: 1` when that does not fit. The bytes stay reserved while the record is queued and come back as `recv` hands it over, so bodies read and queued never exceed `max_in_flight_bytes`. A declared length over `max_body_bytes` is 413 at once. `max_in_flight_bytes` below `max_body_bytes` is refused at construction.
+- Admission: a POST is checked before its body is read. A held governor answers 503, then the request reserves its declared `Content-Length` (or `max_body_bytes` without one) from `max_in_flight_bytes`, and answers 503 with `Retry-After: 1` when that does not fit. The bytes stay reserved while the body's records are queued and come back as `recv` takes the last one, so bodies read and queued never exceed `max_in_flight_bytes`.
+- Body framing: `framing` splits each body into records, and `json` takes an array or NDJSON on one path, see [http.md](http.md#receiving-body-framing). A declared length over `max_body_bytes` is 413 at once. `max_in_flight_bytes` below `max_body_bytes` is refused at construction.
 - Content-Encoding: none or `identity` queues the body as it came. `gzip` and `zstd` are decoded through [`scalo::compression`](../compression.md) before the record is queued, to at most `max_body_bytes`: past that is 413, and bytes that do not decode are 400. Decoding reserves `max_body_bytes` more from `max_in_flight_bytes` for its output, answering 503 when that does not fit, and the record then holds its decoded size. Any other coding, or a list of codings, is 415 before the body is read. Nothing refused is queued.
 
 - Client TLS: the `tls` section ([../api/tls.md](../api/tls.md#client-trust)), with `pin_sha256` for key pins. Unset, it is `strong` with `native` trust. `server_name` is refused: the endpoint's host is the name checked.
@@ -436,7 +437,7 @@ transport:
   cancels the in-flight request. Receive drains from an internal
   mpsc, drop-safe.
 - Sending: credentials, headers, body framing, compression, failover, proxy, redirects and what each status answers are in [http.md](http.md). A refused, reset or timed-out connection, 408, 429 and every 5xx are retried. 400, 413 and 422 are `Reject`. Any other 3xx or 4xx is `Fatal(Config)`, which a tiered sink's drain keeps spooled until the sink is fixed.
-- Acknowledgement: the server answers 200 once the record is queued for `recv`, not once the consumer reads it, so a crash loses what it answered but had not delivered. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`. It does not hold its answer: `<key>.http.acknowledgements` has no effect, and the factory warns once. An endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#a-hand-rolled-loop)).
+- Acknowledgement: the server answers 200 once the body's records are queued for `recv`, not once the consumer reads them, so a crash loses what it answered but had not delivered. A full queue (`recv_buffer_size`), a held inbound gate, and a closed receiver answer 503 with `Retry-After: 1`. It does not hold its answer: `<key>.http.acknowledgements` has no effect, and the factory warns once. An endpoint that must answer only once its records are delivered is an app's own listener over `Tickets` ([../pipeline/acknowledgements.md](../pipeline/acknowledgements.md#a-hand-rolled-loop)).
 - `close()`: answers new POSTs with 503, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Open connections finish their in-flight requests on their own, the listener is free when `close()` returns, and a client that never finishes its request does not hold it open. Dropping the transport stops the server too.
 - Shutdown order: `close()`, then `recv` until `Closed`, then flush. The `BatchEngine` run loops do this at shutdown ([../pipeline/batch-engine.md](../pipeline/batch-engine.md#shutdown)). Flushing first loses the records still queued.
 - Counters: receipts count in `transport_received_*`, never in `transport_sent_total`.

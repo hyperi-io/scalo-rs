@@ -20,6 +20,18 @@ A record's `timestamp_ms` is the Kafka message timestamp, so a record read from 
 
 **Consumer adjustment** -- a `DecodeLimits` struct literal sets `max_records`, to `DecodeLimits::DEFAULT_MAX_RECORDS` for input from outside, or ends in `..DecodeLimits::UNBOUNDED`. A caller that answers the sender maps `TooManyRecords` to a refusal it retries smaller, such as HTTP 413.
 
+### The HTTP receive side splits a body by `framing` (BEHAVIOUR CHANGE)
+
+A receiving `HttpTransport` reads `framing`, which only the send side read. `single`, the default, keeps one record per body. `json_array`, `ndjson` and any other framing split a body into records, slices of it, queued together. `json` takes a JSON array or NDJSON on one path, and a sender refuses it. A body of more than 100000 records is answered 413 naming the cap. An unknown framing name fails the build where a receive-only transport ignored it. `recv_buffer_size` counts requests, each with all its records, and each split record reserves its queued message's memory from `max_in_flight_bytes`. The rules are in [transport/http.md](transport/http.md#receiving-body-framing).
+
+**Consumer adjustment** -- a receiver whose config sets `framing` for its send side gets bodies split by it. One that must keep a body as one record sets `framing: { type: single }`. An app's own framing is registered before a receiver naming it is built.
+
+### `WorkBatch::from_ndjson` and `from_json_array` take `DecodeLimits` (API CHANGE)
+
+Both take `&DecodeLimits` after the blob. `from_ndjson` returns `Result<WorkBatch<T>, FramingError>`, as `from_json_array` does, where it returned a batch that was empty when the blob did not decode. A record over `max_record_bytes` is a `dlq_entries` entry holding its first `max_record_bytes`.
+
+**Consumer adjustment** -- pass `&DecodeLimits::UNBOUNDED` for a blob this process wrote, or limits with `max_records: DecodeLimits::DEFAULT_MAX_RECORDS` for one from outside. Handle the error from `from_ndjson`, and route `dlq_entries`.
+
 ### The syslog receiver caps connections and closes silent ones (API and BEHAVIOUR CHANGE)
 
 `SyslogListenConfig` has public `first_byte_timeout_ms`, `max_connections` and `ip_filter` fields. A TCP or TLS connection that sends nothing for 30 s is closed, and one past 10000 open on a listener is closed as it is accepted. `ip_filter` is off by default. `transport-syslog` pulls `concurrency`, `quinn-udp`, `ipnet` and `ipnet-trie`.

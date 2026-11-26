@@ -2,7 +2,7 @@
 
 A framing says where one encoded record ends and the next begins in a unit that holds many: an HTTP body, a file, a message, a TCP stream. It sits after the record codec. Records reach it as bytes, and it never looks inside one.
 
-Everything in scalo that puts many records in one unit goes through `scalo::framing`: the file and pipe transports, the file output, the DLQ's file and HTTP backends, and `WorkBatch::from_ndjson` and `from_json_array`.
+Everything in scalo that puts many records in one unit goes through `scalo::framing`: the file and pipe transports, the HTTP transport's send and receive sides, the file output, the DLQ's file and HTTP backends, and `WorkBatch::from_ndjson` and `from_json_array`. Those two take a `DecodeLimits`, and return a record over `max_record_bytes` as a dead letter holding its first `max_record_bytes`.
 
 | `type` | One unit | Content type | Appends | Streams |
 | --- | --- | --- | --- | --- |
@@ -91,7 +91,12 @@ impl Framing for RecordSeparated {
     }
     fn decode<'a>(&self, unit: &'a [u8], limits: &DecodeLimits) -> Result<Decoded<'a>, FramingError> {
         limits.check(unit)?;
-        let records = unit.split(|&b| b == 0x1e).filter(|r| !r.is_empty());
+        let records: Vec<&[u8]> = unit
+            .split(|&b| b == 0x1e)
+            .filter(|r| !r.is_empty())
+            .enumerate()
+            .map(|(held, r)| limits.check_records(held).map(|()| r))
+            .collect::<Result<_, _>>()?;
         Ok(Decoded::from_records(records, limits))
     }
 }
