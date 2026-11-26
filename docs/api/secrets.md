@@ -62,6 +62,8 @@ syntax instead of each hand-rolling its own env/vault lookup:
 | `env:VAR` | the environment variable `VAR` (hard error if unset) |
 | anything else | the literal string |
 
+Every `aws:` lookup in a process shares one AWS client for each region and endpoint pair, so the SDK config loads once rather than once per spec. Each `vault:` lookup builds its connection afresh, so a rotated `~/.vault-token` is read by the next lookup. Neither caches the value it reads.
+
 ```rust
 use scalo::secrets::resolve;
 

@@ -19,6 +19,11 @@ use super::error::{SecretsError, SecretsResult};
 use super::provider::SecretProvider;
 use super::types::{SecretMetadata, SecretValue};
 
+/// The endpoint of each `AwsProvider::new` call, so a test can count constructions.
+#[cfg(test)]
+pub(crate) static CONSTRUCTIONS: parking_lot::Mutex<Vec<Option<String>>> =
+    parking_lot::Mutex::new(Vec::new());
+
 /// AWS Secrets Manager configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -99,6 +104,10 @@ impl AwsProvider {
     ///
     /// Returns an error if the AWS client cannot be initialized.
     pub fn new(config: &AwsConfig) -> SecretsResult<Self> {
+        #[cfg(test)]
+        {
+            CONSTRUCTIONS.lock().push(config.endpoint_url.clone());
+        }
         // The AWS config is loaded by blocking on the current runtime.
         let rt = tokio::runtime::Handle::try_current()
             .map_err(|e| SecretsError::ConfigError(format!("tokio runtime required: {e}")))?;
