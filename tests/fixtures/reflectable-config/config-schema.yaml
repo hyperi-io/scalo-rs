@@ -1,0 +1,63 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+title: ExampleConfig
+description: Example app configuration.
+type: object
+properties:
+  store:
+    description: The record store the app writes to.
+    $ref: "#/$defs/StoreConfig"
+required:
+- store
+$defs:
+  StoreConfig:
+    description: How the app reaches its store.
+    type: object
+    properties:
+      host:
+        description: Store host name.
+        type: string
+      protocol:
+        description: Wire protocol to the store.
+        $ref: "#/$defs/Protocol"
+      codec:
+        description: Codec for each batch. Unset sends batches uncompressed.
+        anyOf:
+        - $ref: "#/$defs/Codec"
+        - type: "null"
+      tls:
+        description: TLS to the store.
+        $ref: "#/$defs/TlsConfig"
+    required:
+    - host
+    - protocol
+    - tls
+  Protocol:
+    description: Wire protocol.
+    type: string
+    enum:
+    - http
+    - native
+  Codec:
+    description: Batch codec.
+    type: string
+    enum:
+    - gzip
+    - zstd
+  TlsConfig:
+    description: TLS settings.
+    type: object
+    properties:
+      mode:
+        description: Whether the server certificate is checked.
+        $ref: "#/$defs/TlsMode"
+    required:
+    - mode
+  TlsMode:
+    description: TLS mode.
+    oneOf:
+    - description: Plain TCP.
+      type: string
+      const: "off"
+    - description: TLS with the server certificate checked.
+      type: string
+      const: verify

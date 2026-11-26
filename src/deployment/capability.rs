@@ -155,7 +155,7 @@ impl Capability {
 }
 
 /// A single config field within a [`Capability`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
 pub struct FieldSpec {
     /// Field name.
@@ -189,6 +189,12 @@ pub struct FieldSpec {
     /// Example value. Omitted when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub example: Option<serde_json::Value>,
+
+    /// Dotted path of the config option this field describes, in the app's
+    /// config schema (`store.protocol`). The drift check resolves it, and a
+    /// field with `enum_values` needs one. Omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_path: Option<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -209,6 +215,7 @@ impl FieldSpec {
             secret: false,
             enum_values: Vec::new(),
             example: None,
+            schema_path: None,
         }
     }
 
@@ -313,6 +320,13 @@ impl FieldSpec {
         self.example = Some(value.into());
         self
     }
+
+    /// Set the dotted path of the config option this field describes.
+    #[must_use]
+    pub fn schema_path(mut self, path: impl Into<String>) -> Self {
+        self.schema_path = Some(path.into());
+        self
+    }
 }
 
 /// The type of a [`FieldSpec`]. Serialised lower-snake-case.
@@ -373,8 +387,8 @@ mod tests {
     fn empty_and_default_fields_are_omitted() {
         // A plain, non-secret, non-required string field with no default:
         // name/type/required/description are always present (core catalog
-        // fields). secret/default/example/enum_values are omitted for a clean,
-        // deterministic catalog.
+        // fields). secret/default/example/enum_values/schema_path are omitted
+        // for a clean, deterministic catalog.
         let f = FieldSpec::string("region");
         let v = serde_json::to_value(&f).unwrap();
         let obj = v.as_object().unwrap();
@@ -387,6 +401,7 @@ mod tests {
         assert!(!obj.contains_key("default"));
         assert!(!obj.contains_key("enum_values"));
         assert!(!obj.contains_key("example"));
+        assert!(!obj.contains_key("schema_path"));
     }
 
     #[test]
@@ -423,9 +438,20 @@ mod tests {
     fn catalog_round_trips_through_json() {
         let cap = Capability::source("okta")
             .field(FieldSpec::secret("token").description("SSWS token."))
-            .field(FieldSpec::enumeration("include", ["all", "web", "git"]));
+            .field(
+                FieldSpec::enumeration("include", ["all", "web", "git"])
+                    .schema_path("okta.include"),
+            )
+            .field(FieldSpec {
+                name: "region".into(),
+                schema_path: Some("okta.region".into()),
+                ..FieldSpec::default()
+            });
         let json = serde_json::to_string(&cap).unwrap();
         let back: Capability = serde_json::from_str(&json).unwrap();
         assert_eq!(cap, back);
+        let v = serde_json::to_value(&cap).unwrap();
+        assert_eq!(v["fields"][1]["schema_path"], "okta.include");
+        assert_eq!(v["fields"][2]["type"], "string");
     }
 }

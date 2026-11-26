@@ -127,8 +127,8 @@ pub use dials::{DIAL_KEYWORD, DIAL_TIERS, DialError, dials};
 #[cfg(feature = "config-schema")]
 pub use emit::config_schema_json;
 pub use emit::{
-    assert_listeners_declared, assert_no_config_artifact_drift, check_config_artifact_drift,
-    emit_config_artifacts,
+    assert_listeners_declared, assert_no_config_artifact_drift, check_catalogue_against_schema,
+    check_config_artifact_drift, emit_config_artifacts,
 };
 pub use error::{ContractMismatch, DeploymentError};
 pub use generate::{

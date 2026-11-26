@@ -787,6 +787,13 @@
         },
         "example": {
           "description": "Example value. Omitted when absent."
+        },
+        "schema_path": {
+          "description": "Dotted path of the config option this field describes, in the app's\nconfig schema (`store.protocol`). The drift check resolves it, and a\nfield with `enum_values` needs one. Omitted when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

@@ -176,7 +176,8 @@ fn parity_contract() -> DeploymentContract {
                     FieldSpec::string("brokers")
                         .required()
                         .description("Broker list.")
-                        .example(serde_json::json!(["broker:9092"])),
+                        .example(serde_json::json!(["broker:9092"]))
+                        .schema_path("source.brokers"),
                 )
                 .field(FieldSpec::secret("password").description("Broker password."))
                 .field(
@@ -259,6 +260,7 @@ fn contract_parity_fixture_carries_every_optional_key() {
         "/capabilities/0/maturity",
         "/capabilities/0/children",
         "/capabilities/0/fields/0/example",
+        "/capabilities/0/fields/0/schema_path",
         "/capabilities/0/fields/1/secret",
         "/capabilities/0/fields/2/default",
         "/capabilities/0/fields/2/enum_values",

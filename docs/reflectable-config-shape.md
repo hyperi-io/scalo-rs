@@ -72,6 +72,7 @@ FieldSpec {
   secret: bool             # true => also x-scalo-secret in the schema; UI masks, engine routes via the secrets store
   enum_values: string[]    # allowed values for type=enum; omitted when empty
   example: any | null      # omitted when null
+  schema_path: string | null  # dotted path of the option in config-schema; omitted when null
 }
 
 FieldType (lower_snake_case string):
@@ -83,10 +84,29 @@ Serialisation rules (identical in both languages):
 - `type` is the JSON key for a `FieldSpec`'s field type (Rust `#[serde(rename =
   "type")]`, Python field alias `type`).
 - Empty `fields`, `children`, `enum_values` are OMITTED (not `[]`).
-- `null` `maturity`, `default`, `example` are OMITTED, and so is `secret` when false.
+- `null` `maturity`, `default`, `example`, `schema_path` are OMITTED, and so is `secret` when false.
 - Field order = declaration order. Rust uses schemars `preserve_order` +
   serde_json preserve-order, and Python relies on pydantic/dict insertion order. So
   running twice yields byte-identical output.
+
+## Joining the catalogue to the schema
+
+A catalogue field that describes a config option names it in `schema_path`, the dotted path of property names from the schema root. A consumer joins the two halves on it, to put a field's `enum_values` on the schema option it belongs to. The catalogue `name` stays free-form, because it is often runtime data (a source type like `aws`).
+
+A path resolves one segment at a time. Each segment is looked up in the node's `properties`. Where that misses, the lookup follows the node's `$ref` and then each arm of `allOf`, `anyOf` and `oneOf`, first match wins. A `$ref` is a `#` JSON pointer into the same document (`#/$defs/Name`, `#/definitions/Name`). That covers a nested struct, an `Option<T>` (`anyOf: [T, {"type": "null"}]`) and a flattened struct. A path never steps into `items` or `additionalProperties`, so array elements and map values have no address.
+
+The values an option allows are its `enum` or its `const`, behind any `$ref`, the union of its `anyOf` / `oneOf` arms or the intersection of its `allOf` arms, `null` left out. A Rust enum emits `enum` when its variants are undocumented and `oneOf` of `const` when they are documented, and both count. One arm with no closed set makes the option open.
+
+The drift check fails, one line per field, when:
+
+- `schema_path` names no option in `config_schema`
+- `schema_path` is set and the contract has no `config_schema`
+- `enum_values` is set and `schema_path` isn't
+- `enum_values` is set and the option is open, or allows a different set (order is not compared)
+
+A field with neither key isn't checked: a knob read from a free-form map has no schema option to name. Rust runs this as `check_catalogue_against_schema`.
+
+`tests/fixtures/reflectable-config/` is a reference pair emitted from a small config: an undocumented enum (`enum`), a documented enum (`oneOf` of `const`), an `Option` of an enum and a nested struct, with every catalogue field joined.
 
 ## Secret marker
 
@@ -210,6 +230,7 @@ A consumer that does not read them ignores them.
 
 Emission is deterministic (stable field order, no timestamps). Each app commits
 the four files and a `#[test]` (Rust) / test (Python) regenerates them and asserts
-byte-equality with the committed copies -- drift fails the normal test job. The
+byte-equality with the committed copies -- drift fails the normal test job, and so
+does a catalogue that disagrees with the schema (see the join above). The
 schema must round-trip the app's own `Config::default()` (the emitted schema
 validates the struct it claims to describe).

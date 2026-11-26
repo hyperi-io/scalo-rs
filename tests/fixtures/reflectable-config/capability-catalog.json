@@ -1,0 +1,59 @@
+[
+  {
+    "kind": "sink",
+    "name": "store",
+    "description": "Writes records to a store.",
+    "maturity": "stable",
+    "fields": [
+      {
+        "name": "host",
+        "type": "string",
+        "required": true,
+        "description": "Store host name.",
+        "schema_path": "store.host"
+      },
+      {
+        "name": "protocol",
+        "type": "enum",
+        "required": true,
+        "description": "Wire protocol to the store.",
+        "enum_values": [
+          "http",
+          "native"
+        ],
+        "schema_path": "store.protocol"
+      },
+      {
+        "name": "codec",
+        "type": "enum",
+        "required": false,
+        "description": "Codec for each batch. Unset sends batches uncompressed.",
+        "enum_values": [
+          "gzip",
+          "zstd"
+        ],
+        "schema_path": "store.codec"
+      }
+    ],
+    "children": [
+      {
+        "kind": "service",
+        "name": "tls",
+        "description": "TLS to the store.",
+        "fields": [
+          {
+            "name": "mode",
+            "type": "enum",
+            "required": true,
+            "description": "Whether the server certificate is checked.",
+            "enum_values": [
+              "off",
+              "verify"
+            ],
+            "schema_path": "store.tls.mode"
+          }
+        ]
+      }
+    ]
+  }
+]

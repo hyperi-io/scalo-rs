@@ -23,16 +23,22 @@
 //!
 //! Output is deterministic (stable field order, no timestamps) so a committed
 //! copy can be drift-checked against a fresh regeneration -- see
-//! [`assert_no_config_artifact_drift`]. See `docs/reflectable-config-shape.md`
+//! [`assert_no_config_artifact_drift`]. The same check fails when the
+//! catalogue and the schema disagree on an option's address or values -- see
+//! [`check_catalogue_against_schema`]. See `docs/reflectable-config-shape.md`
 //! for the cross-language shape shared with scalo-py.
 //!
 //! [`assert_listeners_declared`] checks the contract's listeners against its
 //! ports.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use super::DeploymentContract;
+use serde_json::Value;
+
+use super::dials::pointer;
 use super::error::DeploymentError;
+use super::{Capability, DeploymentContract, FieldSpec};
 
 /// Derive a JSON Schema (draft 2020-12) for a config type via schemars.
 ///
@@ -141,7 +147,8 @@ pub fn emit_config_artifacts(
 }
 
 /// Check that the committed config artefacts under `dir` match a fresh
-/// regeneration from `contract` (no drift).
+/// regeneration from `contract` (no drift), and that the contract's catalogue
+/// agrees with its schema.
 ///
 /// Use in a downstream app's test suite so the normal `test` job fails if the
 /// checked-in `config-schema.*` / `capability-catalog.*` drift from the app's current
@@ -150,13 +157,30 @@ pub fn emit_config_artifacts(
 ///
 /// # Errors
 ///
-/// Returns [`DeploymentError::Drift`] if a committed file is missing or its
-/// bytes differ. Other [`DeploymentError`] variants on read/serialise failure.
+/// Returns [`DeploymentError::Drift`] if [`check_catalogue_against_schema`]
+/// finds anything, or a committed file is missing or its bytes differ. Other
+/// [`DeploymentError`] variants on read/serialise failure.
 pub fn check_config_artifact_drift(
     contract: &DeploymentContract,
     dir: impl AsRef<Path>,
 ) -> Result<(), DeploymentError> {
     let dir = dir.as_ref();
+    let findings = check_catalogue_against_schema(contract);
+    if !findings.is_empty() {
+        let lines: Vec<String> = findings.iter().map(|f| format!("  {f}")).collect();
+        return Err(DeploymentError::Drift {
+            path: dir.join("capability-catalog.json").display().to_string(),
+            detail: format!(
+                "the capability catalogue and the config schema disagree. Set each field's \
+                 schema_path to the dotted path of the config option it describes, and make \
+                 a closed-set option an enum in the Config so the schema allows exactly the \
+                 field's enum_values. Then run `<app> config-schema --dir {}` and commit the \
+                 result.\n{}",
+                dir.display(),
+                lines.join("\n")
+            ),
+        });
+    }
     let artefacts = render(contract)?;
     for artefact in artefacts {
         let path = dir.join(artefact.name);
@@ -205,6 +229,202 @@ pub fn assert_no_config_artifact_drift(contract: &DeploymentContract, dir: impl 
     if let Err(e) = check_config_artifact_drift(contract, dir) {
         panic!("{e}");
     }
+}
+
+/// How many `$ref` and `allOf` / `anyOf` / `oneOf` steps one lookup takes
+/// before it gives up, so definitions that refer to each other can't loop.
+const MAX_SCHEMA_DEPTH: usize = 32;
+
+/// Check every catalogue field against the config option it describes.
+///
+/// A field's [`FieldSpec::schema_path`] must name an option in
+/// `contract.config_schema`. A field with [`FieldSpec::enum_values`] needs a
+/// `schema_path`, and that option must allow the same set of values, as
+/// `enum` or `const`. A field with neither isn't checked. Walks every
+/// capability and its children. `docs/reflectable-config-shape.md` has the
+/// rules a path resolves by.
+///
+/// Returns one line per finding, in catalogue order. Empty when the two agree.
+#[must_use]
+pub fn check_catalogue_against_schema(contract: &DeploymentContract) -> Vec<String> {
+    let mut findings = Vec::new();
+    for capability in &contract.capabilities {
+        check_capability(
+            contract.config_schema.as_ref(),
+            capability,
+            "",
+            &mut findings,
+        );
+    }
+    findings
+}
+
+/// Push a finding for each field of `capability` and its children that
+/// disagrees with `schema`. `parent` is the slash-joined names above it.
+fn check_capability(
+    schema: Option<&Value>,
+    capability: &Capability,
+    parent: &str,
+    findings: &mut Vec<String>,
+) {
+    let location = if parent.is_empty() {
+        capability.name.clone()
+    } else {
+        format!("{parent}/{}", capability.name)
+    };
+    for field in &capability.fields {
+        if let Some(finding) = check_field(schema, field) {
+            findings.push(format!(
+                "capability {location}, field {}: {finding}",
+                field.name
+            ));
+        }
+    }
+    for child in &capability.children {
+        check_capability(schema, child, &location, findings);
+    }
+}
+
+/// What disagrees between `field` and `schema`, if anything.
+fn check_field(schema: Option<&Value>, field: &FieldSpec) -> Option<String> {
+    let want: BTreeSet<String> = field.enum_values.iter().cloned().collect();
+    let Some(path) = field.schema_path.as_deref() else {
+        return (!want.is_empty()).then(|| {
+            format!(
+                "enum_values {} but no schema_path, so the schema can't be checked to allow them",
+                listed(&want)
+            )
+        });
+    };
+    let Some(root) = schema else {
+        return Some(format!(
+            "schema_path \"{path}\" is set but the contract has no config_schema"
+        ));
+    };
+    let node = match resolve_path(root, path) {
+        Ok(node) => node,
+        Err(reason) => {
+            return Some(format!(
+                "schema_path \"{path}\" names no option in the config schema ({reason})"
+            ));
+        }
+    };
+    if want.is_empty() {
+        return None;
+    }
+    match closed_set(root, node, 0) {
+        None => Some(format!(
+            "enum_values {} but \"{path}\" in the schema has no enum",
+            listed(&want)
+        )),
+        Some(have) if have == want => None,
+        Some(have) => Some(format!(
+            "enum_values {} but \"{path}\" in the schema allows {}",
+            listed(&want),
+            listed(&have)
+        )),
+    }
+}
+
+/// `values` as a bracketed list of quoted strings.
+fn listed(values: &BTreeSet<String>) -> String {
+    let values: Vec<&String> = values.iter().collect();
+    format!("{values:?}")
+}
+
+/// The schema node at dotted `path` under `root`, or why there is none.
+fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<&'a Value, String> {
+    let mut node = root;
+    let mut walked = String::new();
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return Err("the path has an empty segment".to_string());
+        }
+        node = property(root, node, segment, 0).ok_or_else(|| {
+            if walked.is_empty() {
+                format!("no \"{segment}\" at the top level")
+            } else {
+                format!("no \"{segment}\" under \"{walked}\"")
+            }
+        })?;
+        if !walked.is_empty() {
+            walked.push('.');
+        }
+        walked.push_str(segment);
+    }
+    Ok(node)
+}
+
+/// The subschema of property `name` on `node`, looked up through `$ref` and
+/// every `allOf` / `anyOf` / `oneOf` arm.
+fn property<'a>(root: &'a Value, node: &'a Value, name: &str, depth: usize) -> Option<&'a Value> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return None;
+    }
+    if let Some(found) = node.get("properties").and_then(|p| p.get(name)) {
+        return Some(found);
+    }
+    if let Some(found) =
+        follow_ref(root, node).and_then(|target| property(root, target, name, depth + 1))
+    {
+        return Some(found);
+    }
+    ["allOf", "anyOf", "oneOf"]
+        .iter()
+        .filter_map(|key| node.get(*key).and_then(Value::as_array))
+        .flatten()
+        .find_map(|arm| property(root, arm, name, depth + 1))
+}
+
+/// The closed set of values `node` allows, from `enum` or `const`, through
+/// `$ref`, the union of `anyOf` / `oneOf` arms and the intersection of
+/// `allOf` arms. `null` is left out. `None` when the set is open.
+fn closed_set(root: &Value, node: &Value, depth: usize) -> Option<BTreeSet<String>> {
+    if depth > MAX_SCHEMA_DEPTH {
+        return None;
+    }
+    if let Some(values) = node.get("enum").and_then(Value::as_array) {
+        return Some(values.iter().filter_map(value_text).collect());
+    }
+    if let Some(value) = node.get("const") {
+        return Some(value_text(value).into_iter().collect());
+    }
+    if node.get("$ref").is_some() {
+        return follow_ref(root, node).and_then(|target| closed_set(root, target, depth + 1));
+    }
+    if let Some(arms) = node.get("allOf").and_then(Value::as_array) {
+        let mut sets = arms
+            .iter()
+            .filter_map(|arm| closed_set(root, arm, depth + 1));
+        let first = sets.next()?;
+        return Some(sets.fold(first, |all, set| &all & &set));
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(arms) = node.get(key).and_then(Value::as_array) {
+            let mut all = BTreeSet::new();
+            for arm in arms {
+                if arm.get("type").and_then(Value::as_str) != Some("null") {
+                    all.extend(closed_set(root, arm, depth + 1)?);
+                }
+            }
+            return Some(all);
+        }
+    }
+    None
+}
+
+/// An enum value as the catalogue writes it, or `None` for `null`.
+fn value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+/// The node `node`'s `$ref` points at, when it is local to the schema.
+fn follow_ref<'a>(root: &'a Value, node: &Value) -> Option<&'a Value> {
+    pointer(root, node.get("$ref")?.as_str()?).ok()
 }
 
 /// Panic if `default_config` has a listen address no port declares, or one
@@ -345,6 +565,307 @@ mod tests {
         // Never emitted -> files missing -> drift.
         let err = check_config_artifact_drift(&contract, dir.path()).unwrap_err();
         assert!(matches!(err, DeploymentError::Drift { .. }), "got {err:?}");
+    }
+
+    /// A contract carrying `schema` and one `store` capability holding `field`.
+    fn joined(schema: Option<serde_json::Value>, field: FieldSpec) -> DeploymentContract {
+        let mut contract = contract_with_catalog();
+        contract.config_schema = schema;
+        contract.capabilities = vec![Capability::sink("store").field(field)];
+        contract
+    }
+
+    #[test]
+    fn catalogue_check_follows_each_schema_shape() {
+        use serde_json::json;
+
+        /// One row: the schema, the field's schema_path and enum_values, and a
+        /// piece of the one finding expected, or `None` for no finding.
+        struct Case<'a> {
+            name: &'a str,
+            schema: Option<&'a serde_json::Value>,
+            path: Option<&'a str>,
+            values: &'a [&'a str],
+            want: Option<&'a str>,
+        }
+        const BOTH: &[&str] = &["http", "native"];
+        const AT: Option<&str> = Some("store.protocol");
+
+        let protocol = json!({ "type": "string", "enum": ["http", "native"] });
+        let plain = json!({ "properties": { "protocol": protocol } });
+        let nested = json!({
+            "properties": { "store": { "type": "object", "properties": { "protocol": protocol } } }
+        });
+        let behind_ref = json!({
+            "properties": { "store": { "$ref": "#/$defs/Store" } },
+            "$defs": {
+                "Store": {
+                    "type": "object",
+                    "properties": { "protocol": { "description": "Wire protocol.", "$ref": "#/$defs/Protocol" } }
+                },
+                "Protocol": protocol
+            }
+        });
+        let option = json!({
+            "properties": { "store": { "properties": {
+                "protocol": { "anyOf": [{ "$ref": "#/$defs/Protocol" }, { "type": "null" }] }
+            } } },
+            "$defs": { "Protocol": protocol }
+        });
+        let option_inline = json!({ "properties": { "store": { "properties": {
+            "protocol": { "type": ["string", "null"], "enum": ["http", "native", null] }
+        } } } });
+        let one_of_const = json!({ "properties": { "store": { "properties": { "protocol": { "oneOf": [
+            { "type": "string", "const": "http", "description": "Over HTTP." },
+            { "type": "string", "const": "native", "description": "The native protocol." }
+        ] } } } } });
+        let one_of_mixed = json!({ "properties": { "store": { "properties": { "protocol": { "oneOf": [
+            { "type": "string", "enum": ["http"] },
+            { "type": "string", "const": "native", "description": "The native protocol." }
+        ] } } } } });
+        let one_of_open = json!({ "properties": { "store": { "properties": { "protocol": { "oneOf": [
+            { "type": "string", "enum": ["http", "native"] },
+            { "type": "object", "properties": { "custom": { "type": "string" } } }
+        ] } } } } });
+        let draft7 = json!({
+            "properties": { "store": { "allOf": [{ "$ref": "#/definitions/Store" }] } },
+            "definitions": {
+                "Store": { "properties": { "protocol": { "$ref": "#/definitions/Protocol" } } },
+                "Protocol": protocol
+            }
+        });
+        let escaped = json!({
+            "properties": { "store": { "$ref": "#/$defs/store~1v2" } },
+            "$defs": { "store/v2": { "properties": { "protocol": protocol } } }
+        });
+        let foreign = json!({
+            "properties": { "store": { "$ref": "https://example.com/store.json" } }
+        });
+        let open = json!({ "properties": { "store": { "properties": {
+            "protocol": { "type": "string" }
+        } } } });
+
+        #[rustfmt::skip]
+        let cases = [
+            Case { name: "plain property", schema: Some(&plain), path: Some("protocol"), values: BOTH, want: None },
+            Case { name: "nested struct", schema: Some(&nested), path: AT, values: BOTH, want: None },
+            Case { name: "behind $ref", schema: Some(&behind_ref), path: AT, values: BOTH, want: None },
+            Case { name: "Option behind anyOf", schema: Some(&option), path: AT, values: BOTH, want: None },
+            Case { name: "Option of an inline enum", schema: Some(&option_inline), path: AT, values: BOTH, want: None },
+            Case { name: "enum via oneOf/const", schema: Some(&one_of_const), path: AT, values: BOTH, want: None },
+            Case { name: "oneOf of enum and const arms", schema: Some(&one_of_mixed), path: AT, values: BOTH, want: None },
+            Case { name: "draft-07 definitions behind allOf", schema: Some(&draft7), path: AT, values: BOTH, want: None },
+            Case { name: "JSON-pointer-escaped $ref", schema: Some(&escaped), path: AT, values: BOTH, want: None },
+            Case { name: "catalogue order is not compared", schema: Some(&nested), path: AT, values: &["native", "http"], want: None },
+            Case { name: "path without enum_values", schema: Some(&open), path: AT, values: &[], want: None },
+            Case { name: "no schema_path, no enum_values", schema: Some(&nested), path: None, values: &[], want: None },
+            Case { name: "path missing", schema: Some(&nested), path: Some("store.proto"), values: BOTH, want: Some("names no option in the config schema (no \"proto\" under \"store\")") },
+            Case { name: "path missing at the top", schema: Some(&nested), path: Some("sink.protocol"), values: BOTH, want: Some("(no \"sink\" at the top level)") },
+            Case { name: "empty segment", schema: Some(&nested), path: Some("store..protocol"), values: BOTH, want: Some("(the path has an empty segment)") },
+            Case { name: "$ref outside the document", schema: Some(&foreign), path: AT, values: BOTH, want: Some("(no \"protocol\" under \"store\")") },
+            Case { name: "enum set differs", schema: Some(&behind_ref), path: AT, values: &["http"], want: Some("enum_values [\"http\"] but \"store.protocol\" in the schema allows [\"http\", \"native\"]") },
+            Case { name: "leaf has no enum", schema: Some(&open), path: AT, values: BOTH, want: Some("enum_values [\"http\", \"native\"] but \"store.protocol\" in the schema has no enum") },
+            Case { name: "open oneOf has no enum", schema: Some(&one_of_open), path: AT, values: BOTH, want: Some("in the schema has no enum") },
+            Case { name: "enum_values without schema_path", schema: Some(&nested), path: None, values: BOTH, want: Some("enum_values [\"http\", \"native\"] but no schema_path") },
+            Case { name: "schema absent", schema: None, path: AT, values: BOTH, want: Some("schema_path \"store.protocol\" is set but the contract has no config_schema") },
+        ];
+
+        for case in cases {
+            let mut field = FieldSpec::string("protocol");
+            field.enum_values = case.values.iter().map(|v| (*v).to_string()).collect();
+            field.schema_path = case.path.map(str::to_string);
+            let findings = check_catalogue_against_schema(&joined(case.schema.cloned(), field));
+            let name = case.name;
+            match case.want {
+                None => assert!(findings.is_empty(), "{name}: {findings:?}"),
+                Some(want) => {
+                    assert_eq!(findings.len(), 1, "{name}: {findings:?}");
+                    assert!(
+                        findings[0].starts_with("capability store, field protocol: "),
+                        "{name}: {}",
+                        findings[0]
+                    );
+                    assert!(findings[0].contains(want), "{name}: {}", findings[0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalogue_check_walks_children_in_order() {
+        let schema = serde_json::json!({ "properties": { "store": { "properties": {
+            "host": { "type": "string" }
+        } } } });
+        let mut contract = contract_with_catalog();
+        contract.config_schema = Some(schema);
+        contract.capabilities = vec![
+            Capability::sink("store")
+                .field(FieldSpec::string("host").schema_path("store.host"))
+                .field(FieldSpec::string("port").schema_path("store.port"))
+                .child(
+                    Capability::service("tls")
+                        .field(FieldSpec::enumeration("mode", ["off", "verify"])),
+                ),
+        ];
+        let findings = check_catalogue_against_schema(&contract);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings[0].starts_with("capability store, field port: "));
+        assert!(findings[1].starts_with("capability store/tls, field mode: "));
+    }
+
+    #[test]
+    fn drift_check_fails_when_the_catalogue_and_schema_disagree() {
+        let contract = joined(
+            Some(serde_json::json!({ "properties": { "protocol": {
+                "type": "string", "enum": ["http", "native"]
+            } } })),
+            FieldSpec::enumeration("protocol", ["http"]).schema_path("protocol"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        emit_config_artifacts(&contract, dir.path()).unwrap();
+        let err = check_config_artifact_drift(&contract, dir.path()).unwrap_err();
+        let DeploymentError::Drift { path, detail } = &err else {
+            panic!("got {err:?}");
+        };
+        assert!(path.ends_with("capability-catalog.json"), "{path}");
+        assert!(
+            detail.contains("capability store, field protocol: enum_values [\"http\"]"),
+            "{detail}"
+        );
+    }
+
+    /// Where the reflectable-config fixture lives, relative to the crate root.
+    #[cfg(feature = "config-schema")]
+    const REFLECTABLE_FIXTURE: &str = "tests/fixtures/reflectable-config";
+
+    /// The small app config the reflectable-config fixture describes.
+    #[cfg(feature = "config-schema")]
+    #[allow(dead_code, reason = "only the schema of these types is read")]
+    mod example_config {
+        /// Example app configuration.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        pub struct ExampleConfig {
+            /// The record store the app writes to.
+            pub store: StoreConfig,
+        }
+
+        /// How the app reaches its store.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        pub struct StoreConfig {
+            /// Store host name.
+            pub host: String,
+            /// Wire protocol to the store.
+            pub protocol: Protocol,
+            /// Codec for each batch. Unset sends batches uncompressed.
+            pub codec: Option<Codec>,
+            /// TLS to the store.
+            pub tls: TlsConfig,
+        }
+
+        /// Wire protocol.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum Protocol {
+            Http,
+            Native,
+        }
+
+        /// Batch codec.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum Codec {
+            Gzip,
+            Zstd,
+        }
+
+        /// TLS settings.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        pub struct TlsConfig {
+            /// Whether the server certificate is checked.
+            pub mode: TlsMode,
+        }
+
+        /// TLS mode.
+        #[derive(serde::Deserialize, schemars::JsonSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum TlsMode {
+            /// Plain TCP.
+            Off,
+            /// TLS with the server certificate checked.
+            Verify,
+        }
+    }
+
+    /// The contract the reflectable-config fixture is emitted from.
+    #[cfg(feature = "config-schema")]
+    fn reflectable_contract() -> DeploymentContract {
+        let mut contract = contract_with_catalog();
+        contract.config_schema = Some(config_schema_json::<example_config::ExampleConfig>());
+        contract.capabilities = vec![
+            Capability::sink("store")
+                .description("Writes records to a store.")
+                .maturity("stable")
+                .field(
+                    FieldSpec::string("host")
+                        .required()
+                        .description("Store host name.")
+                        .schema_path("store.host"),
+                )
+                .field(
+                    FieldSpec::enumeration("protocol", ["http", "native"])
+                        .required()
+                        .description("Wire protocol to the store.")
+                        .schema_path("store.protocol"),
+                )
+                .field(
+                    FieldSpec::enumeration("codec", ["gzip", "zstd"])
+                        .description("Codec for each batch. Unset sends batches uncompressed.")
+                        .schema_path("store.codec"),
+                )
+                .child(
+                    Capability::service("tls")
+                        .description("TLS to the store.")
+                        .field(
+                            FieldSpec::enumeration("mode", ["off", "verify"])
+                                .required()
+                                .description("Whether the server certificate is checked.")
+                                .schema_path("store.tls.mode"),
+                        ),
+                ),
+        ];
+        contract
+    }
+
+    /// The committed fixture is what `emit_config_artifacts` writes for
+    /// [`reflectable_contract`], and its catalogue agrees with its schema.
+    /// `env SCALO_WRITE_REFLECTABLE_CONFIG=1` rewrites it after a deliberate
+    /// change.
+    #[cfg(feature = "config-schema")]
+    #[test]
+    fn reflectable_config_fixture_matches_and_joins() {
+        let contract = reflectable_contract();
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(REFLECTABLE_FIXTURE);
+        if std::env::var_os("SCALO_WRITE_REFLECTABLE_CONFIG").is_some() {
+            emit_config_artifacts(&contract, &dir).unwrap();
+        }
+        assert_eq!(
+            check_catalogue_against_schema(&contract),
+            Vec::<String>::new()
+        );
+        if let Err(e) = check_config_artifact_drift(&contract, &dir) {
+            panic!("{e}");
+        }
+        let schema = contract.config_schema.as_ref().unwrap();
+        for pointer in [
+            "/$defs/Protocol/enum",
+            "/$defs/TlsMode/oneOf/0/const",
+            "/$defs/StoreConfig/properties/codec/anyOf/1/type",
+        ] {
+            assert!(
+                schema.pointer(pointer).is_some(),
+                "{pointer} missing, so the fixture no longer covers that schema shape"
+            );
+        }
     }
 
     #[test]
