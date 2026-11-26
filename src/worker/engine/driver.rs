@@ -392,6 +392,21 @@ pub(super) fn note_recovered(stage: &'static str, failures: u32) {
     }
 }
 
+/// Run a block's `process` call so it can't hold a runtime worker: through
+/// [`tokio::task::block_in_place`] on a multi-thread runtime, which hands the
+/// worker's other tasks to another thread, and inline on a current-thread
+/// runtime, where `block_in_place` panics.
+#[cfg(feature = "transport")]
+pub(super) fn off_worker<T>(work: impl FnOnce() -> T) -> T {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|rt| rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
 /// Settle one recv result: the batch, `None` after waiting out a transient
 /// failure (or on shutdown), or the error that ends the loop.
 #[cfg(feature = "transport")]
@@ -488,7 +503,10 @@ impl BatchEngine {
     ///
     /// - `process` runs on the loop task (cancellation-aware between awaits) and
     ///   may fan records out or in. It MUST preserve `commit_tokens` (use
-    ///   [`WorkBatch::map_records`], which does so automatically).
+    ///   [`WorkBatch::map_records`], which does so automatically). On a
+    ///   multi-thread runtime it runs through [`tokio::task::block_in_place`], so
+    ///   a slow or blocking `process` doesn't stall the worker's other tasks. A
+    ///   current-thread runtime runs it inline.
     /// - `sink` is async and receives the WHOLE out-batch by reference.
     /// - `commit` selects [`CommitMode::Auto`] (engine commits after sink `Ok`)
     ///   or [`CommitMode::SinkManaged`] (sink owns commit).
@@ -1178,7 +1196,7 @@ impl BatchEngine {
         // record) -- nil hot-path cost.
         let input_token_count = batch.commit_tokens.len();
 
-        let mut out_batch = process(batch)?;
+        let mut out_batch = off_worker(|| process(batch))?;
 
         if out_batch.commit_tokens.len() != input_token_count {
             tracing::warn!(
@@ -1313,7 +1331,7 @@ impl BatchEngine {
 
             // process() may fan out / fan in within the sub-block. It preserves
             // the (empty) commit_tokens of the sub-block view.
-            let mut out_sub = process(sub_block)?;
+            let mut out_sub = off_worker(|| process(sub_block))?;
 
             // Route any parse/process-generated DLQ entries this sub-block
             // carries BEFORE its sink -- same single policy + route point as the

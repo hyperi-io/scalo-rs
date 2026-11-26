@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 use super::driver::note_recv_block_bytes;
 use super::driver::{
     CommitMode, DRAIN_IDLE_LIMIT, Delivery, LoopTicker, RecvCap, RetryWindow, SHUTDOWN_RETRY_LIMIT,
-    SubBlockDrain, close_source, note_recovered, note_transient, recv_capped, settle_recv,
-    stop_after_abandoned,
+    SubBlockDrain, close_source, note_recovered, note_transient, off_worker, recv_capped,
+    settle_recv, stop_after_abandoned,
 };
 use super::{BatchEngine, EngineError, FilterDlqPolicy};
 use crate::backoff::Backoff;
@@ -675,7 +675,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
     {
         #[cfg(feature = "memory")]
         let _lease = self.engine.lease_ingress_batch(&batch);
-        let mut out = process(batch)?;
+        let mut out = off_worker(|| process(batch))?;
         dead.extend(
             std::mem::take(&mut out.dlq_entries)
                 .into_iter()
@@ -738,7 +738,7 @@ impl<R: TransportReceiver> BlockRun<'_, R> {
             let sub_block: WorkBatch<R::Token> = WorkBatch::from_records(sub_records);
             #[cfg(feature = "memory")]
             let _lease = self.engine.lease_ingress_batch(&sub_block);
-            let mut out = process(sub_block)?;
+            let mut out = off_worker(|| process(sub_block))?;
             let mut dead: Vec<DeadLetter> = std::mem::take(&mut out.dlq_entries)
                 .into_iter()
                 .map(|entry| DeadLetter {

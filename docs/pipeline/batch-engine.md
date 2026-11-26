@@ -94,6 +94,8 @@ lets it defer until a downstream write lands. The sub-block paths take
 `Auto` only. The optional ticker fires inside the loop's `biased`
 `select!`, after the shutdown arm.
 
+`process` runs in `block_in_place` on multi-thread runtimes, inline otherwise.
+
 A `recv` or sink failure that is `Backpressure` or `Timeout` is retried
 after a jittered backoff, 100 ms doubling to 2 s. The refused block is
 held, and nothing later is fetched or committed past it. Any other

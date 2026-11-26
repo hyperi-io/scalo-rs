@@ -4069,6 +4069,16 @@ async fn a_panic_in_process_or_the_sink_releases_the_block_errored() {
     }
 }
 
+/// On a multi-thread worker `process` runs through `block_in_place`, and a
+/// panic there still releases the block `Errored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_panic_in_process_on_a_worker_releases_the_block_errored() {
+    assert_eq!(
+        released_after_a_panic(true).await,
+        vec![(vec![0, 1], DeliveryStatus::Errored)],
+    );
+}
+
 /// The guarantee a pull pipeline publishes when its sink declares `declared`
 /// through `sink_confirms`, or nothing at all, with no sender.
 #[cfg(feature = "metrics")]
@@ -5350,4 +5360,211 @@ async fn an_oversize_record_reaches_the_dlq_never_delivered() {
     );
     assert_eq!(dlq_lines(dir.path()).await, 1);
     dlq_shutdown.cancel();
+}
+
+// ---- A slow process leaves the runtime worker -----------------------------
+
+/// How long the slow `process` below spins on each block.
+const SLOW_PROCESS: Duration = Duration::from_millis(50);
+
+/// The interval of the heartbeat beside it, a fifth of [`SLOW_PROCESS`].
+const HEARTBEAT: Duration = Duration::from_millis(10);
+
+/// One-record blocks the source hands out.
+const SLOW_BLOCKS: usize = 6;
+
+/// The run loop a heartbeat test drives.
+#[derive(Debug, Clone, Copy)]
+enum SlowLoop {
+    Pipeline,
+    Workbatch,
+    Streaming,
+}
+
+/// What a heartbeat on the same runtime should do while `process` spins.
+#[derive(Debug, Clone, Copy)]
+enum Beat {
+    KeepsInterval,
+    WaitsOnProcess,
+}
+
+/// What a heartbeat on the same runtime did while a run loop's `process` spun.
+struct Heartbeat {
+    ticks_during_process: usize,
+    longest_gap: Duration,
+    commits: Vec<u64>,
+}
+
+/// Spin the calling thread for `spin`, as a CPU-bound transform does.
+fn spin_for(spin: Duration) {
+    let until = std::time::Instant::now() + spin;
+    while std::time::Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
+
+/// Run `run_loop` in a spawned task over [`SLOW_BLOCKS`] blocks with a
+/// `process` that spins for [`SLOW_PROCESS`], beside a heartbeat task.
+async fn heartbeat_under_slow_process(run_loop: SlowLoop) -> Heartbeat {
+    use crate::transport::memory::MemoryToken;
+
+    let ticks = Arc::new(parking_lot::Mutex::new(Vec::<std::time::Instant>::new()));
+    let spins = Arc::new(parking_lot::Mutex::new(Vec::<(
+        std::time::Instant,
+        std::time::Instant,
+    )>::new()));
+    let stop = CancellationToken::new();
+    let heartbeat = tokio::spawn({
+        let (ticks, stop) = (Arc::clone(&ticks), stop.clone());
+        async move {
+            loop {
+                tokio::select! {
+                    () = stop.cancelled() => break,
+                    () = tokio::time::sleep(HEARTBEAT) => {
+                        ticks.lock().push(std::time::Instant::now());
+                    }
+                }
+            }
+        }
+    });
+    tokio::time::sleep(HEARTBEAT * 3).await;
+
+    let source = Arc::new(HeldSource::new(
+        AckKind::Pull,
+        (0_u64..).take(SLOW_BLOCKS).map(|seq| vec![seq]).collect(),
+    ));
+    let run = tokio::spawn({
+        let (source, spins) = (Arc::clone(&source), Arc::clone(&spins));
+        async move {
+            let shutdown = CancellationToken::new();
+            let sink_calls = AtomicUsize::new(0);
+            let process = move |batch: WorkBatch<MemoryToken>| -> Result<_, EngineError> {
+                let started = std::time::Instant::now();
+                spin_for(SLOW_PROCESS);
+                spins.lock().push((started, std::time::Instant::now()));
+                Ok(batch)
+            };
+            let sink = |_out: &WorkBatch<MemoryToken>| {
+                if sink_calls.fetch_add(1, Ordering::AcqRel) + 1 == SLOW_BLOCKS {
+                    shutdown.cancel();
+                }
+                std::future::ready(Ok::<(), EngineError>(()))
+            };
+            let engine = default_engine();
+            match run_loop {
+                SlowLoop::Pipeline => {
+                    engine
+                        .pipeline(&*source)
+                        .shutdown(shutdown.clone())
+                        .sink_confirms(SinkConfirmation::Remote)
+                        .run(process, sink)
+                        .await
+                }
+                SlowLoop::Workbatch => {
+                    engine
+                        .run_workbatch(
+                            &*source,
+                            shutdown.clone(),
+                            process,
+                            sink,
+                            CommitMode::Auto,
+                            no_ticker(),
+                        )
+                        .await
+                }
+                SlowLoop::Streaming => {
+                    engine
+                        .run_workbatch_streaming(
+                            &*source,
+                            shutdown.clone(),
+                            process,
+                            sink,
+                            CommitMode::Auto,
+                            1,
+                            no_ticker(),
+                        )
+                        .await
+                }
+            }
+        }
+    });
+    run.await
+        .expect("the run loop task")
+        .expect("a clean shutdown");
+    tokio::time::sleep(HEARTBEAT * 3).await;
+    stop.cancel();
+    heartbeat.await.expect("the heartbeat task");
+
+    let ticks = ticks.lock().clone();
+    let ticks_during_process: usize = spins
+        .lock()
+        .iter()
+        .map(|&(started, ended)| {
+            ticks
+                .iter()
+                .filter(|&&tick| (started..ended).contains(&tick))
+                .count()
+        })
+        .sum();
+    let longest_gap: Duration = ticks
+        .windows(2)
+        .map(|pair| pair[1].saturating_duration_since(pair[0]))
+        .max()
+        .unwrap_or_default();
+    let commits: Vec<u64> = source.commits.lock().clone();
+    Heartbeat {
+        ticks_during_process,
+        longest_gap,
+        commits,
+    }
+}
+
+/// On a multi-thread runtime a run loop's slow `process` leaves the worker to
+/// its other tasks, so a heartbeat beside it keeps its interval. A
+/// current-thread runtime runs `process` inline: the heartbeat waits, and the
+/// run still completes. Every block commits in order either way.
+#[test]
+fn a_slow_process_leaves_the_worker_to_its_other_tasks() {
+    let one_worker = || {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("a multi-thread runtime")
+    };
+    let current_thread = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime")
+    };
+    let in_order: Vec<u64> = (0_u64..).take(SLOW_BLOCKS).collect();
+    for run_loop in [SlowLoop::Pipeline, SlowLoop::Workbatch, SlowLoop::Streaming] {
+        for (flavor, runtime, beat) in [
+            ("one-worker multi-thread", one_worker(), Beat::KeepsInterval),
+            ("current-thread", current_thread(), Beat::WaitsOnProcess),
+        ] {
+            let heartbeat = runtime.block_on(heartbeat_under_slow_process(run_loop));
+            let seen = format!(
+                "{run_loop:?} on {flavor}: {} heartbeat ticks during \
+                 {SLOW_BLOCKS} {SLOW_PROCESS:?} process calls at a {HEARTBEAT:?} \
+                 interval, longest gap {:?}",
+                heartbeat.ticks_during_process, heartbeat.longest_gap
+            );
+            assert_eq!(
+                heartbeat.commits, in_order,
+                "{seen}: every block commits, in order"
+            );
+            match beat {
+                Beat::KeepsInterval => assert!(
+                    heartbeat.ticks_during_process >= 2 * SLOW_BLOCKS,
+                    "{seen}: the heartbeat keeps ticking while process runs"
+                ),
+                Beat::WaitsOnProcess => assert_eq!(
+                    heartbeat.ticks_during_process, 0,
+                    "{seen}: an inline process holds the only thread"
+                ),
+            }
+        }
+    }
 }
