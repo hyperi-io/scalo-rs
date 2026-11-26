@@ -341,32 +341,75 @@ fn secrets_config_for_aws_lookup() -> Result<super::SecretsConfig, CredentialErr
     Ok(config)
 }
 
+/// The shared manager that every one-off `aws:` lookup in the process uses.
+///
+/// Building a manager loads the SDK config, the expensive part of an `aws:`
+/// lookup, so each region and endpoint pair builds one manager and later
+/// lookups reuse it. `AwsProvider::new` reads nothing else from the config,
+/// and the SDK refreshes the credentials it found itself, so the pair is the
+/// whole key. OpenBao is not shared: its token file can be rewritten while
+/// the process runs.
+#[cfg(feature = "secrets-aws")]
+async fn shared_aws_manager(
+    config: super::SecretsConfig,
+) -> Result<std::sync::Arc<super::SecretsManager>, CredentialError> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+
+    use super::{SecretsConfig, SecretsManager};
+
+    type Managers =
+        tokio::sync::Mutex<HashMap<(Option<String>, Option<String>), Arc<SecretsManager>>>;
+    static MANAGERS: OnceLock<Managers> = OnceLock::new();
+
+    let Some(aws) = config.aws else {
+        unreachable!("invariant: secrets_config_for_aws_lookup always sets the aws section")
+    };
+    let key = (aws.region.clone(), aws.endpoint_url.clone());
+
+    // Held across the build, so concurrent first lookups build the manager once.
+    let mut managers = MANAGERS
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .await;
+    if let Some(manager) = managers.get(&key) {
+        return Ok(Arc::clone(manager));
+    }
+
+    let mut build = SecretsConfig {
+        aws: Some(aws),
+        ..SecretsConfig::default()
+    };
+    without_cache(&mut build);
+    // `AwsProvider::new` loads the SDK config with `Handle::block_on`, which
+    // panics on a thread that is driving tasks (`src/secrets/aws.rs`).
+    let manager = tokio::task::spawn_blocking(move || SecretsManager::new(build))
+        .await
+        .map_err(|e| CredentialError::Aws(format!("secrets manager task failed: {e}")))?
+        .map_err(|e| CredentialError::Aws(format!("failed to initialise secrets manager: {e}")))?;
+    let manager = Arc::new(manager);
+    managers.insert(key, Arc::clone(&manager));
+    Ok(manager)
+}
+
 #[cfg(feature = "secrets-aws")]
 async fn resolve_aws(
     spec: &str,
     secret_id: &str,
     key: Option<&str>,
 ) -> Result<String, CredentialError> {
-    use super::{SecretSource, SecretsManager};
+    use super::SecretSource;
 
     let name = one_off_source_name(spec);
-    let mut config = secrets_config_for_aws_lookup()?;
-    config.sources.insert(
-        name.clone(),
-        SecretSource::Aws {
-            secret_id: secret_id.to_string(),
-            key: key.map(str::to_string),
-        },
-    );
-
-    // `AwsProvider::new` loads the SDK config with `Handle::block_on`, which
-    // panics on a thread that is driving tasks (`src/secrets/aws.rs`).
-    let secrets = tokio::task::spawn_blocking(move || SecretsManager::new(config))
-        .await
-        .map_err(|e| CredentialError::Aws(format!("secrets manager task failed: {e}")))?
-        .map_err(|e| CredentialError::Aws(format!("failed to initialise secrets manager: {e}")))?;
+    let secrets = shared_aws_manager(secrets_config_for_aws_lookup()?).await?;
     let value = secrets
-        .get(&name)
+        .get_one_off(
+            &name,
+            &SecretSource::Aws {
+                secret_id: secret_id.to_string(),
+                key: key.map(str::to_string),
+            },
+        )
         .await
         .map_err(|e| CredentialError::Aws(format!("lookup failed for {secret_id}: {e}")))?;
     let text = value
@@ -829,6 +872,72 @@ mod tests {
             err.contains("lookup failed"),
             "expected a failed lookup against the unreachable endpoint: {err}"
         );
+    }
+
+    /// Several one-off `aws:` lookups in one process build one AWS provider,
+    /// and each still reaches the SDK for its own spec.
+    #[tokio::test]
+    #[cfg(all(feature = "secrets-aws", feature = "config"))]
+    async fn aws_lookups_share_one_provider_client() {
+        use super::super::aws::CONSTRUCTIONS;
+
+        // A unique endpoint keeps the count to this test when tests share a process.
+        const ENDPOINT: &str = "http://127.0.0.1:9/one-provider-per-process";
+        let specs = ["aws:prod/a:bearer", "aws:prod/b:bearer", "aws:prod/c"];
+
+        let errors = temp_env::async_with_vars(
+            [
+                ("AWS_ENDPOINT_URL", Some(ENDPOINT)),
+                ("AWS_DEFAULT_REGION", Some("ap-southeast-2")),
+                ("AWS_ACCESS_KEY_ID", Some("not-a-real-key")),
+                ("AWS_SECRET_ACCESS_KEY", Some("not-a-real-secret")),
+            ],
+            async {
+                let mut errors = Vec::new();
+                for spec in specs {
+                    errors.push(resolve(spec).await.unwrap_err().to_string());
+                }
+                errors
+            },
+        )
+        .await;
+
+        for error in &errors {
+            assert!(error.contains("lookup failed"), "{error}");
+        }
+        let builds = CONSTRUCTIONS
+            .lock()
+            .iter()
+            .filter(|endpoint| endpoint.as_deref() == Some(ENDPOINT))
+            .count();
+        assert_eq!(builds, 1, "three aws specs must build one provider");
+    }
+
+    /// One manager serves several one-off specs, and each spec reads its own
+    /// file, so a value never follows the spec that read it last.
+    #[tokio::test]
+    async fn one_manager_resolves_each_one_off_spec_to_its_own_value() {
+        use super::super::{SecretSource, SecretsManager};
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager = SecretsManager::new(file_lookup_config()).unwrap();
+        for (file, value) in [
+            ("alpha", "value-a"),
+            ("beta", "value-b"),
+            ("gamma", "value-c"),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, value).unwrap();
+            let spec = format!("file:{}", path.display());
+            let source = SecretSource::File {
+                path: path.display().to_string(),
+            };
+            let got = manager
+                .get_one_off(&one_off_source_name(&spec), &source)
+                .await
+                .unwrap();
+            assert_eq!(got.as_str().unwrap(), value);
+        }
     }
 
     /// An unrecognised prefix stays a literal: passwords contain colons, and the

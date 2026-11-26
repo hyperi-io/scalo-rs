@@ -307,6 +307,24 @@ impl SecretsManager {
         Ok(value)
     }
 
+    /// Get a secret from a source this manager was not built with, under
+    /// `cache_key` in place of a configured source name.
+    ///
+    /// The manager must have its cache off, so `cache_key` only keys the fetch
+    /// lock and never reaches a cache entry.
+    #[cfg(any(test, feature = "secrets-aws"))]
+    pub(crate) async fn get_one_off(
+        &self,
+        cache_key: &str,
+        source: &SecretSource,
+    ) -> SecretsResult<SecretValue> {
+        debug_assert!(
+            !self.config.cache.enabled,
+            "a one-off lookup must run with the cache off"
+        );
+        self.get_from_source(cache_key, cache_key, source).await
+    }
+
     /// Get a secret from a specific source: a fresh cache entry, else the
     /// provider, else a stale entry within the grace period.
     async fn get_from_source(
