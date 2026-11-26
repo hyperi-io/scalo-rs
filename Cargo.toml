@@ -168,8 +168,8 @@ transport-trace = ["transport", "dep:opentelemetry"]
 transport-memory = ["transport"]
 # Kafka config and token types with no librdkafka.
 transport-kafka-config = ["transport", "base64"]
-# `rustls-native-certs` reads the OS store into ssl.ca.pem for `trust: native` beside CA files.
-transport-kafka = ["transport-kafka-config", "concurrency", "rdkafka", "regex", "tokio-util", "dep:rustls-native-certs"]
+# `rustls-native-certs` reads the OS store into ssl.ca.pem for `trust: native` beside CA files. `arc-swap` holds the consumer a rebuild replaces.
+transport-kafka = ["transport-kafka-config", "concurrency", "rdkafka", "regex", "tokio-util", "dep:rustls-native-certs", "dep:arc-swap"]
 # Kafka fixtures for consumer test suites. Needs a Docker daemon at test time.
 transport-kafka-test-support = ["transport-kafka", "deployment-test-support", "dep:tempfile", "tokio/process"]
 # Shaped senders and delivery approaches for tests and benches: src/transport/test_support/mod.rs

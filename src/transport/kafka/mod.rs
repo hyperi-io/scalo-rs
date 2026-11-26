@@ -56,6 +56,8 @@ mod headers;
 mod metrics;
 mod openssl_floor;
 mod producer;
+#[cfg(all(test, feature = "transport-kafka-test-support", unix))]
+mod rebuild_tests;
 #[cfg(all(feature = "transport-kafka-test-support", unix))]
 pub mod test_support;
 pub mod topic_resolver;
@@ -86,6 +88,7 @@ use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender
 use super::types::{BlockOutcome, Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
 use crate::backoff::Backoff;
+use arc_swap::ArcSwap;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
@@ -318,16 +321,23 @@ pub struct KafkaTransport {
     ///
     /// Shared with the optional [`KafkaGateActuator`] (`governor` feature), so
     /// a client replaced after a fatal error is the one the actuator pauses.
-    /// Every `Consumer` method used takes `&self`. The lock guards only the
-    /// swap, and each caller works on an `Arc` clone of the current client.
+    /// Every `Consumer` method used takes `&self`. A caller loads the slot
+    /// without a lock and works on an `Arc` clone of its client, which keeps
+    /// a client a rebuild replaces alive until that caller is done.
     /// `None` on a transport that only sends.
     consumer: Option<SharedConsumer>,
     /// The resolved config the consumer was built from, kept to rebuild it.
     /// Boxed: it is read only on a rebuild, and inline it makes the transport
     /// the oversized variant of every receiver enum that holds it.
     config: Box<KafkaConfig>,
-    /// Completed consumer rebuilds since a record last arrived.
+    /// Completed consumer rebuilds since a record last arrived, or since a
+    /// rebuild [`REBUILD_QUIET`] before the next.
     rebuilds: std::sync::atomic::AtomicU32,
+    /// When the last fatal rebuild completed.
+    last_rebuild: parking_lot::Mutex<Option<std::time::Instant>>,
+    /// Set while a failed or repeated rebuild holds readiness down. A record
+    /// clears it, and so does [`REBUILD_QUIET`] without a fatal error.
+    rebuild_unready: AtomicBool,
     /// The earliest the next poll may run after a repeated rebuild. Waited out
     /// at the start of a receive, so a receive dropped mid-wait changes nothing.
     rebuild_not_before: parking_lot::Mutex<Option<std::time::Instant>>,
@@ -352,7 +362,8 @@ pub struct KafkaTransport {
     closed: AtomicBool,
     /// Shared healthy flag, read by the health registry closure. `close()`, a
     /// fenced member, a failed rebuild and a second rebuild with no record
-    /// between clear it. A record sets it again, except after `close()`.
+    /// between clear it. A record sets it again, except after `close()`, and
+    /// so does a rebuilt client that runs [`REBUILD_QUIET`] with no fatal error.
     healthy: Arc<AtomicBool>,
     /// Whether a broker refuses each client role's credentials or TLS setup,
     /// kept per role across its rebuilds. Any role refused fails readiness. A
@@ -437,7 +448,7 @@ pub struct KafkaTransport {
 /// The consumer client and the group protocol it joined with, replaced whole
 /// when a fatal error ends the client.
 struct ConsumerSlot {
-    client: Arc<BaseConsumer<StatsContext>>,
+    client: Arc<ConsumerClient>,
     protocol: ConsumerProtocol,
     /// Clients this transport built before this one, which keeps a lease from
     /// an earlier client from matching one of this client's.
@@ -447,8 +458,82 @@ struct ConsumerSlot {
     generation: u64,
 }
 
-/// The transport's consumer slot, shared with the gate actuator.
-type SharedConsumer = Arc<parking_lot::RwLock<ConsumerSlot>>;
+/// The transport's consumer slot, shared with the gate actuator. Read on every
+/// receive and swapped only by a rebuild.
+type SharedConsumer = Arc<ArcSwap<ConsumerSlot>>;
+
+/// A librdkafka consumer. One that is not the transport's current client, a
+/// replaced one or one never put in place, is closed on the blocking pool by
+/// whichever holder drops it last, because a close leaves the group and waits
+/// on the broker.
+struct ConsumerClient {
+    /// Taken only by `drop`.
+    consumer: Option<BaseConsumer<StatsContext>>,
+    /// Set while this is the transport's client, which closes where the
+    /// transport drops.
+    current: AtomicBool,
+}
+
+impl ConsumerClient {
+    fn new(consumer: BaseConsumer<StatsContext>) -> Self {
+        Self {
+            consumer: Some(consumer),
+            current: AtomicBool::new(false),
+        }
+    }
+
+    /// Mark this the transport's client.
+    fn mark_current(&self) {
+        self.current.store(true, Ordering::Release);
+    }
+
+    /// Mark this a client a rebuild replaced.
+    fn retire(&self) {
+        self.current.store(false, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for ConsumerClient {
+    type Target = BaseConsumer<StatsContext>;
+
+    fn deref(&self) -> &Self::Target {
+        self.consumer
+            .as_ref()
+            .unwrap_or_else(|| unreachable!("invariant: only drop takes the consumer"))
+    }
+}
+
+impl Drop for ConsumerClient {
+    fn drop(&mut self) {
+        let Some(consumer) = self.consumer.take() else {
+            return;
+        };
+        if *self.current.get_mut() {
+            drop(consumer);
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || close_replaced(consumer))),
+            Err(_) => close_replaced(consumer),
+        }
+    }
+}
+
+/// Close a consumer the transport no longer uses, logging how long it took.
+fn close_replaced(consumer: BaseConsumer<StatsContext>) {
+    let started = std::time::Instant::now();
+    drop(consumer);
+    tracing::debug!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "kafka: closed a replaced consumer"
+    );
+}
+
+/// How long a rebuilt consumer must run without a fatal error for the next one
+/// to start a new run, which keeps readiness and waits no backoff. Longer than
+/// librdkafka's 45 s default session timeout, so a client that fails at its
+/// first still counts as a repeat.
+const REBUILD_QUIET: Duration = Duration::from_secs(300);
 
 /// A producer client and the refusal generation it was built at.
 #[derive(Clone)]
@@ -563,8 +648,10 @@ async fn rebuild_producer(
 /// `GroupIdNotFound` is the refusal of a group still holding a classic member
 /// whose subscription carries assignor data, which the broker will not drop to
 /// convert the group. `Unknown` is what a KIP-848 member got from a group whose
-/// other member had just moved to classic. The rest are a broker that does not
-/// speak KIP-848.
+/// other member had just moved to classic, with librdkafka 2.15.1. librdkafka
+/// 2.16.0 gets `GroupIdNotFound` there from Kafka 4.3.1 and 4.4.0, so `Unknown`
+/// stays for clients that still answer with it. The rest are a broker that
+/// does not speak KIP-848.
 const PROTOCOL_MISMATCH_CODES: &[RDKafkaErrorCode] = &[
     RDKafkaErrorCode::GroupIdNotFound,
     RDKafkaErrorCode::Unknown,
@@ -598,7 +685,7 @@ fn action_after_fatal(current: ConsumerProtocol, code: RDKafkaErrorCode) -> Fata
 
 /// A poll job still running, with the client it polls.
 struct InFlightPoll {
-    client: Arc<BaseConsumer<StatsContext>>,
+    client: Arc<ConsumerClient>,
     job: tokio::task::JoinHandle<Polled>,
 }
 
@@ -1119,11 +1206,14 @@ fn apply_group_protocol(client_config: &mut ClientConfig, protocol: ConsumerProt
 /// (governor feature) can share it for pause/resume without `unsafe`. Its
 /// context counts lag to the end `client_config`'s isolation level reads to,
 /// and labels its `consumer_` series with the group `client_config` joins.
+///
+/// `rd_kafka_new` starts the client's threads and reads its CA and
+/// credential files, so call this on the blocking pool.
 fn create_consumer(
     client_config: &ClientConfig,
     auth: &Arc<classify::AuthState>,
     generation: u64,
-) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
+) -> TransportResult<Arc<ConsumerClient>> {
     let context = StatsContext::new()
         .sharing(Arc::clone(auth), generation)
         .reading(metrics::Isolation::of(client_config))
@@ -1132,8 +1222,26 @@ fn create_consumer(
     let context = context.in_group(client_config.get("group.id"));
     client_config
         .create_with_context(context)
-        .map(Arc::new)
+        .map(|consumer| Arc::new(ConsumerClient::new(consumer)))
         .map_err(|e| client_build_error("consumer", &e))
+}
+
+/// [`create_consumer`] on the blocking pool, subscribed to `topics` when given.
+async fn create_consumer_off_runtime(
+    client_config: ClientConfig,
+    auth: Arc<classify::AuthState>,
+    generation: u64,
+    topics: Option<Vec<String>>,
+) -> TransportResult<Arc<ConsumerClient>> {
+    tokio::task::spawn_blocking(move || {
+        let client = create_consumer(&client_config, &auth, generation)?;
+        if let Some(topics) = topics {
+            subscribe_consumer(&client, &topics)?;
+        }
+        Ok(client)
+    })
+    .await
+    .map_err(|e| TransportError::Connection(format!("the consumer build task failed: {e}")))?
 }
 
 /// The transport error for a librdkafka `client` that would not build:
@@ -1391,11 +1499,12 @@ impl KafkaTransport {
         let protocol = config.effective_consumer_protocol();
         let consumer_config = reads.then(|| consumer_client_config(config, protocol));
         let consumer_auth = consumer_config.as_ref().map(RoleAuth::new);
-        let consumer = consumer_config
-            .as_ref()
-            .zip(consumer_auth.as_ref())
-            .map(|(c, role)| create_consumer(c, &role.auth, 0))
-            .transpose()?;
+        let consumer = match consumer_config.as_ref().zip(consumer_auth.as_ref()) {
+            Some((c, role)) => {
+                Some(create_consumer_off_runtime(c.clone(), Arc::clone(&role.auth), 0, None).await?)
+            }
+            None => None,
+        };
 
         // Resolve effective topics:
         // - No consumer -> no subscription, whatever `topics` holds
@@ -1558,7 +1667,8 @@ impl KafkaTransport {
             #[cfg(all(feature = "governor", feature = "health"))]
             _partition_limited_registration: partition_limited_registration,
             consumer: consumer.map(|client| {
-                Arc::new(parking_lot::RwLock::new(ConsumerSlot {
+                client.mark_current();
+                Arc::new(ArcSwap::from_pointee(ConsumerSlot {
                     client,
                     protocol,
                     epoch: 0,
@@ -1567,6 +1677,8 @@ impl KafkaTransport {
             }),
             config: Box::new(owned.clone()),
             rebuilds: std::sync::atomic::AtomicU32::new(0),
+            last_rebuild: parking_lot::Mutex::new(None),
+            rebuild_unready: AtomicBool::new(false),
             rebuild_not_before: parking_lot::Mutex::new(None),
             rebuild_latch: classify::DegradedLatch::default(),
             fenced_latch: classify::DegradedLatch::default(),
@@ -1674,14 +1786,14 @@ impl KafkaTransport {
     }
 
     /// The current consumer client, `None` on a transport that only sends.
-    fn client(&self) -> Option<Arc<BaseConsumer<StatsContext>>> {
+    fn client(&self) -> Option<Arc<ConsumerClient>> {
         self.consumer
             .as_ref()
-            .map(|slot| Arc::clone(&slot.read().client))
+            .map(|slot| Arc::clone(&slot.load().client))
     }
 
     /// The current consumer client, refused on a transport that only sends.
-    fn receiving_client(&self) -> TransportResult<Arc<BaseConsumer<StatsContext>>> {
+    fn receiving_client(&self) -> TransportResult<Arc<ConsumerClient>> {
         self.client().ok_or_else(|| {
             TransportError::Config(
                 "this kafka transport only sends: it was built without a consumer".into(),
@@ -1691,7 +1803,7 @@ impl KafkaTransport {
 
     /// The current consumer client, for a test that built one.
     #[cfg(test)]
-    fn consumer(&self) -> Arc<BaseConsumer<StatsContext>> {
+    fn consumer(&self) -> Arc<ConsumerClient> {
         self.client().expect("the transport has a consumer")
     }
 
@@ -1723,7 +1835,7 @@ impl KafkaTransport {
     pub fn group_protocol(&self) -> ConsumerProtocol {
         self.consumer.as_ref().map_or_else(
             || self.config.effective_consumer_protocol(),
-            |slot| slot.read().protocol,
+            |slot| slot.load().protocol,
         )
     }
 
@@ -1742,7 +1854,7 @@ impl KafkaTransport {
     /// out a record read before its partition's last revoke, so every record
     /// of a partition in a batch was read under the lease the partition has
     /// when the batch arrives. One call per partition per batch is enough:
-    /// each takes a read lock and copies the topic name.
+    /// each takes the assignment's read lock and copies the topic name.
     ///
     /// `None` for a record just received means this consumer no longer holds
     /// its partition, as after a consumer rebuild since the poll that read
@@ -1765,7 +1877,7 @@ impl KafkaTransport {
     /// ```
     #[must_use]
     pub fn lease(&self, topic: &str, partition: i32) -> Option<PartitionLease> {
-        let slot = self.consumer.as_ref()?.read();
+        let slot = self.consumer.as_ref()?.load();
         slot.client
             .context()
             .assignment(topic, partition)
@@ -1814,9 +1926,15 @@ impl KafkaTransport {
     /// Replace the consumer client with a new one joined under `protocol`,
     /// subscribed to the same topics.
     ///
-    /// The old client is closed on the blocking pool: closing leaves the
-    /// group, which waits on the broker.
-    fn rebuild_consumer(&self, protocol: ConsumerProtocol, reason: &str) -> TransportResult<()> {
+    /// The new client is built and subscribed on the blocking pool. A receive
+    /// dropped while it builds leaves the old client in place, and the next
+    /// receive builds again. A caller still using the old client keeps it
+    /// until it is done, and the last to let go closes it on the blocking pool.
+    async fn rebuild_consumer(
+        &self,
+        protocol: ConsumerProtocol,
+        reason: &str,
+    ) -> TransportResult<()> {
         if self.rebuild_latch.enter() {
             tracing::warn!(
                 brokers = %self.config.brokers.join(","),
@@ -1835,31 +1953,24 @@ impl KafkaTransport {
             ));
         };
         let generation = role.auth.generation();
-        let client = create_consumer(
-            &consumer_client_config(&self.config, protocol),
-            &role.auth,
+        let topics = self.subscribed_topics.read().clone();
+        let client = create_consumer_off_runtime(
+            consumer_client_config(&self.config, protocol),
+            Arc::clone(&role.auth),
             generation,
-        )?;
-        subscribe_consumer(&client, &self.subscribed_topics.read())?;
-        let old = {
-            let mut slot = shared.write();
-            let epoch = slot.epoch.saturating_add(1);
-            std::mem::replace(
-                &mut *slot,
-                ConsumerSlot {
-                    client,
-                    protocol,
-                    epoch,
-                    generation,
-                },
-            )
-        };
+            Some(topics),
+        )
+        .await?;
+        client.mark_current();
+        let old = shared.rcu(|slot| ConsumerSlot {
+            client: Arc::clone(&client),
+            protocol,
+            epoch: slot.epoch.saturating_add(1),
+            generation,
+        });
+        old.client.retire();
         self.deferred_recv_error.lock().take();
         count_consumer_rebuild(protocol);
-        match tokio::runtime::Handle::try_current() {
-            Ok(runtime) => drop(runtime.spawn_blocking(move || drop(old))),
-            Err(_) => drop(old),
-        }
         Ok(())
     }
 
@@ -1869,16 +1980,17 @@ impl KafkaTransport {
     /// The consumer role's generation advances only while it is refused, so an
     /// older one holds a refused setup. A failed rebuild keeps the old client,
     /// and the next receive tries again.
-    fn rebuild_refused_consumer(&self) {
+    async fn rebuild_refused_consumer(&self) {
         let (Some(shared), Some(role)) = (&self.consumer, &self.auth.consumer) else {
             return;
         };
-        if shared.read().generation >= role.auth.generation() {
+        if shared.load().generation >= role.auth.generation() {
             return;
         }
         let protocol = self.group_protocol();
-        if let Err(e) =
-            self.rebuild_consumer(protocol, "a broker refused its credentials or TLS setup")
+        if let Err(e) = self
+            .rebuild_consumer(protocol, "a broker refused its credentials or TLS setup")
+            .await
         {
             tracing::debug!(error = %e, "kafka: the refused consumer was not rebuilt");
         }
@@ -1889,13 +2001,15 @@ impl KafkaTransport {
     ///
     /// The new client joins as classic when the fatal `code` is the broker
     /// refusing KIP-848, and with the protocol it had otherwise. A rebuild that
-    /// follows another with no record between fails readiness until a record
-    /// arrives, and spaces the next poll by a backoff. A fenced static member
-    /// is not rebuilt: the error is returned and readiness fails.
+    /// follows another with no record between, within [`REBUILD_QUIET`], fails
+    /// readiness, and spaces the next poll by a backoff. A record brings
+    /// readiness back, as does [`recover_if_quiet`](Self::recover_if_quiet).
+    /// A fenced static member is not rebuilt: the error is returned and
+    /// readiness fails.
     ///
-    /// Nothing here awaits, so a receive dropped around it cannot leave the
-    /// count and the client out of step.
-    fn replace_fatal_consumer(
+    /// The count moves only once the new client is in place, so a receive
+    /// dropped while it builds leaves the count and the client in step.
+    async fn replace_fatal_consumer(
         &self,
         code: RDKafkaErrorCode,
         detail: &str,
@@ -1918,21 +2032,58 @@ impl KafkaTransport {
             }
             FatalAction::Rebuild(protocol) => protocol,
         };
+        if self.rebuilt_quiet() {
+            self.rebuilds.store(0, Ordering::Relaxed);
+            self.rebuild_latch.clear();
+        }
         let reason = format!("librdkafka fatal error {code:?}: {detail}");
-        if let Err(e) = self.rebuild_consumer(protocol, &reason) {
+        if let Err(e) = self.rebuild_consumer(protocol, &reason).await {
+            self.rebuild_unready.store(true, Ordering::Relaxed);
             self.healthy.store(false, Ordering::Relaxed);
             return Err(e);
         }
+        *self.last_rebuild.lock() = Some(std::time::Instant::now());
         let rebuilds = self
             .rebuilds
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         if rebuilds > 1 {
+            self.rebuild_unready.store(true, Ordering::Relaxed);
             self.healthy.store(false, Ordering::Relaxed);
             *self.rebuild_not_before.lock() =
                 Some(std::time::Instant::now() + Backoff::TRANSIENT.delay(rebuilds - 1));
         }
         Ok(RecvBatch::from_messages(Vec::new()).into())
+    }
+
+    /// Whether the client the last fatal rebuild built has run
+    /// [`REBUILD_QUIET`] since.
+    fn rebuilt_quiet(&self) -> bool {
+        self.last_rebuild
+            .lock()
+            .is_some_and(|at| at.elapsed() >= REBUILD_QUIET)
+    }
+
+    /// On a client that is not fatal: once [`REBUILD_QUIET`] has passed since
+    /// the last fatal rebuild, start a new run and bring back the readiness a
+    /// failed or repeated rebuild took, so a quiet topic is not held down
+    /// until a record arrives.
+    fn recover_if_quiet(&self) {
+        let unready = self.rebuild_unready.load(Ordering::Relaxed);
+        if (self.rebuilds.load(Ordering::Relaxed) == 0 && !unready) || !self.rebuilt_quiet() {
+            return;
+        }
+        self.rebuilds.store(0, Ordering::Relaxed);
+        self.rebuild_latch.clear();
+        if self.rebuild_unready.swap(false, Ordering::Relaxed)
+            && !self.closed.load(Ordering::Relaxed)
+        {
+            self.healthy.store(true, Ordering::Relaxed);
+            tracing::info!(
+                quiet_secs = REBUILD_QUIET.as_secs(),
+                "kafka: the rebuilt consumer ran with no fatal error, so it is ready again"
+            );
+        }
     }
 
     /// Wait out the spacing a repeated rebuild set before the next poll.
@@ -2533,8 +2684,9 @@ impl TransportReceiver for KafkaTransport {
     ///
     /// A client librdkafka flags fatal is rebuilt on the same subscription and
     /// the call returns an empty batch. Readiness fails only after a second
-    /// rebuild with no record between, or when a rebuild fails, and a record
-    /// sets it again. A fenced static member (`group.instance.id` held by
+    /// rebuild within 5 minutes with no record between, or when a rebuild
+    /// fails. A record sets it again, and so does the first call after the
+    /// rebuilt client has run 5 minutes with no fatal error. A fenced static member (`group.instance.id` held by
     /// another consumer) is not rebuilt: the call returns
     /// [`TransportError::Recv`] and readiness fails.
     async fn recv(&self, max: usize) -> TransportResult<WorkBatch<Self::Token>> {
@@ -2716,11 +2868,12 @@ impl KafkaTransport {
         let max_msgs = max_msgs.min(self.poll_cap);
 
         self.wait_rebuild_backoff().await?;
-        self.rebuild_refused_consumer();
+        self.rebuild_refused_consumer().await;
         let consumer = self.receiving_client()?;
         if let Some((code, detail)) = fatal_error(&consumer) {
-            return self.replace_fatal_consumer(code, &detail);
+            return self.replace_fatal_consumer(code, &detail).await;
         }
+        self.recover_if_quiet();
 
         if let Some(err) = self.deferred_recv_error.lock().take() {
             return Err(TransportError::Recv(err.to_string()));
@@ -2735,18 +2888,15 @@ impl KafkaTransport {
         #[cfg(feature = "governor")]
         if let Some(ref gate) = self.inbound_gate {
             let _ = gate.evaluate();
-            // While held, re-pause the current assignment once per recv: the
-            // edge paused only what was assigned then. Assignments after the
-            // release are resumed by `StatsContext::post_rebalance`.
-            if gate.is_held()
-                && let Ok(tpl) = consumer.assignment()
-                && tpl.count() > 0
-            {
-                match consumer.pause(&tpl) {
-                    Ok(()) => consumer.context().set_paused(true),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "kafka gate: re-pause under hold failed");
-                    }
+            // Level-triggered: a client rebuilt since the edge has its first
+            // assignment paused by `StatsContext::post_rebalance`.
+            if gate.is_held() {
+                consumer.context().set_paused(true);
+                if let Ok(tpl) = consumer.assignment()
+                    && tpl.count() > 0
+                    && let Err(e) = consumer.pause(&tpl)
+                {
+                    tracing::debug!(error = %e, "kafka gate: re-pause under hold failed");
                 }
             }
         }
@@ -2807,6 +2957,7 @@ impl KafkaTransport {
                 self.recv_state.record_success();
                 consumer.context().prove();
                 self.rebuilds.store(0, Ordering::Relaxed);
+                self.rebuild_unready.store(false, Ordering::Relaxed);
                 if self.rebuild_latch.clear() {
                     tracing::info!("kafka: the rebuilt consumer is reading");
                 }
@@ -2887,7 +3038,7 @@ impl KafkaTransport {
     /// since the last call took them.
     async fn poll_off_runtime(
         &self,
-        consumer: &Arc<BaseConsumer<StatsContext>>,
+        consumer: &Arc<ConsumerClient>,
         max_msgs: usize,
         max_bytes: Option<u64>,
     ) -> TransportResult<(Polled, Vec<(u64, Rebalanced)>)> {
@@ -2954,7 +3105,7 @@ impl KafkaTransport {
             classify::RecvFailure::Permanent | classify::RecvFailure::Unclassified => {
                 classify::record_permanent_recv_failure(&err, class);
                 if let Some((code, detail)) = fatal_error(consumer) {
-                    return self.replace_fatal_consumer(code, &detail);
+                    return self.replace_fatal_consumer(code, &detail).await;
                 }
                 return Err(TransportError::Recv(err.to_string()));
             }
@@ -3203,7 +3354,7 @@ enum DrainStop {
 /// empty queue, and every drain after it ends within [`tuning::MAX_DRAIN_MS`]
 /// of the job's start.
 struct PollJob {
-    consumer: Arc<BaseConsumer<StatsContext>>,
+    consumer: Arc<ConsumerClient>,
     topic_cache: Arc<parking_lot::RwLock<HashMap<String, Arc<str>>>>,
     max_msgs: usize,
     max_bytes: Option<u64>,
@@ -3456,10 +3607,10 @@ struct KafkaGateActuator {
 
 #[cfg(feature = "governor")]
 impl KafkaGateActuator {
-    fn client(&self) -> Option<Arc<BaseConsumer<StatsContext>>> {
+    fn client(&self) -> Option<Arc<ConsumerClient>> {
         self.consumer
             .as_ref()
-            .map(|slot| Arc::clone(&slot.read().client))
+            .map(|slot| Arc::clone(&slot.load().client))
     }
 }
 
@@ -3544,7 +3695,7 @@ impl AskedEnds {
     /// Ask the broker for the assignment's ends on the blocking pool, when one
     /// is due. Called from every `recv`, which the run loop keeps making while
     /// the gate holds and while it works through a full local queue.
-    fn refresh(&self, consumer: &Arc<BaseConsumer<StatsContext>>) {
+    fn refresh(&self, consumer: &Arc<ConsumerClient>) {
         let Some(every) = self.every else {
             return;
         };
@@ -4524,8 +4675,9 @@ mod tests {
         let transport = broker_free("scalo-fenced", ConsumerProtocol::Classic).await;
         let before = transport.consumer();
         for _ in 0..2 {
-            let result =
-                transport.replace_fatal_consumer(RDKafkaErrorCode::FencedInstanceId, "fenced");
+            let result = transport
+                .replace_fatal_consumer(RDKafkaErrorCode::FencedInstanceId, "fenced")
+                .await;
             assert!(
                 matches!(&result, Err(TransportError::Recv(detail)) if detail.contains("fenced")),
                 "a fenced member returns the error, got {:?}",
@@ -4558,7 +4710,9 @@ mod tests {
     }
 
     /// A rebuilt consumer takes the new protocol and the same subscription.
-    /// Broker-free: port 1 on loopback refuses every connect.
+    /// A caller still holding the replaced client keeps it whole, as its only
+    /// owner, and its drop closes it on the blocking pool. Broker-free: port 1
+    /// on loopback refuses every connect.
     #[tokio::test]
     async fn a_rebuilt_consumer_keeps_its_subscription() {
         let transport = KafkaTransport::new(&KafkaConfig {
@@ -4571,21 +4725,38 @@ mod tests {
         .await
         .expect("a consumer transport constructs broker-free");
         assert_eq!(transport.group_protocol(), ConsumerProtocol::Consumer);
+        let held = transport.consumer();
 
         transport
             .rebuild_consumer(ConsumerProtocol::Classic, "test")
+            .await
             .expect("rebuild");
         assert_eq!(transport.group_protocol(), ConsumerProtocol::Classic);
-        let subscription = transport
-            .consumer()
-            .subscription()
-            .expect("librdkafka reports the subscription");
-        let topics: Vec<String> = subscription
-            .elements()
-            .iter()
-            .map(|e| e.topic().to_string())
-            .collect();
-        assert_eq!(topics, vec!["events".to_string()]);
+        let subscribed = |client: &ConsumerClient| -> Vec<String> {
+            client
+                .subscription()
+                .expect("librdkafka reports the subscription")
+                .elements()
+                .iter()
+                .map(|e| e.topic().to_string())
+                .collect()
+        };
+        assert_eq!(
+            subscribed(&transport.consumer()),
+            vec!["events".to_string()]
+        );
+        assert!(transport.consumer().current.load(Ordering::Acquire));
+
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "the slot let the old client go"
+        );
+        assert!(
+            !held.current.load(Ordering::Acquire),
+            "the old client is retired"
+        );
+        assert_eq!(subscribed(&held), vec!["events".to_string()]);
     }
 
     /// A refresh that lists none of the discovered topics leaves the consumer
@@ -4631,36 +4802,72 @@ mod tests {
 
     /// One fatal rebuild keeps readiness. A second with no record between
     /// them fails it, so a consumer that keeps dying is not reported Ready,
-    /// and spaces the next poll.
+    /// and spaces the next poll. A second after [`REBUILD_QUIET`] starts a new
+    /// run, as a record would. Either way, a receive once the rebuilt client
+    /// has run [`REBUILD_QUIET`] finds it ready, with no record.
     #[tokio::test]
     async fn repeated_fatal_rebuilds_fail_readiness() {
-        let transport = broker_free("scalo-fatal-twice", ConsumerProtocol::Classic).await;
+        // (case, how long before the second fatal the first rebuild ran, ready after it)
+        let cases = [
+            ("back to back", Duration::ZERO, false),
+            ("after a quiet period", REBUILD_QUIET, true),
+        ];
+        for (case, gap, ready) in cases {
+            let transport = broker_free("scalo-fatal-twice", ConsumerProtocol::Classic).await;
+            let batch = transport
+                .replace_fatal_consumer(RDKafkaErrorCode::Fatal, "fatal")
+                .await
+                .expect("first rebuild");
+            assert_eq!(
+                batch.records,
+                [] as [crate::transport::work_batch::Record; 0]
+            );
+            assert!(
+                transport.is_healthy(),
+                "{case}: one rebuild is recovery, not failure"
+            );
+            assert!(transport.rebuild_not_before.lock().is_none());
 
-        let batch = transport
-            .replace_fatal_consumer(RDKafkaErrorCode::Fatal, "fatal")
-            .expect("first rebuild");
-        assert_eq!(
-            batch.records,
-            [] as [crate::transport::work_batch::Record; 0]
-        );
-        assert!(
-            transport.is_healthy(),
-            "one rebuild is recovery, not failure"
-        );
-        assert!(transport.rebuild_not_before.lock().is_none());
+            let rebuilt_at = std::time::Instant::now().checked_sub(gap);
+            *transport.last_rebuild.lock() = Some(rebuilt_at.expect("the clock reaches back"));
+            transport
+                .replace_fatal_consumer(RDKafkaErrorCode::Fatal, "fatal again")
+                .await
+                .expect("second rebuild");
+            assert_eq!(transport.is_healthy(), ready, "{case}: readiness");
+            assert_eq!(
+                transport.rebuilds.load(Ordering::Relaxed),
+                if ready { 1 } else { 2 },
+                "{case}: rebuilds in this run"
+            );
+            assert_eq!(
+                transport.rebuild_not_before.lock().is_some(),
+                !ready,
+                "{case}: only a repeat spaces the next poll"
+            );
 
-        transport
-            .replace_fatal_consumer(RDKafkaErrorCode::Fatal, "fatal again")
-            .expect("second rebuild");
-        assert!(
-            !transport.is_healthy(),
-            "a second rebuild with no record between fails readiness"
-        );
-        assert_eq!(transport.rebuilds.load(Ordering::Relaxed), 2);
-        assert!(
-            transport.rebuild_not_before.lock().is_some(),
-            "the next poll waits a backoff"
-        );
+            *transport.rebuild_not_before.lock() = None;
+            transport
+                .recv(10)
+                .await
+                .expect("a receive on the rebuilt client");
+            assert_eq!(
+                transport.is_healthy(),
+                ready,
+                "{case}: within the quiet period"
+            );
+            *transport.last_rebuild.lock() = std::time::Instant::now().checked_sub(REBUILD_QUIET);
+            transport
+                .recv(10)
+                .await
+                .expect("a receive on the rebuilt client");
+            assert!(transport.is_healthy(), "{case}: after the quiet period");
+            assert_eq!(
+                transport.rebuilds.load(Ordering::Relaxed),
+                0,
+                "{case}: a new run"
+            );
+        }
     }
 
     /// The backoff after a repeated rebuild is waited out at the start of the
@@ -4672,6 +4879,7 @@ mod tests {
         for _ in 0..2 {
             transport
                 .replace_fatal_consumer(RDKafkaErrorCode::Fatal, "fatal")
+                .await
                 .expect("rebuild");
         }
         let rebuilt = transport.consumer();
@@ -4709,7 +4917,7 @@ mod tests {
     /// dropped mid-poll leaves one.
     async fn leave_in_flight(
         transport: &KafkaTransport,
-        client: Arc<BaseConsumer<StatsContext>>,
+        client: Arc<ConsumerClient>,
         polled: Polled,
     ) {
         *transport.in_flight.lock().await = Some(InFlightPoll {
@@ -4728,6 +4936,7 @@ mod tests {
         let replaced = transport.consumer();
         transport
             .rebuild_consumer(ConsumerProtocol::Classic, "test")
+            .await
             .expect("rebuild");
         let fatal = || KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::Fatal);
 
@@ -5486,7 +5695,7 @@ mod tests {
             .consumer
             .as_ref()
             .expect("a consumer")
-            .read()
+            .load()
             .epoch;
 
         for role in [
@@ -5523,7 +5732,7 @@ mod tests {
         assert_ne!(rebuilt, first, "the producer was replaced");
 
         transport.recv(10).await.expect("a refused receive runs on");
-        let slot = transport.consumer.as_ref().expect("a consumer").read();
+        let slot = transport.consumer.as_ref().expect("a consumer").load();
         assert_eq!(slot.generation, transport.auth.consumer_auth().generation());
         assert!(slot.epoch > epoch, "the consumer was replaced");
         drop(slot);
@@ -5595,7 +5804,7 @@ mod tests {
                 .consumer
                 .as_ref()
                 .expect("a consumer")
-                .read()
+                .load()
                 .generation,
             transport.auth.consumer_auth().generation(),
             "the consumer was rebuilt"
@@ -5708,7 +5917,7 @@ mod tests {
                         .consumer
                         .as_ref()
                         .expect("a consumer")
-                        .read()
+                        .load()
                         .generation,
                     refused.generation(),
                     "the consumer was rebuilt"
@@ -6660,6 +6869,7 @@ mod tests {
 
         transport
             .rebuild_consumer(ConsumerProtocol::Classic, "test rebuild")
+            .await
             .expect("broker-free rebuild");
         assert_eq!(
             transport.lease("events", 0),
