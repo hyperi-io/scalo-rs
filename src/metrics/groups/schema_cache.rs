@@ -11,7 +11,7 @@
 use metrics::{Counter, Gauge};
 
 use super::super::MetricsManager;
-use super::super::manifest::{MetricDescriptor, MetricType};
+use super::super::Series;
 
 /// Schema cache metrics.
 ///
@@ -28,19 +28,13 @@ impl SchemaCacheMetrics {
     pub fn new(manager: &MetricsManager) -> Self {
         // BARE names -- the recorder prefix layer and registry apply the namespace.
 
-        // schema_recovery_total -- label-based, register descriptor manually
-        metrics::describe_counter!("schema_recovery_total", "Schema mismatch recovery events");
-        manager.registry().push(MetricDescriptor {
-            name: "schema_recovery_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Schema mismatch recovery events".into(),
-            unit: String::new(),
-            labels: vec!["table".into()],
-            group: "schema_cache".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
+        manager.registry().describe(
+            "schema_cache",
+            &[
+                Series::counter("schema_recovery_total", "Schema mismatch recovery events")
+                    .labels(&["table"]),
+            ],
+        );
 
         Self {
             hits: manager.counter_with_labels(

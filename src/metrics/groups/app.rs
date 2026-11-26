@@ -11,7 +11,7 @@
 use metrics::{Counter, Gauge};
 
 use super::super::MetricsManager;
-use super::super::manifest::{MetricDescriptor, MetricType};
+use super::super::Series;
 
 /// Mandatory metrics for every application.
 ///
@@ -50,7 +50,13 @@ impl AppMetrics {
     pub fn new(manager: &MetricsManager, version: &str, commit: &str) -> Self {
         // Info metric for service discovery. Names are BARE -- the prefix layer
         // on the global recorder and the registry apply the namespace.
-        metrics::describe_gauge!("info", "Application info for service discovery");
+        manager.registry().describe(
+            "app",
+            &[
+                Series::gauge("info", "Application info for service discovery")
+                    .labels(&["version", "commit"]),
+            ],
+        );
         if manager.registry().claim_build_info(version, commit) {
             metrics::gauge!(
                 "info",
@@ -59,17 +65,6 @@ impl AppMetrics {
             )
             .set(1.0);
         }
-        manager.registry().push(MetricDescriptor {
-            name: "info".into(),
-            metric_type: MetricType::Gauge,
-            description: "Application info for service discovery".into(),
-            unit: String::new(),
-            labels: vec!["version".into(), "commit".into()],
-            group: "app".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
 
         // Start time
         let start_time = manager.gauge_with_labels(
@@ -84,21 +79,12 @@ impl AppMetrics {
                 .map_or(0.0, |d| d.as_secs_f64()),
         );
 
-        // config_reloads_total -- label-based, register descriptor manually.
         // BARE name. The recorder's prefix layer adds the namespace at emit time.
         let config_key = "config_reloads_total";
-        metrics::describe_counter!(config_key, "Config reload attempts");
-        manager.registry().push(MetricDescriptor {
-            name: config_key.into(),
-            metric_type: MetricType::Counter,
-            description: "Config reload attempts".into(),
-            unit: String::new(),
-            labels: vec!["result".into()],
-            group: "app".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
+        manager.registry().describe(
+            "app",
+            &[Series::counter(config_key, "Config reload attempts").labels(&["result"])],
+        );
 
         Self {
             records_received: manager.counter_with_labels(

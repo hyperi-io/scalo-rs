@@ -27,6 +27,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use metrics::{KeyName, SharedString, Unit};
 use serde::{Deserialize, Serialize};
 
 /// Describes a single registered metric for the manifest.
@@ -64,6 +65,73 @@ pub enum MetricType {
     Counter,
     Gauge,
     Histogram,
+}
+
+/// One metric for [`MetricRegistry::describe`], by its BARE name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Series<'a> {
+    name: &'a str,
+    metric_type: MetricType,
+    description: &'a str,
+    unit: &'a str,
+    recorder_unit: Option<Unit>,
+    labels: &'a [&'a str],
+    buckets: Option<&'a [f64]>,
+}
+
+impl<'a> Series<'a> {
+    fn new(name: &'a str, metric_type: MetricType, description: &'a str) -> Self {
+        Self {
+            name,
+            metric_type,
+            description,
+            unit: "",
+            recorder_unit: None,
+            labels: &[],
+            buckets: None,
+        }
+    }
+
+    pub(crate) fn counter(name: &'a str, description: &'a str) -> Self {
+        Self::new(name, MetricType::Counter, description)
+    }
+
+    pub(crate) fn gauge(name: &'a str, description: &'a str) -> Self {
+        Self::new(name, MetricType::Gauge, description)
+    }
+
+    /// A histogram of seconds.
+    pub(crate) fn histogram(name: &'a str, description: &'a str) -> Self {
+        Self::new(name, MetricType::Histogram, description).unit(Unit::Seconds)
+    }
+
+    /// The label keys its emitters set.
+    pub(crate) fn labels(mut self, labels: &'a [&'a str]) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    /// The unit, in the manifest and to the recorder, which makes it the OTLP
+    /// stream's unit.
+    pub(crate) fn unit(mut self, unit: Unit) -> Self {
+        self.unit = unit.as_str();
+        self.recorder_unit = Some(unit);
+        self
+    }
+
+    /// The unit in the manifest alone. The recorder hears none, so the OTLP
+    /// stream keeps the unit `1`.
+    pub(crate) fn manifest_unit(mut self, unit: &'a str) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    /// Histogram bucket bounds for the manifest. The recorder's buckets are
+    /// set when it is installed.
+    pub(crate) fn buckets(mut self, buckets: Option<&'a [f64]>) -> Self {
+        self.buckets = buckets;
+        self
+    }
 }
 
 /// JSON response for `GET /metrics/manifest`.
@@ -157,7 +225,7 @@ impl MetricRegistry {
     /// and the runtime describes its own metrics before the app does, so an app
     /// describing a platform metric again cannot strip its labels, group, use
     /// cases or dashboard hint.
-    pub(crate) fn push(&self, mut descriptor: MetricDescriptor) {
+    fn push(&self, mut descriptor: MetricDescriptor) {
         if let Ok(mut inner) = self.inner.write() {
             if !inner.namespace.is_empty() {
                 descriptor.name = format!("{}_{}", inner.namespace, descriptor.name);
@@ -182,6 +250,32 @@ impl MetricRegistry {
                 }
                 None => inner.descriptors.push(descriptor),
             }
+        }
+    }
+
+    /// Describe each series to the current recorder and push it into the
+    /// manifest under `group`.
+    pub(crate) fn describe(&self, group: &str, series: &[Series<'_>]) {
+        for s in series {
+            let name = KeyName::from(s.name.to_string());
+            let description = SharedString::from(s.description.to_string());
+            let unit = s.recorder_unit;
+            metrics::with_recorder(|recorder| match s.metric_type {
+                MetricType::Counter => recorder.describe_counter(name, unit, description),
+                MetricType::Gauge => recorder.describe_gauge(name, unit, description),
+                MetricType::Histogram => recorder.describe_histogram(name, unit, description),
+            });
+            self.push(MetricDescriptor {
+                name: s.name.to_string(),
+                metric_type: s.metric_type,
+                description: s.description.to_string(),
+                unit: s.unit.to_string(),
+                labels: s.labels.iter().map(|l| (*l).to_string()).collect(),
+                group: group.to_string(),
+                buckets: s.buckets.map(<[f64]>::to_vec),
+                use_cases: vec![],
+                dashboard_hint: None,
+            });
         }
     }
 

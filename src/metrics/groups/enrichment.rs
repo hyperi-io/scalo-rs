@@ -9,7 +9,7 @@
 //! Enrichment cache metrics (GeoIP, reputation, lookup tables).
 
 use super::super::MetricsManager;
-use super::super::manifest::{MetricDescriptor, MetricType};
+use super::super::Series;
 
 /// Enrichment cache metrics.
 ///
@@ -25,65 +25,20 @@ impl EnrichmentMetrics {
     pub fn new(manager: &MetricsManager) -> Self {
         // BARE names -- the recorder prefix layer and registry apply the namespace.
 
-        // enrichment_cache_hits_total -- label-based
-        metrics::describe_counter!("enrichment_cache_hits_total", "Enrichment cache hits");
-        manager.registry().push(MetricDescriptor {
-            name: "enrichment_cache_hits_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Enrichment cache hits".into(),
-            unit: String::new(),
-            labels: vec!["type".into()],
-            group: "enrichment".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        // enrichment_cache_misses_total -- label-based
-        metrics::describe_counter!("enrichment_cache_misses_total", "Enrichment cache misses");
-        manager.registry().push(MetricDescriptor {
-            name: "enrichment_cache_misses_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Enrichment cache misses".into(),
-            unit: String::new(),
-            labels: vec!["type".into()],
-            group: "enrichment".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        // enrichment_cache_size -- label-based
-        metrics::describe_gauge!("enrichment_cache_size", "Current enrichment cache entries");
-        manager.registry().push(MetricDescriptor {
-            name: "enrichment_cache_size".into(),
-            metric_type: MetricType::Gauge,
-            description: "Current enrichment cache entries".into(),
-            unit: String::new(),
-            labels: vec!["type".into()],
-            group: "enrichment".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        // enrichment_duration_seconds -- label-based
-        metrics::describe_histogram!(
-            "enrichment_duration_seconds",
-            metrics::Unit::Seconds,
-            "Enrichment lookup latency"
+        let by_type = ["type"];
+        manager.registry().describe(
+            "enrichment",
+            &[
+                Series::counter("enrichment_cache_hits_total", "Enrichment cache hits")
+                    .labels(&by_type),
+                Series::counter("enrichment_cache_misses_total", "Enrichment cache misses")
+                    .labels(&by_type),
+                Series::gauge("enrichment_cache_size", "Current enrichment cache entries")
+                    .labels(&by_type),
+                Series::histogram("enrichment_duration_seconds", "Enrichment lookup latency")
+                    .labels(&by_type),
+            ],
         );
-        manager.registry().push(MetricDescriptor {
-            name: "enrichment_duration_seconds".into(),
-            metric_type: MetricType::Histogram,
-            description: "Enrichment lookup latency".into(),
-            unit: "seconds".into(),
-            labels: vec!["type".into()],
-            group: "enrichment".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
 
         Self { _private: () }
     }
