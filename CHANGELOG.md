@@ -3,6 +3,32 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.41](https://github.com/hyperi-io/scalo-rs/compare/v2.14.40...v2.14.41) (2026-11-26)
+
+### Bug Fixes
+
+* **build:** line-tables-only debuginfo for tests ([1b297b2](https://github.com/hyperi-io/scalo-rs/commit/1b297b2a8ebc07903f316908ec95c1f0f8fdab47))
+* **ci:** fail the quality stage on any rustdoc warning ([dbc6880](https://github.com/hyperi-io/scalo-rs/commit/dbc6880070ed71db9ad6c860cbee4c57d91151a4))
+* **concurrency:** split batches at the byte limit ([d374235](https://github.com/hyperi-io/scalo-rs/commit/d374235d26d661dd5b2ea4235d94e1d6c35ec96a))
+* **deployment:** join each catalogue field to its schema option ([2473a41](https://github.com/hyperi-io/scalo-rs/commit/2473a41033ca84a5cef662220c193d7dbcd76a44))
+* **docs:** make doc links resolve in every feature build ([afaa943](https://github.com/hyperi-io/scalo-rs/commit/afaa943fbf16d27ee588d67d78eaad241c6f5d00))
+* **filter:** support CEL rule actions on evaluation errors ([96e8dc0](https://github.com/hyperi-io/scalo-rs/commit/96e8dc00a043fce9073ab4f185f56f044eec5863))
+* **kafka:** preserve record headers across a hop ([220eac2](https://github.com/hyperi-io/scalo-rs/commit/220eac23d0c61f71f973a1e1c9cd7e82814d24ba))
+* **kafka:** set the message timestamp from the record ([13aede1](https://github.com/hyperi-io/scalo-rs/commit/13aede1a7800f48d5ab911ce1134995d70ee2369))
+* **metrics:** describe every series scalo writes in the manifest ([6ac3128](https://github.com/hyperi-io/scalo-rs/commit/6ac31282236905079e964ee61537a6b1744a3dbe)), closes [#137](https://github.com/hyperi-io/scalo-rs/issues/137)
+* **metrics:** render the installed recorder from a later manager ([27bd43f](https://github.com/hyperi-io/scalo-rs/commit/27bd43f26e2c757da2996a919af73ec3c46f41f3))
+* **secrets:** key each cached source on what it reads ([d686764](https://github.com/hyperi-io/scalo-rs/commit/d6867648ed011fa8e900d02751bc4006feea5823))
+* **secrets:** reuse one logged-in Vault client per connection ([702ec9d](https://github.com/hyperi-io/scalo-rs/commit/702ec9debccf8e13e324df9d590ff27fbe092a7a))
+* **secrets:** share one AWS client across one-off lookups ([f5008b9](https://github.com/hyperi-io/scalo-rs/commit/f5008b9ee250e281bed7a53b5cd8bfd05f795c58))
+* **syslog:** use the time_unix_nano header for timestamps ([3e7546e](https://github.com/hyperi-io/scalo-rs/commit/3e7546e8195ccc0dc07ec3b3e94194216e1283c2))
+* **transport:** add syslog receiver limits and UDP batching ([a2c786a](https://github.com/hyperi-io/scalo-rs/commit/a2c786a8894a45ca2670ba1b417399e1778162ba))
+* **transport:** add UDP syslog sender and listener examples ([fd6bfc6](https://github.com/hyperi-io/scalo-rs/commit/fd6bfc6b7b7fc9d4cd75c094e341fd8ede3c72df))
+* **transport:** split HTTP bodies by framing ([1f6b4b4](https://github.com/hyperi-io/scalo-rs/commit/1f6b4b47cf37059babc5104fa3c03a1a36e06060))
+* **transport:** syslog resolver and numbered DLQ ([29935b7](https://github.com/hyperi-io/scalo-rs/commit/29935b7eb708fa9cbccf64e27ccd1d5e4bc5918b))
+* **wasm:** host signed WebAssembly component plugins under limits ([fb3d4ab](https://github.com/hyperi-io/scalo-rs/commit/fb3d4ab99260a0d5b9595fd13184aea53ad69cc2))
+* **wasm:** log a guest's stdout and stderr with its plugin name ([8b03a33](https://github.com/hyperi-io/scalo-rs/commit/8b03a334baf5db8bd259b96d19a47db7bd59afd0))
+* **wasm:** pull plugins from an OCI registry ([dcbf58c](https://github.com/hyperi-io/scalo-rs/commit/dcbf58c78bd586cb493bcf173abeecafeafe00c0))
+
 ## [2.14.40](https://github.com/hyperi-io/scalo-rs/compare/v2.14.39...v2.14.40) (2026-11-26)
 
 ### Bug Fixes
