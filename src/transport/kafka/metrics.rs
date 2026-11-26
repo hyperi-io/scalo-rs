@@ -431,7 +431,7 @@ impl StatsContext {
         }
     }
 
-    /// Whether the inbound gate has the assignment paused.
+    /// Whether the inbound gate holds, so a new assignment is paused too.
     #[cfg(feature = "governor")]
     pub(crate) fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
@@ -950,6 +950,35 @@ impl rdkafka::consumer::ConsumerContext for StatsContext {
                 self.assign(&given, number);
             }
             rdkafka::consumer::Rebalance::Error(_) => {}
+        }
+    }
+
+    /// Puts each newly assigned partition in the inbound gate's state.
+    /// librdkafka keeps an application pause across a revoke and a later
+    /// assign, so a partition the gate paused, lost during the hold and
+    /// given back after it would otherwise never fetch again.
+    #[cfg(feature = "governor")]
+    fn post_rebalance(
+        &self,
+        consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        rebalance: &rdkafka::consumer::Rebalance<'_>,
+    ) {
+        use rdkafka::consumer::Consumer;
+
+        let rdkafka::consumer::Rebalance::Assign(given) = rebalance else {
+            return;
+        };
+        if given.count() == 0 {
+            return;
+        }
+        let (op, applied) = if self.is_paused() {
+            ("pause", consumer.pause(given))
+        } else {
+            ("resume", consumer.resume(given))
+        };
+        if let Err(e) = applied {
+            tracing::warn!(error = %e, op, "kafka gate: a new assignment was not brought into the gate's state");
+            super::gate_actuator_error(op);
         }
     }
 }
