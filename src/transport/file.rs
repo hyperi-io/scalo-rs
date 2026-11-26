@@ -16,13 +16,24 @@
 //! Appends one NDJSON line per record through [`crate::io::NdjsonWriter`],
 //! a whole `send_batch` block in one write. Rotation by size or time,
 //! `durable` syncing and file modes come from the writer's keys. Rotation is
-//! off by default, and a reader of the same path does not follow a rotation.
+//! off by default, and a reader of the same path follows a rotation only with
+//! acknowledgements on.
 //!
 //! ## Receive
 //!
 //! Reads NDJSON lines from the file, tracking byte offset for commit.
 //! Position is persisted to a `.pos` sidecar file so reads survive restarts,
 //! written by temporary file and rename so a crash cannot truncate it.
+//!
+//! With an `acknowledgements` section that is enabled, the saved position
+//! moves only past lines whose release delivered them, in file order, so a
+//! later block delivered first never moves it past an earlier one. On Unix
+//! the sidecar then names the file's device and inode too, and a reader that
+//! finds the path renamed under it by rotation finishes the renamed file,
+//! waits for its last line to be released, then reads the new file from its
+//! start. A restart whose saved position names a rotated file finds that file
+//! by inode and reads its tail first. Without the section the reader saves
+//! the highest offset released and does not follow a rotation.
 //!
 //! Only a line that ends in `\n` becomes a record. A trailing line without
 //! one is held until the writer finishes it, so a file whose last line has no
@@ -39,8 +50,10 @@
 //! transport.send("events", bytes::Bytes::from_static(b"{\"msg\":\"hello\"}")).await;
 //! ```
 
+use super::ack::{AckControl, AckKind, AcknowledgementsConfig, AcknowledgingReceiver, HeldAcks};
 use super::core::{Lifecycle, Meter};
 use super::error::{TransportError, TransportResult};
+use super::finalizer::DeliveryStatus;
 use super::traits::{CommitToken, RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::WorkBatch;
@@ -50,8 +63,10 @@ use crate::io::{
     FileWriteOptions, FileWriterConfig, NO_AGE_LIMIT, NdjsonWriter, ROTATED_ACCEPTS, RotationPeriod,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
@@ -181,16 +196,197 @@ impl FileTransportConfig {
     }
 }
 
+/// The device and inode of a file, which a rename keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    /// The id of the file `meta` describes, `None` off Unix.
+    #[cfg_attr(unix, allow(clippy::unnecessary_wraps))]
+    fn of(meta: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Some(Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            None
+        }
+    }
+
+    /// The id of the file at `path`, `None` when it is missing or off Unix.
+    async fn at(path: &Path) -> Option<Self> {
+        Self::of(&tokio::fs::metadata(path).await.ok()?)
+    }
+}
+
+/// A position saved in the `.pos` sidecar: `<offset>`, or `<offset> <dev>:<ino>`
+/// once acknowledgements name the file it is in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SavedPosition {
+    offset: u64,
+    file: Option<FileId>,
+}
+
+impl SavedPosition {
+    /// Read back what [`render`](Self::render) wrote. An unreadable sidecar
+    /// is offset 0 in the file at the path.
+    fn parse(content: &str) -> Self {
+        let mut words = content.split_whitespace();
+        let offset = words.next().and_then(|w| w.parse().ok()).unwrap_or(0);
+        let file = words.next().and_then(|w| {
+            let (dev, ino) = w.split_once(':')?;
+            Some(FileId {
+                dev: dev.parse().ok()?,
+                ino: ino.parse().ok()?,
+            })
+        });
+        Self { offset, file }
+    }
+
+    fn render(self) -> String {
+        match self.file {
+            Some(FileId { dev, ino }) => format!("{} {dev}:{ino}", self.offset),
+            None => self.offset.to_string(),
+        }
+    }
+}
+
+/// Where a line `recv` handed out stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Line {
+    Out,
+    Delivered,
+    /// Released `Errored`: the saved position never passes it.
+    Withheld,
+}
+
+/// The lines handed out of the file being read and not yet saved past, by
+/// the offset after each.
+#[derive(Debug, Default)]
+struct HeldLines {
+    /// The file the lines are in.
+    file: Option<FileId>,
+    lines: BTreeMap<u64, Line>,
+}
+
+impl HeldLines {
+    fn hand_out(&mut self, offsets: impl IntoIterator<Item = u64>) {
+        for offset in offsets {
+            self.lines.insert(offset, Line::Out);
+        }
+    }
+
+    /// Mark `offsets` released, and the position the saved one may move to:
+    /// past every line from the front that is delivered.
+    fn release(&mut self, offsets: impl IntoIterator<Item = u64>, delivered: bool) -> Option<u64> {
+        for offset in offsets {
+            if let Some(line) = self.lines.get_mut(&offset) {
+                *line = if delivered {
+                    Line::Delivered
+                } else {
+                    Line::Withheld
+                };
+            }
+        }
+        let mut to = None;
+        while let Some(front) = self.lines.first_entry() {
+            if *front.get() != Line::Delivered {
+                break;
+            }
+            to = Some(*front.key());
+            front.remove();
+        }
+        to
+    }
+}
+
+/// The acknowledgement state of a file source built with an `acknowledgements`
+/// section.
+#[derive(Debug)]
+struct FileAcks {
+    config: AcknowledgementsConfig,
+    armed: AtomicBool,
+    held: parking_lot::Mutex<HeldLines>,
+    /// The position last saved, which a save never moves back.
+    saved: Mutex<SavedPosition>,
+}
+
+impl FileAcks {
+    fn new(config: AcknowledgementsConfig) -> Self {
+        Self {
+            config,
+            armed: AtomicBool::new(false),
+            held: parking_lot::Mutex::new(HeldLines::default()),
+            saved: Mutex::new(SavedPosition::default()),
+        }
+    }
+}
+
+impl AckControl for FileAcks {
+    fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Acquire)
+    }
+
+    fn kind(&self) -> AckKind {
+        AckKind::Pull
+    }
+
+    fn held(&self) -> HeldAcks {
+        let held = self.held.lock();
+        let count = held
+            .lines
+            .values()
+            .filter(|l| **l != Line::Delivered)
+            .count();
+        HeldAcks::new(count as u64, 0, None, None)
+    }
+}
+
 /// Internal state for the read side, kept across `recv` calls so a dropped
 /// call loses nothing.
 struct ReadState {
     reader: BufReader<tokio::fs::File>,
     /// Byte offset the reader started at.
     base: u64,
+    /// The file the reader has open, which rotation may have renamed.
+    file: Option<FileId>,
     /// Holds a line still waiting for its newline.
     decoder: StreamDecoder,
     /// Lines read but not yet returned, in file order.
     pending: Vec<ReadLine>,
+}
+
+impl ReadState {
+    fn new(file: tokio::fs::File, base: u64, id: Option<FileId>, max_line_bytes: usize) -> Self {
+        let limits = DecodeLimits {
+            max_record_bytes: max_line_bytes,
+            ..DecodeLimits::UNBOUNDED
+        };
+        Self {
+            reader: BufReader::new(file),
+            base,
+            file: id,
+            decoder: StreamDecoder::new(Arc::new(Lf), limits),
+            pending: Vec::new(),
+        }
+    }
 }
 
 /// A complete line the reader has taken off the file.
@@ -199,6 +395,16 @@ enum ReadLine {
     Record(Message<FileToken>),
     /// A line over `max_line_bytes`, as a dead letter of its head.
     TooLong(super::filter::FilteredDlqEntry, FileToken),
+}
+
+impl ReadLine {
+    /// The offset after the line.
+    fn offset(&self) -> u64 {
+        match self {
+            Self::Record(message) => message.token.offset,
+            Self::TooLong(_, token) => token.offset,
+        }
+    }
 }
 
 /// NDJSON file transport.
@@ -211,6 +417,8 @@ pub struct FileTransport {
     /// The send side's writer, opened on the first send.
     writer: Mutex<Option<Arc<NdjsonWriter>>>,
     reader: Mutex<Option<ReadState>>,
+    /// Set by an `acknowledgements` section, `None` without one.
+    acks: Option<FileAcks>,
     lifecycle: Lifecycle,
     filter_engine: super::filter::TransportFilterEngine,
 }
@@ -254,9 +462,28 @@ impl FileTransport {
             config: config.clone(),
             writer: Mutex::new(None),
             reader: Mutex::new(None),
+            acks: None,
             lifecycle: Lifecycle::new::<Self>(|| true),
             filter_engine,
         })
+    }
+
+    /// Apply an `acknowledgements` section. Enabled, the saved position moves
+    /// only past lines delivered, in file order, and the reader follows a
+    /// rotation once the renamed file's last line is released. Without a
+    /// section, or with it disabled, the reader saves the highest offset
+    /// released.
+    ///
+    /// `AnyReceiver::from_config` reads it from `<key>.file.acknowledgements`.
+    #[must_use]
+    pub fn with_acknowledgements(mut self, acknowledgements: AcknowledgementsConfig) -> Self {
+        self.acks = Some(FileAcks::new(acknowledgements));
+        self
+    }
+
+    /// The acknowledgement state, when a section turned acknowledgements on.
+    fn holding(&self) -> Option<&FileAcks> {
+        self.acks.as_ref().filter(|a| a.config.enabled)
     }
 
     /// Path to the `.pos` sidecar file that tracks read position.
@@ -267,11 +494,11 @@ impl FileTransport {
     }
 
     /// Load committed read position from the sidecar file.
-    async fn load_position(data_path: &Path) -> u64 {
+    async fn load_position(data_path: &Path) -> SavedPosition {
         let pos_path = Self::pos_path(data_path);
         match tokio::fs::read_to_string(&pos_path).await {
-            Ok(content) => content.trim().parse::<u64>().unwrap_or(0),
-            Err(_) => 0,
+            Ok(content) => SavedPosition::parse(&content),
+            Err(_) => SavedPosition::default(),
         }
     }
 
@@ -280,7 +507,7 @@ impl FileTransport {
     /// Written to a temporary sibling, synced and renamed over the sidecar, so
     /// a crash mid-commit leaves the previous position rather than an empty
     /// file that reads back as offset 0.
-    async fn save_position(data_path: &Path, offset: u64) -> TransportResult<()> {
+    async fn save_position(data_path: &Path, position: SavedPosition) -> TransportResult<()> {
         let pos_path = Self::pos_path(data_path);
         let mut tmp_path = pos_path.as_os_str().to_owned();
         tmp_path.push(".tmp");
@@ -292,7 +519,7 @@ impl FileTransport {
         let mut tmp = tokio::fs::File::create(&tmp_path)
             .await
             .map_err(commit_err)?;
-        tmp.write_all(offset.to_string().as_bytes())
+        tmp.write_all(position.render().as_bytes())
             .await
             .map_err(commit_err)?;
         tmp.sync_all().await.map_err(commit_err)?;
@@ -377,35 +604,183 @@ impl FileTransport {
                 )));
             }
 
-            let offset = Self::load_position(path).await;
-            let mut file = tokio::fs::File::open(&self.config.path)
-                .await
-                .map_err(|e| {
-                    TransportError::Connection(format!(
-                        "failed to open '{}' for reading: {e}",
-                        self.config.path
-                    ))
-                })?;
+            let saved = Self::load_position(path).await;
+            let (open_path, start) = match self.holding() {
+                Some(_) => self.resume_from(saved).await,
+                None => (path.to_path_buf(), saved.offset),
+            };
+            let mut file = tokio::fs::File::open(&open_path).await.map_err(|e| {
+                TransportError::Connection(format!(
+                    "failed to open '{}' for reading: {e}",
+                    open_path.display()
+                ))
+            })?;
 
             // Seek to committed position
-            file.seek(std::io::SeekFrom::Start(offset))
+            file.seek(std::io::SeekFrom::Start(start))
                 .await
                 .map_err(|e| {
-                    TransportError::Recv(format!("failed to seek to offset {offset}: {e}"))
+                    TransportError::Recv(format!("failed to seek to offset {start}: {e}"))
                 })?;
 
-            let limits = DecodeLimits {
-                max_record_bytes: self.config.max_line_bytes,
-                ..DecodeLimits::UNBOUNDED
-            };
-            *guard = Some(ReadState {
-                reader: BufReader::new(file),
-                base: offset,
-                decoder: StreamDecoder::new(Arc::new(Lf), limits),
-                pending: Vec::new(),
-            });
+            let id = FileId::of(&file.metadata().await.map_err(|e| {
+                TransportError::Recv(format!("failed to stat '{}': {e}", open_path.display()))
+            })?);
+            if let Some(acks) = self.holding() {
+                let opened = SavedPosition {
+                    offset: start,
+                    file: id,
+                };
+                // Saved at once, so a rotation before the first release still
+                // leaves a sidecar that names this file.
+                if opened != saved {
+                    Self::save_position(path, opened).await?;
+                }
+                acks.held.lock().file = id;
+                *acks.saved.lock().await = opened;
+            }
+            *guard = Some(ReadState::new(file, start, id, self.config.max_line_bytes));
         }
         Ok(())
+    }
+
+    /// The file and offset a holding reader resumes from: the saved file, by
+    /// inode, when rotation renamed it, else the file at the path.
+    async fn resume_from(&self, saved: SavedPosition) -> (PathBuf, u64) {
+        let path = Path::new(&self.config.path);
+        let Some(want) = saved.file else {
+            return (path.to_path_buf(), saved.offset);
+        };
+        if FileId::at(path).await == Some(want) {
+            return (path.to_path_buf(), saved.offset);
+        }
+        if let Some(rotated) = Self::find_by_id(path, want).await {
+            #[cfg(feature = "logger")]
+            tracing::info!(
+                path = %rotated.display(),
+                offset = saved.offset,
+                "File transport: reading the rotated file the saved position names first"
+            );
+            return (rotated, saved.offset);
+        }
+        #[cfg(feature = "logger")]
+        tracing::warn!(
+            path = %self.config.path,
+            offset = saved.offset,
+            "File transport: the rotated file the saved position names is gone, so its unread \
+             lines are lost and the live file is read from its start"
+        );
+        (path.to_path_buf(), 0)
+    }
+
+    /// The sibling of `live` named `<live>.<suffix>` whose id is `want`.
+    async fn find_by_id(live: &Path, want: FileId) -> Option<PathBuf> {
+        let prefix = {
+            let mut name = live.file_name()?.to_owned();
+            name.push(".");
+            name
+        };
+        let dir = live
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            if !name
+                .as_encoded_bytes()
+                .starts_with(prefix.as_encoded_bytes())
+            {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata().await
+                && FileId::of(&meta) == Some(want)
+            {
+                return Some(entry.path());
+            }
+        }
+        None
+    }
+
+    /// Move a holding reader at the end of a file rotation renamed onto the
+    /// new file at the path, once every line handed out of the old one is
+    /// released delivered.
+    async fn follow_rotation(&self, acks: &FileAcks, state: &mut ReadState) -> TransportResult<()> {
+        let path = Path::new(&self.config.path);
+        if !acks.held.lock().lines.is_empty() {
+            return Ok(());
+        }
+        let file = match tokio::fs::File::open(path).await {
+            Ok(file) => file,
+            // Renamed away and not yet created again.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(TransportError::Connection(format!(
+                    "failed to open '{}' for reading: {e}",
+                    self.config.path
+                )));
+            }
+        };
+        let opened = FileId::of(&file.metadata().await.map_err(|e| {
+            TransportError::Recv(format!("failed to stat '{}': {e}", self.config.path))
+        })?);
+        let start = SavedPosition {
+            offset: 0,
+            file: opened,
+        };
+        {
+            let mut saved = acks.saved.lock().await;
+            Self::save_position(path, start).await?;
+            *saved = start;
+        }
+        acks.held.lock().file = opened;
+        *state = ReadState::new(file, 0, opened, self.config.max_line_bytes);
+        #[cfg(feature = "logger")]
+        tracing::info!(
+            path = %self.config.path,
+            "File transport: the rotated file is delivered, reading the new one"
+        );
+        Ok(())
+    }
+
+    /// Save `offset` in `file` unless a later position is saved already.
+    async fn save_in_order(
+        &self,
+        acks: &FileAcks,
+        file: Option<FileId>,
+        offset: u64,
+    ) -> TransportResult<()> {
+        let mut saved = acks.saved.lock().await;
+        if saved.file != file || offset <= saved.offset {
+            return Ok(());
+        }
+        let position = SavedPosition { offset, file };
+        Self::save_position(Path::new(&self.config.path), position).await?;
+        *saved = position;
+        #[cfg(feature = "logger")]
+        tracing::debug!(offset, "File transport: position committed");
+        Ok(())
+    }
+
+    /// Release `tokens` in file order: the saved position moves past every
+    /// line from the front that is delivered, and never past one that is not.
+    ///
+    /// An undelivered release does its work before its first await.
+    async fn release_in_order(
+        &self,
+        acks: &FileAcks,
+        tokens: &[FileToken],
+        delivered: bool,
+    ) -> TransportResult<()> {
+        let (file, to) = {
+            let mut held = acks.held.lock();
+            let to = held.release(tokens.iter().map(|t| t.offset), delivered);
+            (held.file, to)
+        };
+        match to {
+            Some(offset) => self.save_in_order(acks, file, offset).await,
+            None => Ok(()),
+        }
     }
 }
 
@@ -512,6 +887,13 @@ impl TransportReceiver for FileTransport {
             .as_mut()
             .ok_or_else(|| TransportError::Internal("reader not initialised".into()))?;
 
+        // Seen before the read, so the read ends the renamed file.
+        let renamed = match self.holding() {
+            Some(_) => FileId::at(Path::new(&self.config.path))
+                .await
+                .is_some_and(|live| Some(live) != state.file),
+            None => false,
+        };
         // A dropped read leaves a partial line in the decoder, and `pending`
         // holds finished lines, so a dropped call resumes here.
         let ReadState {
@@ -519,7 +901,8 @@ impl TransportReceiver for FileTransport {
             base,
             decoder,
             pending,
-        } = state;
+            ..
+        } = &mut *state;
         let cap = self.config.max_line_bytes;
 
         for _ in pending.len()..max {
@@ -572,6 +955,15 @@ impl TransportReceiver for FileTransport {
         // A call with a smaller `max` than the dropped one leaves the rest queued.
         let rest = pending.split_off(pending.len().min(max));
         let lines = std::mem::replace(pending, rest);
+        if let Some(acks) = self.holding() {
+            if !lines.is_empty() {
+                acks.held
+                    .lock()
+                    .hand_out(lines.iter().map(ReadLine::offset));
+            } else if renamed {
+                self.follow_rotation(acks, state).await?;
+            }
+        }
         drop(guard);
 
         let mut messages = Vec::with_capacity(lines.len());
@@ -616,10 +1008,19 @@ impl TransportReceiver for FileTransport {
         .into())
     }
 
+    /// Save the read position past `tokens`. With acknowledgements on, this
+    /// releases them delivered, in file order.
     async fn commit(&self, tokens: &[Self::Token]) -> TransportResult<()> {
+        if let Some(acks) = self.holding() {
+            return self.release_in_order(acks, tokens, true).await;
+        }
         if let Some(max_token) = tokens.iter().max_by_key(|t| t.offset) {
             let path = Path::new(&self.config.path);
-            Self::save_position(path, max_token.offset).await?;
+            let position = SavedPosition {
+                offset: max_token.offset,
+                file: None,
+            };
+            Self::save_position(path, position).await?;
 
             #[cfg(feature = "logger")]
             tracing::debug!(
@@ -628,6 +1029,38 @@ impl TransportReceiver for FileTransport {
             );
         }
         Ok(())
+    }
+
+    /// The acknowledgement controls, present once an `acknowledgements`
+    /// section was applied.
+    fn ack_control(&self) -> Option<&dyn AckControl> {
+        self.acks.as_ref().map(|a| a as &dyn AckControl)
+    }
+
+    /// With acknowledgements on, move the saved position past every line from
+    /// the front released delivered, dropped or dead-lettered, and never past
+    /// one released `Errored`. Otherwise commit as `commit` does.
+    async fn release(
+        &self,
+        tokens: &[Self::Token],
+        outcome: DeliveryStatus,
+    ) -> TransportResult<()> {
+        match self.holding() {
+            Some(acks) => {
+                self.release_in_order(acks, tokens, outcome.should_commit())
+                    .await
+            }
+            None if outcome.should_commit() => self.commit(tokens).await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl AcknowledgingReceiver for FileTransport {
+    fn acknowledgements(&self) -> AcknowledgementsConfig {
+        self.acks
+            .as_ref()
+            .map_or(AcknowledgementsConfig::new(false), |a| a.config)
     }
 }
 
@@ -647,6 +1080,198 @@ mod tests {
             ..Default::default()
         };
         FileTransport::new(&config).await.unwrap()
+    }
+
+    /// A reader of `filename` with acknowledgements on.
+    async fn holding(dir: &TempDir, filename: &str) -> FileTransport {
+        make_transport(dir, filename)
+            .await
+            .with_acknowledgements(AcknowledgementsConfig::new(true))
+    }
+
+    /// The offset the sidecar of `filename` holds.
+    fn saved(dir: &TempDir, filename: &str) -> u64 {
+        let pos = dir.path().join(format!("{filename}.pos"));
+        SavedPosition::parse(&std::fs::read_to_string(pos).unwrap_or_default()).offset
+    }
+
+    /// Lines `0\n` to `{n-1}\n`, as one body.
+    fn numbered(n: usize) -> String {
+        (0..n).flat_map(|i| [i.to_string(), "\n".into()]).collect()
+    }
+
+    /// The payloads of `batch`, as text.
+    #[cfg(unix)]
+    fn texts(batch: &WorkBatch<FileToken>) -> Vec<String> {
+        batch
+            .records
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.payload).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_saved_position_reads_back_with_or_without_its_file() {
+        let named = SavedPosition {
+            offset: 42,
+            file: Some(FileId { dev: 7, ino: 9 }),
+        };
+        assert_eq!(named.render(), "42 7:9");
+        assert_eq!(SavedPosition::parse(&named.render()), named);
+        for (content, offset) in [("42", 42), ("42\n", 42), ("", 0), ("x 1:2", 0)] {
+            let parsed = SavedPosition::parse(content);
+            assert_eq!(parsed.offset, offset, "{content:?}");
+        }
+        assert_eq!(SavedPosition::parse("5 bad").file, None);
+    }
+
+    /// With acknowledgements on, the saved position moves past a line only
+    /// once it and every line before it is released delivered: a later block
+    /// released first waits, and an `Errored` block holds it until delivered.
+    #[tokio::test]
+    async fn the_position_moves_only_past_lines_delivered_in_order() {
+        use DeliveryStatus as S;
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("in.ndjson"), numbered(6)).unwrap();
+        let reader = holding(&dir, "in.ndjson").await;
+        let mut blocks = Vec::new();
+        for _ in 0..3 {
+            blocks.push(reader.recv(2).await.unwrap().commit_tokens);
+        }
+        // (block, status, saved position after it): each line is 2 bytes.
+        let steps = [
+            (2, S::Delivered, 0),
+            (0, S::Errored, 0),
+            (1, S::Dropped, 0),
+            (0, S::Rejected, 12),
+        ];
+        for (block, status, want) in steps {
+            reader.release(&blocks[block], status).await.unwrap();
+            assert_eq!(saved(&dir, "in.ndjson"), want, "block {block} {status:?}");
+        }
+        let control = reader.ack_control().expect("section applied");
+        assert_eq!((control.enabled(), control.held().count), (true, 0));
+        assert_eq!(control.kind(), AckKind::Pull);
+
+        // Without the section the highest offset released is saved, as before.
+        std::fs::write(dir.path().join("plain.ndjson"), numbered(4)).unwrap();
+        let plain = make_transport(&dir, "plain.ndjson").await;
+        let first = plain.recv(2).await.unwrap().commit_tokens;
+        let second = plain.recv(2).await.unwrap().commit_tokens;
+        plain.release(&second, S::Delivered).await.unwrap();
+        plain.release(&first, S::Errored).await.unwrap();
+        assert_eq!(saved(&dir, "plain.ndjson"), 8);
+        assert!(plain.ack_control().is_none());
+    }
+
+    /// An `Errored` release does its work before its first await, so a block
+    /// dropped mid-way is withheld from a drop that polls once.
+    #[tokio::test]
+    async fn an_errored_release_finishes_in_one_poll() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("in.ndjson"), numbered(2)).unwrap();
+        let reader = holding(&dir, "in.ndjson").await;
+        let tokens = reader.recv(2).await.unwrap().commit_tokens;
+        let release = std::pin::pin!(reader.release(&tokens, DeliveryStatus::Errored));
+        let polled = release.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        assert!(matches!(polled, std::task::Poll::Ready(Ok(()))));
+        assert_eq!(reader.ack_control().unwrap().held().count, 2);
+    }
+
+    /// A rotation renames the file under the reader: it finishes the renamed
+    /// file, reads nothing new until that file's last line is released, then
+    /// saves 0 in the new file and reads it from its start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotation_is_followed_once_the_renamed_file_is_delivered() {
+        let dir = TempDir::new().unwrap();
+        let live = dir.path().join("in.ndjson");
+        std::fs::write(&live, "a\nb\n").unwrap();
+        let reader = holding(&dir, "in.ndjson").await;
+        let first = reader.recv(1).await.unwrap();
+        std::fs::rename(&live, dir.path().join("in.ndjson.1")).unwrap();
+        std::fs::write(&live, "c\n").unwrap();
+
+        let tail = reader.recv(10).await.unwrap();
+        assert_eq!(texts(&tail), ["b"], "the renamed file is finished first");
+        reader
+            .release(&tail.commit_tokens, DeliveryStatus::Delivered)
+            .await
+            .unwrap();
+        assert!(reader.recv(10).await.unwrap().is_empty(), "line a is out");
+        assert_eq!(saved(&dir, "in.ndjson"), 0, "nothing saved past line a");
+
+        reader
+            .release(&first.commit_tokens, DeliveryStatus::Delivered)
+            .await
+            .unwrap();
+        let pos = dir.path().join("in.ndjson.pos");
+        assert_eq!(
+            std::fs::read_to_string(&pos).unwrap().split(' ').next(),
+            Some("4")
+        );
+        assert!(
+            reader.recv(10).await.unwrap().is_empty(),
+            "the move reads nothing"
+        );
+        assert_eq!(saved(&dir, "in.ndjson"), 0, "0 in the new file");
+        let new = reader.recv(10).await.unwrap();
+        assert_eq!(texts(&new), ["c"]);
+        reader
+            .release(&new.commit_tokens, DeliveryStatus::Delivered)
+            .await
+            .unwrap();
+        assert_eq!(
+            SavedPosition::parse(&std::fs::read_to_string(&pos).unwrap()).file,
+            FileId::at(&live).await,
+            "the sidecar names the new file"
+        );
+    }
+
+    /// A restart whose saved position names a rotated file reads that file's
+    /// tail by inode first, then the live file, also when the rotation came
+    /// before any release. With the rotated file gone, it reads the live file
+    /// from its start.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_restart_finds_the_rotated_file_by_inode() {
+        let rows: [(bool, bool, &[&str]); 3] = [
+            (true, true, &["b", "c"]),
+            (true, false, &["a", "b", "c"]),
+            (false, true, &["c"]),
+        ];
+        for (keep, released, want) in rows {
+            let dir = TempDir::new().unwrap();
+            let live = dir.path().join("in.ndjson");
+            std::fs::write(&live, "a\nb\n").unwrap();
+            let first = holding(&dir, "in.ndjson").await;
+            let batch = first.recv(1).await.unwrap();
+            if released {
+                first
+                    .release(&batch.commit_tokens, DeliveryStatus::Delivered)
+                    .await
+                    .unwrap();
+            }
+            drop(first);
+            let rotated = dir.path().join("in.ndjson.20260101T000000");
+            std::fs::rename(&live, &rotated).unwrap();
+            std::fs::write(&live, "c\n").unwrap();
+            if !keep {
+                std::fs::remove_file(&rotated).unwrap();
+            }
+
+            let restarted = holding(&dir, "in.ndjson").await;
+            let mut got = Vec::new();
+            for _ in 0..4 {
+                let batch = restarted.recv(10).await.unwrap();
+                got.extend(texts(&batch));
+                restarted
+                    .release(&batch.commit_tokens, DeliveryStatus::Delivered)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(got, want, "kept {keep}, released {released}");
+        }
     }
 
     /// A closed and dropped transport leaves the health registry, so a

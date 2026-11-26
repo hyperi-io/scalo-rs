@@ -361,6 +361,8 @@ transport:
       durable: false            # true: sync the file after each block, the folder after a create or rotation
       file_mode: "0600"         # files created, before the umask. Unix only
       dir_mode: "0700"          # folders created, before the umask. Unix only
+      acknowledgements:         # as a source: absent, the highest offset released is saved
+        enabled: true           # save only past lines delivered, in order, and follow rotation
 ```
 
 Rotation renames the file to `<path>.<local YYYYMMDDTHHMMSS>`, adding `.1`,
@@ -368,8 +370,9 @@ Rotation renames the file to `<path>.<local YYYYMMDDTHHMMSS>`, adding `.1`,
 together: either triggers it. A block larger than `max_bytes` still lands
 whole, in a file of its own. A rotation the folder refuses (a read-only folder,
 say) is logged at warn, the block goes into the current file, and rotation is tried again after 250 ms, doubling to
-30 s. A reader of the same path does not follow a rotation, so rotate only a
-file nothing reads through this transport. Each rotation is logged at info and
+30 s. A reader of the same path follows a rotation only with acknowledgements
+on (below), so otherwise rotate only a file nothing reads through this
+transport. Each rotation is logged at info and
 counted in `file_writer_rotations_total{writer, trigger}`.
 
 `naming: numbered` names rotated files by number, newest first: each rotation moves `<path>.1` onwards up one, renames the file to `<path>.1` and deletes numbers past `max_files` (`0` keeps none, unset keeps all). Numbered files carry no date and stay uncompressed, so `max_age_days` or a `compress_rotated` codec beside it fails the build. Rotated files of the other naming are left alone.
@@ -394,7 +397,7 @@ ACL, so set the ACL on the folder.
 - Line bytes: passed through as read, so a line need not be UTF-8.
 - `is_healthy()`: `!closed` atomic flag.
 - Delivery guarantee: `Written`, so a factory-built sender needs `delivery: flush` ([custom.md](custom.md#delivery-guarantee)).
-- Acknowledgements: not held. `commit` and `release` save the highest offset they are given, so a restart reads again from the last position released, but a block released `Errored` is skipped once a later block is delivered. `<key>.file.acknowledgements` has no effect, and the factory warns once.
+- Acknowledgements: off without a `<key>.file.acknowledgements` section, and the highest offset released is saved. On, the position moves only past lines released delivered, in file order, so an `Errored` block holds it. On Unix the sidecar adds `<dev>:<ino>` and the reader follows a rotation once the renamed file's last line is released. A restart finds a rotated file by inode, or WARNs that its tail is lost.
 
 Source: [../../src/transport/file.rs](../../src/transport/file.rs).
 

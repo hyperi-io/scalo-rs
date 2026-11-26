@@ -1097,12 +1097,6 @@ async fn armed_http(
 const NO_ACKNOWLEDGEMENT_TO_HOLD: &str = "acknowledgements has no effect here: this source has no \
      acknowledgement to hold, so the pipeline reports best effort";
 
-/// Why a section under a file source has no effect.
-#[cfg(all(feature = "config", feature = "transport-file"))]
-const FILE_ACKNOWLEDGEMENT_NOT_HELD: &str = "acknowledgements is not supported on a file \
-     source yet: it saves the highest read position released, so a block released Errored is \
-     skipped once a later block is delivered, and the pipeline reports best effort";
-
 /// Warn, once per process and `backend`, when `<key>.<backend>.acknowledgements`
 /// is set on a source that does not hold its acknowledgement.
 #[cfg(all(
@@ -1110,7 +1104,6 @@ const FILE_ACKNOWLEDGEMENT_NOT_HELD: &str = "acknowledgements is not supported o
     any(
         feature = "transport-memory",
         feature = "transport-pipe",
-        feature = "transport-file",
         feature = "transport-syslog"
     )
 ))]
@@ -1259,9 +1252,9 @@ impl AnyReceiver {
         self
     }
 
-    /// Apply the `<key>.<type>.acknowledgements` section to a Kafka, gRPC or
-    /// HTTP source, and warn once per backend when one sits under a memory,
-    /// pipe, file or syslog source, which does not hold its acknowledgement.
+    /// Apply the `<key>.<type>.acknowledgements` section to a Kafka, gRPC,
+    /// HTTP or file source, and warn once per backend when one sits under a
+    /// memory, pipe or syslog source, which does not hold its acknowledgement.
     #[cfg(feature = "config")]
     #[cfg_attr(
         not(any(
@@ -1275,12 +1268,13 @@ impl AnyReceiver {
         )),
         allow(unused_variables)
     )]
-    // Only the Kafka, gRPC and HTTP arms can fail.
+    // Only the Kafka, gRPC, HTTP and file arms can fail.
     #[cfg_attr(
         not(any(
             feature = "transport-kafka",
             feature = "transport-grpc",
-            feature = "transport-http"
+            feature = "transport-http",
+            feature = "transport-file"
         )),
         allow(clippy::unnecessary_wraps)
     )]
@@ -1310,13 +1304,12 @@ impl AnyReceiver {
                 warn_acknowledgements_ignored(key, "pipe", &WARNED, NO_ACKNOWLEDGEMENT_TO_HOLD);
                 Ok(Self::Pipe(t))
             }
+            // Without a section a file source saves the highest offset released.
             #[cfg(feature = "transport-file")]
-            Self::File(t) => {
-                static WARNED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                warn_acknowledgements_ignored(key, "file", &WARNED, FILE_ACKNOWLEDGEMENT_NOT_HELD);
-                Ok(Self::File(t))
-            }
+            Self::File(t) => Ok(match acknowledgements_section(key, "file")? {
+                Some(acks) => Self::File(t.with_acknowledgements(acks)),
+                None => Self::File(t),
+            }),
             #[cfg(feature = "transport-http")]
             Self::Http(t) => Ok(match acknowledgements_section(key, "http")? {
                 Some(acks) => Self::Http(t.with_acknowledgements(acks)),

@@ -22,8 +22,8 @@
 //! - [`AckControl`] -- the run-time view a caller queries through
 //!   [`TransportReceiver::ack_control`]:
 //!   enabled, arm, held.
-//! - [`AcknowledgingReceiver`] -- the type-level capability. Kafka, gRPC and
-//!   HTTP implement it. File does not yet, and pipe and memory cannot.
+//! - [`AcknowledgingReceiver`] -- the type-level capability. Kafka, gRPC,
+//!   HTTP and file implement it. Pipe and memory cannot.
 //! - [`SourceAck`] -- the release API for a hand-rolled receive loop.
 //! - [`Tickets`] -- admission and outcome for an app's own listeners.
 //! - [`SinkConfirmation`] and [`EffectiveGuarantee`] -- what a sink confirms,
@@ -176,7 +176,7 @@ pub trait AckControl: Send + Sync {
 /// A receive transport that can hold its source acknowledgement until every
 /// piece built from a record is delivered.
 ///
-/// Kafka, gRPC and HTTP implement it. File does not yet. Pipe and memory
+/// Kafka, gRPC, HTTP and file implement it. Pipe and memory
 /// cannot: they have no acknowledgement to hold.
 pub trait AcknowledgingReceiver: TransportReceiver {
     /// The `acknowledgements` config this source was built with.
@@ -374,7 +374,7 @@ pub enum GuaranteeReason {
     /// The source has `acknowledgements.enabled: false`.
     AcksDisabled,
     /// The source does not hold its acknowledgement: pipe, memory and syslog
-    /// have none, and file does not hold its own yet.
+    /// have none, and a file source has no `acknowledgements` section.
     SourceCannotAck,
     /// The sink's `Ok` proves nothing beyond the call returning.
     SinkCannotConfirm,
