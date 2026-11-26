@@ -40,7 +40,7 @@ kafka:
     enabled: true   # the default
 ```
 
-The key sits beside the transport's own section: `AnyReceiver::from_config(key)` reads `<key>.kafka.acknowledgements`, `<key>.grpc.acknowledgements` or `<key>.http.acknowledgements`, and a transport built from an explicit config takes it with `KafkaTransport::with_acknowledgements`, `GrpcTransport::builder(..).acknowledgements(..)` or `HttpTransport::builder(..).acknowledgements(..)`. Only those three sources hold their acknowledgement ([below](#which-sources-hold-it)), and HTTP only when its section is present: without one it is off. Under a memory, pipe, file or syslog source the key has no effect, and the factory logs one WARN per backend saying so.
+The key sits beside the transport's own section: `AnyReceiver::from_config(key)` reads `<key>.kafka.acknowledgements`, `<key>.grpc.acknowledgements`, `<key>.http.acknowledgements` or `<key>.file.acknowledgements`, and a transport built from an explicit config takes it with `KafkaTransport::with_acknowledgements`, `GrpcTransport::builder(..).acknowledgements(..)`, `HttpTransport::builder(..).acknowledgements(..)` or `FileTransport::with_acknowledgements`. Only those four sources hold their acknowledgement ([below](#which-sources-hold-it)), and HTTP and file only when their section is present: without one they are off. Under a memory, pipe or syslog source the key has no effect, and the factory logs one WARN per backend saying so.
 
 - On: the loop arms the source (`AckControl::arm`) before the first `recv`. Kafka then commits each partition only up to its lowest offset not yet released, whatever order releases arrive in, and an `Errored` offset holds the commit below it. A push source answers its sender only on release, once armed. Before that it answers at enqueue, so a push that arrives between the server starting and the loop's `arm` is acknowledged with nothing to deliver it. Build a push source armed instead: `GrpcTransport::builder(..).armed(true)`, `HttpTransport::builder(..).armed(true)`, or `AnyReceiver::from_config_armed(key)` and `from_config_with_governor_armed(key, governor)`. The loop's own `arm` then changes nothing.
 - Off: the source is released at receipt, before the block is processed. A crash or a failed delivery loses what was released.
@@ -55,11 +55,11 @@ The key sits beside the transport's own section: `AnyReceiver::from_config(key)`
 | Kafka | Yes: the offset commit | Applied |
 | gRPC | Yes: the answer to a push | Applied |
 | HTTP | Yes, when the section is present: the answer to a POST, 200 once every record of its body is released, 503 otherwise ([backends.md](../transport/backends.md#http)) | Applied. Absent, off |
-| File, as a source | No. It saves the highest read position released: a restart reads again what was not released, but a block released `Errored` is skipped once a later block is delivered | No effect, one WARN |
+| File, as a source | Yes, when the section is present: the saved read position, moved only past lines delivered, in file order, and following a rotation on Unix ([backends.md](../transport/backends.md#file)) | Applied. Absent, the highest position released is saved |
 | Pipe, memory | No: there is no acknowledgement to hold | No effect, one WARN |
 | Syslog | No: no syslog protocol it listens on answers the sender | No effect, one WARN |
 
-A pipeline over a file source reports `best_effort` / `source_cannot_ack`. An app's own HTTP listener that must answer only once its records are delivered uses `Tickets` ([below](#a-hand-rolled-loop)).
+A pipeline over a file source with no section reports `best_effort` / `source_cannot_ack`. An app's own HTTP listener that must answer only once its records are delivered uses `Tickets` ([below](#a-hand-rolled-loop)).
 
 ---
 
@@ -99,7 +99,7 @@ At start the loop sets `pipeline_delivery_guarantee{guarantee, reason}` to 1:
 | `at_least_once_local` | `sink_confirms_locally` | The sink confirms a durable local write |
 | `best_effort` | `sink_cannot_confirm` | The sink's `Ok` proves nothing more, including a pipeline with neither `.sender(&sender)` nor `.sink_confirms(..)`. `.sink_confirms(..)` declares a custom sink that does |
 | `best_effort` | `acks_disabled` | `acknowledgements.enabled: false` |
-| `best_effort` | `source_cannot_ack` | Pipe, memory, file or syslog source |
+| `best_effort` | `source_cannot_ack` | Pipe, memory or syslog source, or a file source with no section |
 | `best_effort` | `unarmed` | A push source with acknowledgements on, run by a loop that does not arm it, so it answers at enqueue |
 
 A write to a sink that cannot confirm still counts as delivered: the metric reports the weaker guarantee rather than refusing to run. The other run loops set only the `unarmed` row.

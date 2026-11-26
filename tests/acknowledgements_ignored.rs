@@ -1,15 +1,16 @@
 // Project:   scalo
 // File:      tests/acknowledgements_ignored.rs
-// Purpose:   An acknowledgements section warns once where it is ignored, and applies under HTTP
+// Purpose:   An acknowledgements section warns once where it is ignored, and applies under HTTP and file
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! `AnyReceiver::from_config` warns once per backend when
-//! `<key>.<type>.acknowledgements` sits under a memory, pipe or file source,
-//! none of which holds its acknowledgement, and builds the receiver anyway.
-//! Under an HTTP source the section is applied, with no warning.
+//! `<key>.<type>.acknowledgements` sits under a memory or pipe source,
+//! neither of which holds its acknowledgement, and builds the receiver
+//! anyway. Under an HTTP or file source the section is applied, with no
+//! warning.
 //!
 //! The global config installs once per process, and each warning fires once
 //! per process, so this file owns both.
@@ -68,6 +69,19 @@ async fn http_section_applies() {
             (enabled, true),
             "{key}"
         );
+        let _ = receiver.close().await;
+    }
+}
+
+/// The section reaches a file source, and without one it holds nothing.
+#[cfg(feature = "transport-file")]
+async fn file_section_applies() {
+    for (key, holds) in [("transport.file_in", true), ("transport.file_plain", false)] {
+        let receiver = AnyReceiver::from_config(key)
+            .await
+            .unwrap_or_else(|e| panic!("{key}: {e}"));
+        let control = scalo::transport::TransportReceiver::ack_control(&receiver);
+        assert_eq!(control.map(|c| c.enabled()), holds.then_some(true), "{key}");
         let _ = receiver.close().await;
     }
 }
@@ -132,6 +146,7 @@ async fn a_section_under_a_source_that_does_not_hold_it_warns_once() {
     {
         build_twice("transport.file_in").await;
         build_twice("transport.file_plain").await;
+        file_section_applies().await;
     }
     #[cfg(feature = "transport-http")]
     {
@@ -162,16 +177,9 @@ async fn a_section_under_a_source_that_does_not_hold_it_warns_once() {
     }
     #[cfg(feature = "transport-file")]
     {
-        let lines = warnings_for(&out, "transport.file_in.file.acknowledgements");
-        assert_eq!(lines.len(), 1, "file warns once: {out}");
         assert!(
-            lines[0].contains("not supported on a file source yet")
-                && lines[0].contains("a block released Errored is skipped"),
-            "{out}"
-        );
-        assert!(
-            !out.contains("transport.file_plain"),
-            "a file source with no section does not warn: {out}"
+            !out.contains("transport.file_in") && !out.contains("transport.file_plain"),
+            "a file source applies the section without a warning: {out}"
         );
     }
     #[cfg(feature = "transport-http")]

@@ -8,8 +8,9 @@
 
 //! Every record whose source ack is released arrives, under each fault the
 //! harness injects: the engine pipeline builder over a pull-shaped source, a
-//! push-shaped source built armed, and the real gRPC and HTTP servers built
-//! armed, and a hand-rolled `SourceAck` loop over the push source. The same engine pipeline
+//! push-shaped source built armed, the real gRPC and HTTP servers built
+//! armed and the real file source, and a hand-rolled `SourceAck` loop over
+//! the push source. The same engine pipeline
 //! sends through `AnySender::Custom` too, the path an app's own sender takes.
 
 use std::sync::Arc;
@@ -335,6 +336,23 @@ async fn the_harness_catches_a_push_source_answered_at_enqueue() {
     );
 }
 
+/// Poll `ready` every 5 ms until it holds or `within` passes. Whether it held.
+#[cfg(any(
+    feature = "transport-grpc",
+    feature = "transport-file",
+    all(feature = "transport-http", feature = "http-server")
+))]
+async fn poll_until(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let until = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < until {
+        if ready() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    ready()
+}
+
 /// A real push server killed mid-batch under the engine pipeline: the steps
 /// the gRPC and HTTP servers share.
 #[cfg(any(
@@ -384,17 +402,6 @@ mod push_server {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
-    }
-
-    async fn poll_until(within: Duration, mut ready: impl FnMut() -> bool) -> bool {
-        let until = tokio::time::Instant::now() + within;
-        while tokio::time::Instant::now() < until {
-            if ready() {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        ready()
     }
 
     /// A server built armed by `server` takes pushes before its pipeline runs,
@@ -574,5 +581,129 @@ mod http {
         let server = server(false).await;
         let client = client_of(Arc::clone(&server)).await;
         unarmed_answers_at_enqueue(&*server, &*client).await;
+    }
+}
+
+/// The real file source under the engine pipeline, its acknowledgements on:
+/// killed mid-batch with no close or flush, then a new reader over the same
+/// file and sidecar.
+#[cfg(feature = "transport-file")]
+mod file {
+    use super::*;
+    use scalo::deployment::test_support::conformance::{marked_payloads, marker_of};
+    use scalo::transport::AcknowledgementsConfig;
+    use scalo::transport::file::{FileTransport, FileTransportConfig};
+    use std::path::Path;
+
+    /// The markers 0 to 199, as NDJSON lines.
+    fn lines() -> Vec<Vec<u8>> {
+        marked_payloads(200)
+            .iter()
+            .map(|p| [p.as_ref(), b"\n"].concat())
+            .collect()
+    }
+
+    async fn reader(path: &Path) -> Arc<FileTransport> {
+        let config = FileTransportConfig {
+            path: path.display().to_string(),
+            ..FileTransportConfig::default()
+        };
+        let reader = FileTransport::new(&config).await.expect("reader");
+        Arc::new(reader.with_acknowledgements(AcknowledgementsConfig::new(true)))
+    }
+
+    /// The offset the sidecar of `path` holds.
+    fn saved(path: &Path) -> u64 {
+        let pos = path.with_extension("ndjson.pos");
+        std::fs::read_to_string(pos)
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Kill the pipeline while the sink holds marker 100, with the file
+    /// rotated under the reader first when `rotate` is set: every line the
+    /// saved position had passed arrived, and the restart delivers the rest,
+    /// the rotated file's tail included.
+    async fn kill_mid_batch(rotate: bool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dir.path().join("in.ndjson");
+        let lines = lines();
+        let split = if rotate { 150 } else { 200 };
+        std::fs::write(&live, lines[..split].concat()).expect("write");
+
+        let ledger = Ledger::with_records(200);
+        let sink = FaultSink::new(ledger.clone());
+        sink.hold_at(100);
+        let first = reader(&live).await;
+        let running = tokio::spawn(engine_pipeline(
+            Arc::clone(&first),
+            Arc::new(sink.instance(0)),
+            ledger.clone(),
+            CancellationToken::new(),
+        ));
+        assert!(
+            poll_until(Duration::from_secs(30), || sink.held_by() == Some(0)).await,
+            "the send carrying marker 100 never reached the sink"
+        );
+        if rotate {
+            std::fs::rename(&live, dir.path().join("in.ndjson.1")).expect("rotate");
+            std::fs::write(&live, lines[split..].concat()).expect("write");
+        }
+        // Kill: the pipeline dies mid-send and the reader goes, closing nothing.
+        running.abort();
+        let _ = running.await;
+        drop(first);
+        sink.unhold();
+
+        // What the saved position passed in the first file is acknowledged.
+        let at_kill = saved(&live);
+        let mut end = 0;
+        for line in &lines[..split] {
+            end += line.len() as u64;
+            if end <= at_kill {
+                ledger.acked(marker_of(line.trim_ascii_end()).expect("marked"));
+            }
+        }
+        assert!(
+            at_kill < end,
+            "the held send kept the position short of the end"
+        );
+
+        let restarted = reader(&live).await;
+        let shutdown = CancellationToken::new();
+        let draining = tokio::spawn(engine_pipeline(
+            Arc::clone(&restarted),
+            Arc::new(sink.instance(1)),
+            ledger.clone(),
+            shutdown.clone(),
+        ));
+        let live_len = std::fs::metadata(&live).expect("live").len();
+        assert!(
+            poll_until(Duration::from_secs(60), || ledger.verdict().arrived == 200
+                && saved(&live) == live_len)
+            .await,
+            "the restart delivers and saves every line: {:?}",
+            ledger.verdict()
+        );
+        for m in 0..200 {
+            ledger.acked(m);
+        }
+        shutdown.cancel();
+        let _ = draining.await;
+        assert_conforms(&ledger.verdict());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn engine_file_kill_mid_batch() {
+        kill_mid_batch(false).await;
+    }
+
+    /// A rotation before the held lines are released loses none of the
+    /// renamed file's tail.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn engine_file_rotated_then_killed_mid_batch() {
+        kill_mid_batch(true).await;
     }
 }
