@@ -196,9 +196,42 @@ impl Service<http::Uri> for TlsConnector {
 /// answering is dropped and the next call dials afresh. `0` leaves the dial
 /// unbounded and PINGs at [`DEFAULT_SEND_TIMEOUT_MS`].
 pub(crate) fn lazy_channel(
-    mut ep: tonic::transport::Endpoint,
+    ep: tonic::transport::Endpoint,
     send_timeout_ms: u64,
     proxy: crate::transport::ProxyDialer,
+    tls: Option<ChannelTls>,
+) -> tonic::transport::Channel {
+    let dial = crate::transport::proxy::Connector::new(proxy, plain_tcp());
+    bounded_channel(ep, send_timeout_ms, dial, tls)
+}
+
+/// [`lazy_channel`] dialling where `resolved` says, with no proxy.
+#[cfg(feature = "transport-grpc")]
+pub(crate) fn resolved_channel(
+    ep: tonic::transport::Endpoint,
+    send_timeout_ms: u64,
+    resolved: crate::transport::resolver::ResolvedDial,
+    tls: Option<ChannelTls>,
+) -> tonic::transport::Channel {
+    let dial = crate::transport::proxy::Connector::new(
+        crate::transport::ProxyDialer::direct(),
+        plain_tcp(),
+    )
+    .resolved_by(resolved);
+    bounded_channel(ep, send_timeout_ms, dial, tls)
+}
+
+fn plain_tcp() -> hyper_util::client::legacy::connect::HttpConnector {
+    let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
+    tcp.enforce_http(false);
+    tcp.set_nodelay(true);
+    tcp
+}
+
+fn bounded_channel(
+    mut ep: tonic::transport::Endpoint,
+    send_timeout_ms: u64,
+    dial: crate::transport::proxy::Connector,
     tls: Option<ChannelTls>,
 ) -> tonic::transport::Channel {
     // A dial left running when its send gives up hands its failure to the
@@ -220,10 +253,6 @@ pub(crate) fn lazy_channel(
     // Given the connector, tonic abandons a dial whose DNS, TCP connect or TLS
     // handshake outruns the connect timeout, where connect_lazy() bounds the
     // TCP connect alone and the next send queues behind it.
-    let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
-    tcp.enforce_http(false);
-    tcp.set_nodelay(true);
-    let dial = crate::transport::proxy::Connector::new(proxy, tcp);
     match tls {
         Some(tls) => ep.connect_with_connector_lazy(TlsConnector {
             dial: dial.for_tls(),

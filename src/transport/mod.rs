@@ -88,6 +88,7 @@ pub mod filter;
 pub mod finalizer;
 pub mod hold;
 pub mod propagation;
+mod resolver;
 mod traits;
 mod types;
 mod work_batch;
@@ -161,6 +162,7 @@ pub use delivery::{DeliveryGuarantee, DeliveryRequirement};
 pub use error::{TransportError, TransportResult};
 pub use factory::{AnyReceiver, AnySender, AnyToken};
 pub use finalizer::{BatchFinalizer, DeliveryStatus, PieceFinalizer};
+pub use resolver::ConnectResolver;
 pub use routed::RoutedSender;
 pub use traits::{
     CommitToken, FromCascade, HealthcheckConfig, RecvBatch, RecvLimits, Transport, TransportBase,
@@ -193,7 +195,9 @@ pub use pipe::{PipeToken, PipeTransport, PipeTransportConfig};
 pub use file::{FileToken, FileTransport, FileTransportConfig};
 
 #[cfg(feature = "transport-http")]
-pub use http::{HttpAuth, HttpEndpoint, HttpToken, HttpTransport, HttpTransportConfig};
+pub use http::{
+    HttpAuth, HttpEndpoint, HttpToken, HttpTransport, HttpTransportBuilder, HttpTransportConfig,
+};
 
 #[cfg(feature = "transport-syslog")]
 pub use syslog::{SyslogConfig, SyslogTransport};

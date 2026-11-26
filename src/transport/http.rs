@@ -71,7 +71,6 @@ use super::work_batch::WorkBatch;
 use crate::compression::{Accepts, Codec, Compression};
 use crate::tls_config::Removed;
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "http-server", feature = "governor"))]
 use std::sync::Arc;
 #[cfg(feature = "http-server")]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -469,6 +468,60 @@ pub struct HttpTransport {
     filter_engine: super::filter::TransportFilterEngine,
 }
 
+/// Builds an [`HttpTransport`] with what [`HttpTransportConfig`] does not
+/// carry: the pressure governor and a connect resolver.
+///
+/// ```rust,ignore
+/// let transport = HttpTransport::builder(&config)
+///     .resolver(Arc::new(proven_routes))
+///     .start()
+///     .await?;
+/// ```
+#[must_use = "the transport starts only when `start` is awaited"]
+pub struct HttpTransportBuilder<'a> {
+    config: &'a HttpTransportConfig,
+    #[cfg(feature = "governor")]
+    pressure: Option<Arc<crate::governor::UnifiedPressure>>,
+    resolver: Option<Arc<dyn super::ConnectResolver>>,
+}
+
+impl std::fmt::Debug for HttpTransportBuilder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTransportBuilder")
+            .field("config", self.config)
+            .field("resolver", &self.resolver.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpTransportBuilder<'_> {
+    /// Answer 503 on the receive side while `pressure` holds (`governor`
+    /// feature), as [`HttpTransport::with_pressure`] does.
+    #[cfg(feature = "governor")]
+    pub fn pressure(mut self, pressure: Arc<crate::governor::UnifiedPressure>) -> Self {
+        self.pressure = Some(pressure);
+        self
+    }
+
+    /// Dial each endpoint where `resolver` says, asked at every connect. The
+    /// send side then keeps no idle connection, so a changed answer takes
+    /// the next request, and a `proxy` other than `none` fails
+    /// [`start`](Self::start). See [`ConnectResolver`](super::ConnectResolver).
+    pub fn resolver(mut self, resolver: Arc<dyn super::ConnectResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Bind the receive server and build the client, as configured.
+    ///
+    /// # Errors
+    ///
+    /// As [`HttpTransport::new`], and a resolver beside a proxy.
+    pub async fn start(self) -> TransportResult<HttpTransport> {
+        HttpTransport::new_inner(self).await
+    }
+}
+
 impl HttpTransport {
     /// Create a new HTTP transport.
     ///
@@ -479,13 +532,17 @@ impl HttpTransport {
     ///
     /// Returns error if the listen address is invalid or the server fails to bind.
     pub async fn new(config: &HttpTransportConfig) -> TransportResult<Self> {
-        // Default path: no pressure governor -> byte-identical to before.
-        Self::new_inner(
+        Self::builder(config).start().await
+    }
+
+    /// A builder for the settings `config` does not carry.
+    pub fn builder(config: &HttpTransportConfig) -> HttpTransportBuilder<'_> {
+        HttpTransportBuilder {
             config,
             #[cfg(feature = "governor")]
-            None,
-        )
-        .await
+            pressure: None,
+            resolver: None,
+        }
     }
 
     /// Create an HTTP transport bound to a pressure governor (`governor`
@@ -506,19 +563,32 @@ impl HttpTransport {
         config: &HttpTransportConfig,
         pressure: Option<Arc<crate::governor::UnifiedPressure>>,
     ) -> TransportResult<Self> {
-        Self::new_inner(config, pressure).await
+        let builder = Self::builder(config);
+        match pressure {
+            Some(pressure) => builder.pressure(pressure),
+            None => builder,
+        }
+        .start()
+        .await
     }
 
-    async fn new_inner(
-        config: &HttpTransportConfig,
-        #[cfg(feature = "governor")] pressure: Option<Arc<crate::governor::UnifiedPressure>>,
-    ) -> TransportResult<Self> {
+    async fn new_inner(options: HttpTransportBuilder<'_>) -> TransportResult<Self> {
+        let config = options.config;
+        #[cfg(feature = "governor")]
+        let pressure = options.pressure;
         let mut client_builder = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_millis(config.connect_timeout_ms))
             .timeout(std::time::Duration::from_millis(config.send_timeout_ms));
 
         let sender = match config.endpoint.as_deref() {
             Some(endpoint) => {
+                // A kept connection would outlive a moved answer.
+                if let Some(resolver) = options.resolver {
+                    super::resolver::refuse_proxy(&config.proxy, "HTTP")?;
+                    client_builder = client_builder
+                        .dns_resolver(super::resolver::ReqwestResolver(resolver))
+                        .pool_max_idle_per_host(0);
+                }
                 let tls = config.client_tls()?;
                 let settings = tls
                     .profile_settings()

@@ -213,6 +213,9 @@ impl NdjsonWriter {
         super::ROTATED_ACCEPTS
             .check(config.compress_rotated)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        config
+            .check_naming()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let dir = if subdir.is_empty() {
             config.path.clone()
         } else {
@@ -369,7 +372,7 @@ impl NdjsonWriter {
     fn rotate(&self, target: &mut Target, trigger: Trigger) -> Result<(), std::io::Error> {
         let from_len = target.file.as_ref().map_or(0, LiveFile::len);
         target.file = None;
-        let rotated = match rotating::rename_live(&self.file_path) {
+        let rotated = match rotating::rename_live(&self.file_path, self.config.write.naming) {
             Ok(rotated) => rotated,
             Err(e) => {
                 let now = Instant::now();
