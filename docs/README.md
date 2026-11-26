@@ -140,7 +140,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Other subsystems | [api/geoip-download.md](api/geoip-download.md) | GeoIP database provisioning |
 | Other subsystems | [version-check.md](version-check.md) | Opt-out startup version check |
 | Reference | [reflectable-config-shape.md](reflectable-config-shape.md) | The schema and capability catalogue scalo and scalo-py both emit |
-| Reference | [migrations.md](migrations.md) | API and behaviour changes by scalo version |
+| Reference | [migrations.md](migrations.md), [migrations/](migrations/) | API and behaviour changes by scalo version |
 | Reference | [migrating.md](migrating.md) | Moving from hyperi-rustlib to scalo |
 | Reference | [dependency-duplication.md](dependency-duplication.md) | Duplicate crate versions in the dependency tree |
 | Reference | [dts-rust-memory-tier-list.md](dts-rust-memory-tier-list.md) | Rust memory structures, tier list |
