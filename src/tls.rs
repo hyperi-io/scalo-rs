@@ -75,6 +75,8 @@ mod server;
 pub(crate) mod test_pki;
 
 pub use client::{ClientIdentity, ClientTls, build_client_tls};
+#[cfg(feature = "http")]
+pub(crate) use client::{NoRoots, build_client_tls_with};
 pub use profile::{ProfileSettings, is_post_quantum};
 pub use server::{CertResolver, HandshakeError, Reloaded, ServerTls, ServerTlsOptions};
 

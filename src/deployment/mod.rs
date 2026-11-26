@@ -74,6 +74,7 @@
 //!     singleton: false,
 //!     service_account: ServiceAccount::Own,
 //!     hot_paths: vec![],
+//!     openssl_conf: scalo::deployment::DEFAULT_OPENSSL_CONF.to_string(),
 //! };
 //!
 //! // Generate production Dockerfile (without identity annotations. New
@@ -114,10 +115,10 @@ pub mod waves;
 pub use app_project::{AppProjectContract, AppProjectDestination, generate_argocd_app_project};
 pub use capability::{Capability, FieldSpec, FieldType};
 pub use contract::{
-    CONTRACT_SCHEMA_VERSION, DEFAULT_LABEL_NAMESPACE, DEFAULT_METRICS_PORT, DeploymentContract,
-    HealthContract, ImageProfile, OciLabels, PortCondition, PortContract, ResourceList,
-    ResourcesContract, SecretEnvContract, SecretGroupContract, SecurityContract, ServiceAccount,
-    WritablePath,
+    CONTRACT_SCHEMA_VERSION, DEFAULT_LABEL_NAMESPACE, DEFAULT_METRICS_PORT, DEFAULT_OPENSSL_CONF,
+    DeploymentContract, HealthContract, ImageProfile, OciLabels, PortCondition, PortContract,
+    ResourceList, ResourcesContract, SecretEnvContract, SecretGroupContract, SecurityContract,
+    ServiceAccount, WritablePath,
 };
 pub use contract_identity::{ContractIdentity, IdentityError, KEY_SEGMENT, VERSION};
 #[cfg(feature = "config-schema")]

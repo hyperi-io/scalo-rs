@@ -249,6 +249,50 @@ mod tests {
         ]);
     }
 
+    /// The `tls` section reaches the config through the cascade, from YAML
+    /// and from the environment, which wins.
+    #[cfg(all(feature = "config", feature = "yaml", feature = "figment"))]
+    #[test]
+    fn the_tls_section_reaches_the_config_through_the_cascade() {
+        use crate::crypto::CryptoProfile;
+        use crate::tls_config::{ClientAuth, ServerTlsConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "http_server:\n  bind_address: 0.0.0.0:8443\n  tls:\n    profile: commercial\n    \
+             cert_file: /etc/tls/tls.crt\n    key_file: /etc/tls/tls.key\n    \
+             ca_files: /etc/tls/ca.pem\n    client_auth: optional\n",
+        )
+        .unwrap();
+        temp_env::with_var(
+            "HTTPTLS__HTTP_SERVER__TLS__CLIENT_AUTH",
+            Some("required"),
+            || {
+                crate::config::setup(crate::config::ConfigOptions {
+                    env_prefix: "HTTPTLS".to_string(),
+                    config_paths: vec![dir.path().to_path_buf()],
+                    search_standard_paths: false,
+                    load_dotenv: false,
+                    ..crate::config::ConfigOptions::default()
+                })
+                .unwrap();
+            },
+        );
+        let config: HttpServerConfig = crate::cascade::section("http_server").unwrap();
+        assert_eq!(
+            config.tls,
+            Some(ServerTlsConfig {
+                profile: CryptoProfile::Commercial,
+                cert_file: Some("/etc/tls/tls.crt".into()),
+                key_file: Some("/etc/tls/tls.key".into()),
+                ca_files: vec!["/etc/tls/ca.pem".into()],
+                client_auth: ClientAuth::Required,
+                ..ServerTlsConfig::default()
+            })
+        );
+    }
+
     #[test]
     fn test_duration_conversions() {
         let config = HttpServerConfig::default();

@@ -117,6 +117,7 @@ The config file and every file set sit base64-encoded under the ConfigMap's `bin
 | `singleton` | one replica, Recreate, no autoscaler, no budget | false |
 | `service_account` | `own`: a ServiceAccount the pod runs as; `none`: no ServiceAccount, and the pod names none, so it runs as the namespace's `default` account | `own` |
 | `hot_paths` | dotted config paths left out of the pod's `checksum/config`, with any parent the removal empties, so an edit there reaches the mounted file without rolling the pods. Ignored under `configMount.subPath`, whose file never refreshes | every config key counts |
+| `openssl_conf` | `OPENSSL_CONF`, the file a Kafka client writes its OpenSSL TLS floor into. `extraEnv.OPENSSL_CONF` replaces it | `/tmp/scalo-openssl.cnf`; empty sets none |
 
 A condition reads its `path` from values. A path under `config.` reads the config the app ends up running: the contract's `default_config`, then `config`, then `configOverrides`. So a port the app opens by default is open without anyone setting it. A missing or null value never satisfies a condition.
 
@@ -168,7 +169,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `publicService.enabled`, `type`, `loadBalancerIP`, `udpLoadBalancerIP`, `loadBalancerClass`, `loadBalancerSourceRanges`, `externalTrafficPolicy`, `annotations` | off, `LoadBalancer` | Load balancers for public ports. `loadBalancerIP` pins the TCP/SCTP Service only and `udpLoadBalancerIP` pins the UDP Service, since many clouds refuse two Services on one address |
 | `networkPolicy.enabled`, `from`, `publicFrom` | off, the namespace, any source | Ingress policy |
 | `serviceAccount.create`, `name`, `mountToken`, `annotations` | contract `service_account`, fullname, false | Service account; the token stays unmounted unless asked. With none created, the pod runs as `name` when set, else names none |
-| `extraEnv` | `{}` | Env by name: a scalar through `tpl`, an object as its `valueFrom`; a name the chart derives is dropped |
+| `extraEnv` | `{}` | Env by name: a scalar through `tpl`, an object as its `valueFrom`; a name the chart derives is dropped, except `OPENSSL_CONF`, which replaces the contract's |
 | `extraEnvFrom`, `extraVolumes`, `extraVolumeMounts`, `initContainers`, `sidecars` | `[]` | Passed through `tpl` |
 | `extraPorts[{name, port, protocol, appProtocol, public}]` | `[]` | Ports beside the contract's, on the container and Services |
 | `extraObjects` | `[]` | Extra documents, maps or strings, through `tpl` |

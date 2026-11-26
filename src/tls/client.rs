@@ -18,11 +18,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rustls::client::WebPkiServerVerifier;
-use rustls::client::danger::ServerCertVerifier;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
+};
 use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
 use super::TlsError;
 use super::pin;
@@ -203,15 +205,50 @@ impl ClientTlsConfig {
 /// [`TlsError::Build`] when the OS verifier cannot start or the key does not
 /// match the certificate.
 pub fn build_client_tls(tls: &ClientTls) -> Result<Arc<ClientConfig>, TlsError> {
+    build_client_tls_with(tls, NoRoots::Fail)
+}
+
+/// What `trust: native` does when the OS root store is empty and no CA file
+/// is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoRoots {
+    /// Fail the build with [`TlsError::EmptyTrustStore`].
+    Fail,
+    /// Build a config that refuses every server certificate, for a client
+    /// that may only ever call `http://`.
+    #[cfg_attr(
+        not(feature = "http"),
+        allow(dead_code, reason = "only HttpClient builds with no roots")
+    )]
+    RefuseEveryServer,
+}
+
+/// [`build_client_tls`], with `no_roots` deciding an empty native store.
+pub(crate) fn build_client_tls_with(
+    tls: &ClientTls,
+    no_roots: NoRoots,
+) -> Result<Arc<ClientConfig>, TlsError> {
     let settings = tls.profile_settings()?;
     let provider = settings.provider();
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(settings.versions())
         .map_err(|e| TlsError::Build(e.to_string()))?;
     let verifier: Arc<dyn ServerCertVerifier> = match tls.trust {
-        TrustChoice::Native => {
-            webpki_verifier(root_store(&tls.ca_paths, Roots::WithOs)?, provider)?
-        }
+        TrustChoice::Native => match root_store(&tls.ca_paths, Roots::WithOs) {
+            Ok(roots) => webpki_verifier(roots, provider)?,
+            Err(TlsError::EmptyTrustStore) if no_roots == NoRoots::RefuseEveryServer => {
+                tracing::warn!(
+                    "TLS: the OS root store is empty and tls.ca_paths is unset, so every \
+                     https:// call fails as untrusted"
+                );
+                Arc::new(NoRootVerifier {
+                    schemes: provider
+                        .signature_verification_algorithms
+                        .supported_schemes(),
+                })
+            }
+            Err(e) => return Err(e),
+        },
         TrustChoice::Bundle => webpki_verifier(root_store(&tls.ca_paths, Roots::Only)?, provider)?,
         TrustChoice::Platform => platform_verifier(&tls.ca_paths, provider)?,
     };
@@ -237,6 +274,57 @@ pub fn build_client_tls(tls: &ClientTls) -> Result<Arc<ClientConfig>, TlsError> 
         "TLS client config built"
     );
     Ok(Arc::new(config))
+}
+
+/// A verifier with nothing to trust: every server's issuer is unknown.
+#[derive(Debug)]
+#[cfg_attr(
+    not(feature = "http"),
+    allow(dead_code, reason = "only HttpClient builds with no roots")
+)]
+struct NoRootVerifier {
+    schemes: Vec<SignatureScheme>,
+}
+
+impl ServerCertVerifier for NoRootVerifier {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
+    }
 }
 
 /// rustls's WebPKI verifier over `roots`.

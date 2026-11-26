@@ -273,11 +273,47 @@ pub struct ClientTlsConfig {
     #[serde(skip_serializing, deserialize_with = "removed_ca_path")]
     #[cfg_attr(feature = "config-schema", schemars(skip))]
     pub ca_path: Removed,
+    /// Removed, from the Vector compat section: `trust`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_native_roots")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub native_roots: Removed,
+    /// Removed, from the Vector compat section: `ca_paths`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_extra_roots")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub extra_roots: Removed,
+    /// Removed, from the Vector compat section: `trust: bundle`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_exclusive")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub exclusive: Removed,
+    /// Removed, from the Vector compat section: `server_name`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_domain")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub domain: Removed,
+    /// Removed, from the Vector compat section: `client_cert_path`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_client_cert")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub client_cert: Removed,
+    /// Removed, from the Vector compat section: `client_key_path`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_client_key")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub client_key: Removed,
 }
 
 #[cfg(any(feature = "tls", feature = "transport-kafka-config"))]
 crate::tls_config::removed_keys! {
     removed_ca_path: "ca_path" => "ca_paths, one path or a list";
+    removed_native_roots: "native_roots" => "trust: native, or trust: bundle to leave the OS store out";
+    removed_extra_roots: "extra_roots" => "ca_paths";
+    removed_exclusive: "exclusive" => "trust: bundle";
+    removed_domain: "domain" => "server_name";
+    removed_client_cert: "client_cert" => "client_cert_path";
+    removed_client_key: "client_key" => "client_key_path";
 }
 
 #[cfg(any(feature = "tls", feature = "transport-kafka-config"))]
@@ -583,7 +619,15 @@ mod tests {
     #[test]
     fn a_removed_tls_key_fails_the_load() {
         #[cfg(any(feature = "tls", feature = "transport-kafka-config"))]
-        assert_removed::<ClientTlsConfig>(&[(r#"{"ca_path": "/ca.pem"}"#, "ca_paths")]);
+        assert_removed::<ClientTlsConfig>(&[
+            (r#"{"ca_path": "/ca.pem"}"#, "ca_paths"),
+            (r#"{"native_roots": false}"#, "trust: bundle"),
+            (r#"{"extra_roots": ["/ca.pem"]}"#, "ca_paths"),
+            (r#"{"exclusive": true}"#, "trust: bundle"),
+            (r#"{"domain": "source"}"#, "server_name"),
+            (r#"{"client_cert": "/c.pem"}"#, "client_cert_path"),
+            (r#"{"client_key": "/k.pem"}"#, "client_key_path"),
+        ]);
         #[cfg(any(feature = "tls", feature = "http-server"))]
         assert_removed::<ServerTlsConfig>(&[(r#"{"ca_file": "/ca.pem"}"#, "ca_files")]);
     }

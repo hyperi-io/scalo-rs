@@ -20,12 +20,13 @@ Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `
 | `grpc.tls_domain` | `grpc.tls.server_name` |
 | `grpc.tls_client_{cert,key}_path` | `grpc.tls.client_{cert,key}_path` |
 | `transport.{otlp,syslog}.tls.ca_path` | `.tls.ca_paths` |
+| Vector compat `tls.{native_roots, exclusive, extra_roots, domain, client_cert, client_key}` | `tls.{trust, trust: bundle, ca_paths, server_name, client_cert_path, client_key_path}` |
 | Kafka `ssl_ca_location` | `tls.ca_paths` plus `trust: bundle` |
 | Kafka `ssl_{certificate,key}_location` | `tls.client_{cert,key}_path` |
 | server `tls.ca_file` | `tls.ca_files` |
 | `http_server.tls_{cert,key}_path` | `http_server.tls`, a server section |
 
-- HTTP with no `tls_*` key used reqwest's verifier, and now takes the section's defaults. `HttpClient` (`http_client.tls`), the HTTP DLQ (`http.tls` in the DLQ section) and the version check build through the same path. `HttpClient` builds its TLS when it is created, so it needs a root store, or `trust: bundle` with CA files. An HTTP sink or DLQ with only `http://` endpoints builds none.
+- HTTP with no `tls_*` key used reqwest's verifier, and now takes the section's defaults. `HttpClient` (`http_client.tls`), the HTTP DLQ (`http.tls` in the DLQ section) and the version check build through the same path. An empty OS store with no CA file fails no `HttpClient`: its `https://` calls fail as untrusted. An HTTP sink or DLQ with only `http://` endpoints builds no TLS.
 - gRPC, OTLP-gRPC and Vector compat run scalo's rustls over each stream, take every trust choice and pins, and need ALPN `h2`. scalo enables no tonic TLS feature.
 - `tls_handshakes_total{key_exchange}` reads `post_quantum` for `hybrid`. `tls_tls12_handshakes_total{role, profile}` is new.
 - `CryptoProfile::{Prod, HighSec, DevTest}` become `Strong`, `Cnsa2` and nothing, beside `Commercial`. `PqcMode` and `TlsFloor` are gone. `profile: fips` fails at load.
@@ -35,9 +36,9 @@ Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `
 
 ### Kafka's TLS floor goes through OPENSSL_CONF (BEHAVIOUR CHANGE)
 
-librdkafka has no version property, and `ssl.cipher.suites` reaches TLS 1.2 only. Before its first TLS client scalo writes the profile's `MinProtocol` and TLS 1.3 `Ciphersuites` into the file `OPENSSL_CONF` names, if missing or scalo's, and OpenSSL reads it once per process, so all Kafka clients share one floor. It is OpenSSL's system default, so every OpenSSL user in the process and any child that inherits the variable takes it too. Unset, the floor is not set and a warning says so.
+librdkafka has no version property, and `ssl.cipher.suites` reaches TLS 1.2 only. Before its first TLS client scalo writes the profile's `MinProtocol` and TLS 1.3 `Ciphersuites` into the file `OPENSSL_CONF` names, if missing or scalo's, and OpenSSL reads it once per process, so all Kafka clients share one floor. It is OpenSSL's system default, so every OpenSSL user in the process takes it too. Generated Dockerfiles and the `scalo-service` chart set `OPENSSL_CONF=/tmp/scalo-openssl.cnf`. Unset, a warning names what OpenSSL takes beyond the profile.
 
-**Consumer adjustment** -- set `OPENSSL_CONF` to a writable path in the deployment, or call `scalo::transport::kafka::set_openssl_conf()` first in `main`.
+**Consumer adjustment** -- regenerate the Dockerfile or bump the chart, with the contract's `openssl_conf` empty for an app with no Kafka client. Otherwise set `OPENSSL_CONF` in the deployment.
 
 ### A spool held by a live owner is refused with its own variant
 

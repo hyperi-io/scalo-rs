@@ -425,3 +425,37 @@ fn a_bundle_file_yields_its_certificates_and_skips_the_rest() {
     let certs = read_certs(&path).unwrap();
     assert_eq!(certs.len(), 2, "the CA and the leaf, not the key");
 }
+
+/// With the OS root store empty, `native` with no CA file fails the build,
+/// and the HTTP client's mode builds a config whose handshakes all fail as
+/// untrusted. `SSL_CERT_FILE` replaces the OS store on every OS.
+#[cfg(feature = "http")]
+#[test]
+fn an_empty_os_store_fails_the_build_or_refuses_every_server() {
+    let pki = Pki::new();
+    let empty = pki.write("empty.pem", "");
+    temp_env::with_vars(
+        [
+            ("SSL_CERT_FILE", Some(empty.as_os_str())),
+            ("SSL_CERT_DIR", None),
+        ],
+        || {
+            let tls = ClientTls::new(TrustChoice::Native).with_profiles(TlsProfiles::default());
+            assert!(matches!(
+                build_client_tls(&tls),
+                Err(TlsError::EmptyTrustStore)
+            ));
+            let config = super::build_client_tls_with(&tls, super::NoRoots::RefuseEveryServer)
+                .expect("built with no roots");
+            let mut client =
+                ClientConnection::new(config, ServerName::try_from("localhost").unwrap()).unwrap();
+            let mut server = ServerConnection::new(server_config(&pki.server_a, None)).unwrap();
+            assert_eq!(
+                pump(&mut client, &mut server).err(),
+                Some(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer
+                ))
+            );
+        },
+    );
+}

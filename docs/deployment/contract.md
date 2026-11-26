@@ -208,6 +208,7 @@ and `validate()` rejects it until they are set.
 | `singleton` | `bool` | `false` | Exactly one pod: no autoscaling, Recreate rollout (v4) |
 | `service_account` | `ServiceAccount` | `Own` | `none` for an app that calls no Kubernetes API: the chart creates no ServiceAccount and the pod names none. Omitted from the JSON while `own` (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
 | `hot_paths` | `Vec<String>` | `[]` | Dotted config paths the app reloads while it runs. Omitted from the JSON while empty (v4) -- see [Hot paths](#hot-paths) |
+| `openssl_conf` | `String` | `/tmp/scalo-openssl.cnf` | `OPENSSL_CONF` in the image and the pod, the file a Kafka client writes its TLS floor into ([TLS profiles](../tls-profiles.md#fips-and-kafka)). Empty sets none, for an app with no Kafka client that runs another OpenSSL user. Omitted from the JSON at its default (v4) |
 
 `HealthContract` fields:
 

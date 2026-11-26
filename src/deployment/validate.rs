@@ -156,6 +156,7 @@ mod tests {
             singleton: false,
             service_account: super::super::ServiceAccount::Own,
             hot_paths: vec![],
+            openssl_conf: crate::deployment::DEFAULT_OPENSSL_CONF.to_string(),
         }
     }
 

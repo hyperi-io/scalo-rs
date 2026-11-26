@@ -203,9 +203,22 @@ pub(super) fn liveness_check(contract: &DeploymentContract) -> String {
     )
 }
 
+/// The ENV naming the contract's `openssl_conf`, the file a Kafka client
+/// writes its OpenSSL TLS floor into, and nothing when it is empty.
+fn openssl_conf(contract: &DeploymentContract) -> String {
+    if contract.openssl_conf.is_empty() {
+        return String::new();
+    }
+    format!(
+        "# A Kafka client writes its OpenSSL TLS floor here (scalo docs/tls-profiles.md).\n\
+         ENV OPENSSL_CONF={}\n",
+        contract.openssl_conf
+    )
+}
+
 /// The instructions both generators end on: the non-root user and the
-/// directories it writes, the exposed ports, the Docker healthcheck and the
-/// entrypoint.
+/// directories it writes, `OPENSSL_CONF`, the exposed ports, the Docker
+/// healthcheck and the entrypoint.
 fn image_tail(contract: &DeploymentContract) -> String {
     let binary = contract.binary();
     let cmd = if contract.entrypoint_args.is_empty() {
@@ -225,7 +238,7 @@ RUN if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi && useradd --create
 {writable_dirs}WORKDIR /home/appuser
 # Numeric, so Kubernetes runAsNonRoot can verify it without reading /etc/passwd.
 USER 1000
-
+{openssl_conf}
 EXPOSE {expose_ports}
 
 # bash builtins only, so the image needs no HTTP client. A status other than 200 exits 1.
@@ -235,6 +248,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 ENTRYPOINT ["{binary}"]{cmd}
 "#,
         writable_dirs = writable_dirs(contract),
+        openssl_conf = openssl_conf(contract),
         expose_ports = expose_ports(contract),
         liveness_check = liveness_check(contract),
     )

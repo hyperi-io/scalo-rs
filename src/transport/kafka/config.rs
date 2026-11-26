@@ -2361,6 +2361,46 @@ mod tests {
         ]);
     }
 
+    /// The `tls` section reaches the config through the cascade, from YAML
+    /// and from the environment, which wins.
+    #[cfg(all(feature = "config", feature = "yaml", feature = "figment"))]
+    #[test]
+    fn the_tls_section_reaches_the_config_through_the_cascade() {
+        use crate::crypto::CryptoProfile;
+        use crate::tls_config::{ClientTlsConfig, TrustChoice};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "kafka:\n  brokers: [broker:9093]\n  security_protocol: ssl\n  tls:\n    \
+             profile: commercial\n    trust: bundle\n    ca_paths: /etc/tls/ca.pem\n    \
+             client_cert_path: /etc/tls/client.crt\n    client_key_path: /etc/tls/client.key\n",
+        )
+        .unwrap();
+        temp_env::with_var("KAFKATLS__KAFKA__TLS__PROFILE", Some("cnsa2"), || {
+            crate::config::setup(crate::config::ConfigOptions {
+                env_prefix: "KAFKATLS".to_string(),
+                config_paths: vec![dir.path().to_path_buf()],
+                search_standard_paths: false,
+                load_dotenv: false,
+                ..crate::config::ConfigOptions::default()
+            })
+            .unwrap();
+        });
+        let config: KafkaConfig = crate::cascade::section("kafka").unwrap();
+        assert_eq!(
+            config.tls,
+            ClientTlsConfig {
+                profile: CryptoProfile::Cnsa2,
+                trust: TrustChoice::Bundle,
+                ca_paths: vec!["/etc/tls/ca.pem".into()],
+                client_cert_path: Some("/etc/tls/client.crt".into()),
+                client_key_path: Some("/etc/tls/client.key".into()),
+                ..ClientTlsConfig::default()
+            }
+        );
+    }
+
     /// A broker grants consumer groups by a fixed per-app prefix, so an
     /// internal client's group id has to start with whatever the app is
     /// already granted, never with a literal of scalo's own.
