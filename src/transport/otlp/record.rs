@@ -13,16 +13,11 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::transform::common::tonic::ResourceAttributesWithSchema;
 
 use super::config::OtlpConfig;
-use crate::transport::work_batch::Record;
+use crate::transport::work_batch::{Record, TIME_UNIX_NANO_HEADER, parse_time_unix_nano};
 
 /// The record header whose value becomes the log record's severity, instead
 /// of an attribute.
 pub const SEVERITY_HEADER: &str = "severity";
-
-/// The record header whose value, decimal nanoseconds since the epoch, becomes
-/// the log record's time in place of `metadata.timestamp_ms`, instead of an
-/// attribute.
-pub const TIME_UNIX_NANO_HEADER: &str = "time_unix_nano";
 
 /// The resource every log export carries, and its schema URL.
 #[derive(Debug, Clone)]
@@ -103,9 +98,7 @@ pub(super) fn log_record(record: &Record, observed_unix_nano: u64) -> LogRecord 
             continue;
         }
         if name == TIME_UNIX_NANO_HEADER
-            && let Some(nanos) = std::str::from_utf8(value)
-                .ok()
-                .and_then(|text| text.trim().parse::<u64>().ok())
+            && let Some(nanos) = parse_time_unix_nano(value)
         {
             log.time_unix_nano = nanos;
             continue;

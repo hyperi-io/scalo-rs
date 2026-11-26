@@ -42,6 +42,19 @@ use bytes::Bytes;
 use std::sync::Arc;
 use thiserror::Error;
 
+/// The record header whose value, decimal nanoseconds since the epoch, is the
+/// record's time to the nanosecond. The OTLP sender writes it as the log
+/// record's time and the syslog sender as the RFC 5424 TIMESTAMP, floored to
+/// microseconds, each in place of [`RecordMeta::timestamp_ms`].
+pub const TIME_UNIX_NANO_HEADER: &str = "time_unix_nano";
+
+/// The nanoseconds a [`TIME_UNIX_NANO_HEADER`] value holds, `None` when it is
+/// not decimal digits in a `u64`.
+#[cfg(any(feature = "transport-otlp", feature = "transport-syslog"))]
+pub(crate) fn parse_time_unix_nano(value: &[u8]) -> Option<u64> {
+    std::str::from_utf8(value).ok()?.trim().parse::<u64>().ok()
+}
+
 /// Lean per-record metadata.
 ///
 /// Unlike the engine's `MessageMetadata`, this carries **no** commit token --

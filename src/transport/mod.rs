@@ -169,7 +169,7 @@ pub use traits::{
     TransportReceiver, TransportSender, boot_healthcheck,
 };
 pub use types::{Message, SendResult, TransportConfig, TransportType};
-pub use work_batch::{Record, RecordCodecError, RecordMeta, WorkBatch};
+pub use work_batch::{Record, RecordCodecError, RecordMeta, TIME_UNIX_NANO_HEADER, WorkBatch};
 
 #[cfg(feature = "transport-kafka")]
 pub use kafka::KafkaTransport;

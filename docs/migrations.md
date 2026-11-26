@@ -14,6 +14,12 @@ A record's `timestamp_ms` is the Kafka message timestamp, so a record read from 
 
 **Consumer adjustment** -- none for the data. A reader that took the message timestamp as the send time reads the record's time instead, and a topic set to `message.timestamp.type=LogAppendTime` still stamps the broker's time.
 
+### The syslog sender stamps a record's `time_unix_nano` header (BEHAVIOUR CHANGE)
+
+A record with a `time_unix_nano` header, decimal nanoseconds since the epoch, gets that time as its RFC 5424 TIMESTAMP, floored to the microsecond, in place of `timestamp_ms`. `TIME_UNIX_NANO_HEADER` is exported as `scalo::transport::TIME_UNIX_NANO_HEADER`, and `scalo::transport::otlp::TIME_UNIX_NANO_HEADER` stays as the same constant.
+
+**Consumer adjustment** -- none unless a record already carries a header of that name that disagrees with its `timestamp_ms`. The syslog sender then writes the header's time, as the OTLP sender does.
+
 ### `DecodeLimits` has a `max_records` field (API CHANGE)
 
 `framing::DecodeLimits` has a public `max_records: usize`. `Framing::decode` refuses a unit holding more records with `FramingError::TooManyRecords { max }`, at the first record past it. `DecodeLimits::UNBOUNDED` sets it to `usize::MAX`, and `DecodeLimits::DEFAULT_MAX_RECORDS` is 100000.

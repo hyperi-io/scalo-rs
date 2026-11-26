@@ -12,7 +12,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use super::config::{SyslogConfig, SyslogFormat};
-use crate::transport::work_batch::Record;
+use crate::transport::work_batch::{Record, TIME_UNIX_NANO_HEADER, parse_time_unix_nano};
 
 /// The longest RFC 5424 HOSTNAME.
 const HOSTNAME_MAX: usize = 255;
@@ -87,11 +87,7 @@ impl Formatter {
             self.write_body(payload, out);
             return;
         }
-        let when = record
-            .metadata
-            .timestamp_ms
-            .and_then(|ms| Timestamp::from_millisecond(ms).ok())
-            .unwrap_or_else(Timestamp::now);
+        let when = record_time(record).unwrap_or_else(Timestamp::now);
         // A write to a Vec cannot fail.
         match self.format {
             SyslogFormat::Rfc5424 => {
@@ -176,6 +172,21 @@ pub(super) fn has_pri(payload: &[u8]) -> bool {
         .ok()
         .and_then(|d| d.parse::<u16>().ok())
         .is_some_and(|pri| pri <= 191)
+}
+
+/// The time of `record`: its [`TIME_UNIX_NANO_HEADER`] floored to the
+/// microsecond, else its `timestamp_ms`, `None` when neither is usable. RFC
+/// 5424 has six fractional digits, so the floor loses nothing the wire can
+/// hold.
+fn record_time(record: &Record) -> Option<Timestamp> {
+    let precise = parse_time_unix_nano(header_value(record, TIME_UNIX_NANO_HEADER))
+        .and_then(|nanos| Timestamp::from_nanosecond(i128::from(nanos - nanos % 1000)).ok());
+    precise.or_else(|| {
+        record
+            .metadata
+            .timestamp_ms
+            .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+    })
 }
 
 /// The value of `record`'s first header named `name`, empty when it has none.
@@ -378,6 +389,86 @@ mod tests {
             let mut out = Vec::new();
             formatter.write(&record(payload, key, &[]), &mut out);
             assert_eq!(String::from_utf8_lossy(&out), want, "{case}");
+        }
+    }
+
+    /// A `time_unix_nano` header is the RFC 5424 TIMESTAMP floored to the
+    /// microsecond, never rounded, and wins over `timestamp_ms`. A header that
+    /// is not decimal digits in a `u64` leaves `timestamp_ms` in force. RFC
+    /// 3164 reads the same time to the second.
+    #[test]
+    fn a_time_header_sets_the_timestamp_floored_to_microseconds() {
+        // (case, format, header value, wire TIMESTAMP)
+        let cases: [(&str, SyslogFormat, Option<&[u8]>, &str); 11] = [
+            (
+                "sub-microsecond digits are dropped",
+                SyslogFormat::Rfc5424,
+                Some(b"1791756855003456789"),
+                "2026-10-11T22:14:15.003456Z",
+            ),
+            (
+                "999 ns past the microsecond floors",
+                SyslogFormat::Rfc5424,
+                Some(b"1791756855999999999"),
+                "2026-10-11T22:14:15.999999Z",
+            ),
+            (
+                "under one microsecond is zero",
+                SyslogFormat::Rfc5424,
+                Some(b"1791756855000000999"),
+                "2026-10-11T22:14:15.000000Z",
+            ),
+            (
+                "the header wins over timestamp_ms",
+                SyslogFormat::Rfc5424,
+                Some(b"1791756856500000000"),
+                "2026-10-11T22:14:16.500000Z",
+            ),
+            (
+                "surrounding spaces are trimmed",
+                SyslogFormat::Rfc5424,
+                Some(b" 1791756855003456789 "),
+                "2026-10-11T22:14:15.003456Z",
+            ),
+            (
+                "no header is timestamp_ms",
+                SyslogFormat::Rfc5424,
+                None,
+                STAMP,
+            ),
+            ("an empty header", SyslogFormat::Rfc5424, Some(b""), STAMP),
+            ("not a number", SyslogFormat::Rfc5424, Some(b"soon"), STAMP),
+            ("negative", SyslogFormat::Rfc5424, Some(b"-1"), STAMP),
+            (
+                "a fraction",
+                SyslogFormat::Rfc5424,
+                Some(b"1791756855.5"),
+                STAMP,
+            ),
+            (
+                "3164 takes the header's second",
+                SyslogFormat::Rfc3164,
+                Some(b"1791756856999999999"),
+                "Oct 11 22:14:16",
+            ),
+        ];
+        for (case, format, value, stamp) in cases {
+            let formatter = Formatter::new(&config(format), false, TimeZone::UTC);
+            let headers: Vec<(&str, &[u8])> = value
+                .map(|v| (TIME_UNIX_NANO_HEADER, v))
+                .into_iter()
+                .collect();
+            let mut out = Vec::new();
+            formatter.write(&record(b"x", None, &headers), &mut out);
+            let wire = String::from_utf8_lossy(&out);
+            let prefix = match format {
+                SyslogFormat::Rfc5424 => "<165>1 ",
+                SyslogFormat::Rfc3164 => "<165>",
+            };
+            let got = wire
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.get(..stamp.len()));
+            assert_eq!(got, Some(stamp), "{case}: {wire}");
         }
     }
 
