@@ -13,6 +13,7 @@ those are auto-wired and live in [../core-pillars/README.md](../core-pillars/REA
 | [tls.md](tls.md) | server TLS with certificate reload, and the handshake helper every listener shares |
 | [http-client.md](http-client.md) | `reqwest` plus retry, backoff and the signing hook |
 | [auth.md](auth.md) | credential acquisition (token exchanges, metadata servers) and placement |
+| [wasm.md](wasm.md) | WebAssembly component plugins: limits, signed loading, reload, metrics |
 | [directory-config.md](directory-config.md) | YAML directory store, optional git backing |
 | [concurrency.md](concurrency.md) | `BackgroundSink`, `PeriodicWorker`, `ActorHandle` |
 | [geoip-download.md](geoip-download.md) | GeoIP MMDB provisioning -- files onto disk, no lookup engine |
