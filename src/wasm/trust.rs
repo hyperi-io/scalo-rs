@@ -110,16 +110,22 @@ impl Evidence<'_> {
 
 /// The label of the first signer in `policy` that `evidence` checks out
 /// against for `bytes`. A bundle is checked against the keyless signers, and
-/// a signature against the keys.
+/// a signature against the keys. A bad bundle refuses the plugin even beside
+/// a good signature.
 pub(super) fn check(
     bytes: &[u8],
     evidence: Evidence<'_>,
     policy: &TrustPolicy,
     root: &TrustedRoot,
 ) -> Result<String, Refusal> {
-    match (evidence.bundle, evidence.signature) {
-        (Some(bundle), _) => check_bundle(bytes, bundle, policy, root),
-        (None, Some(signature)) => check_signature(bytes, signature, policy),
+    let by_bundle = evidence
+        .bundle
+        .map(|bundle| check_bundle(bytes, bundle, policy, root));
+    match (by_bundle, evidence.signature) {
+        (Some(Ok(signer)), _) => Ok(signer),
+        (Some(Err(bad @ Refusal::Bad(_))), _) => Err(bad),
+        (Some(Err(untrusted)), None) => Err(untrusted),
+        (_, Some(signature)) => check_signature(bytes, signature, policy),
         (None, None) => Err(Refusal::Untrusted("nothing signs it".to_string())),
     }
 }

@@ -417,7 +417,7 @@ fn a_signature_loads_only_when_a_trusted_signer_made_it_over_these_bytes() {
     let impostor = keyless_impostor(&trusted, &good);
 
     // (case, bytes, bundle, signature, policy, outcome)
-    let cases: [SignCase<'_>; 10] = [
+    let cases: [SignCase<'_>; 12] = [
         (
             "a trusted key",
             &good,
@@ -425,6 +425,22 @@ fn a_signature_loads_only_when_a_trusted_signer_made_it_over_these_bytes() {
             Some(&trusted_signature),
             &trusts_key,
             Ok(()),
+        ),
+        (
+            "a bundle no keyless signer can judge, beside a trusted signature",
+            &good,
+            Some(&impostor),
+            Some(&trusted_signature),
+            &trusts_key,
+            Ok(()),
+        ),
+        (
+            "a bad bundle beside a trusted signature",
+            &good,
+            Some(&impostor),
+            Some(&trusted_signature),
+            &keyless_and_key,
+            Err("bad_signature"),
         ),
         (
             "a trusted key beside a keyless signer",

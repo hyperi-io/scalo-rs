@@ -28,8 +28,9 @@ pub(super) const CALL_OUTCOMES: [&str; 9] = [
     "poisoned",
 ];
 
-/// One plugin's metric handles.
+/// One plugin's metric handles. Dropping them sets its info gauge to 0.
 pub(super) struct PluginMetrics {
+    info: Gauge,
     calls: [Counter; CALL_OUTCOMES.len()],
     duration: Histogram,
     instantiations: Counter,
@@ -39,14 +40,15 @@ pub(super) struct PluginMetrics {
 
 impl PluginMetrics {
     pub(super) fn new(plugin: &str, digest: &str, signer: &str) -> Self {
-        ::metrics::gauge!(
+        let info = ::metrics::gauge!(
             "wasm_plugin_info",
             "plugin" => plugin.to_string(),
             "digest" => digest.to_string(),
             "signer" => signer.to_string()
-        )
-        .set(1.0);
+        );
+        info.set(1.0);
         Self {
+            info,
             calls: CALL_OUTCOMES.map(|outcome| {
                 ::metrics::counter!(
                     "wasm_plugin_calls_total",
@@ -87,6 +89,12 @@ impl PluginMetrics {
         if self.peak_memory.fetch_max(bytes, Ordering::Relaxed) < bytes {
             self.memory.set(bytes as f64);
         }
+    }
+}
+
+impl Drop for PluginMetrics {
+    fn drop(&mut self) {
+        self.info.set(0.0);
     }
 }
 
