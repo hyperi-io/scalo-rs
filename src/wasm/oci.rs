@@ -280,28 +280,46 @@ async fn fetch(
         .pull_blob_stream(reference, layer)
         .await
         .map_err(PullError::Registry)?;
-    let mut stream = sized.stream;
+    collect_checked(sized.stream, &media_type, max_bytes, expected).await
+}
+
+/// The bytes of `stream`, refused once they pass `max_bytes` and checked
+/// against `expected` at the end.
+async fn collect_checked<S, B>(
+    mut stream: S,
+    media_type: &str,
+    max_bytes: usize,
+    expected: [u8; 32],
+) -> Result<Vec<u8>, PullError>
+where
+    S: futures_util::Stream<Item = Result<B, std::io::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
     let mut bytes = Vec::new();
     let mut hasher = Sha256::new();
     while let Some(chunk) = stream
         .try_next()
         .await
         .map_err(|source| PullError::Download {
-            media_type: media_type.clone(),
+            media_type: media_type.to_string(),
             source,
         })?
     {
+        let chunk = chunk.as_ref();
         if chunk.len() > max_bytes - bytes.len() {
-            return Err(too_large());
+            return Err(PullError::TooLarge {
+                media_type: media_type.to_string(),
+                limit: max_bytes,
+            });
         }
-        hasher.update(&chunk);
-        bytes.extend_from_slice(&chunk);
+        hasher.update(chunk);
+        bytes.extend_from_slice(chunk);
     }
 
     let actual: [u8; 32] = hasher.finalize().into();
     if actual != expected {
         return Err(PullError::DigestMismatch {
-            media_type,
+            media_type: media_type.to_string(),
             expected: hex(&expected),
             actual: hex(&actual),
         });
@@ -337,6 +355,26 @@ mod tests {
             annotations: None,
             artifact_type: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_layer_is_refused_past_the_cap_mid_stream_or_on_a_digest_mismatch() {
+        let chunks = || vec![b"abc".to_vec(), b"defg".to_vec()];
+        let digest: [u8; 32] = Sha256::digest(b"abcdefg").into();
+        let collect = |max: usize, expected: [u8; 32]| {
+            let stream =
+                futures_util::stream::iter(chunks().into_iter().map(Ok::<_, std::io::Error>));
+            collect_checked(stream, WASM_MEDIA_TYPE, max, expected)
+        };
+        assert_eq!(collect(7, digest).await.unwrap(), b"abcdefg");
+        assert!(matches!(
+            collect(6, digest).await,
+            Err(PullError::TooLarge { limit: 6, .. })
+        ));
+        assert!(matches!(
+            collect(7, [0; 32]).await,
+            Err(PullError::DigestMismatch { .. })
+        ));
     }
 
     fn label(error: &PullError) -> &'static str {
