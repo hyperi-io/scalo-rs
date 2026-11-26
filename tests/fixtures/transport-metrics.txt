@@ -26,6 +26,7 @@ counter transport_dropped_total transport="kafka" reason="header_key_not_utf8"
 counter transport_dropped_total transport="kafka" reason="headers_over_cap"
 counter transport_dropped_total transport="syslog" reason="kernel"
 counter transport_dropped_total transport="syslog" reason=<reason>
+counter transport_filter_cel_eval_errors_total
 counter transport_filter_cel_payload_skip_total
 counter transport_filter_msgpack_bypass_total direction=<direction.to_string()>
 counter transport_filtered_total direction=<dir> action=<act>

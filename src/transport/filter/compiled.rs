@@ -13,6 +13,8 @@
 //! the extracted field value. ~50-100ns per message.
 
 use super::classify::{ClassifyResult, Tier1Op};
+#[cfg(feature = "expression")]
+use super::config::CelOnError;
 use super::config::{FilterAction, FilterDirection, FilterTier, TransportFilterTierConfig};
 
 /// A compiled filter ready for hot-path evaluation.
@@ -89,8 +91,10 @@ pub enum CompiledFilter {
         expression_text: String,
         tier: FilterTier,
         action: FilterAction,
-        /// Runtime payload cap (Gate 2). Larger payloads skip CEL and pass.
+        /// Runtime payload cap (Gate 2). Larger payloads skip CEL and take `on_error`.
         max_payload_bytes: usize,
+        /// The answer for a payload over the cap or one CEL can't evaluate.
+        on_error: CelOnError,
     },
 }
 
@@ -140,6 +144,7 @@ impl CompiledFilter {
                     tier: FilterTier::Tier2,
                     action,
                     max_payload_bytes: tier_config.budget.max_payload_bytes,
+                    on_error: tier_config.cel_on_error,
                 })
             }
             #[cfg(feature = "expression")]
@@ -163,6 +168,7 @@ impl CompiledFilter {
                     tier: FilterTier::Tier3,
                     action,
                     max_payload_bytes: tier_config.budget.max_payload_bytes,
+                    on_error: tier_config.cel_on_error,
                 })
             }
             #[cfg(not(feature = "expression"))]
@@ -360,8 +366,16 @@ impl CompiledFilter {
                 fields,
                 action,
                 max_payload_bytes,
+                on_error,
                 ..
-            } => evaluate_cel(payload, program, fields, *action, *max_payload_bytes),
+            } => evaluate_cel(
+                payload,
+                program,
+                fields,
+                *action,
+                *max_payload_bytes,
+                *on_error,
+            ),
         }
     }
 
@@ -591,43 +605,61 @@ pub(crate) fn evaluations() -> u64 {
     EVALUATIONS.with(std::cell::Cell::get)
 }
 
-thread_local! {
-    /// The CEL payload skips held back while a sender's dead-letter screen
-    /// runs, `None` outside one.
-    static HELD_SKIPS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+/// CEL payloads a filter couldn't judge: over the size cap, or not evaluable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CelMisses {
+    pub(super) skips: u64,
+    pub(super) errors: u64,
 }
 
-/// Run `screen` holding back its CEL payload skips, and return them with its
-/// result. The send that follows a kept record counts its skip, so the screen
-/// counts only the skips of a record it takes out.
-pub(super) fn holding_skips<R>(screen: impl FnOnce() -> R) -> (R, u64) {
-    let outer = HELD_SKIPS.replace(Some(0));
+thread_local! {
+    /// The CEL misses held back while a sender's dead-letter screen runs,
+    /// `None` outside one.
+    static HELD: std::cell::Cell<Option<CelMisses>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `screen` holding back its CEL misses, and return them with its result.
+/// The send that follows a kept record counts its own, so the screen counts
+/// only the misses of a record it takes out.
+pub(super) fn holding_misses<R>(screen: impl FnOnce() -> R) -> (R, CelMisses) {
+    let outer = HELD.replace(Some(CelMisses::default()));
     let result = screen();
-    let held = HELD_SKIPS.replace(outer).unwrap_or(0);
+    let held = HELD.replace(outer).unwrap_or_default();
     (result, held)
 }
 
-/// Count `skips` CEL payload skips in `transport_filter_cel_payload_skip_total`.
-pub(super) fn count_cel_skips(skips: u64) {
+/// Count `misses` in `transport_filter_cel_payload_skip_total` and
+/// `transport_filter_cel_eval_errors_total`.
+pub(super) fn count_cel_misses(misses: CelMisses) {
     #[cfg(feature = "metrics")]
-    if skips > 0 {
-        metrics::counter!("transport_filter_cel_payload_skip_total").increment(skips);
+    {
+        if misses.skips > 0 {
+            metrics::counter!("transport_filter_cel_payload_skip_total").increment(misses.skips);
+        }
+        if misses.errors > 0 {
+            metrics::counter!("transport_filter_cel_eval_errors_total").increment(misses.errors);
+        }
     }
     #[cfg(not(feature = "metrics"))]
-    let _ = skips;
+    let _ = misses;
 }
 
-/// Hold one CEL payload skip back when a screen is running: `false` outside
-/// one.
+/// Count one miss now, or hold it back while a screen is running.
 #[cfg(feature = "expression")]
-fn hold_skip() -> bool {
-    HELD_SKIPS.with(|held| match held.get() {
+fn miss(add: CelMisses) {
+    let held = HELD.with(|held| match held.get() {
         Some(n) => {
-            held.set(Some(n + 1));
+            held.set(Some(CelMisses {
+                skips: n.skips + add.skips,
+                errors: n.errors + add.errors,
+            }));
             true
         }
         None => false,
-    })
+    });
+    if !held {
+        count_cel_misses(add);
+    }
 }
 
 /// Evaluate a Tier 2/3 CEL expression against a JSON payload.
@@ -642,6 +674,9 @@ fn hold_skip() -> bool {
 /// `CompiledFilter::fields` storage, which lives as long as the filter. A
 /// `HashMap<String, Value>` per call would clone every field name, and at
 /// PB/hr rates that allocator pressure shows up as tail-latency spikes.
+///
+/// A payload over `max_payload_bytes`, or one the program can't evaluate to a
+/// bool, takes `on_error`: no action for `pass`, the rule's for `match`.
 #[cfg(feature = "expression")]
 fn evaluate_cel(
     payload: &[u8],
@@ -649,14 +684,19 @@ fn evaluate_cel(
     fields: &[String],
     action: FilterAction,
     max_payload_bytes: usize,
+    on_error: CelOnError,
 ) -> Option<FilterAction> {
-    // Gate 2: skip oversized payloads (pass-through). Data-driven
-    // CEL cost scales with payload size -- caps the worst case.
+    let missed = |add: CelMisses| {
+        miss(add);
+        (on_error == CelOnError::Match).then_some(action)
+    };
+    // Gate 2: skip oversized payloads. Data-driven CEL cost scales with
+    // payload size -- caps the worst case.
     if payload.len() > max_payload_bytes {
-        if !hold_skip() {
-            count_cel_skips(1);
-        }
-        return None;
+        return missed(CelMisses {
+            skips: 1,
+            errors: 0,
+        });
     }
 
     let mut extracted: Vec<(&String, serde_json::Value)> = Vec::with_capacity(fields.len());
@@ -671,10 +711,17 @@ fn evaluate_cel(
 
     // `build_context` takes `(&String, &JsonValue)`. `extracted.iter()` yields
     // `&(&String, JsonValue)`, so we re-borrow the value to match.
-    let ctx = crate::expression::build_context(extracted.iter().map(|(k, v)| (*k, v))).ok()?;
+    let error = CelMisses {
+        skips: 0,
+        errors: 1,
+    };
+    let Ok(ctx) = crate::expression::build_context(extracted.iter().map(|(k, v)| (*k, v))) else {
+        return missed(error);
+    };
     match program.execute(&ctx) {
         Ok(cel::Value::Bool(true)) => Some(action),
-        _ => None,
+        Ok(cel::Value::Bool(false)) => None,
+        _ => missed(error),
     }
 }
 
@@ -1055,6 +1102,74 @@ mod tests {
                 "{expr} on {}",
                 String::from_utf8_lossy(payload)
             );
+        }
+    }
+
+    /// An allow-list written as a negated drop: with `cel_on_error: match` a
+    /// payload it can't judge is dropped, and with `pass` it goes through.
+    #[cfg(feature = "expression")]
+    #[test]
+    fn cel_on_error_decides_a_payload_the_rule_cannot_judge() {
+        use crate::transport::filter::FilterBudget;
+        let small_cap = FilterBudget {
+            max_payload_bytes: 64,
+            ..FilterBudget::default()
+        };
+        let allow_high = r#"!(severity == "high")"#;
+        let allow_above_3 = "!(severity > 3)";
+        let big = format!(r#"{{"severity":"high","pad":"{}"}}"#, "x".repeat(100));
+        // (case, expression, payload, dropped under pass, dropped under match)
+        let cases: [(&str, &str, &[u8], bool, bool); 6] = [
+            (
+                "kept: high",
+                allow_high,
+                br#"{"severity":"high"}"#,
+                false,
+                false,
+            ),
+            (
+                "dropped: low",
+                allow_high,
+                br#"{"severity":"low"}"#,
+                true,
+                true,
+            ),
+            ("field missing", allow_high, br#"{"other":1}"#, false, true),
+            ("kept: 5", allow_above_3, br#"{"severity":5}"#, false, false),
+            (
+                "a string against a number",
+                allow_above_3,
+                br#"{"severity":"high"}"#,
+                false,
+                true,
+            ),
+            ("over the size cap", allow_high, big.as_bytes(), false, true),
+        ];
+        for on_error in [CelOnError::Pass, CelOnError::Match] {
+            let tiers = TransportFilterTierConfig {
+                allow_cel_filters_in: true,
+                budget: small_cap.clone(),
+                cel_on_error: on_error,
+                ..TransportFilterTierConfig::default()
+            };
+            for (case, expr, payload, dropped_pass, dropped_match) in cases {
+                let filter = CompiledFilter::from_expression(
+                    expr,
+                    FilterAction::Drop,
+                    FilterDirection::In,
+                    &tiers,
+                )
+                .unwrap();
+                let want = match on_error {
+                    CelOnError::Pass => dropped_pass,
+                    CelOnError::Match => dropped_match,
+                };
+                assert_eq!(
+                    filter.evaluate(payload).is_some(),
+                    want,
+                    "{on_error:?}: {case}"
+                );
+            }
         }
     }
 

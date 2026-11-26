@@ -119,6 +119,25 @@ pub struct TransportFilterTierConfig {
     /// Static + runtime budget for Tier 2/3 evaluation.
     #[serde(default)]
     pub budget: FilterBudget,
+
+    /// What a CEL rule does with a payload it can't evaluate: a field missing,
+    /// a type mismatch, a result that isn't a bool, or a payload over the
+    /// budget's size cap. Default `pass`. Counted in
+    /// `transport_filter_cel_eval_errors_total` either way.
+    #[serde(default)]
+    pub cel_on_error: CelOnError,
+}
+
+/// A CEL rule's answer for a payload it can't evaluate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CelOnError {
+    /// Let the payload through, as if the rule didn't match.
+    #[default]
+    Pass,
+    /// Take the rule's action, as if it matched. An allow-list written as a
+    /// negated `drop` then never passes a record it couldn't judge.
+    Match,
 }
 
 impl TransportFilterTierConfig {

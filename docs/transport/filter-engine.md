@@ -178,7 +178,9 @@ misconfigured drop/dlq rule never runs as an empty filter engine that
 lets every message through. `PipeTransport::new` rejects traffic
 instead -- see [Where it's embedded](#where-its-embedded).
 
-`transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule, which then does not match, and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature). A screened record counts its skip once, at the send, or at the screen when a `dlq` rule takes it out.
+`transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature). A payload the rule can't evaluate (a field missing, a type mismatch, a result that isn't a bool) counts in `transport_filter_cel_eval_errors_total`. A screened record counts each once, at the send, or at the screen when a `dlq` rule takes it out.
+
+`transport.filter_tiers.cel_on_error` sets what a skipped or unevaluable payload does. `pass`, the default, lets it through as if the rule didn't match. `match` takes the rule's action, so an allow-list written as a negated drop, such as `!(severity == "high")` with `action: drop`, never passes a record it couldn't judge, and a `dlq` rule dead-letters it.
 
 ### `expression.*` -- the app-wide CEL function profile
 
