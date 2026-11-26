@@ -439,6 +439,10 @@ items_after_statements = "allow"          # Test helper structs defined where ne
 inefficient_to_string = "allow"           # Clarity over micro-optimization in tests
 unwrap_used = "allow"                     # Allowed in tests for cleaner assertions
 
+[profile.test]
+# Line tables keep file and line in panic backtraces without the full debuginfo the test link holds in memory.
+debug = "line-tables-only"
+
 [[bench]]
 name = "config_benchmark"
 harness = false

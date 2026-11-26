@@ -11,6 +11,8 @@ The general rules are hyperi-ai's testing standard (`standards/universal/testing
 
 Core is nextest's default selection. The `default-filter` in `.config/nextest.toml` holds every test that needs a real broker, OpenBao or a docker build out of it, bar one main-cases test per service. Full adds those and the `#[ignore]` tests. hyperi-ci runs core on push and PR, and full on the schedule, on a release, or on a dispatch with `test-tier: full`.
 
+The test profile in `Cargo.toml` sets `debug = "line-tables-only"`: panic backtraces keep file and line, and debugger variables are not available in test binaries.
+
 Core holds:
 
 - the unit tests in `src/`, the smoke test and the integration tests that need no server
