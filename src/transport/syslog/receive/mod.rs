@@ -18,8 +18,16 @@
 //! A full queue stops TCP and TLS reads, so the sender's writes back up, and
 //! drops a datagram, counted in `transport_dropped_total{reason="queue_full"}`.
 //! No syslog protocol here answers the sender, so `commit` does nothing.
+//!
+//! Each listener checks a sender before reading it: the IP filter, the
+//! connection cap and the first-byte timeout close a TCP or TLS connection as
+//! it is accepted, and the filter drops a datagram. On Linux UDP reads a batch
+//! per `recvmmsg`, and the datagrams the kernel drops on a full socket buffer
+//! are counted from `/proc/net/udp`.
 
 mod config;
+mod ip_filter;
+mod kernel_drops;
 mod tcp;
 mod udp;
 
@@ -27,18 +35,20 @@ mod udp;
 mod tests;
 
 pub use config::SyslogListenConfig;
+pub use ip_filter::{IpFilterConfig, IpFilterMode};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use self::tcp::Connection;
+use self::ip_filter::IpFilter;
+use self::tcp::{Connection, Gate};
 use crate::tls::ServerTls;
 use crate::transport::core::{Lifecycle, Meter};
 use crate::transport::delivery::DeliveryGuarantee;
@@ -119,6 +129,7 @@ impl SyslogReceiver {
     /// `TransportError::Connection` for an address that cannot be bound.
     pub async fn new(config: &SyslogListenConfig) -> TransportResult<Self> {
         let addresses = config.addresses()?;
+        let ip_filter = Arc::new(IpFilter::new(&config.ip_filter)?);
         let tls = match &config.tls {
             Some(tls) => Some(
                 ServerTls::load(tls)
@@ -136,13 +147,15 @@ impl SyslogReceiver {
         let secure = bind_tcp(addresses.tls).await?;
         let udp = addresses
             .udp
-            .map(|addr| udp::bind(addr, config.udp_recv_buffer_bytes))
+            .map(|addr| {
+                udp::Listener::bind(addr, config.udp_recv_buffer_bytes, config.udp_batch_size)
+            })
             .transpose()?;
         let local = |addr: Option<std::io::Result<SocketAddr>>| addr.transpose().ok().flatten();
         let bound = Bound {
             tcp: local(tcp.as_ref().map(TcpListener::local_addr)),
             tls: local(secure.as_ref().map(TcpListener::local_addr)),
-            udp: local(udp.as_ref().map(tokio::net::UdpSocket::local_addr)),
+            udp: local(udp.as_ref().map(|udp| udp.socket().local_addr())),
         };
 
         let (tx, rx) = mpsc::channel(config.recv_buffer_size);
@@ -158,18 +171,15 @@ impl SyslogReceiver {
                     listener,
                     tls,
                     Arc::clone(&connection),
+                    Gate::new(Arc::clone(&ip_filter), config.max_connections),
                     Arc::clone(&inbox),
                     shutdown.clone(),
                 ));
             }
         }
-        if let Some(socket) = udp {
-            tokio::spawn(udp::read(
-                socket,
-                config.udp_batch_size,
-                Arc::clone(&inbox),
-                shutdown.clone(),
-            ));
+        if let Some(udp) = udp {
+            kernel_drops::watch(udp.socket(), shutdown.clone());
+            tokio::spawn(udp.read(ip_filter, Arc::clone(&inbox), shutdown.clone()));
         }
         let guarantee = if bound.udp.is_some() {
             DeliveryGuarantee::FireAndForget
@@ -182,6 +192,8 @@ impl SyslogReceiver {
             udp = ?bound.udp,
             carriage_returns = ?config.carriage_returns,
             max_message_bytes = config.max_message_bytes,
+            max_connections = config.max_connections,
+            ip_filter = ?config.ip_filter.mode,
             "syslog receiver listening"
         );
         Ok(Self {
@@ -220,6 +232,27 @@ impl SyslogReceiver {
     #[must_use]
     pub fn udp_addr(&self) -> Option<SocketAddr> {
         self.bound.udp
+    }
+}
+
+/// Says when a repeated log line is due, at most once per `every`.
+struct LogEvery {
+    every: Duration,
+    last: Option<Instant>,
+}
+
+impl LogEvery {
+    const fn new(every: Duration) -> Self {
+        Self { every, last: None }
+    }
+
+    /// Whether to log now. True marks it logged.
+    fn due(&mut self) -> bool {
+        let due = self.last.is_none_or(|at| at.elapsed() >= self.every);
+        if due {
+            self.last = Some(Instant::now());
+        }
+        due
     }
 }
 

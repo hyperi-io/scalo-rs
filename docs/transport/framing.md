@@ -29,6 +29,7 @@ Appends means two units back to back decode as the records of both, so a file ca
 | `max_decoded_bytes` | the unit `decode` takes, after content decoding. A gzip body meets the transport's own limit as it arrives and this one once inflated |
 | `max_record_bytes` | one record. A longer one goes to `Decoded::oversize`, or arrives from a stream as `Frame::Oversize` with its first `max_record_bytes`, and is never held whole |
 | `max_frame_bytes` | an octet count. A frame over `max_record_bytes` and within this is skipped whole. A larger count is not trusted: the bytes from it to the next `\n` are read as an LF line, and counting resumes after it |
+| `max_records` | the records one unit holds, oversize ones included. A unit with more is refused whole with `FramingError::TooManyRecords` at the first record past it, so the sender can retry it smaller and nothing past the limit is held. `DecodeLimits::DEFAULT_MAX_RECORDS` is 100000. A stream has no unit and does not read it |
 
 `octet_counting` is for syslog. A frame is counted only when it is a count starting 1 to 9, one space, then the `<` of the PRI. Anything else is an LF line, so one stream can carry both, and a line such as `2026 Oct 11 ...` never swallows what follows it. A space at the end of the input so far waits for the next byte, and at the end of input it is a line.
 
@@ -42,7 +43,7 @@ A framing that streams decodes a byte stream as it arrives:
 use std::sync::Arc;
 use scalo::framing::{DecodeLimits, Frame, OctetCounting, StreamDecoder};
 
-let limits = DecodeLimits { max_decoded_bytes: usize::MAX, max_record_bytes: 64 * 1024, max_frame_bytes: 1024 * 1024 };
+let limits = DecodeLimits { max_record_bytes: 64 * 1024, max_frame_bytes: 1024 * 1024, ..DecodeLimits::UNBOUNDED };
 let mut decoder = StreamDecoder::new(Arc::new(OctetCounting::default()), limits);
 while let Some(frame) = decoder.read(&mut reader).await? {
     match frame {

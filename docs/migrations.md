@@ -6,6 +6,20 @@ release and the target before bumping.
 
 ---
 
+## 2.14.41
+
+### `DecodeLimits` has a `max_records` field (API CHANGE)
+
+`framing::DecodeLimits` has a public `max_records: usize`. `Framing::decode` refuses a unit holding more records with `FramingError::TooManyRecords { max }`, at the first record past it. `DecodeLimits::UNBOUNDED` sets it to `usize::MAX`, and `DecodeLimits::DEFAULT_MAX_RECORDS` is 100000.
+
+**Consumer adjustment** -- a `DecodeLimits` struct literal sets `max_records`, to `DecodeLimits::DEFAULT_MAX_RECORDS` for input from outside, or ends in `..DecodeLimits::UNBOUNDED`. A caller that answers the sender maps `TooManyRecords` to a refusal it retries smaller, such as HTTP 413.
+
+### The syslog receiver caps connections and closes silent ones (API and BEHAVIOUR CHANGE)
+
+`SyslogListenConfig` has public `first_byte_timeout_ms`, `max_connections` and `ip_filter` fields. A TCP or TLS connection that sends nothing for 30 s is closed, and one past 10000 open on a listener is closed as it is accepted. `ip_filter` is off by default. `transport-syslog` pulls `concurrency`, `quinn-udp`, `ipnet` and `ipnet-trie`.
+
+**Consumer adjustment** -- a `SyslogListenConfig` struct literal ends in `..SyslogListenConfig::default()`. A sender that connects well before its first message needs `first_byte_timeout_ms: 0` or a longer wait, and a listener with more than 10000 senders at once a larger `max_connections`.
+
 ## 2.14.40: syslog receiver and metric units
 
 ### Twelve byte and time metrics report their unit over OTLP (BEHAVIOUR CHANGE)

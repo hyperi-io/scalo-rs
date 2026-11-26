@@ -38,7 +38,7 @@ mod stream;
 mod tests;
 
 pub use config::{Facility, Severity, SyslogConfig, SyslogFormat, SyslogFraming, SyslogProtocol};
-pub use receive::{SyslogListenConfig, SyslogReceiver, SyslogToken};
+pub use receive::{IpFilterConfig, IpFilterMode, SyslogListenConfig, SyslogReceiver, SyslogToken};
 
 use std::ops::Range;
 use std::sync::Arc;

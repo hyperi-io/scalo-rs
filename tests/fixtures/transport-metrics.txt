@@ -20,10 +20,10 @@ counter transport_coalesced_blocks_total transport="grpc"
 counter transport_coalesced_calls_total transport="grpc"
 counter transport_coalesced_records_total transport="grpc"
 counter transport_coalesced_timeouts_total transport="grpc"
-counter transport_connections_closed_total transport="syslog" reason=<why.as_str()>
+counter transport_connections_closed_total transport="syslog" reason=<self.as_str()>
 counter transport_consumer_rebuilds_total transport="kafka" protocol=<protocol.as_str()>
-counter transport_dropped_total transport="syslog" reason="empty"
-counter transport_dropped_total transport="syslog" reason="queue_full"
+counter transport_dropped_total transport="syslog" reason="kernel"
+counter transport_dropped_total transport="syslog" reason=<reason>
 counter transport_filter_cel_payload_skip_total
 counter transport_filter_msgpack_bypass_total direction=<direction.to_string()>
 counter transport_filtered_total direction=<dir> action=<act>
