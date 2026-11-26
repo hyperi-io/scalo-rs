@@ -201,6 +201,19 @@ An `https://` endpoint runs TLS with the `tls` section every transport reads ([.
 
 ### Receiving
 
+- TLS: `listen_tls` serves TLS on `listen` with the server section every listener reads ([../api/tls.md](../api/tls.md)): `profile`, `cert_file` or `cert_secret`, `key_file` or `key_secret`, `ca_files`, `client_auth`, `reload_interval_secs` and `handshake_timeout_ms`. The listener offers ALPN `h2`, the one protocol the client accepts. With `client_auth: required`, a client with no certificate from the CA sees a closed connection, so it is `Backpressured`. Unset, `listen` serves plaintext, and with `APP_ENV=production` it logs one warning at bind ([runtime-context](../runtime/runtime-context.md)). `listen_tls` without `listen` is refused at build.
+
+```yaml
+transport:
+  input:
+    type: grpc
+    grpc:
+      listen: 0.0.0.0:6000
+      listen_tls:
+        cert_file: /etc/tls/push.pem
+        key_file: /etc/tls/push.key
+```
+
 - Acknowledgement: unarmed, or with acknowledgements disabled, the server answers once the records are queued for `recv`, not once the consumer reads them. Armed, it answers once they are released: see [Held responses](#held-responses). A full queue (`recv_buffer_size`) answers `ResourceExhausted`.
 - `RouteBatch`: each record's headers, the dedup key among them, reach `recv` on its `Record`. A batch is queued whole or not at all. One with more records than `recv_buffer_size` never fits the queue, so it is held whole in a slot of its own, one batch at a time: it lands in one step, or is answered `ResourceExhausted` with nothing queued while an earlier one is still waiting. `recv` hands that batch over before the queue, so the receiver holds at most `recv_buffer_size` records plus one such batch. Each request takes one contiguous range of token sequence numbers.
 - `close()`: rejects new pushes with `Unavailable`, which senders retry, and keeps every acknowledged record: `recv` returns them, then `TransportError::Closed`. Held responses are answered as their records are released, and those still held at the drain deadline (`drain_deadline`, default 20 s, kept under the pod's termination grace period) are answered `Unavailable`. Open connections finish their in-flight RPCs on their own, the listener is free when `close()` returns, and a client that never finishes its RPC does not hold it open. Dropping the transport stops the server too, and answers every held response `Unavailable` at once.

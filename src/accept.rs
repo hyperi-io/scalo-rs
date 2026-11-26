@@ -17,7 +17,7 @@ const PAUSE: Duration = Duration::from_secs(1);
 /// The pause after a failed accept. A connection-level error is the client's
 /// and costs nothing. Anything else, out of file descriptors say, comes back
 /// on the next accept, so the loop would spin.
-fn pause_for(kind: io::ErrorKind) -> Option<Duration> {
+pub(crate) fn pause_for(kind: io::ErrorKind) -> Option<Duration> {
     match kind {
         io::ErrorKind::ConnectionRefused
         | io::ErrorKind::ConnectionAborted
@@ -27,6 +27,7 @@ fn pause_for(kind: io::ErrorKind) -> Option<Duration> {
 }
 
 /// Log a failed accept on `listener` and back off unless it was the client's.
+#[cfg(any(feature = "metrics", all(feature = "http-server", feature = "tls")))]
 pub(crate) async fn pause_after_error(listener: &'static str, e: &io::Error) {
     let Some(pause) = pause_for(e.kind()) else {
         return;
