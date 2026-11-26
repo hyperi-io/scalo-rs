@@ -14,6 +14,8 @@ use wasmtime::ResourceLimiter;
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
+use super::guest_log::{GuestLog, Stream};
+
 use super::config::WasmConfig;
 
 /// A cap a guest ran into. Carried as the error of the trap it raised.
@@ -116,8 +118,10 @@ impl ResourceLimiter for Limiter {
 /// The data a plugin's [`Store`](wasmtime::Store) holds: the world's `D`, the
 /// caps, the import budget and a WASI context that grants nothing.
 ///
-/// A guest sees no files, sockets, environment, arguments or stdin. Secrets
-/// never enter it: an import resolves a credential name host-side.
+/// A guest sees no files, sockets, environment, arguments or stdin. Its
+/// stdout and stderr become log lines with a `plugin` field, cut at 1 KiB and
+/// capped at 100 a second. Secrets never enter it: an import resolves a
+/// credential name host-side.
 pub struct HostCtx<D> {
     data: D,
     plugin: Arc<str>,
@@ -129,6 +133,10 @@ pub struct HostCtx<D> {
 
 impl<D> HostCtx<D> {
     pub(super) fn new(data: D, plugin: Arc<str>, config: &WasmConfig) -> Self {
+        let wasi = WasiCtx::builder()
+            .stdout(GuestLog::new(Arc::clone(&plugin), Stream::Stdout))
+            .stderr(GuestLog::new(Arc::clone(&plugin), Stream::Stderr))
+            .build();
         Self {
             data,
             plugin,
@@ -138,7 +146,7 @@ impl<D> HostCtx<D> {
                 max_table_elements: config.max_table_elements,
                 peak_memory_bytes: 0,
             },
-            wasi: WasiCtx::builder().build(),
+            wasi,
             table: ResourceTable::new(),
         }
     }

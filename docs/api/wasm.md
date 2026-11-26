@@ -56,7 +56,7 @@ Every call runs under these, and hitting one traps the guest, never the host. Th
 
 `recycle_after_calls` (100,000) and `recycle_above_memory_bytes` (64 MiB) replace an instance that has served that many calls or grown past that much memory. `unhealthy_after_traps` (5) traps in a row mark the plugin unhealthy: every call then returns `CallError::Unhealthy` until the plugin is loaded again. The caller owns retry and dead-lettering.
 
-WASI is linked over a context that grants nothing: no files (no preopened directories), no sockets, no environment, no arguments, no stdin. A plugin that imports `wasi:sockets` or `wasi:http` is refused at load. Secrets never enter the guest: an import resolves a credential name host-side.
+WASI is linked over a context that grants nothing: no files (no preopened directories), no sockets, no environment, no arguments, no stdin. A guest's stdout and stderr become `info` log lines with `plugin` and `stream` fields, cut at 1 KiB and capped at 100 lines a second per instance. A `warn` line counts the rest. A plugin that imports `wasi:sockets` or `wasi:http` is refused at load. Secrets never enter the guest: an import resolves a credential name host-side.
 
 ## Loading and trust
 

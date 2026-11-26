@@ -198,7 +198,7 @@ secrets-all = ["secrets-vault", "secrets-aws"]
 tls = ["dep:rustls", "dep:rustls-native-certs", "dep:rustls-platform-verifier", "dep:rustls-pki-types", "dep:tokio-rustls", "dep:arc-swap", "dep:sha2", "base64", "tokio", "tracing"]
 
 # The wasmtime host runtime. Off by default and out of `full`: it adds the compiler to the build.
-wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha2", "dep:sigstore-verify", "dep:arc-swap", "metrics-core", "tracing"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha2", "dep:sigstore-verify", "dep:arc-swap", "metrics-core", "tokio", "tracing"]
 # Test guests written as WAT. Never in a shipping build, so production never parses text.
 wasm-test-support = ["wasm", "dep:wat"]
 
