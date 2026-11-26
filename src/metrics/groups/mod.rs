@@ -55,6 +55,8 @@ pub use backpressure::BackpressureMetrics;
 pub use buffer::BufferMetrics;
 pub use circuit_breaker::CircuitBreakerMetrics;
 pub use consumer::ConsumerMetrics;
+#[cfg(feature = "transport-kafka")]
+pub(crate) use consumer::series as consumer_series;
 pub use enrichment::EnrichmentMetrics;
 pub use schema_cache::SchemaCacheMetrics;
 pub use sink::SinkMetrics;

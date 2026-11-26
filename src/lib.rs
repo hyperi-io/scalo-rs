@@ -555,6 +555,9 @@ pub fn init(env_prefix: &str) -> Result<(), Box<dyn std::error::Error + Send + S
 }
 
 #[cfg(test)]
+mod source_census;
+
+#[cfg(test)]
 mod runner {
     /// The suite shares process-global state, so plain `cargo test` fails
     /// tests for that reason alone. This one says so by name.

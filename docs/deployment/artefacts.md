@@ -41,10 +41,10 @@ each name once and under the `metrics.namespace` the service's own
 config sets. CI uses it to check that Prometheus dashboards and alerts
 reference real metrics. Byte-identical to `metrics-manifest` on stdout.
 
-It lists what the scalo registry describes, which is not everything
-the service serves: the `process_*`, `container_*`, `http_client_*` and
-memory guard gauges are on `/metrics` but not in the manifest
-(scalo-rs#137).
+It lists every series scalo's modules write that the build
+compiles in, including `process_*`, `container_*` and `http_client_*`,
+and whatever the app describes. A series an app writes without
+describing it is not in the manifest.
 
 ```json
 {

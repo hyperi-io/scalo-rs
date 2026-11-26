@@ -19,6 +19,25 @@ const LAG: &str = "consumer_lag";
 const PARTITIONS_ASSIGNED: &str = "consumer_partitions_assigned";
 const REBALANCES: &str = "consumer_rebalance_total";
 
+/// The series a Kafka consumer's group labels: its lag, assigned partitions and
+/// rebalances.
+pub(crate) fn series() -> [Series<'static>; 3] {
+    [
+        Series::gauge(LAG, "Kafka consumer lag per group/topic/partition").labels(&[
+            "group_id",
+            "topic",
+            "partition",
+        ]),
+        Series::gauge(
+            PARTITIONS_ASSIGNED,
+            "Current assigned partition count per group",
+        )
+        .labels(&["group_id"]),
+        Series::counter(REBALANCES, "Consumer group rebalance events per group")
+            .labels(&["group_id"]),
+    ]
+}
+
 /// Kafka consumer metrics.
 ///
 /// Tracks consumer lag, partition assignments, rebalances, poll latency,
@@ -43,23 +62,7 @@ impl ConsumerMetrics {
     #[must_use]
     pub fn new(manager: &MetricsManager) -> Self {
         // BARE names -- the recorder prefix layer and registry apply the namespace.
-        manager.registry().describe(
-            "consumer",
-            &[
-                Series::gauge(LAG, "Kafka consumer lag per group/topic/partition").labels(&[
-                    "group_id",
-                    "topic",
-                    "partition",
-                ]),
-                Series::gauge(
-                    PARTITIONS_ASSIGNED,
-                    "Current assigned partition count per group",
-                )
-                .labels(&["group_id"]),
-                Series::counter(REBALANCES, "Consumer group rebalance events per group")
-                    .labels(&["group_id"]),
-            ],
-        );
+        manager.registry().describe("consumer", &series());
 
         Self {
             partitions_assigned: Gauge::from_arc(Arc::new(Unlabelled(PARTITIONS_ASSIGNED))),

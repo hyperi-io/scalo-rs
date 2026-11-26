@@ -28,6 +28,7 @@
 
 use metrics::Unit;
 
+use super::catalogue;
 use super::manifest::Series;
 
 /// Standard metric set: labelled counters, gauges, and histograms across
@@ -252,10 +253,7 @@ impl ServiceMetrics {
                 )
                 .labels(&["transport", "reason"]),
                 // --- Records ---
-                Series::counter(
-                    "records_received_total",
-                    "Records received from all sources",
-                ),
+                catalogue::records_received_total(),
                 Series::counter(
                     "records_delivered_total",
                     "Records successfully delivered to sink",

@@ -8,6 +8,12 @@ release and the target before bumping.
 
 ## 2.14.41
 
+### The manifest lists every series scalo writes (BEHAVIOUR CHANGE)
+
+`/metrics/manifest` and the `metrics-manifest` and `generate-artefacts` output now describe the series scalo's modules write, as well as the ones an app pushed: `process_*`, `container_*`, TLS, Kafka client, syslog, DLQ, worker pool thresholds and fan-out, governor, rate limit, secrets, HTTP client, file writer and WASM series, each when its feature is compiled in. The `self_regulation_*` series, which the batch engine described, are described whenever `governor` is on, in group `platform`, with their label keys. `records_received_total` is `platform` however an app registers it, where `AppMetrics` alone listed it under `app`.
+
+**Consumer adjustment** -- none for the service. A dashboard or alert generator that reads the manifest sees more series, and one that panels every listed series gets panels for them.
+
 ### The secret cache keys each source on what it reads (BEHAVIOUR CHANGE)
 
 A configured source's cache entry is keyed on its name and a digest of what it reads, not the name alone. Before, two apps sharing a cache directory, each with a source called `api_token`, read each other's secret from the disk tier until its TTL ran out.
