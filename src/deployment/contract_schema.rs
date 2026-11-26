@@ -176,9 +176,16 @@ mod tests {
             "/$defs/PortContract/properties/app_protocol",
             "/$defs/SecretGroupContract/properties/optional",
             "/$defs/ConfigSchemaNode/properties/x-scalo-dial",
+            "/properties/memory",
+            "/$defs/MemoryProfile/properties/reading",
+            "/$defs/BenchLoad/properties/sources",
         ] {
             assert!(schema.pointer(pointer).is_some(), "{pointer} missing");
         }
+        assert_eq!(
+            schema["$defs"]["MemoryProfile"]["properties"]["min_bytes"]["minimum"],
+            1
+        );
         assert_eq!(
             schema["properties"]["termination_grace_seconds"]["default"],
             45
@@ -188,12 +195,13 @@ mod tests {
             1
         );
         assert_eq!(schema["properties"]["service_account"]["default"], "own");
-        assert!(
-            !schema["required"]
-                .as_array()
-                .unwrap()
-                .contains(&"service_account".into())
-        );
+        let required = schema["required"].as_array().unwrap();
+        for optional in ["service_account", "memory"] {
+            assert!(
+                !required.contains(&optional.into()),
+                "{optional} is required"
+            );
+        }
     }
 
     /// The no-op baseline every breaking-change run starts from.

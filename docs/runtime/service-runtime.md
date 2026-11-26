@@ -176,6 +176,8 @@ pub trait ServiceApp: Sized {
     fn scaling_components(&self, _: &Self::Config) -> Vec<ScalingComponent> { vec![] }  // cfg: scaling
     fn register_metrics(&self, _: &MetricsManager) {}                                   // cfg: metrics | otel-metrics
     fn deployment_contract(&self) -> Option<DeploymentContract> { None }                // cfg: deployment
+    fn bench_pipeline(&self, _: Self::Config, _: ServiceRuntime, _: BenchPipeline)
+        -> Option<impl Future<Output = Result<(), CliError>> + Send> { None }            // cfg: bench-memory
     fn version_check_defaults(&self) -> VersionCheckConfig { Default::default() }       // cfg: version-check
 }
 ```
@@ -195,6 +197,7 @@ pub trait ServiceApp: Sized {
 | `scaling_components` | no (cfg `scaling`) | Register app-specific KEDA signals (lag, queue depth) |
 | `register_metrics` | no (cfg `metrics`) | Describe the app's metrics for `metrics-manifest` / `generate-artefacts`. The scalo runtime set is always in the manifest, so an override adds only what the app emits itself |
 | `deployment_contract` | no (cfg `deployment`) | Build the contract for `generate-artefacts` |
+| `bench_pipeline` | no (cfg `bench-memory`) | Run the app's pipeline between `BenchPipeline`'s source and sink until `runtime.shutdown`, for `bench-memory` |
 | `version_check_defaults` | no (cfg `version-check`) | Supply the service's releases endpoint. The cascade overlays it, and `version_check.enabled: false` always wins |
 
 Apps that don't override the optional methods get sensible no-op
@@ -215,7 +218,8 @@ writing any extra code:
 | `version` | Print `version_info()` and exit |
 | `config-check` | Load logger + config, print summary, exit non-zero on failure |
 | `metrics-manifest` | Load config (best-effort, for `metrics.namespace`), describe the scalo runtime set, call `register_metrics`, print manifest JSON to stdout, exit. Warnings go to stderr |
-| `generate-artefacts --output-dir <dir>` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, and `config-schema.*` / `capability-catalog.*` when the contract has them. Rejects, writing nothing, a contract whose `default_config` binds a listener no port declares |
+| `generate-artefacts --output-dir <dir> [--memory-profile <file>]` | Load config once (best-effort, a failure warned on stderr), then emit `metrics-manifest.json`, `deployment-contract.json`, `container-manifest.json`, `Dockerfile.runtime`, and `config-schema.*` / `capability-catalog.*` when the contract has them. `--memory-profile` puts a `bench-memory` profile in the contract's `memory`. Rejects, writing nothing, a contract whose `default_config` binds a listener no port declares, or that sets `memory` in code |
+| `bench-memory [--output <file>]` | Build the runtime as `run` does, run `bench_pipeline` under the standard load, and write the memory profile (needs `bench-memory`, see [contract.md](../deployment/contract.md#memory)). Exits non-zero for an app with no `bench_pipeline` |
 | `config-schema --dir <dir>` | Write `config-schema.{json,yaml}` and `capability-catalog.{json,yaml}` from the app's config and capability catalogue (needs `deployment`) |
 | `top` | Live metrics TUI (when `top` feature is on) |
 

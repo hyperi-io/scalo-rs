@@ -35,7 +35,7 @@ library chart renders version 4 only.
 | 1 | Initial shape -- no `image_profile`, no `oci_labels` |
 | 2 | `ImageProfile`, `OciLabels`, `SecretGroupContract` |
 | 3 | Adds `config_schema` + `capabilities` |
-| 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `service_account`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, `hot_paths`, the `x-scalo-dial` keyword in `config_schema`, and `config_mount_path` may be empty |
+| 4 | Current - adds `writable_paths`, `termination_grace_seconds`, `resources`, `security`, `singleton`, `service_account`, `health.startup_budget_seconds`, `ports[].public`, `ports[].app_protocol`, `secrets[].optional`, `hot_paths`, `memory`, the `x-scalo-dial` keyword in `config_schema`, and `config_mount_path` may be empty |
 
 An app that writes `schema_version: 3` in its struct literal still emits 3, and
 a version-4 reader rejects it. Write `CONTRACT_SCHEMA_VERSION` instead. Serde
@@ -204,6 +204,7 @@ and `validate()` rejects it until they are set.
 | `writable_paths` | `Vec<WritablePath>` | `[]` | Directories the app writes, so the root filesystem stays read-only (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
 | `termination_grace_seconds` | `u32` | `45` | Seconds between SIGTERM and SIGKILL (v4) |
 | `resources` | `ResourcesContract` | empty | The app's requests and limits. Empty leaves the chart default (v4) |
+| `memory` | `Option<MemoryProfile>` | `None` | Memory under the standard load, from `bench-memory` through `generate-artefacts --memory-profile` only. Omitted from the JSON while `None` (v4) -- see [Memory](#memory) |
 | `security` | `SecurityContract` | uid/gid/fsGroup 1000, read-only root | Identity and capabilities the image runs with (v4) |
 | `singleton` | `bool` | `false` | Exactly one pod: no autoscaling, Recreate rollout (v4) |
 | `service_account` | `ServiceAccount` | `Own` | `none` for an app that calls no Kubernetes API: the chart creates no ServiceAccount and the pod names none. Omitted from the JSON while `own` (v4) -- see [Writable paths](#writable-paths-resources-and-security) |
@@ -289,6 +290,49 @@ A chart always adds a scratch `/tmp` beside the declared paths.
 An app with a file DLQ builds its contract with `.with_dlq(&dlq_config)` (feature `dlq`), passing the `DlqConfig` it spawns the DLQ with. That adds a `dlq` path at `file.path` whenever the DLQ writes files, so the file backend starts on the read-only root filesystem. A `kafka_only` DLQ, a DLQ or file backend that is off, or a directory under a declared path adds nothing.
 
 `service_account: ServiceAccount::None` (`"none"` in the JSON) is for an app with no Kubernetes client and no use for a token. The scalo-service chart then creates no ServiceAccount and leaves `serviceAccountName` off the pod, so it runs as the namespace's `default` account with the token still unmounted. Values can still set `serviceAccount.create` either way, or `serviceAccount.name` to run as an account the operator supplies.
+
+---
+
+## Memory
+
+`memory` is what the service held under the standard load, measured on the release binary by `bench-memory` (feature `bench-memory`). Nothing else writes it. `generate-artefacts` takes it only from a profile file and rejects a contract that sets it in code.
+
+```bash
+my-app bench-memory --output ci/memory-profile.json
+my-app generate-artefacts --output-dir ci/ --memory-profile ci/memory-profile.json
+```
+
+`bench-memory` loads the config and builds the runtime as `run` does, then hands `ServiceApp::bench_pipeline` an in-memory source and sink. Producers offer JSON records to the source, a drain discards what reaches the sink, and after the warm-up the figure the memory guard reads by default is sampled at the end of each interval. An app with no `bench_pipeline` exits non-zero and writes nothing.
+
+| Flag | Default | Recorded as |
+| --- | --- | --- |
+| `--records-per-second` | `5000` | `load.records_per_second`, split evenly across the sources |
+| `--record-bytes` | `1024` | `load.record_bytes`, 16 bytes to 16 MiB |
+| `--sources` | `1` | `load.sources`, the producers feeding the source at once |
+| `--warmup-seconds` | `30` | `warmup_seconds` |
+| `--window-seconds` | `120` | `window_seconds` |
+| `--sample-interval-ms` | `1000` | `samples`, the window over the interval |
+| `--output` | `memory-profile.json` | the file written |
+
+| Field | Notes |
+| --- | --- |
+| `min_bytes`, `avg_bytes`, `max_bytes` | Lowest, mean and highest sample. `validate()` needs them above 0 and rising in that order |
+| `load` | `records_per_second`, `record_bytes` and `sources` the run offered |
+| `warmup_seconds`, `window_seconds`, `samples` | How the window was taken |
+| `reading` | `cgroup-v2` or `cgroup-v1`, the cgroup working set of every process in it. `proc-status`, this process's `VmRSS`. `working-set` on Windows, `task-info` on macOS |
+
+Run the bench in the app's own image to read `cgroup-v2`, the figure kubelet evicts on. In a CI runner's container the cgroup covers the runner too.
+
+The scalo-service chart does not read `memory`. A chart that does sets `requests.memory` from `avg_bytes` and `limits.memory` from `max_bytes` plus a headroom it chooses, above its library default and below the contract's `resources` and the deployment's `resources` values, so either of those still wins. Helm reads the figures as floats, so they go through `int64` before `toString`, or `104857600` renders as `1.048576e+08`:
+
+```yaml
+{{- with $contract.memory }}
+{{- $_ := set $resources.requests "memory" (.avg_bytes | int64 | toString) }}
+{{- $_ := set $resources.limits "memory" (mulf .max_bytes (addf 1 $.Values.memoryHeadroom) | ceil | int64 | toString) }}
+{{- end }}
+```
+
+A plain byte count is a Kubernetes memory quantity, so no unit is added.
 
 ---
 
@@ -508,6 +552,8 @@ reference has no codename.
 | `config_schema_json::<T>()` | Derive the JSON Schema for the app's `Config` |
 | `CONTRACT_SCHEMA_VERSION` | The contract schema version this crate writes and reads (4) |
 | `WritablePath` / `ResourcesContract` / `ResourceList` / `SecurityContract` / `ServiceAccount` | v4 pod needs -- see [Writable paths](#writable-paths-resources-and-security) |
+| `MemoryProfile` / `BenchLoad` / `MemoryReading` | The `memory` block, its load and what each sample read -- see [Memory](#memory) |
+| `ServiceApp::bench_pipeline` / `cli::BenchPipeline` | The app's pipeline between the bench source and sink (feature `bench-memory`) -- see [Memory](#memory) |
 | `contract_json_schema()` / `contract_schema_file_name(version)` | The contract's JSON Schema and its committed file name (feature `config-schema`) |
 | `DIAL_KEYWORD` / `DIAL_TIERS` / `dials(config_schema)` | The dial marker, its two values, and every marked node by path -- see [Dials](#dials) |
 | `breaking_changes(old, new)` / `SchemaBreak` / `SchemaBreakKind` | Every change between two JSON Schemas that rejects what the old one accepted |

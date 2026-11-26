@@ -197,6 +197,13 @@ pub struct DeploymentContract {
     #[serde(default, skip_serializing_if = "ResourcesContract::is_empty")]
     pub resources: ResourcesContract,
 
+    /// Memory the service held under the standard load, from a `bench-memory`
+    /// run. Only `generate-artefacts --memory-profile` sets it, and
+    /// `generate-artefacts` rejects a contract that sets it in code. Left out
+    /// of the serialised contract while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<super::MemoryProfile>,
+
     /// The user, group and Linux capabilities the image runs with.
     #[serde(default)]
     pub security: SecurityContract,
@@ -291,6 +298,7 @@ impl Default for DeploymentContract {
             writable_paths: Vec::new(),
             termination_grace_seconds: default_termination_grace_seconds(),
             resources: ResourcesContract::default(),
+            memory: None,
             security: SecurityContract::default(),
             singleton: false,
             service_account: ServiceAccount::default(),
@@ -1099,6 +1107,7 @@ mod tests {
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
             openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
+            memory: None,
         };
         let json = contract.to_json().unwrap();
         assert!(json.contains("test-app"));
@@ -1210,6 +1219,7 @@ mod tests {
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
             openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
+            memory: None,
         };
         assert_eq!(contract.binary(), "my-app");
     }
@@ -1248,6 +1258,7 @@ mod tests {
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
             openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
+            memory: None,
         };
         assert_eq!(contract.config_filename(), "loader.yaml");
         assert_eq!(contract.config_dir(), "/etc/event-loader");
@@ -1287,6 +1298,7 @@ mod tests {
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
             openssl_conf: DEFAULT_OPENSSL_CONF.to_string(),
+            memory: None,
         }
     }
 

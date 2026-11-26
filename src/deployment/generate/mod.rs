@@ -112,6 +112,7 @@ mod tests {
             service_account: crate::deployment::ServiceAccount::Own,
             hot_paths: vec![],
             openssl_conf: crate::deployment::DEFAULT_OPENSSL_CONF.to_string(),
+            memory: None,
         }
     }
 

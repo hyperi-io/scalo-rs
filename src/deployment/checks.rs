@@ -58,7 +58,8 @@ impl DeploymentContract {
     /// digits, `_` and `-` segments, and needs a config file. Each added
     /// capability is an upper-case Linux capability name such as `NET_ADMIN`.
     /// `openssl_conf` is empty or an absolute path a Dockerfile ENV line takes
-    /// unquoted. Every `x-scalo-dial` marker in `config_schema` is `big` or
+    /// unquoted. A `memory` profile has no zero figure, and its min, average
+    /// and max bytes rise in that order. Every `x-scalo-dial` marker in `config_schema` is `big` or
     /// `small`, and every `$ref` the dial search follows resolves.
     ///
     /// # Errors
@@ -110,6 +111,9 @@ impl DeploymentContract {
             ));
         }
         self.check_security()?;
+        if let Some((field, reason)) = self.memory.as_ref().and_then(super::MemoryProfile::fault) {
+            return Err(invalid(format!("memory.{field}"), reason));
+        }
         if let Some(schema) = &self.config_schema {
             super::dials(schema)
                 .map_err(|e| invalid("config_schema".to_string(), e.to_string()))?;
@@ -443,6 +447,7 @@ mod tests {
             service_account: ServiceAccount::Own,
             hot_paths: vec![],
             openssl_conf: crate::deployment::DEFAULT_OPENSSL_CONF.to_string(),
+            memory: None,
         }
     }
 
@@ -493,6 +498,51 @@ mod tests {
         ] {
             c.openssl_conf = bad.into();
             assert_eq!(refused_field(&c), "openssl_conf", "{bad:?}");
+        }
+    }
+
+    /// A memory profile passes with rising figures, and one no bench run writes
+    /// is refused at the field at fault.
+    #[test]
+    fn a_memory_profile_no_bench_writes_is_refused() {
+        use crate::deployment::{BenchLoad, MemoryProfile, MemoryReading};
+
+        let good = MemoryProfile {
+            min_bytes: 10,
+            avg_bytes: 20,
+            max_bytes: 30,
+            load: BenchLoad {
+                records_per_second: 5000,
+                record_bytes: 1024,
+                sources: 1,
+            },
+            warmup_seconds: 0,
+            window_seconds: 120,
+            samples: 120,
+            reading: MemoryReading::ProcStatus,
+        };
+        let mut c = contract();
+        c.memory = Some(good.clone());
+        c.validate().unwrap();
+
+        let faults: [(fn(&mut MemoryProfile), &str); 8] = [
+            (|p| p.min_bytes = 0, "memory.min_bytes"),
+            (|p| p.avg_bytes = 5, "memory.avg_bytes"),
+            (|p| p.max_bytes = 15, "memory.avg_bytes"),
+            (|p| p.window_seconds = 0, "memory.window_seconds"),
+            (|p| p.samples = 0, "memory.samples"),
+            (
+                |p| p.load.records_per_second = 0,
+                "memory.load.records_per_second",
+            ),
+            (|p| p.load.record_bytes = 0, "memory.load.record_bytes"),
+            (|p| p.load.sources = 0, "memory.load.sources"),
+        ];
+        for (fault, field) in faults {
+            let mut profile = good.clone();
+            fault(&mut profile);
+            c.memory = Some(profile);
+            assert_eq!(refused_field(&c), field);
         }
     }
 

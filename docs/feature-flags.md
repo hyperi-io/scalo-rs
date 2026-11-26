@@ -71,6 +71,7 @@ Pick `metrics` for service binaries. scalo's series, the tiered sink's and the t
 | `cli` | `clap`-based `CommonArgs`, `StandardCommand`, `VersionInfo`, output helpers |
 | `cli-service` | Above + `ServiceApp` trait, `run_app`, `ServiceRuntime` (pulls `health + metrics + memory + scaling + shutdown + governor + lifecycle`). `health` is what lets a transport, a circuit or a paused gate fail `/readyz`. No transport comes with it: add the `transport-*` backends, and `sink-stack` for `outbound_sink_stack`. The worker pool is opt-in: add `worker-pool`, or `worker-batch` for the pool plus `BatchEngine` |
 | `lifecycle` | Idle-until-configured gate (`WorkState`, `IdleGate`, `pipeline_idle`) -- folded into `cli-service` |
+| `bench-memory` | Above + the `bench-memory` subcommand and `ServiceApp::bench_pipeline`, which measure the contract's `memory` block (pulls `deployment` and `transport-memory`). See [deployment/contract.md](deployment/contract.md#memory) |
 | `top` | Above + `ratatui` TUI metrics dashboard |
 
 ### Transport

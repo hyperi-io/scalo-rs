@@ -33,7 +33,7 @@ features = [
     "concurrency", "strmatch", "memory", "scaling",
     "io", "spool", "tiered-sink",
     "worker-pool", "worker-batch", "worker", "worker-msgpack",
-    "cli", "cli-service",
+    "cli", "cli-service", "bench-memory",
     "http", "http-server",
     "transport", "transport-trace",
     "transport-memory", "transport-grpc", "transport-file",
@@ -128,6 +128,8 @@ cli-service = ["cli", "health", "metrics", "memory", "scaling", "shutdown", "gov
 # Folded into cli-service: docs/core-pillars/lifecycle.md
 lifecycle = ["config", "tokio", "tracing"]
 top = ["cli-service", "ratatui"]
+# `bench-memory` and `ServiceApp::bench_pipeline`: docs/deployment/contract.md#memory
+bench-memory = ["cli-service", "deployment", "transport-memory"]
 
 io = ["parking_lot", "dep:jiff", "compression", "tracing", "tokio"]
 
@@ -207,7 +209,7 @@ wasm-oci = ["wasm", "dep:oci-client", "dep:futures-util"]
 # Can leak secrets: not in `full`, off in every shipping build.
 dangerous-diagnostics = []
 
-full = ["compression", "compression-snappy", "config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "io", "dlq", "dlq-kafka", "dlq-http", "output-file", "expression", "rules", "tls", "geoip-download", "auth"]
+full = ["compression", "compression-snappy", "config", "config-reload", "lifecycle", "logger", "metrics", "service-metrics", "otel", "otel-metrics", "otel-tracing", "runtime", "shutdown", "health", "http", "http-server", "spool", "tiered-sink", "sink-stack", "transport-all", "transport-trace", "transport-grpc-vector-compat", "secrets-all", "directory-config", "directory-config-git", "deployment", "config-schema", "version-check", "scaling", "memory", "worker", "cli-service", "bench-memory", "io", "dlq", "dlq-kafka", "dlq-http", "output-file", "expression", "rules", "tls", "geoip-download", "auth"]
 
 [dependencies]
 serde = { version = ">=1.0.229, <2", features = ["derive"] }

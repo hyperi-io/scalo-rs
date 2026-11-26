@@ -75,6 +75,7 @@
 //!     service_account: ServiceAccount::Own,
 //!     hot_paths: vec![],
 //!     openssl_conf: scalo::deployment::DEFAULT_OPENSSL_CONF.to_string(),
+//!     memory: None,
 //! };
 //!
 //! // Generate production Dockerfile (without identity annotations. New
@@ -102,6 +103,7 @@ mod error;
 pub mod generate;
 mod keda;
 mod listeners;
+mod memory_profile;
 mod native_deps;
 mod registry;
 mod schema_compat;
@@ -136,6 +138,7 @@ pub use generate::{
     generate_runtime_stage,
 };
 pub use keda::{KafkaLagTrigger, KedaConfig, KedaContract};
+pub use memory_profile::{BenchLoad, MemoryProfile, MemoryReading};
 pub use native_deps::{AptRepoContract, BaseDistro, NativeDepsContract};
 pub use registry::{
     DEFAULT_BASE_DISTRO, DEFAULT_BASE_IMAGE, base_distro_from_cascade, base_image_from_cascade,

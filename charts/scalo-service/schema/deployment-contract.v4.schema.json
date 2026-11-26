@@ -176,6 +176,17 @@
       "description": "The app's own CPU and memory requests and limits. Empty values leave\nthe chart's defaults in place. Deployment values override both.",
       "$ref": "#/$defs/ResourcesContract"
     },
+    "memory": {
+      "description": "Memory the service held under the standard load, from a `bench-memory`\nrun. Only `generate-artefacts --memory-profile` sets it, and\n`generate-artefacts` rejects a contract that sets it in code. Left out\nof the serialised contract while `None`.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MemoryProfile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "security": {
       "description": "The user, group and Linux capabilities the image runs with.",
       "$ref": "#/$defs/SecurityContract",
@@ -928,6 +939,125 @@
           "type": "string"
         }
       }
+    },
+    "MemoryProfile": {
+      "description": "Memory a service held over one `bench-memory` run, and the load it ran under.\n\nA chart can take its memory request from `avg_bytes` and its limit from\n`max_bytes` plus headroom, below the contract's `resources` and the\ndeployment's values. The contract's `validate()` rejects a profile with a\nzero figure, or whose min, average and max bytes do not rise in that order.",
+      "type": "object",
+      "properties": {
+        "min_bytes": {
+          "description": "Lowest sample over the window, in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "avg_bytes": {
+          "description": "Mean of the samples, in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "max_bytes": {
+          "description": "Highest sample, in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "load": {
+          "description": "The load offered while the samples were taken.",
+          "$ref": "#/$defs/BenchLoad"
+        },
+        "warmup_seconds": {
+          "description": "Seconds the load ran before the first sample.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "window_seconds": {
+          "description": "Seconds the samples span.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "samples": {
+          "description": "How many samples the figures come from.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        },
+        "reading": {
+          "description": "What each sample read.",
+          "$ref": "#/$defs/MemoryReading"
+        }
+      },
+      "required": [
+        "min_bytes",
+        "avg_bytes",
+        "max_bytes",
+        "load",
+        "warmup_seconds",
+        "window_seconds",
+        "samples",
+        "reading"
+      ]
+    },
+    "BenchLoad": {
+      "description": "The synthetic load `bench-memory` offers the pipeline.",
+      "type": "object",
+      "properties": {
+        "records_per_second": {
+          "description": "JSON records a second offered to the pipeline's source, across all\nproducers.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "record_bytes": {
+          "description": "Bytes in each record.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "sources": {
+          "description": "Producers feeding the source at once, each offering an even share of\nthe rate.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "records_per_second",
+        "record_bytes",
+        "sources"
+      ]
+    },
+    "MemoryReading": {
+      "description": "What a memory sample reads, the source the memory guard reads by default.\n\nSerialised in kebab case: `cgroup-v2`, `proc-status` and so on.",
+      "oneOf": [
+        {
+          "description": "The cgroup v2 working set, `memory.current` less `inactive_file`, which\nis what kubelet evicts on. It covers every process in the cgroup.",
+          "type": "string",
+          "const": "cgroup-v2"
+        },
+        {
+          "description": "The cgroup v1 working set, `memory.usage_in_bytes` less\n`total_inactive_file`.",
+          "type": "string",
+          "const": "cgroup-v1"
+        },
+        {
+          "description": "This process's `VmRSS` from `/proc/self/status`, on a Linux host with\nno cgroup memory controller of its own.",
+          "type": "string",
+          "const": "proc-status"
+        },
+        {
+          "description": "This process's working set on Windows.",
+          "type": "string",
+          "const": "working-set"
+        },
+        {
+          "description": "This process's resident size on macOS.",
+          "type": "string",
+          "const": "task-info"
+        }
+      ]
     },
     "SecurityContract": {
       "description": "The identity and privileges the container runs with.\n\nThe defaults match the image the Dockerfile generator writes: uid and gid\n1000, a read-only root filesystem and no added capability.",

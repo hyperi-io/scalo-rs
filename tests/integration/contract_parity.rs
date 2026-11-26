@@ -218,6 +218,7 @@ fn parity_contract() -> DeploymentContract {
         service_account: ServiceAccount::None,
         hot_paths: vec!["rules".into(), "routing.source_rules".into()],
         openssl_conf: String::new(),
+        memory: None,
     }
 }
 
