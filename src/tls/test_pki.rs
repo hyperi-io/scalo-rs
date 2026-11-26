@@ -89,7 +89,11 @@ impl TestCa {
     }
 
     /// A server certificate named `name` for `host` alone.
-    #[cfg(any(feature = "transport-http", feature = "transport-grpc"))]
+    #[cfg(any(
+        feature = "transport-http",
+        feature = "transport-grpc",
+        feature = "transport-syslog"
+    ))]
     pub(crate) fn server_for(&self, name: &str, host: &str) -> Leaf {
         self.leaf_on(
             name,

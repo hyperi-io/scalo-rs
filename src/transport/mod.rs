@@ -200,7 +200,7 @@ pub use http::{
 };
 
 #[cfg(feature = "transport-syslog")]
-pub use syslog::{SyslogConfig, SyslogTransport};
+pub use syslog::{SyslogConfig, SyslogTransport, SyslogTransportBuilder};
 
 #[cfg(feature = "transport-otlp")]
 pub use otlp::{OTLP_ACCEPTS, OtlpConfig, OtlpMetricExporter, OtlpProtocol, OtlpTransport};

@@ -20,6 +20,12 @@ release and the target before bumping.
 
 **Consumer adjustment** -- a `SyslogListenConfig` struct literal ends in `..SyslogListenConfig::default()`. A sender that connects well before its first message needs `first_byte_timeout_ms: 0` or a longer wait, and a listener with more than 10000 senders at once a larger `max_connections`.
 
+### `max_age_days` on the file DLQ and file output is an `Option`, and `SyslogConfig` has two header keys (API CHANGE)
+
+`FileDlqConfig::max_age_days` and `FileOutputConfig::max_age_days` are `Option<u32>`, unset by default. Unset, the writer keeps the old defaults under `naming: stamped` (30 days for the DLQ, 7 for the file output) and sets no age limit under `naming: numbered`, so both can now rotate by number. A config that sets the key loads as before. `SyslogConfig` has public `hostname_header` and `msg_id_header` fields, and `SyslogTransport::builder` takes a connect resolver.
+
+**Consumer adjustment** -- a struct literal writes `max_age_days: Some(n)` where it wrote `max_age_days: n`, and code reading the field handles `None`. A `SyslogConfig` struct literal ends in `..SyslogConfig::default()`.
+
 ## 2.14.40: syslog receiver and metric units
 
 ### Twelve byte and time metrics report their unit over OTLP (BEHAVIOUR CHANGE)

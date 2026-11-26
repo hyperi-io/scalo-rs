@@ -350,6 +350,8 @@ counted in `file_writer_rotations_total{writer, trigger}`.
 
 `naming: numbered` names rotated files by number, newest first: each rotation moves `<path>.1` onwards up one, renames the file to `<path>.1` and deletes numbers past `max_files` (`0` keeps none, unset keeps all). Numbered files carry no date and stay uncompressed, so `max_age_days` or a `compress_rotated` codec beside it fails the build. Rotated files of the other naming are left alone.
 
+The DLQ file backend (`dlq.file`) and the file output take `naming` too. Their `max_age_days` is unset by default, which means 30 days for the DLQ and 7 for the file output under `stamped`, and no age limit under `numbered`. Their `compress_rotated` defaults to gzip, so a numbered one sets `compress_rotated: {codec: none}`.
+
 `durable: true` makes a block that returned `Ok` survive power loss, at the
 cost of a disk flush per block. Without it a block is in the kernel page
 cache when `send` returns.

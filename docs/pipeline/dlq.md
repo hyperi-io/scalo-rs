@@ -232,10 +232,11 @@ dlq:
     enabled: true
     path: /var/spool/scalo/dlq   # the service name is appended as a subdirectory
     rotation: hourly             # hourly | daily | never, by local time
-    max_age_days: 30
+    max_age_days: null           # null: 30, or no limit under naming: numbered
     compress_rotated: {codec: gzip}  # none, gzip or zstd for all but the six newest rotated files
     max_bytes: null              # rotate before a batch that would pass this many bytes
     max_files: null              # rotated files kept; null: no count limit
+    naming: stamped              # stamped | numbered: dlq.ndjson.1 newest, with compress_rotated none
     durable: false               # sync each batch and the folder after a rotation
     file_mode: null              # files created, before the umask; null: 0666. Unix only
     dir_mode: null               # folders created, before the umask; null: 0777. Unix only

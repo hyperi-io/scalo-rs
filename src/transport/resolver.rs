@@ -7,8 +7,8 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! [`ConnectResolver`]: the address a transport dials for an endpoint's host,
-//! asked at every connect in place of DNS. The HTTP and gRPC transports take
-//! one through their builders.
+//! asked at every connect in place of DNS. The HTTP, gRPC and syslog
+//! transports take one through their builders.
 
 use std::net::SocketAddr;
 
@@ -22,11 +22,12 @@ use std::net::SocketAddr;
 /// port is 0. An endpoint whose host is an IP address is dialled as written,
 /// without asking.
 ///
-/// A transport given a resolver keeps no connection between sends, so a
-/// changed answer takes effect at the next send rather than whenever a kept
-/// connection drops. Each send pays a TCP and TLS handshake for that. A
-/// `proxy` other than `none` is refused beside a resolver, since the proxy
-/// looks the name up itself.
+/// The HTTP and gRPC transports keep no connection between sends when given a
+/// resolver, so a changed answer takes effect at the next send rather than
+/// whenever a kept connection drops. Each send pays a TCP and TLS handshake
+/// for that. The syslog sender asks before every batch instead, and keeps its
+/// connection until the answer changes. A `proxy` other than `none` is refused
+/// beside a resolver, since the proxy looks the name up itself.
 pub trait ConnectResolver: Send + Sync {
     /// The address to dial for `host`, the endpoint's host name in lowercase.
     /// `None` when this resolver doesn't answer for `host`: that connect
@@ -38,9 +39,42 @@ pub trait ConnectResolver: Send + Sync {
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The connect error for a host the resolver has no answer for.
-#[cfg(any(feature = "transport-http", feature = "transport-grpc"))]
-fn unanswered(host: &str) -> BoxError {
-    format!("the connect resolver has no address for {host}").into()
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-grpc",
+    feature = "transport-syslog"
+))]
+fn unanswered(host: &str) -> String {
+    format!("the connect resolver has no address for {host}")
+}
+
+/// Where a dial to `host` at `port` goes, under the port rule: an IP host as
+/// written, a name where `resolver` says. A name is dialled at `named_port`
+/// when the endpoint names one, else at the answer's port, else at `port` when
+/// the answer's is 0.
+///
+/// # Errors
+///
+/// When `resolver` has no answer for `host`.
+#[cfg(any(feature = "transport-grpc", feature = "transport-syslog"))]
+pub(crate) fn dial_address(
+    resolver: &dyn ConnectResolver,
+    host: &str,
+    named_port: Option<u16>,
+    port: u16,
+) -> Result<SocketAddr, String> {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let mut addr = resolver
+        .resolve(&host.to_ascii_lowercase())
+        .ok_or_else(|| unanswered(host))?;
+    match named_port {
+        Some(named) => addr.set_port(named),
+        None if addr.port() == 0 => addr.set_port(port),
+        None => {}
+    }
+    Ok(addr)
 }
 
 /// Refuse `proxy` beside a resolver, at build.
@@ -48,7 +82,11 @@ fn unanswered(host: &str) -> BoxError {
 /// # Errors
 ///
 /// `TransportError::Config` naming `transport` unless `proxy` is `none`.
-#[cfg(any(feature = "transport-http", feature = "transport-grpc"))]
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-grpc",
+    feature = "transport-syslog"
+))]
 pub(crate) fn refuse_proxy(
     proxy: &crate::transport::ProxyConfig,
     transport: &str,
@@ -74,7 +112,7 @@ impl reqwest::dns::Resolve for ReqwestResolver {
             .0
             .resolve(name.as_str())
             .map(|addr| -> reqwest::dns::Addrs { Box::new(std::iter::once(addr)) })
-            .ok_or_else(|| unanswered(name.as_str()));
+            .ok_or_else(|| BoxError::from(unanswered(name.as_str())));
         Box::pin(std::future::ready(answer))
     }
 }
@@ -118,19 +156,7 @@ impl ResolvedDial {
             .ok_or("the dial has no host")?
             .trim_matches(['[', ']']);
         let port = uri.port_u16().unwrap_or_else(|| default_port(uri));
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            return Ok(SocketAddr::new(ip, port));
-        }
-        let mut addr = self
-            .resolver
-            .resolve(&host.to_ascii_lowercase())
-            .ok_or_else(|| unanswered(host))?;
-        match self.named_port {
-            Some(named) => addr.set_port(named),
-            None if addr.port() == 0 => addr.set_port(port),
-            None => {}
-        }
-        Ok(addr)
+        dial_address(self.resolver.as_ref(), host, self.named_port, port).map_err(BoxError::from)
     }
 
     /// A TCP connection, with `TCP_NODELAY` on, to where `uri` resolves.

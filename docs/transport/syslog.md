@@ -28,6 +28,18 @@ transport:
         client_key_path: /etc/tls/client.key
 ```
 
+An agent forwarding records from many hosts sets HOSTNAME and MSGID per record from headers it puts on each record, with PROCID nil:
+
+```yaml
+    syslog:
+      address: logs.example.net:6514
+      protocol: tls
+      app_name: agent
+      proc_id: "-"
+      hostname_header: host.name    # record header holding the source host
+      msg_id_header: source.kind    # record header holding the source kind
+```
+
 ---
 
 ## Messages
@@ -45,9 +57,11 @@ RFC 3164:
 ```
 
 - PRI is `facility * 8 + severity`, from config for every message.
-- The time is the record's timestamp, else the send time. RFC 5424 writes it in UTC to the microsecond, RFC 3164 in the host's zone to the second.
+- The time is the record's timestamp, else the send time. RFC 5424 writes it in UTC to the microsecond, RFC 3164 in the host's zone to the second. A record's timestamp is in milliseconds, so the last three digits are `000`.
 - HOSTNAME, APP-NAME and PROCID come from config. Unset, they are the machine's host name, the executable's name and the process id. RFC 3164 keeps letters, digits, `-`, `_` and `.` in the tag, up to 32.
 - MSGID is the record's key, else `msg_id`, else `-`. `send(destination, payload)` uses the destination.
+- `hostname_header` and `msg_id_header` take HOSTNAME and MSGID from each record instead: the value of the record header they name. A record without that header gets `-`, never the configured value or the machine's host name. RFC 3164 has no MSGID, so it reads `hostname_header` only.
+- Every header field keeps its printable ASCII, no spaces, cut to the RFC 5424 maximum: 255 for HOSTNAME, 48 for APP-NAME, 128 for PROCID, 32 for MSGID. A field that leaves nothing is `-`.
 - STRUCTURED-DATA is `structured_data` from config, the same on every message, with `"`, `\` and `]` escaped in values.
 - One trailing `\n` or `\r\n` is taken off the payload. An empty payload sends the header alone.
 - With `passthrough: true`, a payload that already starts with a `<PRI>` (1 to 3 digits, at most 191) is sent as it is. Anything else gets a header.
@@ -69,7 +83,8 @@ One connection is held and reused, behind a lock, so concurrent sends go one aft
 | --- | --- |
 | Batch written and flushed (`tcp`, `tls`), sent (`udp`), every message answered `200` (`relp`) | `Ok`, or `FilteredDlq` when a record was left out |
 | Receiver closed the connection while it was idle | reconnect before the batch, no loss |
-| Connect refused or timed out, DNS failed | `Backpressured` |
+| Connect refused or timed out, DNS failed, the connect resolver has no answer | `Backpressured` |
+| The connect resolver's answer changed since the last batch | the old connection ended, a new one dialled before the batch |
 | Write broke off mid-batch, or the deadline passed | `Backpressured`, the connection dropped, never `Ok` |
 | TLS refused the receiver's certificate or ours, or found no version, suite or group in common | `Fatal(Config)`, naming the `TlsFailure` |
 | The proxy refused CONNECT | `Backpressured`, with the proxy's status and the receiver's port logged once per run and `is_healthy()` and the `transport:syslog` health check false until a send goes through: many proxies allow CONNECT to port 443 only |
@@ -87,6 +102,18 @@ RELP has no answer that means a message can never be taken: a receiver answers `
 The client opens a session with `relp_version=0` and `commands=syslog`, then sends each message as a `syslog` command with its own transaction number. Up to `relp_window` (default 128) go out before an answer is awaited. `close` sends the `close` command and waits a second for the answer. A `serverclose` from the receiver ends the session, and the next batch opens another.
 
 There is no maintained Rust RELP crate. The client is in `src/transport/syslog/relp.rs`.
+
+### Connect resolver
+
+`SyslogTransport::builder(&config).resolver(Arc::new(routes)).build()` takes a `ConnectResolver`, asked before every batch where to dial the address's host in place of DNS. It's code, not config, because the address is the app's runtime state. The rules match the HTTP and gRPC transports ([http.md](http.md#connect-resolver)):
+
+- The address always names its port, so the dial goes to the answer's IP at that port. An IP address host is dialled as written.
+- TLS still sends and checks the address's host name, or `tls.server_name`.
+- A host the resolver has no answer for is `Backpressured`, and ends the kept connection.
+- The connection is kept while the answer holds. When the answer changes, the next batch ends the old connection (a RELP session with `close`) and dials the new address. UDP binds a socket to the new address.
+- A `proxy` other than `none` fails the build, since the proxy looks the name up itself.
+
+Source: [../../src/transport/syslog/stream.rs](../../src/transport/syslog/stream.rs), [../../src/transport/resolver.rs](../../src/transport/resolver.rs).
 
 ---
 
@@ -167,7 +194,7 @@ cargo nextest run --release --features transport-syslog --run-ignored only --no-
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `address` | required | `host:port` or `[v6]:port`, resolved on each connect |
+| `address` | required | `host:port` or `[v6]:port`, resolved on each connect, or by the [connect resolver](#connect-resolver) |
 | `protocol` | `tcp` | `tcp`, `tls`, `udp` or `relp` |
 | `framing` | `octet_counting` | `octet_counting` or `lf`, for `tcp` and `tls` |
 | `format` | `rfc5424` | `rfc5424` or `rfc3164` |
@@ -175,9 +202,11 @@ cargo nextest run --release --features transport-syslog --run-ignored only --no-
 | `facility` | `user` | `kern`, `user`, `mail`, `daemon`, `auth`, `syslog`, `lpr`, `news`, `uucp`, `cron`, `authpriv`, `ftp`, `ntp`, `audit`, `alert`, `clock`, `local0` to `local7` |
 | `severity` | `info` | `emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug` |
 | `hostname` | host name | HOSTNAME |
+| `hostname_header` | none | record header whose value is HOSTNAME, `-` when a record lacks it |
 | `app_name` | executable name | APP-NAME, the RFC 3164 tag |
 | `proc_id` | process id | PROCID |
 | `msg_id` | `-` | MSGID for a record with no key |
+| `msg_id_header` | none | record header whose value is MSGID, in place of the key, `-` when a record lacks it |
 | `structured_data` | none | SD-ID to its parameters, RFC 5424 only |
 | `max_message_bytes` | 2048 UDP, 8192 otherwise | see above |
 | `connect_timeout_ms` | 5000 | TCP connect, TLS handshake and RELP open |
@@ -194,6 +223,6 @@ cargo nextest run --release --features transport-syslog --run-ignored only --no-
 | `filters_out` | none | outbound filters on each payload ([filter-engine.md](filter-engine.md)) |
 | `listen` | none | the listeners, see [Receiving](#receiving) |
 
-A `tls` section with `protocol: tcp` or `udp` is refused at build, and so are a `proxy` other than `none` with `udp`, an address with no port, a `max_message_bytes` under 480 or, for UDP, over 65507, and a `relp_window` of 0.
+A `tls` section with `protocol: tcp` or `udp` is refused at build, and so are a `proxy` other than `none` with `udp` or beside a resolver, an address with no port, a `max_message_bytes` under 480 or, for UDP, over 65507, a `relp_window` of 0, and an empty `hostname_header` or `msg_id_header`.
 
 All carry `transport="syslog"`: `transport_sent_total` (messages), `transport_sent_bytes_total` (message bytes before framing), `transport_send_errors_total`, `transport_backpressured_total`, `transport_send_duration_seconds`, `transport_message_too_large_total`, `transport_truncated_total`, and `transport_redelivered_total` with `reason` `reconnect` (a RELP resend in the call) or `deadline`.

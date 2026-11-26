@@ -190,7 +190,7 @@ fn dlq_config(mode: DlqMode, topic: &str, file_dir: Option<&Path>) -> DlqConfig 
             enabled: file_dir.is_some(),
             path: file_dir.map_or_else(|| "/nonexistent".into(), Path::to_path_buf),
             rotation: RotationPeriod::Daily,
-            max_age_days: 1,
+            max_age_days: Some(1),
             compress_rotated: scalo::compression::Compression::NONE,
             ..FileDlqConfig::default()
         },

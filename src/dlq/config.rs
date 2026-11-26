@@ -19,7 +19,7 @@
 //!     enabled: true
 //!     path: /var/spool/scalo/dlq
 //!     rotation: hourly
-//!     max_age_days: 30
+//!     max_age_days: 30               # unset: 30, or none under naming: numbered
 //!     compress_rotated: {codec: gzip}
 //!   kafka:
 //!     enabled: true
@@ -142,8 +142,10 @@ pub struct FileDlqConfig {
     /// File rotation period.
     pub rotation: RotationPeriod,
 
-    /// Auto-cleanup files older than this many days.
-    pub max_age_days: u32,
+    /// Delete rotated files older than this many days, at each rotation.
+    /// Unset: 30, or no age limit under `naming: numbered`, which refuses a
+    /// set value since its names carry no date.
+    pub max_age_days: Option<u32>,
 
     /// Codec for rotated files past the six newest: `none`, `gzip` or `zstd`.
     /// Default gzip.
@@ -164,12 +166,15 @@ impl Default for FileDlqConfig {
             enabled: true,
             path: PathBuf::from(DEFAULT_SPOOL_ROOT).join("dlq"),
             rotation: RotationPeriod::default(),
-            max_age_days: 30,
+            max_age_days: None,
             compress_rotated: Compression::new(Codec::Gzip),
             write: FileWriteOptions::default(),
         }
     }
 }
+
+/// The age limit of a stamped file DLQ with `max_age_days` unset.
+const DEFAULT_MAX_AGE_DAYS: u32 = 30;
 
 impl FileDlqConfig {
     /// Convert to the shared `FileWriterConfig` for use with `NdjsonWriter`.
@@ -178,7 +183,11 @@ impl FileDlqConfig {
         FileWriterConfig {
             path: self.path.clone(),
             rotation: self.rotation,
-            max_age_days: self.max_age_days,
+            max_age_days: crate::io::age_limit(
+                self.max_age_days,
+                DEFAULT_MAX_AGE_DAYS,
+                self.write.naming,
+            ),
             compress_rotated: self.compress_rotated,
             write: self.write,
         }
@@ -272,7 +281,8 @@ mod tests {
         assert_eq!(config.mode, DlqMode::Cascade);
         assert!(config.file.enabled);
         assert_eq!(config.file.path, PathBuf::from("/var/spool/scalo/dlq"));
-        assert_eq!(config.file.max_age_days, 30);
+        assert_eq!(config.file.max_age_days, None);
+        assert_eq!(config.file.to_writer_config().max_age_days, 30);
         assert_eq!(config.file.compress_rotated, Compression::new(Codec::Gzip));
         assert_eq!(config.file.rotation, RotationPeriod::Hourly);
     }
@@ -322,7 +332,7 @@ mod tests {
                 enabled: true,
                 path: "/tmp/test-dlq".into(),
                 rotation: RotationPeriod::Daily,
-                max_age_days: 7,
+                max_age_days: Some(7),
                 compress_rotated: crate::compression::Compression::NONE,
                 write: crate::io::FileWriteOptions {
                     max_bytes: Some(1 << 20),
@@ -340,7 +350,7 @@ mod tests {
         let parsed: DlqConfig = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(parsed.mode, DlqMode::FanOut);
         assert_eq!(parsed.file.rotation, RotationPeriod::Daily);
-        assert_eq!(parsed.file.max_age_days, 7);
+        assert_eq!(parsed.file.max_age_days, Some(7));
         assert_eq!(parsed.file.write, config.file.write);
         assert!(
             json.contains(r#""max_files":4"#),
@@ -349,6 +359,48 @@ mod tests {
         assert_eq!(parsed.queue_capacity, 50_000);
         assert_eq!(parsed.batch_size, 128);
         assert_eq!(parsed.flush_interval_ms, 250);
+    }
+
+    /// Unset, `max_age_days` is 30 under `stamped` and no limit under
+    /// `numbered`, so a numbered DLQ opens. A set value is kept, and numbered
+    /// refuses it. A config that sets the key still loads.
+    #[test]
+    fn numbered_naming_opens_with_no_age_limit() {
+        use crate::io::NdjsonWriter;
+        use crate::io::RotatedNaming::{Numbered, Stamped};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = |naming, max_age_days| FileDlqConfig {
+            path: dir.path().to_path_buf(),
+            max_age_days,
+            compress_rotated: Compression::NONE,
+            write: FileWriteOptions {
+                naming,
+                ..FileWriteOptions::default()
+            },
+            ..FileDlqConfig::default()
+        };
+        // (case, config, the writer's age limit with u32::MAX for none, opens)
+        let cases = [
+            ("stamped-unset", file(Stamped, None), 30, true),
+            ("stamped-set", file(Stamped, Some(5)), 5, true),
+            ("numbered-unset", file(Numbered, None), u32::MAX, true),
+            ("numbered-set", file(Numbered, Some(5)), 5, false),
+        ];
+        for (case, config, age, opens) in cases {
+            let writer = config.to_writer_config();
+            assert_eq!(writer.max_age_days, age, "{case}");
+            let opened = NdjsonWriter::new(&writer, case, "dlq.ndjson", "dlq");
+            assert_eq!(opened.is_ok(), opens, "{case}");
+        }
+        for (json, want) in [
+            (r#"{"max_age_days":30}"#, Some(30)),
+            ("{}", None),
+            (r#"{"max_age_days":null}"#, None),
+        ] {
+            let parsed: FileDlqConfig = serde_json::from_str(json).expect("deserialise");
+            assert_eq!(parsed.max_age_days, want, "{json}");
+        }
     }
 
     /// `docs/pipeline/dlq.md` documents this default in its config example.

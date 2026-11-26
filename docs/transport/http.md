@@ -106,6 +106,6 @@ Each body goes to `endpoint`, then each `failover` endpoint in order, starting f
 - The sender keeps no idle connection, so a changed answer takes the next request, at the cost of a TCP and TLS handshake each.
 - A `proxy` other than `none` fails the build, since the proxy looks the name up itself.
 
-The gRPC transport's builder takes the same resolver ([backends.md](backends.md#sending-over-grpc)).
+The gRPC and syslog transports' builders take the same resolver ([backends.md](backends.md#sending-over-grpc), [syslog.md](syslog.md#connect-resolver)).
 
 Source: [../../src/transport/http/send.rs](../../src/transport/http/send.rs), [../../src/transport/resolver.rs](../../src/transport/resolver.rs).

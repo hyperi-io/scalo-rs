@@ -4930,7 +4930,7 @@ fn file_dlq(dir: &std::path::Path, shutdown: &CancellationToken) -> Arc<crate::d
             enabled: true,
             path: dir.to_path_buf(),
             rotation: crate::dlq::RotationPeriod::Daily,
-            max_age_days: 1,
+            max_age_days: Some(1),
             compress_rotated: crate::compression::Compression::NONE,
             ..crate::dlq::FileDlqConfig::default()
         },

@@ -7,6 +7,7 @@
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use rustls_pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio_rustls::TlsConnector;
 
+use crate::transport::ConnectResolver;
 use crate::transport::proxy::{ProxyDialer, ProxyError, ProxyRefused, Scheme};
 
 /// A connection that can be written to and checked for a close by the peer.
@@ -46,13 +48,15 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
-/// Opens connections to one receiver, directly or through the proxy.
+/// Opens connections to one receiver, directly, through the proxy, or where
+/// the resolver says.
 pub(super) struct Connector {
     host: String,
     port: u16,
     timeout: Duration,
     tls: Option<ConnectorTls>,
     dialer: ProxyDialer,
+    resolver: Option<Arc<dyn ConnectResolver>>,
 }
 
 /// The client TLS a connector runs over each connection.
@@ -69,6 +73,7 @@ impl Connector {
         timeout: Duration,
         tls: Option<ConnectorTls>,
         dialer: ProxyDialer,
+        resolver: Option<Arc<dyn ConnectResolver>>,
     ) -> Self {
         Self {
             host,
@@ -76,6 +81,7 @@ impl Connector {
             timeout,
             tls,
             dialer,
+            resolver,
         }
     }
 
@@ -84,23 +90,46 @@ impl Connector {
         self.timeout
     }
 
-    /// A new connection, its TLS handshake done, within the connect timeout.
-    pub(super) async fn connect(&self) -> Result<Stream, ConnectError> {
+    /// Where the next connection goes: the resolver's answer at the address's
+    /// port, or `None` with no resolver, to dial the host by name.
+    pub(super) fn target(&self) -> Result<Option<SocketAddr>, ConnectError> {
+        let Some(resolver) = &self.resolver else {
+            return Ok(None);
+        };
+        crate::transport::resolver::dial_address(
+            resolver.as_ref(),
+            &self.host,
+            Some(self.port),
+            self.port,
+        )
+        .map(Some)
+        .map_err(|e| ConnectError::Unreachable(io::Error::other(e)))
+    }
+
+    /// A new connection to `target`, else to the host by name, its TLS
+    /// handshake done, within the connect timeout. TLS checks the host's name
+    /// either way.
+    pub(super) async fn connect(&self, target: Option<SocketAddr>) -> Result<Stream, ConnectError> {
         let connecting = async {
             let scheme = if self.tls.is_some() {
                 Scheme::Tls
             } else {
                 Scheme::Plain
             };
-            let tcp = self
-                .dialer
-                .connect(scheme, &self.host, self.port)
-                .await
-                .map_err(|e| match e {
-                    ProxyError::Refused(refused) => ConnectError::Refused(refused),
-                    ProxyError::Target(e) => ConnectError::Unreachable(e),
-                    other => ConnectError::Unreachable(io::Error::other(other)),
-                })?;
+            let tcp = match target {
+                Some(addr) => tokio::net::TcpStream::connect(addr)
+                    .await
+                    .map_err(ConnectError::Unreachable)?,
+                None => self
+                    .dialer
+                    .connect(scheme, &self.host, self.port)
+                    .await
+                    .map_err(|e| match e {
+                        ProxyError::Refused(refused) => ConnectError::Refused(refused),
+                        ProxyError::Target(e) => ConnectError::Unreachable(e),
+                        other => ConnectError::Unreachable(io::Error::other(other)),
+                    })?,
+            };
             tcp.set_nodelay(true).map_err(ConnectError::Unreachable)?;
             let stream: Stream = match &self.tls {
                 None => Box::new(tcp),
