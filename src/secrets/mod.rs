@@ -782,6 +782,7 @@ mod tests {
     }
 
     /// The disk-cache file name of configured source `name`.
+    #[cfg(unix)]
     fn disk_file_name(config: &SecretsConfig, name: &str) -> String {
         use base64::Engine;
         let key = source_cache_key(config, name, &config.sources[name]);
