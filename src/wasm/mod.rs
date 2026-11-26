@@ -38,7 +38,7 @@ mod tests;
 pub use config::WasmConfig;
 pub use engine::{EngineError, LoadError, PluginSource, WasmEngine};
 pub use host::{HostBudget, HostCtx, LimitHit};
-pub use plugin::{CallError, Instance, Plugin, World};
+pub use plugin::{CallError, Instance, Plugin, PluginSlot, World};
 pub use trust::{Signer, TrustPolicy};
 
 pub use wasmtime;

@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use arc_swap::ArcSwap;
 use wasmtime::component::{InstancePre, Linker};
 use wasmtime::{PoolConcurrencyLimitError, Store, Trap};
 
@@ -146,6 +147,7 @@ impl<W: World> Plugin<W> {
         engine: Arc<EngineInner>,
     ) -> Self {
         let limit = engine.config.unhealthy_after_traps;
+        engine.retain(&digest);
         Self {
             name,
             digest,
@@ -192,11 +194,20 @@ impl<W: World> Plugin<W> {
     /// recycle count or the memory mark replace the instance, and `data` moves
     /// to the new one.
     pub fn instance(self: &Arc<Self>, data: W::Data) -> Result<Instance<W>, CallError> {
+        self.instance_in(data, None)
+    }
+
+    fn instance_in(
+        self: &Arc<Self>,
+        data: W::Data,
+        slot: Option<Arc<PluginSlot<W>>>,
+    ) -> Result<Instance<W>, CallError> {
         self.health.check()?;
         let mut store = self.new_store(data);
         match W::instantiate(&self.pre, &mut store) {
             Ok(bindings) => Ok(Instance {
                 plugin: Arc::clone(self),
+                slot,
                 state: State::Ready { store, bindings },
                 calls: 0,
             }),
@@ -219,6 +230,45 @@ impl<W: World> Plugin<W> {
     }
 }
 
+impl<W: World> Drop for Plugin<W> {
+    fn drop(&mut self) {
+        self.engine.release(&self.digest);
+    }
+}
+
+/// A plugin that can be replaced while workers call it. Each [`Instance`]
+/// taken from the slot moves to the replacement at its next call, keeping its
+/// data, so a reload drops no call.
+pub struct PluginSlot<W: World> {
+    current: ArcSwap<Plugin<W>>,
+}
+
+impl<W: World> PluginSlot<W> {
+    /// A slot holding `plugin`.
+    #[must_use]
+    pub fn new(plugin: Arc<Plugin<W>>) -> Arc<Self> {
+        Arc::new(Self {
+            current: ArcSwap::new(plugin),
+        })
+    }
+
+    /// The plugin calls go to now.
+    #[must_use]
+    pub fn current(&self) -> Arc<Plugin<W>> {
+        self.current.load_full()
+    }
+
+    /// Put `plugin` in the slot and hand back the one it replaces.
+    pub fn replace(&self, plugin: Arc<Plugin<W>>) -> Arc<Plugin<W>> {
+        self.current.swap(plugin)
+    }
+
+    /// An instance that follows the slot.
+    pub fn instance(self: &Arc<Self>, data: W::Data) -> Result<Instance<W>, CallError> {
+        self.current().instance_in(data, Some(Arc::clone(self)))
+    }
+}
+
 enum State<W: World> {
     Ready {
         store: Store<HostCtx<W::Data>>,
@@ -233,6 +283,7 @@ enum State<W: World> {
 /// One worker's instance of a [`Plugin`]. Not shared: a call needs `&mut`.
 pub struct Instance<W: World> {
     plugin: Arc<Plugin<W>>,
+    slot: Option<Arc<PluginSlot<W>>>,
     state: State<W>,
     calls: u64,
 }
@@ -248,6 +299,7 @@ impl<W: World> Instance<W> {
         &mut self,
         f: impl FnOnce(&W::Bindings, &mut Store<HostCtx<W::Data>>) -> wasmtime::Result<R>,
     ) -> Result<R, CallError> {
+        self.follow_slot()?;
         self.plugin.health.check()?;
         let deadline = self.plugin.engine.deadline_ticks;
         let (mut store, bindings) = match std::mem::replace(&mut self.state, State::Poisoned) {
@@ -294,6 +346,26 @@ impl<W: World> Instance<W> {
     #[must_use]
     pub fn plugin(&self) -> &Arc<Plugin<W>> {
         &self.plugin
+    }
+
+    /// Move to the slot's plugin if it was replaced, taking this instance's
+    /// data into a fresh store of the new one.
+    fn follow_slot(&mut self) -> Result<(), CallError> {
+        let Some(slot) = &self.slot else {
+            return Ok(());
+        };
+        let current = slot.current();
+        if Arc::ptr_eq(&current, &self.plugin) {
+            return Ok(());
+        }
+        let store = match std::mem::replace(&mut self.state, State::Poisoned) {
+            State::Ready { store, .. } | State::Idle(store) => store,
+            State::Poisoned => return Err(CallError::Poisoned),
+        };
+        self.state = State::Idle(current.renew(store));
+        self.plugin = current;
+        self.calls = 0;
+        Ok(())
     }
 
     fn due_for_recycle(&self, store: &Store<HostCtx<W::Data>>) -> bool {

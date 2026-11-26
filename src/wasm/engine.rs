@@ -8,10 +8,11 @@
 
 //! The process-wide engine and the plugin loader.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -242,12 +243,62 @@ impl Drop for Ticker {
     }
 }
 
+/// A compiled component and the live plugins built from it.
+struct Compiled {
+    component: Component,
+    plugins: usize,
+}
+
 pub(super) struct EngineInner {
     pub(super) engine: Engine,
     pub(super) config: WasmConfig,
     pub(super) deadline_ticks: u64,
     trusted_root: TrustedRoot,
+    components: Mutex<HashMap<[u8; 32], Compiled>>,
     _ticker: Ticker,
+}
+
+impl EngineInner {
+    fn components(&self) -> MutexGuard<'_, HashMap<[u8; 32], Compiled>> {
+        self.components
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The component for `digest`, compiled once while any plugin uses it.
+    fn compile(&self, name: &str, digest: [u8; 32], bytes: &[u8]) -> Result<Component, LoadError> {
+        if let Some(compiled) = self.components().get(&digest) {
+            return Ok(compiled.component.clone());
+        }
+        let component =
+            Component::from_binary(&self.engine, bytes).map_err(|e| LoadError::Compile {
+                name: name.to_string(),
+                detail: format!("{e:#}"),
+            })?;
+        let mut components = self.components();
+        components.retain(|_, compiled| compiled.plugins > 0);
+        components.entry(digest).or_insert(Compiled {
+            component: component.clone(),
+            plugins: 0,
+        });
+        Ok(component)
+    }
+
+    pub(super) fn retain(&self, digest: &[u8; 32]) {
+        if let Some(compiled) = self.components().get_mut(digest) {
+            compiled.plugins += 1;
+        }
+    }
+
+    pub(super) fn release(&self, digest: &[u8; 32]) {
+        let mut components = self.components();
+        if let Some(compiled) = components.get_mut(digest) {
+            compiled.plugins = compiled.plugins.saturating_sub(1);
+            if compiled.plugins == 0 {
+                components.remove(digest);
+            }
+        }
+    }
 }
 
 /// One per process: the compiler, the instance pool and the epoch ticker
@@ -272,6 +323,7 @@ impl WasmEngine {
                 config,
                 deadline_ticks,
                 trusted_root,
+                components: Mutex::new(HashMap::new()),
                 _ticker: ticker,
             }),
         })
@@ -281,6 +333,17 @@ impl WasmEngine {
     #[must_use]
     pub fn config(&self) -> &WasmConfig {
         &self.inner.config
+    }
+
+    /// Compiled components held for live plugins. A `.wasm` loaded twice
+    /// compiles once.
+    #[must_use]
+    pub fn cached_components(&self) -> usize {
+        self.inner
+            .components()
+            .values()
+            .filter(|compiled| compiled.plugins > 0)
+            .count()
     }
 
     /// Check, compile and link a plugin for world `W`.
@@ -361,10 +424,7 @@ impl WasmEngine {
         };
 
         let engine = &self.inner.engine;
-        let component = Component::from_binary(engine, bytes).map_err(|e| LoadError::Compile {
-            name: name.clone(),
-            detail: format!("{e:#}"),
-        })?;
+        let component = self.inner.compile(&name, digest, bytes)?;
         self.check_imports(&name, &component)?;
         self.check_resources(&name, &component)?;
 

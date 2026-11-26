@@ -556,6 +556,49 @@ fn a_signed_plugin_loads_from_a_path_with_its_signature_beside_it() {
 }
 
 #[test]
+fn one_wasm_compiles_once_while_a_plugin_holds_it() {
+    let engine = WasmEngine::new(test_config()).unwrap();
+    let bytes = guest();
+    let first = engine
+        .load::<FixtureWorld>(unsigned("a", &bytes), &UNSIGNED_OK)
+        .unwrap();
+    let second = engine
+        .load::<FixtureWorld>(unsigned("b", &bytes), &UNSIGNED_OK)
+        .unwrap();
+    assert_eq!(engine.cached_components(), 1);
+    drop(first);
+    assert_eq!(engine.cached_components(), 1, "the second plugin holds it");
+    drop(second);
+    assert_eq!(engine.cached_components(), 0);
+}
+
+#[test]
+fn a_replaced_plugin_takes_over_each_instance_at_its_next_call() {
+    let engine = WasmEngine::new(test_config()).unwrap();
+    let bytes = guest();
+    let load = || {
+        engine
+            .load::<FixtureWorld>(unsigned("fixture", &bytes), &UNSIGNED_OK)
+            .unwrap()
+    };
+    let slot = PluginSlot::new(load());
+    let mut instance = slot.instance(()).unwrap();
+    assert_eq!(run(&mut instance, 7, 0).unwrap(), 1);
+    assert_eq!(run(&mut instance, 7, 0).unwrap(), 2);
+
+    let next = load();
+    let old = slot.replace(Arc::clone(&next));
+    assert_eq!(
+        run(&mut instance, 7, 0).unwrap(),
+        1,
+        "the first call after the swap succeeds, in a fresh guest of the new plugin"
+    );
+    assert!(Arc::ptr_eq(instance.plugin(), &next));
+    drop(old);
+    assert_eq!(run(&mut instance, 7, 0).unwrap(), 2);
+}
+
+#[test]
 fn a_plugin_loads_from_a_path_named_after_its_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("enrich.wasm");
