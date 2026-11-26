@@ -517,6 +517,15 @@ required-features = ["memory", "logger"]
 name = "cpu_loadgen"
 required-features = ["worker"]
 
+# UDP syslog flood sender and a counting listener, to compare listeners' receive rate.
+[[example]]
+name = "syslog_udp_sender"
+required-features = ["transport-syslog"]
+
+[[example]]
+name = "syslog_udp_listener"
+required-features = ["transport-syslog"]
+
 # Demo examples gate on the library modules they exercise, so a partial
 # `--features` build skips them instead of erroring (CI runs `features: all`).
 [[example]]

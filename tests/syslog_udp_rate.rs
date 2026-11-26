@@ -23,20 +23,15 @@
 #![cfg(feature = "transport-syslog")]
 #![allow(clippy::cast_precision_loss, reason = "rates print as f64")]
 
-use std::net::UdpSocket;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use scalo::transport::syslog::{SyslogListenConfig, SyslogReceiver};
 use scalo::transport::{TransportBase, TransportReceiver};
 
-fn setting(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
+#[path = "../examples/syslog_udp_sender/flood.rs"]
+mod flood;
+
+use flood::{Flood, datagram, setting};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement: cargo nextest run --release --features transport-syslog --run-ignored only --no-capture -E 'test(syslog_udp_rate)'"]
@@ -52,32 +47,8 @@ async fn syslog_udp_rate() {
     .await
     .unwrap();
     let to = receiver.udp_addr().unwrap();
-    let mut line = b"<14>Nov 26 12:00:00 host app[1]: ".to_vec();
-    line.resize(bytes.max(line.len()), b'x');
-    let line: Arc<[u8]> = line.into();
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let sent_total = Arc::new(AtomicU64::new(0));
-    let threads: Vec<_> = (0..senders)
-        .map(|_| {
-            let (stop, total, line) = (
-                Arc::clone(&stop),
-                Arc::clone(&sent_total),
-                Arc::clone(&line),
-            );
-            std::thread::spawn(move || {
-                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-                socket.connect(to).unwrap();
-                let mut count = 0_u64;
-                while !stop.load(Ordering::Relaxed) {
-                    if socket.send(&line).is_ok() {
-                        count += 1;
-                    }
-                }
-                total.fetch_add(count, Ordering::Relaxed);
-            })
-        })
-        .collect();
+    let line = datagram(bytes);
+    let flood = Flood::start(to, senders, &line);
 
     let run = Duration::from_secs(secs);
     let start = Instant::now();
@@ -86,11 +57,7 @@ async fn syslog_udp_rate() {
         delivered += receiver.recv(10_000).await.unwrap().records.len() as u64;
     }
     let elapsed = start.elapsed().as_secs_f64();
-    stop.store(true, Ordering::Relaxed);
-    for thread in threads {
-        thread.join().unwrap();
-    }
-    let sent = sent_total.load(Ordering::Relaxed);
+    let sent = flood.finish();
     let rate = delivered as f64 / elapsed;
     println!(
         "syslog_udp_rate: {rate:.0} datagrams/s received ({delivered} in {elapsed:.2} s), \

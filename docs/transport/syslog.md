@@ -186,6 +186,12 @@ A datagram the kernel drops because the socket's receive buffer is full is lost 
 cargo nextest run --release --features transport-syslog --run-ignored only --no-capture -E 'test(syslog_udp_rate)'
 ```
 
+To compare listeners, run the same flood against each. `syslog_udp_sender <host:port>` sends 200-byte datagrams from 4 threads for 5 s and prints what it sent. `syslog_udp_listener <ip:port>` runs scalo's listener and prints the datagrams it received. For another listener, read its received counter and the socket's `drops` column in `/proc/net/udp`. Pin the sender and the listener to separate CPU sets with `taskset -c`.
+
+```sh
+cargo build --release --features transport-syslog --example syslog_udp_sender --example syslog_udp_listener
+```
+
 ---
 
 ## Config
