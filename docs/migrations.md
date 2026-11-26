@@ -6,7 +6,7 @@ release and the target before bumping.
 
 ---
 
-## 2.14.41
+## 2.14.40
 
 ### One TLS section on named profiles (API, CONFIG and BEHAVIOUR CHANGE)
 
@@ -38,8 +38,6 @@ Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `
 librdkafka has no version property, and `ssl.cipher.suites` reaches TLS 1.2 only. Before its first TLS client scalo writes the profile's `MinProtocol` and TLS 1.3 `Ciphersuites` into the file `OPENSSL_CONF` names, if missing or scalo's, and OpenSSL reads it once per process, so all Kafka clients share one floor. It is OpenSSL's system default, so every OpenSSL user in the process and any child that inherits the variable takes it too. Unset, the floor is not set and a warning says so.
 
 **Consumer adjustment** -- set `OPENSSL_CONF` to a writable path in the deployment, or call `scalo::transport::kafka::set_openssl_conf()` first in `main`.
-
-## 2.14.40
 
 ### A spool held by a live owner is refused with its own variant
 
