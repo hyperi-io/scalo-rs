@@ -8,6 +8,37 @@ release and the target before bumping.
 
 ## 2.14.40
 
+### One TLS section on named profiles (API, CONFIG and BEHAVIOUR CHANGE)
+
+Every TLS client reads one `tls:` section (`ClientTlsConfig`) and every server `ServerTlsConfig`, each with a `profile`, `strong` by default and TLS 1.3 only. `tls.profiles.<name>.allow_tls12` turns TLS 1.2 on per profile ([tls-profiles.md](tls-profiles.md)). Each old key below fails the load with an error naming its new key, and an unknown key inside a `tls` section fails it too.
+
+| Old key | New key |
+| --- | --- |
+| `transport.http.tls_{ca_path, trust, client_cert_path, client_key_path, pin_sha256}` | `transport.http.tls.{ca_paths, trust, client_cert_path, client_key_path, pin_sha256}` |
+| `grpc.tls_enabled` | gone: `https://` runs TLS |
+| `grpc.tls_ca_path` | `grpc.tls.ca_paths` plus `trust: bundle` |
+| `grpc.tls_domain` | `grpc.tls.server_name` |
+| `grpc.tls_client_{cert,key}_path` | `grpc.tls.client_{cert,key}_path` |
+| `transport.{otlp,syslog}.tls.ca_path` | `.tls.ca_paths` |
+| Kafka `ssl_ca_location` | `tls.ca_paths` plus `trust: bundle` |
+| Kafka `ssl_{certificate,key}_location` | `tls.client_{cert,key}_path` |
+| server `tls.ca_file` | `tls.ca_files` |
+| `http_server.tls_{cert,key}_path` | `http_server.tls`, a server section |
+
+- HTTP with no `tls_*` key used reqwest's verifier, and now takes the section's defaults. `HttpClient` (`http_client.tls`), the HTTP DLQ (`http.tls` in the DLQ section) and the version check build through the same path. `HttpClient` builds its TLS when it is created, so it needs a root store, or `trust: bundle` with CA files. An HTTP sink or DLQ with only `http://` endpoints builds none.
+- gRPC, OTLP-gRPC and Vector compat run scalo's rustls over each stream, take every trust choice and pins, and need ALPN `h2`. scalo enables no tonic TLS feature.
+- `tls_handshakes_total{key_exchange}` reads `post_quantum` for `hybrid`. `tls_tls12_handshakes_total{role, profile}` is new.
+- `CryptoProfile::{Prod, HighSec, DevTest}` become `Strong`, `Cnsa2` and nothing, beside `Commercial`. `PqcMode` and `TlsFloor` are gone. `profile: fips` fails at load.
+- `build_client_tls(&tls)` takes the profile from `ClientTls`. `TlsTrust`, `TlsConfigSource`, `build_client_config(_with)`, `build_root_store`, `add_pem_file_certs`, `TlsParts`, `tls_parts`, `ServerTlsOptions::with_profile`, `HttpServerConfig::tls_files`, `SyslogTlsConfig` and `VectorCompatTls` are gone. The sections live in `scalo::tls_config`.
+
+**Consumer adjustment** -- move each key. A service with a TLS 1.2-only peer sets `allow_tls12` on its profile, or names `commercial`. One that relied on scalo enabling tonic's TLS features enables them itself.
+
+### Kafka's TLS floor goes through OPENSSL_CONF (BEHAVIOUR CHANGE)
+
+librdkafka has no version property, and `ssl.cipher.suites` reaches TLS 1.2 only. Before its first TLS client scalo writes the profile's `MinProtocol` and TLS 1.3 `Ciphersuites` into the file `OPENSSL_CONF` names, if missing or scalo's, and OpenSSL reads it once per process, so all Kafka clients share one floor. It is OpenSSL's system default, so every OpenSSL user in the process and any child that inherits the variable takes it too. Unset, the floor is not set and a warning says so.
+
+**Consumer adjustment** -- set `OPENSSL_CONF` to a writable path in the deployment, or call `scalo::transport::kafka::set_openssl_conf()` first in `main`.
+
 ### A spool held by a live owner is refused with its own variant
 
 `Spool::open` returns `SpoolError::Locked { path, pid }` and `TieredSink::new` returns `TieredSinkError::SpoolLocked { path, pid }` where both returned `Open` / `SpoolOpen` before. `pid` is the one the lock file names, `None` where it can't be read. The message still says "locked by a live owner".

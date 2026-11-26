@@ -85,16 +85,25 @@ flag.store(true, Ordering::Release);
 
 ## TLS
 
-With the `tls` feature the server terminates TLS itself. Set `tls_cert_path` and `tls_key_path` and it serves that certificate, offers ALPN `h2` and `http/1.1`, and re-reads both files every 30 s, so a rotated certificate is served from the next handshake with no restart. A bad new certificate keeps the old one in service.
+With the `tls` feature the server terminates TLS itself. Its `tls` section is the `ServerTlsConfig` every server reads ([tls.md](tls.md)): profile, certificate and key from files or secrets, client CAs and client auth. It offers ALPN `h2` and `http/1.1` and re-reads its sources every `reload_interval_secs`, so a rotated certificate is served from the next handshake with no restart. A bad new certificate keeps the old one in service.
 
-For a certificate from a secret, client certificates, a crypto profile or one certificate shared with other listeners, load a `ServerTls` and pass it in:
+```yaml
+http_server:
+  bind_address: 0.0.0.0:8443
+  tls:
+    profile: strong
+    cert_file: /etc/tls/tls.crt
+    key_file: /etc/tls/tls.key
+```
+
+For one certificate shared with other listeners, load a `ServerTls` and pass it in, with no `tls` section:
 
 ```rust
-let tls = ServerTls::load_with(&config.tls, ServerTlsOptions::http()).await?;
+let tls = ServerTls::load_with(&shared_tls, ServerTlsOptions::http()).await?;
 HttpServer::new(config.http_server).with_tls(tls).serve(app).await?;
 ```
 
-`validate()` runs before anything binds, so the server never serves cleartext while its config asks for TLS. It rejects one path set without the other, either path in a build without the `tls` feature, and `with_tls` together with the paths. [tls.md](tls.md) covers sources, reload and the handshake metrics.
+`validate()` runs before anything binds, so the server never serves cleartext while its config asks for TLS. It rejects a `tls` section in a build without the `tls` feature, and the section together with `with_tls`. [tls.md](tls.md) covers sources, reload and the handshake metrics.
 
 ---
 
@@ -123,7 +132,7 @@ http_server:
   shutdown_timeout_ms: 30000
 ```
 
-`max_body_bytes` applies to every route, so a handler that takes the body through a custom extractor or streams it is capped too. A declared `Content-Length` over the limit is answered 413 before the handler runs. `tls_cert_path` and `tls_key_path` turn on TLS, see [TLS](#tls).
+`max_body_bytes` applies to every route, so a handler that takes the body through a custom extractor or streams it is capped too. A declared `Content-Length` over the limit is answered 413 before the handler runs. A `tls` section turns on TLS, see [TLS](#tls).
 
 ---
 

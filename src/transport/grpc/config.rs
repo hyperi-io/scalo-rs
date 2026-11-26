@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::compression::{Accepts, Compression};
+use crate::tls_config::Removed;
 use crate::transport::tonic_channel::{DEFAULT_SEND_TIMEOUT_MS, TONIC_CODECS};
 
 /// The codecs a gRPC client sends with: none, gzip, and zstd with the
@@ -46,8 +47,9 @@ pub struct GrpcConfig {
     /// When set, the transport accepts incoming Push RPCs.
     pub listen: Option<String>,
 
-    /// Client endpoint URI (e.g., "http://loader:6000").
-    /// When set, the transport can send messages to a remote server.
+    /// Client endpoint URI (e.g., "http://loader:6000"). When set, the
+    /// transport can send messages to a remote server, over TLS when it is
+    /// `https://`.
     pub endpoint: Option<String>,
 
     /// Receive buffer size (messages buffered from incoming RPCs).
@@ -86,25 +88,12 @@ pub struct GrpcConfig {
     )]
     pub compression: Compression,
 
-    // --- Client TLS, mapped onto tonic's ClientTlsConfig by crate::tls. In-cluster
-    // gRPC is usually mesh mTLS, so these are for direct TLS to a remote endpoint. ---
-    /// Enable client TLS for the `endpoint` connection.
-    #[serde(default)]
-    pub tls_enabled: bool,
-    /// CA PEM file, trusted alone when set. Unset with `tls_enabled`, the OS
-    /// native roots are trusted. The HTTP transport's `tls_ca_path` differs:
-    /// by default it adds the CA beside the OS store.
-    #[serde(default)]
-    pub tls_ca_path: Option<String>,
-    /// Domain name for SNI / certificate verification (overrides the URI host).
-    #[serde(default)]
-    pub tls_domain: Option<String>,
-    /// Client certificate PEM for mTLS (with `tls_client_key_path`).
-    #[serde(default)]
-    pub tls_client_cert_path: Option<String>,
-    /// Client key PEM for mTLS (with `tls_client_cert_path`).
-    #[serde(default)]
-    pub tls_client_key_path: Option<String>,
+    /// Client TLS for an `https://` endpoint, the
+    /// [`ClientTlsConfig`](crate::tls::ClientTlsConfig) every transport reads.
+    /// An `https://` endpoint with no section takes the defaults: `strong`,
+    /// the OS root store, the endpoint's host as the name. A section beside an
+    /// `http://` endpoint is refused.
+    pub tls: Option<crate::tls::ClientTlsConfig>,
 
     /// Proxy the `endpoint` connection goes through: `none` (default),
     /// `system` (the machine's proxy) or a proxy URL. The connection is an
@@ -128,6 +117,44 @@ pub struct GrpcConfig {
     /// Joining small `send_batch` blocks for `endpoint` into one `RouteBatch`
     /// call.
     pub coalesce: CoalesceConfig,
+
+    /// Removed: an `https://` endpoint runs TLS.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_tls_enabled")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub tls_enabled: Removed,
+
+    /// Removed: `tls.ca_paths` with `tls.trust: bundle`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_tls_ca_path")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub tls_ca_path: Removed,
+
+    /// Removed: `tls.server_name`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_tls_domain")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub tls_domain: Removed,
+
+    /// Removed: `tls.client_cert_path`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_tls_client_cert_path")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub tls_client_cert_path: Removed,
+
+    /// Removed: `tls.client_key_path`.
+    #[doc(hidden)]
+    #[serde(skip_serializing, deserialize_with = "removed_tls_client_key_path")]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub tls_client_key_path: Removed,
+}
+
+crate::tls_config::removed_keys! {
+    removed_tls_enabled: "tls_enabled" => "an https:// endpoint, which runs TLS";
+    removed_tls_ca_path: "tls_ca_path" => "tls.ca_paths with tls.trust: bundle";
+    removed_tls_domain: "tls_domain" => "tls.server_name";
+    removed_tls_client_cert_path: "tls_client_cert_path" => "tls.client_cert_path";
+    removed_tls_client_key_path: "tls_client_key_path" => "tls.client_key_path";
 }
 
 /// How `send_batch` joins small blocks for one endpoint into one `RouteBatch`
@@ -171,17 +198,18 @@ impl Default for GrpcConfig {
             send_timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
             max_message_size: 16 * 1024 * 1024, // 16 MB
             compression: Compression::NONE,
-            tls_enabled: false,
-            tls_ca_path: None,
-            tls_domain: None,
-            tls_client_cert_path: None,
-            tls_client_key_path: None,
+            tls: None,
             proxy: crate::transport::ProxyConfig::None,
             #[cfg(feature = "transport-grpc-vector-compat")]
             vector_compat: false,
             filters_in: Vec::new(),
             filters_out: Vec::new(),
             coalesce: CoalesceConfig::default(),
+            tls_enabled: Removed,
+            tls_ca_path: Removed,
+            tls_domain: Removed,
+            tls_client_cert_path: Removed,
+            tls_client_key_path: Removed,
         }
     }
 }
@@ -251,3 +279,65 @@ impl GrpcConfig {
 }
 
 impl crate::transport::traits::FromCascade for GrpcConfig {}
+
+#[cfg(all(test, feature = "yaml", feature = "figment"))]
+mod tests {
+    use super::*;
+
+    /// A removed TLS key fails the load, naming its replacement, where the
+    /// client would dial with the key dropped.
+    #[test]
+    fn a_removed_tls_key_fails_the_load() {
+        crate::tls_config::assert_removed::<GrpcConfig>(&[
+            (r#"{"tls_enabled": true}"#, "https://"),
+            (r#"{"tls_ca_path": "/ca.pem"}"#, "tls.ca_paths"),
+            (r#"{"tls_domain": "loader"}"#, "tls.server_name"),
+            (
+                r#"{"tls_client_cert_path": "/c.pem"}"#,
+                "tls.client_cert_path",
+            ),
+            (
+                r#"{"tls_client_key_path": "/k.pem"}"#,
+                "tls.client_key_path",
+            ),
+        ]);
+    }
+
+    /// The `tls` section reaches the config through the cascade, from YAML
+    /// and from the environment, which wins.
+    #[cfg(feature = "config")]
+    #[test]
+    fn the_tls_section_reaches_the_config_through_the_cascade() {
+        use crate::tls::{ClientTlsConfig, CryptoProfile, KeyShare, TrustChoice};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.yaml"),
+            "grpc:\n  endpoint: https://loader:6000\n  tls:\n    profile: cnsa2\n    \
+             trust: bundle\n    ca_paths: /etc/tls/ca.pem\n    server_name: loader\n",
+        )
+        .unwrap();
+        temp_env::with_var("GRPCTLS__GRPC__TLS__KEY_SHARE", Some("classical"), || {
+            crate::config::setup(crate::config::ConfigOptions {
+                env_prefix: "GRPCTLS".to_string(),
+                config_paths: vec![dir.path().to_path_buf()],
+                search_standard_paths: false,
+                load_dotenv: false,
+                ..crate::config::ConfigOptions::default()
+            })
+            .unwrap();
+        });
+        let config = GrpcConfig::from_cascade().unwrap();
+        assert_eq!(
+            config.tls,
+            Some(ClientTlsConfig {
+                profile: CryptoProfile::Cnsa2,
+                trust: TrustChoice::Bundle,
+                ca_paths: vec!["/etc/tls/ca.pem".into()],
+                server_name: Some("loader".to_string()),
+                key_share: KeyShare::Classical,
+                ..ClientTlsConfig::default()
+            })
+        );
+    }
+}

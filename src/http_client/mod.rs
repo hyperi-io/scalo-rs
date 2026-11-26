@@ -67,6 +67,8 @@
 //!   max_retry_interval_ms: 30000
 //!   retry_non_idempotent: false
 //!   user_agent: "my-app/1.0"
+//!   tls:
+//!     profile: strong
 //! ```
 
 pub mod config;
@@ -92,6 +94,11 @@ pub enum HttpClientError {
     /// The `http_client` config section does not parse.
     #[error(transparent)]
     Config(#[from] crate::cascade::CascadeError),
+
+    /// The `tls` section names a file that can't be read, trusts nothing, sets
+    /// `server_name` or has refused profile settings.
+    #[error("HTTP client TLS: {0}")]
+    Tls(String),
 }
 
 /// Error from an HTTP request.
@@ -232,8 +239,9 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
-    /// client cannot be constructed (typically TLS backend init failure).
+    /// [`HttpClientError::Tls`] when the `tls` section can't be built, which
+    /// needs a root store unless it names its CA files, and
+    /// [`HttpClientError::BuildError`] when reqwest refuses the client.
     pub fn new(config: HttpClientConfig) -> Result<Self, HttpClientError> {
         Self::with_redirect_policy(config, reqwest::redirect::Policy::default())
     }
@@ -247,8 +255,9 @@ impl HttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HttpClientError::BuildError`] if the underlying reqwest
-    /// client cannot be constructed (typically TLS backend init failure).
+    /// [`HttpClientError::Tls`] when the `tls` section can't be built, which
+    /// needs a root store unless it names its CA files, and
+    /// [`HttpClientError::BuildError`] when reqwest refuses the client.
     pub fn with_redirect_policy(
         config: HttpClientConfig,
         redirects: reqwest::redirect::Policy,
@@ -261,6 +270,17 @@ impl HttpClient {
         if let Some(ref ua) = config.user_agent {
             builder = builder.user_agent(ua.clone());
         }
+        if config.tls.server_name.is_some() {
+            return Err(HttpClientError::Tls(
+                "tls.server_name is not taken: the URL's host is the name checked".to_string(),
+            ));
+        }
+        let tls = config
+            .tls
+            .client_tls()
+            .and_then(|tls| crate::tls::build_client_tls(&tls))
+            .map_err(|e| HttpClientError::Tls(e.to_string()))?;
+        builder = builder.use_preconfigured_tls((*tls).clone());
 
         Ok(Self {
             inner: builder.build()?,
@@ -625,6 +645,55 @@ mod tests {
         assert_eq!(
             method_label(&Method::from_bytes(b"PROPFIND").unwrap()),
             "OTHER"
+        );
+    }
+
+    /// The client's TLS comes from its `tls` section and profile: a TLS
+    /// 1.2-only server is refused on the default strong profile and reached on
+    /// commercial, and a `server_name` is refused at build.
+    #[tokio::test]
+    async fn the_tls_section_and_profile_reach_the_handshake() {
+        use crate::tls::test_pki::{TestCa, tls12_https_server};
+        use crate::tls::{ClientTlsConfig, CryptoProfile, TrustChoice};
+
+        let ca = TestCa::new("http client ca");
+        let dir = tempfile::tempdir().unwrap();
+        let ca_file = dir.path().join("ca.pem");
+        tokio::fs::write(&ca_file, ca.pem()).await.unwrap();
+        let url = format!(
+            "https://localhost:{}/",
+            tls12_https_server(&ca).await.port()
+        );
+        let client = |profile| {
+            HttpClient::new(HttpClientConfig {
+                max_retries: 0,
+                tls: ClientTlsConfig {
+                    profile,
+                    trust: TrustChoice::Bundle,
+                    ca_paths: vec![ca_file.clone()],
+                    ..ClientTlsConfig::default()
+                },
+                ..HttpClientConfig::default()
+            })
+            .unwrap()
+        };
+
+        let refused = client(CryptoProfile::Strong).get(&url).await;
+        assert!(refused.is_err(), "strong reached a TLS 1.2-only server");
+        let reached = client(CryptoProfile::Commercial).get(&url).await.unwrap();
+        assert_eq!(reached.status(), StatusCode::OK);
+
+        let named = HttpClient::new(HttpClientConfig {
+            tls: ClientTlsConfig {
+                server_name: Some("other.example".to_string()),
+                ..ClientTlsConfig::default()
+            },
+            ..HttpClientConfig::default()
+        });
+        assert!(
+            matches!(&named, Err(HttpClientError::Tls(m)) if m.contains("server_name")),
+            "{:?}",
+            named.err()
         );
     }
 

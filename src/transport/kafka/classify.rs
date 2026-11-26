@@ -467,6 +467,9 @@ impl AuthState {
         let Some(code) = err.rdkafka_error_code().filter(|c| is_auth_failure(*c)) else {
             return false;
         };
+        let named = super::openssl_floor::version_failure(detail)
+            .map(|failure| format!("{failure}: {detail}"));
+        let detail = named.as_deref().unwrap_or(detail);
         if self.proven.load(Ordering::Relaxed) {
             *self.reason.lock() = Some(format!("{code:?}: {detail}"));
             if self.refused.load(Ordering::Relaxed) {

@@ -144,7 +144,7 @@ pub enum Severity {
 ///       app_name: billing
 ///       tls:
 ///         trust: bundle
-///         ca_path: /etc/tls/ca.pem
+///         ca_paths: [/etc/tls/ca.pem]
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
@@ -184,8 +184,10 @@ pub struct SyslogConfig {
     pub send_timeout_ms: u64,
     /// RELP messages sent before an answer is awaited. Default 128.
     pub relp_window: usize,
-    /// Client TLS, for `tls`, and for `relp` over TLS. Default trust `native`.
-    pub tls: Option<SyslogTlsConfig>,
+    /// Client TLS, for `tls`, and for `relp` over TLS: the [`ClientTlsConfig`]
+    /// every transport reads. `server_name` defaults to the host part of
+    /// `address`.
+    pub tls: Option<ClientTlsConfig>,
     /// Proxy for `tcp`, `tls` and `relp`: `none` (default), `system` or a
     /// proxy URL. The connection is an HTTP CONNECT tunnel, and TLS runs
     /// inside it. `udp` takes `none` only. See
@@ -193,20 +195,6 @@ pub struct SyslogConfig {
     pub proxy: crate::transport::ProxyConfig,
     /// Outbound message filters, applied to each record's payload.
     pub filters_out: Vec<FilterRule>,
-}
-
-/// Client TLS for syslog: the shared [`ClientTlsConfig`] keys plus the name
-/// the receiver's certificate is checked against.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
-#[serde(default)]
-pub struct SyslogTlsConfig {
-    /// Trust, CA file and client certificate.
-    #[serde(flatten)]
-    pub client: ClientTlsConfig,
-    /// The name checked against the receiver's certificate. Default the host
-    /// part of `address`.
-    pub server_name: Option<String>,
 }
 
 /// Datagrams over this cannot be sent over IPv4 or IPv6.

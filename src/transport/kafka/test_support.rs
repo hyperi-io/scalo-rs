@@ -32,6 +32,8 @@
 //! | `SSL`      | TLS       | nothing                                 |
 //! | `SASL_SSL` | TLS       | SCRAM-SHA-512 credentials               |
 //! | `SSL_MTLS` | TLS       | a certificate signed by the test CA     |
+//! | `SSL_TLS12`| TLS 1.2 only | nothing                              |
+//! | `SSL_TLS13`| TLS 1.3 only | nothing                              |
 //!
 //! The certificates come from `openssl` in a pinned container, so the host needs
 //! no `openssl` and the keys are a different implementation from the one under
@@ -428,20 +430,45 @@ pub struct TlsBroker {
     pub sasl_ssl: String,
     /// `SSL_MTLS` listener: TLS, a client certificate required.
     pub mtls: String,
+    /// `SSL_TLS12` listener: TLS 1.2 only, no client certificate.
+    pub tls12_only: String,
+    /// `SSL_TLS13` listener: TLS 1.3 only, no client certificate.
+    pub tls13_only: String,
     scratch: tempfile::TempDir,
 }
 
-fn server_properties(controller: u16, tls: u16, sasl_ssl: u16, mtls: u16) -> String {
+/// The listener ports, controller first.
+struct Ports {
+    controller: u16,
+    tls: u16,
+    sasl_ssl: u16,
+    mtls: u16,
+    tls12: u16,
+    tls13: u16,
+}
+
+fn server_properties(ports: &Ports) -> String {
+    let Ports {
+        controller,
+        tls,
+        sasl_ssl,
+        mtls,
+        tls12,
+        tls13,
+    } = ports;
     format!(
         "process.roles=broker,controller\n\
          node.id=1\n\
          controller.quorum.voters=1@127.0.0.1:{controller}\n\
          controller.listener.names=CONTROLLER\n\
          listeners=CONTROLLER://127.0.0.1:{controller},SSL://127.0.0.1:{tls},\
-         SASL_SSL://127.0.0.1:{sasl_ssl},SSL_MTLS://127.0.0.1:{mtls}\n\
+         SASL_SSL://127.0.0.1:{sasl_ssl},SSL_MTLS://127.0.0.1:{mtls},\
+         SSL_TLS12://127.0.0.1:{tls12},SSL_TLS13://127.0.0.1:{tls13}\n\
          advertised.listeners=SSL://127.0.0.1:{tls},SASL_SSL://127.0.0.1:{sasl_ssl},\
-         SSL_MTLS://127.0.0.1:{mtls}\n\
-         listener.security.protocol.map=CONTROLLER:PLAINTEXT,SSL:SSL,SASL_SSL:SASL_SSL,SSL_MTLS:SSL\n\
+         SSL_MTLS://127.0.0.1:{mtls},SSL_TLS12://127.0.0.1:{tls12},\
+         SSL_TLS13://127.0.0.1:{tls13}\n\
+         listener.security.protocol.map=CONTROLLER:PLAINTEXT,SSL:SSL,SASL_SSL:SASL_SSL,\
+         SSL_MTLS:SSL,SSL_TLS12:SSL,SSL_TLS13:SSL\n\
          inter.broker.listener.name=SSL\n\
          ssl.keystore.type=PEM\n\
          ssl.keystore.location={BROKER_DIR}/server.pem\n\
@@ -449,6 +476,10 @@ fn server_properties(controller: u16, tls: u16, sasl_ssl: u16, mtls: u16) -> Str
          ssl.truststore.location={BROKER_DIR}/ca.crt\n\
          ssl.client.auth=none\n\
          listener.name.ssl_mtls.ssl.client.auth=required\n\
+         listener.name.ssl_tls12.ssl.protocol=TLSv1.2\n\
+         listener.name.ssl_tls12.ssl.enabled.protocols=TLSv1.2\n\
+         listener.name.ssl_tls13.ssl.protocol=TLSv1.3\n\
+         listener.name.ssl_tls13.ssl.enabled.protocols=TLSv1.3\n\
          sasl.enabled.mechanisms=SCRAM-SHA-512\n\
          listener.name.sasl_ssl.scram-sha-512.sasl.jaas.config=\
          org.apache.kafka.common.security.scram.ScramLoginModule required;\n\
@@ -488,8 +519,14 @@ impl TlsBroker {
     /// not copy in, or the broker does not come up.
     pub async fn start(suite: &Suite, test: &str) -> Result<Self, String> {
         let pki = Pki::generate(suite, test).await;
-        let controller = free_port();
-        let (tls, sasl_ssl, mtls) = (free_port(), free_port(), free_port());
+        let ports = Ports {
+            controller: free_port(),
+            tls: free_port(),
+            sasl_ssl: free_port(),
+            mtls: free_port(),
+            tls12: free_port(),
+            tls13: free_port(),
+        };
 
         let scratch = tempfile::tempdir().map_err(|e| format!("temp dir: {e}"))?;
         for name in ["ca.crt", "server.pem"] {
@@ -499,7 +536,7 @@ impl TlsBroker {
         }
         write(
             &scratch.path().join("server.properties"),
-            &server_properties(controller, tls, sasl_ssl, mtls),
+            &server_properties(&ports),
         )
         .await?;
         write(&scratch.path().join("start.sh"), &start_script()).await?;
@@ -544,9 +581,11 @@ impl TlsBroker {
         let broker = Self {
             name,
             pki,
-            tls: format!("127.0.0.1:{tls}"),
-            sasl_ssl: format!("127.0.0.1:{sasl_ssl}"),
-            mtls: format!("127.0.0.1:{mtls}"),
+            tls: format!("127.0.0.1:{}", ports.tls),
+            sasl_ssl: format!("127.0.0.1:{}", ports.sasl_ssl),
+            mtls: format!("127.0.0.1:{}", ports.mtls),
+            tls12_only: format!("127.0.0.1:{}", ports.tls12),
+            tls13_only: format!("127.0.0.1:{}", ports.tls13),
             scratch,
         };
 

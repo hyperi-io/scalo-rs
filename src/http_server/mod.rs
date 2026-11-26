@@ -13,8 +13,8 @@
 //! - Graceful shutdown
 //! - Configurable request timeout, in-flight cap, Tower middleware
 //! - Health endpoints (`/livez` and `/readyz` -- no aliases)
-//! - TLS with certificate reload, with the `tls` feature: `tls_cert_path` /
-//!   `tls_key_path`, or `HttpServer::with_tls` for any `ServerTls`
+//! - TLS with certificate reload, with the `tls` feature: the `tls` section,
+//!   or `HttpServer::with_tls` for any `ServerTls`
 //!
 //! A `/metrics` endpoint is not wired here. Metrics are served by
 //! `MetricsManager` on its own listener.

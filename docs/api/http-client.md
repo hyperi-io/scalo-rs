@@ -119,10 +119,14 @@ http_client:
   max_retry_interval_ms: 30000
   retry_non_idempotent: false
   user_agent: "my-app/1.0"
+  tls:
+    profile: strong
 ```
 
 `max_retries: 0` disables retries. `user_agent` unset leaves reqwest's
 own default.
+
+`tls` is the client section every scalo TLS client reads ([tls.md](tls.md), [../tls-profiles.md](../tls-profiles.md)), minus `server_name`: the URL's host is the name checked. The client builds it when created, so it needs a root store, or `trust: bundle` with CA files.
 
 Redirects are not in the config: they are a property of what the client
 is for, so they are set where it is built.

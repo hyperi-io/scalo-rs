@@ -201,7 +201,11 @@ fn test_kafka_config_with_tls() {
     let config = KafkaConfig::default().with_tls(Some("/path/to/ca.crt"));
 
     assert_eq!(config.security_protocol, "ssl");
-    assert_eq!(config.ssl_ca_location, Some("/path/to/ca.crt".to_string()));
+    assert_eq!(config.tls.trust, scalo::tls_config::TrustChoice::Bundle);
+    assert_eq!(
+        config.tls.ca_paths,
+        [std::path::PathBuf::from("/path/to/ca.crt")]
+    );
 }
 
 #[test]
@@ -218,10 +222,13 @@ fn test_kafka_config_with_client_cert() {
     let config = KafkaConfig::default().with_client_cert("/path/cert.pem", "/path/key.pem");
 
     assert_eq!(
-        config.ssl_certificate_location,
-        Some("/path/cert.pem".to_string())
+        config.tls.client_cert_path,
+        Some(std::path::PathBuf::from("/path/cert.pem"))
     );
-    assert_eq!(config.ssl_key_location, Some("/path/key.pem".to_string()));
+    assert_eq!(
+        config.tls.client_key_path,
+        Some(std::path::PathBuf::from("/path/key.pem"))
+    );
 }
 
 #[test]

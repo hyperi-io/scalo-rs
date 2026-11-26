@@ -23,8 +23,13 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-use super::posture_provider;
-use crate::crypto::PqcMode;
+use super::profile::ProfileSettings;
+use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
+
+/// A fresh ECDSA P-384 key, the key every profile verifies, cnsa2 included.
+fn p384_key() -> KeyPair {
+    KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap()
+}
 
 /// A self-signed CA that signs leaves.
 pub(crate) struct TestCa {
@@ -62,7 +67,7 @@ impl TestCa {
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.distinguished_name.push(DnType::CommonName, name);
-        let issuer = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let issuer = CertifiedIssuer::self_signed(params, p384_key()).unwrap();
         Self { issuer }
     }
 
@@ -80,13 +85,22 @@ impl TestCa {
         self.leaf(name, ExtendedKeyUsagePurpose::ClientAuth)
     }
 
+    /// A `localhost` server certificate on a P-256 key, which cnsa2 refuses.
+    pub(crate) fn server_p256(&self, name: &str) -> Leaf {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        self.leaf_on(name, ExtendedKeyUsagePurpose::ServerAuth, key)
+    }
+
     fn leaf(&self, name: &str, usage: ExtendedKeyUsagePurpose) -> Leaf {
+        self.leaf_on(name, usage, p384_key())
+    }
+
+    fn leaf_on(&self, name: &str, usage: ExtendedKeyUsagePurpose, key: KeyPair) -> Leaf {
         let mut params =
             CertificateParams::new(vec!["localhost".to_string(), "target.test".to_string()])
                 .unwrap();
         params.distinguished_name.push(DnType::CommonName, name);
         params.extended_key_usages = vec![usage];
-        let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &self.issuer).unwrap();
         Leaf {
             cert_pem: cert.pem(),
@@ -110,8 +124,13 @@ pub(crate) fn connector(ca_pem: &str, identity: Option<&Leaf>, alpn: &[&[u8]]) -
     for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
         roots.add(cert.unwrap()).unwrap();
     }
-    let builder = ClientConfig::builder_with_provider(posture_provider(PqcMode::Prefer))
-        .with_safe_default_protocol_versions()
+    let settings = ProfileSettings::new(
+        CryptoProfile::Strong,
+        &TlsProfiles::default(),
+        KeyShare::Profile,
+    );
+    let builder = ClientConfig::builder_with_provider(settings.provider())
+        .with_protocol_versions(settings.versions())
         .unwrap()
         .with_root_certificates(roots);
     let mut config = match identity {
@@ -239,6 +258,170 @@ fn request_complete(request: &[u8]) -> bool {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(0);
     request.len() >= end + 4 + length
+}
+
+/// What one handshake agreed, read on the server side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Agreed {
+    pub version: Option<rustls::ProtocolVersion>,
+    pub suite: Option<rustls::CipherSuite>,
+    pub group: Option<rustls::NamedGroup>,
+}
+
+impl Agreed {
+    /// TLS 1.3 with `suite` and `group`.
+    pub(crate) fn tls13(suite: rustls::CipherSuite, group: rustls::NamedGroup) -> Self {
+        Self {
+            version: Some(rustls::ProtocolVersion::TLSv1_3),
+            suite: Some(suite),
+            group: Some(group),
+        }
+    }
+
+    pub(crate) fn of(connection: &rustls::CommonState) -> Self {
+        Self {
+            version: connection.protocol_version(),
+            suite: connection.negotiated_cipher_suite().map(|s| s.suite()),
+            group: connection.negotiated_key_exchange_group().map(|g| g.name()),
+        }
+    }
+}
+
+/// A `ServerTls` on `profile` serving a `localhost` certificate from `ca`,
+/// offering `alpn`, on the default profile settings.
+pub(crate) async fn server_tls(
+    ca: &TestCa,
+    profile: CryptoProfile,
+    alpn: &[&[u8]],
+) -> (super::ServerTls, tempfile::TempDir) {
+    server_tls_with(ca, profile, alpn, super::ClientAuth::None).await
+}
+
+/// [`server_tls`] asking clients for a certificate from `ca` under
+/// `client_auth`.
+pub(crate) async fn server_tls_with(
+    ca: &TestCa,
+    profile: CryptoProfile,
+    alpn: &[&[u8]],
+    client_auth: super::ClientAuth,
+) -> (super::ServerTls, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let leaf = ca.server("front");
+    let (cert, key, ca_file) = (
+        dir.path().join("cert.pem"),
+        dir.path().join("key.pem"),
+        dir.path().join("ca.pem"),
+    );
+    tokio::fs::write(&cert, &leaf.cert_pem).await.unwrap();
+    tokio::fs::write(&key, &leaf.key_pem).await.unwrap();
+    tokio::fs::write(&ca_file, ca.pem()).await.unwrap();
+    let config = super::ServerTlsConfig {
+        profile,
+        client_auth,
+        ca_files: if client_auth == super::ClientAuth::None {
+            Vec::new()
+        } else {
+            vec![ca_file]
+        },
+        reload_interval_secs: 0,
+        ..super::ServerTlsConfig::from_files(cert, key)
+    };
+    let options = super::ServerTlsOptions {
+        alpn_protocols: alpn.iter().map(|p| p.to_vec()).collect(),
+        profiles: Some(TlsProfiles::default()),
+    };
+    let tls = super::ServerTls::load_with(&config, options).await.unwrap();
+    (tls, dir)
+}
+
+/// A TLS listener on localhost in front of `upstream`: each connection's
+/// handshake runs on `tls` and is noted, then its plain bytes are relayed.
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-syslog",
+    feature = "transport-otlp",
+    feature = "transport-grpc"
+))]
+pub(crate) struct Front {
+    pub addr: SocketAddr,
+    agreed: Arc<std::sync::Mutex<Vec<Agreed>>>,
+}
+
+#[cfg(any(
+    feature = "transport-http",
+    feature = "transport-syslog",
+    feature = "transport-otlp",
+    feature = "transport-grpc"
+))]
+impl Front {
+    pub(crate) async fn start(tls: super::ServerTls, upstream: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let agreed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let noted = Arc::clone(&agreed);
+        tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                let tls = tls.clone();
+                let noted = Arc::clone(&noted);
+                tokio::spawn(async move {
+                    let Ok(mut stream) = tls.accept(stream, Some(peer)).await else {
+                        return;
+                    };
+                    noted.lock().unwrap().push(Agreed::of(stream.get_ref().1));
+                    let Ok(mut plain) = TcpStream::connect(upstream).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut plain).await;
+                });
+            }
+        });
+        Self { addr, agreed }
+    }
+
+    /// What each handshake so far agreed.
+    pub(crate) fn agreed(&self) -> Vec<Agreed> {
+        self.agreed.lock().unwrap().clone()
+    }
+}
+
+/// An HTTPS server on localhost that offers TLS 1.2 only, on a certificate
+/// from `ca`, and answers every request 200 with an empty body.
+#[cfg(feature = "http")]
+pub(crate) async fn tls12_https_server(ca: &TestCa) -> SocketAddr {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let leaf = ca.server("tls12 https");
+    let config = rustls::ServerConfig::builder_with_provider(
+        rustls::crypto::aws_lc_rs::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS12])
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![leaf.der.clone()],
+        PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut request = [0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
 }
 
 /// Connect to `addr` and run the client handshake for `localhost`.

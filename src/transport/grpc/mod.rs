@@ -80,6 +80,7 @@ use super::core::{Lifecycle, Meter};
 use super::error::{TransportError, TransportResult};
 use super::finalizer::DeliveryStatus;
 use super::proxy::Refusals;
+use super::tonic_channel::ChannelTls;
 use super::traits::{RecvBatch, TransportBase, TransportReceiver, TransportSender};
 use super::types::{Message, PayloadFormat, SendResult};
 use super::work_batch::{Record, WorkBatch};
@@ -378,6 +379,9 @@ pub struct GrpcTransport {
 #[derive(Clone)]
 struct Wire {
     client: proto::transport_client::TransportClient<tonic::transport::Channel>,
+    /// The TLS settings of an `https://` endpoint, which names a handshake
+    /// failure. `None` in plain text.
+    settings: Option<crate::tls::ProfileSettings>,
     send_timeout_ms: u64,
     /// Whether the proxy is refusing CONNECT, shared with the transport's readiness.
     refusals: Refusals,
@@ -415,32 +419,30 @@ impl Drop for InFlight<'_> {
     }
 }
 
-/// tonic's client TLS config for the `tls_*` fields on `GrpcConfig`: only the
-/// CA when `tls_ca_path` is set, else the OS roots, and the client identity
-/// when both its paths are set.
+/// The channel TLS for `endpoint` and its settings: the `tls` section, or the
+/// defaults when there is none, for `https://`, and `None` for `http://`.
 fn build_grpc_client_tls(
     config: &GrpcConfig,
-) -> TransportResult<tonic::transport::ClientTlsConfig> {
-    let mut tls = match &config.tls_ca_path {
-        Some(ca) => crate::tls::ClientTls::pinned(ca),
-        None => crate::tls::ClientTls::default(),
+    endpoint: &str,
+) -> TransportResult<Option<(ChannelTls, crate::tls::ProfileSettings)>> {
+    let fail = |e: &dyn std::fmt::Display| TransportError::Config(format!("gRPC {e}"));
+    let https = endpoint
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    let section = match (https, &config.tls) {
+        (false, None) => return Ok(None),
+        (false, Some(_)) => return Err(fail(&"TLS: a tls section needs an https:// endpoint")),
+        (true, section) => section.clone().unwrap_or_default(),
     };
-    match (&config.tls_client_cert_path, &config.tls_client_key_path) {
-        (Some(cert), Some(key)) => tls = tls.with_identity(cert, key),
-        (None, None) => {}
-        _ => {
-            return Err(TransportError::Config(
-                "gRPC TLS: mTLS requires BOTH tls_client_cert_path and tls_client_key_path"
-                    .to_string(),
-            ));
-        }
-    }
-    let mut tls = crate::tls::tonic_client_tls(&tls)
-        .map_err(|e| TransportError::Config(format!("gRPC TLS: {e}")))?;
-    if let Some(domain) = &config.tls_domain {
-        tls = tls.domain_name(domain.clone());
-    }
-    Ok(tls)
+    let tls = section.client_tls().map_err(|e| fail(&e))?;
+    let settings = tls.profile_settings().map_err(|e| fail(&e))?;
+    let rustls = crate::tls::build_client_tls(&tls).map_err(|e| fail(&e))?;
+    let name = match &tls.server_name {
+        Some(name) => name.clone(),
+        None => super::tonic_channel::origin_host(endpoint).map_err(|e| fail(&e))?,
+    };
+    let channel = ChannelTls::new(&rustls, &name).map_err(|e| fail(&e))?;
+    Ok(Some((channel, settings)))
 }
 
 /// Builds a [`GrpcTransport`] with the settings [`GrpcConfig`] does not
@@ -602,24 +604,20 @@ fn native_server(
 }
 
 /// The lazily connected client for `endpoint`, with the configured TLS,
-/// deadlines and compression.
+/// deadlines and compression, and the TLS settings when it is `https://`.
 fn build_client(
     config: &GrpcConfig,
     endpoint: &str,
-) -> TransportResult<proto::transport_client::TransportClient<tonic::transport::Channel>> {
-    let mut ep = tonic::transport::Channel::from_shared(endpoint.to_string())
-        .map_err(|e| TransportError::Config(format!("invalid endpoint: {e}")))?;
-
-    // Client TLS. tonic owns its TLS stack, so we map the unified
-    // vocabulary onto ClientTlsConfig (private CA, mTLS identity, SNI).
-    if config.tls_enabled {
-        ep = ep
-            .tls_config(build_grpc_client_tls(config)?)
-            .map_err(|e| TransportError::Config(format!("gRPC TLS config: {e}")))?;
-    }
-
+) -> TransportResult<(
+    proto::transport_client::TransportClient<tonic::transport::Channel>,
+    Option<crate::tls::ProfileSettings>,
+)> {
+    let tls = build_grpc_client_tls(config, endpoint)?;
+    let ep = super::tonic_channel::endpoint(endpoint, None, tls.is_some())
+        .map_err(TransportError::Config)?;
+    let (tls, settings) = tls.unzip();
     let channel =
-        super::tonic_channel::lazy_channel(ep, config.send_timeout_ms, config.proxy.dialer()?);
+        super::tonic_channel::lazy_channel(ep, config.send_timeout_ms, config.proxy.dialer()?, tls);
 
     // No encoding limit: tonic's refusal arrives as a stream reset that
     // reads as an outage, so send and send_batch check the size instead.
@@ -632,7 +630,7 @@ fn build_client(
     if let Some(encoding) = super::tonic_channel::encoding(config.compression.codec) {
         client = client.send_compressed(encoding);
     }
-    Ok(client)
+    Ok((client, settings))
 }
 
 impl GrpcTransport {
@@ -1009,13 +1007,21 @@ fn redelivery_reason(status: &tonic::Status) -> Option<&'static str> {
 
 /// The send result for a failed RPC: backpressure while the server is down or
 /// busy or the proxy refused the tunnel, so the caller retries rather than drops,
-/// and `Fatal(Config)` when TLS refused the server's certificate or name, which
-/// no retry fixes.
-fn failed_rpc_result(status: &tonic::Status, refusals: &Refusals) -> SendResult {
+/// and `Fatal(Config)` when the TLS handshake failed on `settings`, which no
+/// retry fixes.
+fn failed_rpc_result(
+    status: &tonic::Status,
+    refusals: &Refusals,
+    settings: Option<crate::tls::ProfileSettings>,
+) -> SendResult {
     if let Some(refused) = crate::transport::proxy::refusal(status) {
         return refusals.hold(refused, "grpc");
     }
-    if let Some(tls) = crate::tls::rustls_error(status) {
+    let tls = match settings {
+        Some(settings) => crate::tls::describe_failure(status, settings),
+        None => crate::tls::rustls_error(status).map(ToString::to_string),
+    };
+    if let Some(tls) = tls {
         GrpcTransport::count_send_error();
         tracing::error!(error = %tls, "gRPC: TLS with the server failed");
         return SendResult::Fatal(TransportError::Config(format!(
@@ -1055,7 +1061,10 @@ impl TransportSender for GrpcTransport {
         }
 
         let Some(Wire {
-            client, refusals, ..
+            client,
+            refusals,
+            settings,
+            ..
         }) = &self.wire
         else {
             return SendResult::Fatal(TransportError::Config(
@@ -1107,7 +1116,7 @@ impl TransportSender for GrpcTransport {
                 self.max_message_size,
                 status.message(),
             ),
-            Err(status) => failed_rpc_result(&status, refusals),
+            Err(status) => failed_rpc_result(&status, refusals, *settings),
         };
 
         #[cfg(feature = "metrics")]
@@ -1401,11 +1410,15 @@ fn coalescer(
 
 impl Wire {
     fn new(
-        client: proto::transport_client::TransportClient<tonic::transport::Channel>,
+        (client, settings): (
+            proto::transport_client::TransportClient<tonic::transport::Channel>,
+            Option<crate::tls::ProfileSettings>,
+        ),
         send_timeout_ms: u64,
     ) -> Self {
         Self {
             client,
+            settings,
             send_timeout_ms,
             refusals: Refusals::default(),
             #[cfg(feature = "metrics")]
@@ -1496,7 +1509,7 @@ impl Wire {
             }
             Err(status) => {
                 code = Some(status.code());
-                failed_rpc_result(&status, &self.refusals)
+                failed_rpc_result(&status, &self.refusals, self.settings)
             }
         };
 
@@ -2076,8 +2089,7 @@ mod tests {
         assert_eq!(config.send_timeout_ms, 30_000);
         assert_eq!(config.max_message_size, 16 * 1024 * 1024);
         assert!(config.compression.is_none());
-        assert!(!config.tls_enabled);
-        assert!(config.tls_ca_path.is_none());
+        assert!(config.tls.is_none());
         assert_eq!(
             config.coalesce,
             CoalesceConfig {
@@ -2088,32 +2100,70 @@ mod tests {
         );
     }
 
+    /// The endpoint's scheme decides TLS: `https://` takes the section or the
+    /// defaults, `http://` none, and a section beside `http://`, half an
+    /// identity or a missing CA file fail the build.
     #[test]
-    fn grpc_client_tls_builds_with_private_ca_and_rejects_half_mtls() {
-        use std::io::Write;
-        let cert = rcgen::generate_simple_self_signed(vec!["grpc.test".to_string()]).unwrap();
-        let mut ca = tempfile::NamedTempFile::new().unwrap();
-        ca.write_all(cert.cert.pem().as_bytes()).unwrap();
-        ca.flush().unwrap();
+    fn grpc_client_tls_follows_the_scheme_and_refuses_mistakes() {
+        use crate::tls::{ClientTlsConfig, TrustChoice};
 
-        // Private CA + SNI -> builds.
-        let cfg = GrpcConfig {
-            endpoint: Some("https://peer:6000".to_string()),
-            tls_enabled: true,
-            tls_ca_path: Some(ca.path().to_string_lossy().into_owned()),
-            tls_domain: Some("grpc.test".to_string()),
-            ..Default::default()
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, crate::tls::test_pki::TestCa::new("grpc ca").pem()).unwrap();
+        let section = |cert: Option<&std::path::Path>, ca: &std::path::Path| ClientTlsConfig {
+            trust: TrustChoice::Bundle,
+            ca_paths: vec![ca.to_path_buf()],
+            client_cert_path: cert.map(std::path::Path::to_path_buf),
+            server_name: Some("grpc.test".to_string()),
+            ..ClientTlsConfig::default()
         };
-        assert!(build_grpc_client_tls(&cfg).is_ok());
-
-        // Half-configured mTLS (cert without key) -> error.
-        let cfg = GrpcConfig {
-            tls_enabled: true,
-            tls_client_cert_path: Some(ca.path().to_string_lossy().into_owned()),
-            tls_client_key_path: None,
-            ..Default::default()
+        let build = |endpoint: &str, tls: Option<ClientTlsConfig>| {
+            let config = GrpcConfig {
+                tls,
+                ..GrpcConfig::client(endpoint)
+            };
+            build_grpc_client_tls(&config, endpoint)
+                .map(|tls| tls.is_some())
+                .map_err(|e| e.to_string())
         };
-        assert!(build_grpc_client_tls(&cfg).is_err());
+        let cases: Vec<(&str, Result<bool, String>, Result<bool, &str>)> = vec![
+            ("plain text", build("http://peer:6000", None), Ok(false)),
+            (
+                "https with no section",
+                build("https://peer:6000", None),
+                Ok(true),
+            ),
+            (
+                "https with a private CA and a server name",
+                build("https://peer:6000", Some(section(None, &ca))),
+                Ok(true),
+            ),
+            (
+                "a section beside http",
+                build("http://peer:6000", Some(section(None, &ca))),
+                Err("needs an https:// endpoint"),
+            ),
+            (
+                "a certificate without its key",
+                build("https://peer:6000", Some(section(Some(&ca), &ca))),
+                Err("needs both client_cert_path and client_key_path"),
+            ),
+            (
+                "a missing CA file",
+                build(
+                    "https://peer:6000",
+                    Some(section(None, &dir.path().join("gone.pem"))),
+                ),
+                Err("gone.pem"),
+            ),
+        ];
+        for (name, got, want) in cases {
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{name}"),
+                (Err(got), Err(want)) => assert!(got.contains(want), "{name}: {got}"),
+                (got, want) => panic!("{name}: got {got:?}, want {want:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2415,7 +2465,7 @@ mod tests {
             ))),
         ] {
             assert!(
-                failed_rpc_result(&status, &refusals).is_backpressured(),
+                failed_rpc_result(&status, &refusals, None).is_backpressured(),
                 "{status:?} should be retried"
             );
         }
@@ -2426,7 +2476,7 @@ mod tests {
             tonic::Status::internal("server bug"),
         ] {
             assert!(
-                failed_rpc_result(&status, &refusals).is_fatal(),
+                failed_rpc_result(&status, &refusals, None).is_fatal(),
                 "{status:?} is the server's answer and should stay fatal"
             );
         }
@@ -2674,8 +2724,11 @@ mod tests {
             config.proxy = ProxyConfig::Url(SensitiveString::new(proxy.as_str()));
             config.send_timeout_ms = 10_000;
             if *over_tls {
-                config.tls_enabled = true;
-                config.tls_ca_path = Some(ca_file.path().to_string_lossy().into_owned());
+                config.tls = Some(crate::tls::ClientTlsConfig {
+                    trust: crate::tls::TrustChoice::Bundle,
+                    ca_paths: vec![ca_file.path().to_path_buf()],
+                    ..crate::tls::ClientTlsConfig::default()
+                });
             }
             let client = GrpcTransport::new(&config).await.unwrap();
             let result = client.send("events", filled(8)).await;
@@ -2685,7 +2738,7 @@ mod tests {
     }
 
     /// A server certificate the client does not trust holds the batch as
-    /// `Fatal(Config)` naming the rustls error, never a retry.
+    /// `Fatal(Config)` naming the failure, never a retry.
     #[cfg(any(
         feature = "transport-http",
         all(feature = "transport-proxy-test-support", unix)
@@ -2697,14 +2750,45 @@ mod tests {
         let (server, _) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
         let (front, _ca) = tls_front(server.local_addr().unwrap(), &[b"h2"]).await;
         let mut config = GrpcConfig::client(&format!("https://localhost:{}", front.port()));
-        config.tls_enabled = true;
         config.send_timeout_ms = 5_000;
         let client = GrpcTransport::new(&config).await.unwrap();
         let result = client.send("events", filled(8)).await;
         let SendResult::Fatal(TransportError::Config(text)) = &result else {
             panic!("got {result:?}");
         };
-        assert!(text.contains("UnknownIssuer"), "{text}");
+        assert!(text.contains("does not chain to a trusted CA"), "{text}");
+    }
+
+    /// The `tls` section reaches the handshake: a cnsa2 client against a
+    /// cnsa2 server agrees ML-KEM-1024 and AES-256, where the default strong
+    /// client would agree P-384.
+    #[tokio::test]
+    async fn the_tls_section_reaches_the_handshake() {
+        use crate::tls::test_pki::{Agreed, Front, TestCa, server_tls};
+
+        let (server, _) = receiver(GrpcConfig::server("127.0.0.1:0")).await;
+        let ca = TestCa::new("grpc handshake ca");
+        let (tls, _files) = server_tls(&ca, crate::crypto::CryptoProfile::Cnsa2, &[b"h2"]).await;
+        let front = Front::start(tls, server.local_addr().unwrap()).await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), ca.pem()).unwrap();
+        let mut config = GrpcConfig::client(&format!("https://localhost:{}", front.addr.port()));
+        config.tls = Some(crate::tls::ClientTlsConfig {
+            profile: crate::crypto::CryptoProfile::Cnsa2,
+            trust: crate::tls::TrustChoice::Bundle,
+            ca_paths: vec![ca_file.path().to_path_buf()],
+            ..crate::tls::ClientTlsConfig::default()
+        });
+        let client = GrpcTransport::new(&config).await.unwrap();
+        let result = client.send("events", filled(8)).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            front.agreed(),
+            [Agreed::tls13(
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+                rustls::NamedGroup::MLKEM1024
+            )]
+        );
     }
 
     /// Record headers, the dedup key among them, reach `recv` from a

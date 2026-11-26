@@ -59,30 +59,14 @@ impl ConnectTo {
         Ok(moved)
     }
 
-    /// A tonic endpoint for `url` that dials this address, with `tls` checking
-    /// `url`'s host name and calls naming `url` as `:authority`.
-    pub(crate) fn tonic_endpoint(
-        self,
-        url: &reqwest::Url,
-        tls: Option<tonic::transport::ClientTlsConfig>,
-    ) -> Result<tonic::transport::Endpoint, String> {
-        let host = Self::named_host(url)?;
+    /// The URL a tonic channel to `url` dials: this address, and this port
+    /// when one is set. The channel's TLS and `:authority` keep `url`'s name.
+    pub(crate) fn dial_url(self, url: &reqwest::Url) -> Result<String, String> {
+        Self::named_host(url)?;
         let mut dial = self.with_port(url)?;
         dial.set_ip_host(self.ip)
             .map_err(|()| "connect_to: the endpoint cannot take an address".to_string())?;
-        let origin: tonic::transport::Uri = url
-            .as_str()
-            .parse()
-            .map_err(|e| format!("invalid endpoint: {e}"))?;
-        let mut endpoint = tonic::transport::Endpoint::from_shared(dial.to_string())
-            .map_err(|e| format!("invalid endpoint: {e}"))?
-            .origin(origin);
-        if let Some(tls) = tls {
-            endpoint = endpoint
-                .tls_config(tls.domain_name(host))
-                .map_err(|e| format!("TLS: {e}"))?;
-        }
-        Ok(endpoint)
+        Ok(dial.to_string())
     }
 
     /// `builder` resolving `url`'s host to this address.

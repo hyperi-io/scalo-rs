@@ -53,6 +53,7 @@ mod acks;
 mod admin;
 mod classify;
 mod metrics;
+mod openssl_floor;
 mod producer;
 #[cfg(all(feature = "transport-kafka-test-support", unix))]
 pub mod test_support;
@@ -63,6 +64,7 @@ pub use admin::{KafkaAdmin, TopicInfo};
 pub use metrics::{
     BrokerMetrics, KafkaMetrics, StatsContext, healthy_broker_count, total_consumer_lag,
 };
+pub use openssl_floor::set_openssl_conf;
 pub use producer::{KafkaProducer, ProducerMetrics, ProducerProfile};
 pub use topic_resolver::{TopicRefreshHandle, TopicResolver};
 use types::config;
@@ -726,20 +728,121 @@ pub fn producer_client_config(
     client_config
 }
 
-/// Set librdkafka's TLS properties from the `ssl_*` fields of `config`.
+/// Set librdkafka's TLS properties from the `tls` section of `config`, the
+/// profile's lists only when the protocol runs TLS.
 pub(super) fn set_tls(client_config: &mut ClientConfig, config: &KafkaConfig) {
-    if let Some(ref ca) = config.ssl_ca_location {
-        client_config.set("ssl.ca.location", ca);
+    use crate::tls_config::TrustChoice;
+
+    let tls = &config.tls;
+    match (tls.trust, tls.ca_paths.as_slice()) {
+        // The OS store, through set_default_ca, or Windows' own store.
+        (_, []) | (TrustChoice::Platform, _) => {}
+        (TrustChoice::Bundle, [one]) => {
+            client_config.set("ssl.ca.location", one.to_string_lossy());
+        }
+        (trust, files) => match ca_pem(trust == TrustChoice::Native, files) {
+            Ok(pem) => {
+                client_config.set("ssl.ca.pem", pem);
+            }
+            // librdkafka refuses the client naming the file it cannot read.
+            Err(unreadable) => {
+                client_config.set("ssl.ca.location", unreadable.to_string_lossy());
+            }
+        },
     }
-    if let Some(ref cert) = config.ssl_certificate_location {
-        client_config.set("ssl.certificate.location", cert);
+    if let Some((cert, key)) = tls.identity_paths().ok().flatten() {
+        client_config.set("ssl.certificate.location", cert.to_string_lossy());
+        client_config.set("ssl.key.location", key.to_string_lossy());
     }
-    if let Some(ref key) = config.ssl_key_location {
-        client_config.set("ssl.key.location", key);
+    let runs_tls = ["ssl", "sasl_ssl"]
+        .iter()
+        .any(|p| config.security_protocol.trim().eq_ignore_ascii_case(p));
+    if runs_tls {
+        // validate refuses a section that does not parse, so the defaults stand in only here.
+        let profiles = crate::crypto::TlsProfiles::from_cascade().unwrap_or_default();
+        let tls12 = tls.profile.has_tls12() && profiles.options(tls.profile).allow_tls12;
+        openssl_floor::apply(tls.profile, tls12);
+        let lists = OpenSslLists::of(tls.profile);
+        client_config.set("ssl.cipher.suites", lists.tls12_ciphers);
+        if let Some(groups) = lists.groups {
+            client_config.set("ssl.curves.list", groups);
+        }
+        if let Some(sigalgs) = lists.sigalgs {
+            client_config.set("ssl.sigalgs.list", sigalgs);
+        }
     }
     if config.ssl_skip_verify {
         client_config.set("enable.ssl.certificate.verification", "false");
     }
+}
+
+/// A profile in OpenSSL's names, for librdkafka.
+struct OpenSslLists {
+    /// The TLS 1.2 suites, which a peer reaches only where the version floor
+    /// is not set. A profile with no TLS 1.2 suites gives strong's.
+    tls12_ciphers: &'static str,
+    /// Key-exchange groups, set only where the profile needs groups OpenSSL
+    /// 3.5 and later name: older OpenSSL refuses a list naming them.
+    groups: Option<&'static str>,
+    /// Signature schemes, set only where the profile narrows OpenSSL's.
+    sigalgs: Option<&'static str>,
+}
+
+impl OpenSslLists {
+    fn of(profile: crate::crypto::CryptoProfile) -> Self {
+        use crate::crypto::CryptoProfile;
+
+        const STRONG_TLS12: &str = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384";
+        match profile {
+            CryptoProfile::Strong => Self {
+                tls12_ciphers: STRONG_TLS12,
+                groups: None,
+                sigalgs: None,
+            },
+            CryptoProfile::Commercial => Self {
+                tls12_ciphers: "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:\
+                                ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-AES256-GCM-SHA384:\
+                                ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-CHACHA20-POLY1305",
+                groups: None,
+                sigalgs: None,
+            },
+            CryptoProfile::Cnsa2 => Self {
+                tls12_ciphers: STRONG_TLS12,
+                groups: Some("MLKEM1024:P-384"),
+                sigalgs: Some("ECDSA+SHA384:mldsa87"),
+            },
+        }
+    }
+}
+
+/// The CA files at `files`, after the OS root store when `with_os`, as one
+/// PEM string for `ssl.ca.pem`, which librdkafka reads every certificate of.
+///
+/// # Errors
+///
+/// The path of a file that cannot be read.
+fn ca_pem(with_os: bool, files: &[std::path::PathBuf]) -> Result<String, std::path::PathBuf> {
+    use base64::Engine as _;
+
+    let mut pem = String::new();
+    if with_os {
+        let native = rustls_native_certs::load_native_certs();
+        for cert in &native.certs {
+            let body = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+            pem.push_str("-----BEGIN CERTIFICATE-----\n");
+            for line in body.as_bytes().chunks(64) {
+                pem.push_str(&String::from_utf8_lossy(line));
+                pem.push('\n');
+            }
+            pem.push_str("-----END CERTIFICATE-----\n");
+        }
+    }
+    for file in files {
+        let text = std::fs::read_to_string(file).map_err(|_| file.clone())?;
+        pem.push_str(&text);
+        pem.push('\n');
+    }
+    Ok(pem)
 }
 
 /// With TLS on and no CA named, trust what [`default_ca_location`] picks. A
@@ -4787,6 +4890,139 @@ mod tests {
             .await
             .expect("delivery: none accepts fire-and-forget");
         assert_eq!(built.delivery_guarantee(), DeliveryGuarantee::FireAndForget);
+    }
+
+    /// The `tls` section maps onto librdkafka's properties on every client:
+    /// CA files to `ssl.ca.location` or `ssl.ca.pem`, the identity to its
+    /// files, and the profile to OpenSSL's lists once the protocol runs TLS.
+    /// Keys librdkafka cannot honour fail validation.
+    #[test]
+    fn the_tls_section_maps_onto_librdkafka() {
+        use crate::crypto::{CryptoProfile, KeyShare};
+        use crate::tls_config::{ClientTlsConfig, TrustChoice};
+
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.pem");
+        let b = dir.path().join("b.pem");
+        std::fs::write(
+            &a,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let with = |tls: ClientTlsConfig| KafkaConfig {
+            security_protocol: "ssl".to_string(),
+            tls,
+            ..KafkaConfig::default()
+        };
+        let bundle = |files: Vec<std::path::PathBuf>| ClientTlsConfig {
+            trust: TrustChoice::Bundle,
+            ca_paths: files,
+            ..ClientTlsConfig::default()
+        };
+        let built = |config: &KafkaConfig| {
+            [
+                consumer_client_config(config, ConsumerProtocol::Classic),
+                producer_client_config(config, &[]),
+                admin::admin_client_config(config),
+            ]
+        };
+
+        for client in built(&with(bundle(vec![a.clone(), b.clone()]))) {
+            let pem = client.get("ssl.ca.pem").unwrap_or_default();
+            assert!(pem.contains("AAAA") && pem.contains("BBBB"), "{pem}");
+            assert_eq!(client.get("ssl.ca.location"), None);
+            assert_eq!(
+                client.get("ssl.cipher.suites"),
+                Some("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
+            );
+            assert_eq!(client.get("ssl.curves.list"), None);
+        }
+        let native = with(ClientTlsConfig {
+            ca_paths: vec![a.clone()],
+            client_cert_path: Some(b.clone()),
+            client_key_path: Some(a.clone()),
+            profile: CryptoProfile::Cnsa2,
+            ..ClientTlsConfig::default()
+        });
+        for client in built(&native) {
+            let pem = client.get("ssl.ca.pem").unwrap_or_default();
+            assert!(pem.ends_with("-----END CERTIFICATE-----\n\n") && pem.contains("AAAA"));
+            assert_eq!(
+                client.get("ssl.certificate.location"),
+                Some(b.to_string_lossy().as_ref())
+            );
+            assert_eq!(
+                client.get("ssl.key.location"),
+                Some(a.to_string_lossy().as_ref())
+            );
+            assert_eq!(client.get("ssl.curves.list"), Some("MLKEM1024:P-384"));
+            assert_eq!(client.get("ssl.sigalgs.list"), Some("ECDSA+SHA384:mldsa87"));
+        }
+        let plain = KafkaConfig {
+            tls: bundle(vec![a.clone()]),
+            ..KafkaConfig::default()
+        };
+        for client in built(&plain) {
+            assert_eq!(
+                client.get("ssl.cipher.suites"),
+                None,
+                "plaintext takes no lists"
+            );
+        }
+
+        let refused: Vec<(&str, ClientTlsConfig, &str)> = vec![
+            (
+                "a pin",
+                ClientTlsConfig {
+                    pin_sha256: vec!["00".repeat(32).parse().unwrap()],
+                    ..ClientTlsConfig::default()
+                },
+                "pin_sha256 is not taken",
+            ),
+            (
+                "a server name",
+                ClientTlsConfig {
+                    server_name: Some("broker.example".to_string()),
+                    ..ClientTlsConfig::default()
+                },
+                "server_name is not taken",
+            ),
+            (
+                "a classical key share",
+                ClientTlsConfig {
+                    key_share: KeyShare::Classical,
+                    ..ClientTlsConfig::default()
+                },
+                "key_share classical is not taken",
+            ),
+            ("a bundle with no CA", bundle(Vec::new()), "needs a CA file"),
+            (
+                "half an identity",
+                ClientTlsConfig {
+                    client_cert_path: Some(a.clone()),
+                    ..ClientTlsConfig::default()
+                },
+                "needs both client_cert_path and client_key_path",
+            ),
+        ];
+        for (name, tls, want) in refused {
+            let error = with(tls).validate(false).unwrap_err();
+            assert!(error.contains(want), "{name}: {error}");
+        }
+        let platform = with(ClientTlsConfig {
+            trust: TrustChoice::Platform,
+            ..ClientTlsConfig::default()
+        });
+        assert_eq!(
+            platform.validate(false).is_ok(),
+            cfg!(windows),
+            "platform is the Windows store, Windows only"
+        );
     }
 
     // =========================================================================

@@ -176,26 +176,24 @@ async fn grpc_collector(answer: Answer, seen: Shared, ca: Option<&TestCa>) -> So
     .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
     let metrics = MetricsServiceServer::new(GrpcCollector { answer, seen })
         .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
-    let mut server = tonic::transport::Server::builder();
-    if let Some(ca) = ca {
-        crate::tls::install_default_provider();
-        let leaf = ca.server("otlp collector");
-        let tls = tonic::transport::ServerTlsConfig::new()
-            .identity(tonic::transport::Identity::from_pem(
-                &leaf.cert_pem,
-                &leaf.key_pem,
-            ))
-            .client_ca_root(tonic::transport::Certificate::from_pem(ca.pem()));
-        server = server.tls_config(tls).unwrap();
-    }
     let incoming = tonic::transport::server::TcpIncoming::from(listener);
     tokio::spawn(
-        server
+        tonic::transport::Server::builder()
             .add_service(logs)
             .add_service(metrics)
             .serve_with_incoming(incoming),
     );
-    addr
+    let Some(ca) = ca else {
+        return addr;
+    };
+    let (tls, _files) = crate::tls::test_pki::server_tls_with(
+        ca,
+        crate::crypto::CryptoProfile::Strong,
+        &[b"h2"],
+        crate::tls::ClientAuth::Required,
+    )
+    .await;
+    crate::tls::test_pki::Front::start(tls, addr).await.addr
 }
 
 /// An HTTP collector on localhost taking `POST /v1/logs` and `POST /v1/metrics`.
@@ -537,6 +535,8 @@ const CASES: &[Case] = &[
         tls: Tls::WithIdentity,
         ..case("grpc mutual TLS", GRPC, Answer::Accept, "Ok")
     },
+    // TLS 1.3 refuses a missing client certificate after the client's side of
+    // the handshake is done, and tonic reports the closed connection.
     Case {
         tls: Tls::WithoutIdentity,
         records: 0,
@@ -550,7 +550,7 @@ const CASES: &[Case] = &[
     Case {
         tls: Tls::Untrusted,
         records: 0,
-        detail: "UnknownIssuer",
+        detail: "does not chain to a trusted CA",
         ..case(
             "grpc collector from a CA the client does not trust",
             GRPC,
@@ -633,7 +633,7 @@ const CASES: &[Case] = &[
     Case {
         tls: Tls::WithoutIdentity,
         records: 0,
-        detail: "CertificateRequired",
+        detail: "client certificate",
         ..case(
             "http mutual TLS without the certificate",
             HTTP,
@@ -644,7 +644,7 @@ const CASES: &[Case] = &[
     Case {
         tls: Tls::Untrusted,
         records: 0,
-        detail: "UnknownIssuer",
+        detail: "does not chain to a trusted CA",
         ..case(
             "http collector from a CA the client does not trust",
             HTTP,
@@ -665,7 +665,7 @@ const CASES: &[Case] = &[
     Case {
         tls: Tls::Rekeyed,
         records: 0,
-        detail: "ApplicationVerificationFailure",
+        detail: "matches no configured pin_sha256",
         ..case(
             "http collector re-keyed off the pin",
             HTTP,
@@ -758,14 +758,15 @@ async fn each_collector_answer_maps_onto_a_send_result() {
             let pin = matches!(case.tls, Tls::Pinned | Tls::Rekeyed);
             config.tls = Some(ClientTlsConfig {
                 trust: TrustChoice::Bundle,
-                ca_path: Some(if case.tls == Tls::Untrusted {
+                ca_paths: vec![if case.tls == Tls::Untrusted {
                     files.other_ca.clone()
                 } else {
                     files.ca.clone()
-                }),
+                }],
                 client_cert_path: identity.then(|| files.cert.clone()),
                 client_key_path: identity.then(|| files.key.clone()),
                 pin_sha256: pin.then(|| pinned.pin()).into_iter().collect(),
+                ..ClientTlsConfig::default()
             });
         }
         (case.tweak)(&mut config);
@@ -819,16 +820,16 @@ async fn a_bad_setting_fails_the_build_and_a_closed_transport_refuses() {
         protocol,
         tls: Some(ClientTlsConfig {
             trust,
-            ca_path: Some(missing.clone()),
+            ca_paths: vec![missing.clone()],
             ..ClientTlsConfig::default()
         }),
         ..OtlpConfig::grpc("https://collector:4317")
     };
     let refused = [
         (
-            "platform trust on gRPC",
+            "a missing CA file on gRPC",
             pinned(GRPC, TrustChoice::Platform),
-            "not `platform`",
+            "otlp-ca.pem",
         ),
         (
             "a missing CA file",
@@ -1198,7 +1199,7 @@ async fn connect_to_dials_the_address_and_keeps_the_endpoint_name() {
         if tls != Tls::Off {
             config.tls = Some(ClientTlsConfig {
                 trust: TrustChoice::Bundle,
-                ca_path: Some(files.ca.clone()),
+                ca_paths: vec![files.ca.clone()],
                 client_cert_path: Some(files.cert.clone()),
                 client_key_path: Some(files.key.clone()),
                 ..ClientTlsConfig::default()
@@ -1261,7 +1262,7 @@ async fn exports_go_through_a_connect_proxy() {
         } else {
             let tls = ClientTlsConfig {
                 trust: TrustChoice::Bundle,
-                ca_path: Some(ca_file.path().to_path_buf()),
+                ca_paths: vec![ca_file.path().to_path_buf()],
                 ..ClientTlsConfig::default()
             };
             (format!("https://{TARGET_HOST}:{}", front.port()), Some(tls))
@@ -1290,6 +1291,50 @@ async fn exports_go_through_a_connect_proxy() {
             (seen.requests.len(), seen.metrics.len()),
             (1, 1),
             "one {protocol} logs export and one metrics export"
+        );
+    }
+}
+
+/// The `tls` section reaches the handshake under both protocols: a cnsa2
+/// client against a cnsa2 collector agrees ML-KEM-1024 and AES-256, where the
+/// default strong client would agree P-384.
+#[tokio::test]
+async fn the_tls_section_reaches_the_handshake() {
+    use crate::tls::test_pki::{Agreed, Front, server_tls};
+
+    let ca = TestCa::new("otlp handshake ca");
+    let ca_file = tempfile::NamedTempFile::new().unwrap();
+    tokio::fs::write(ca_file.path(), ca.pem()).await.unwrap();
+    for (protocol, alpn) in [(GRPC, b"h2".as_slice()), (HTTP, b"http/1.1".as_slice())] {
+        let seen = Shared::default();
+        let collector = if protocol == GRPC {
+            grpc_collector(Answer::Accept, Arc::clone(&seen), None).await
+        } else {
+            http_collector(Answer::Accept, Arc::clone(&seen)).await
+        };
+        let (tls, _files) = server_tls(&ca, crate::crypto::CryptoProfile::Cnsa2, &[alpn]).await;
+        let front = Front::start(tls, collector).await;
+        let transport = super::OtlpTransport::new(&OtlpConfig {
+            endpoint: format!("https://localhost:{}", front.addr.port()),
+            protocol,
+            tls: Some(ClientTlsConfig {
+                profile: crate::crypto::CryptoProfile::Cnsa2,
+                trust: TrustChoice::Bundle,
+                ca_paths: vec![ca_file.path().to_path_buf()],
+                ..ClientTlsConfig::default()
+            }),
+            ..OtlpConfig::default()
+        })
+        .unwrap();
+        let result = transport.send_batch(&block()).await;
+        assert!(result.is_ok(), "{protocol:?}: {result:?}");
+        assert_eq!(
+            front.agreed(),
+            [Agreed::tls13(
+                rustls::CipherSuite::TLS13_AES_256_GCM_SHA384,
+                rustls::NamedGroup::MLKEM1024
+            )],
+            "{protocol:?}"
         );
     }
 }

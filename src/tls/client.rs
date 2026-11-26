@@ -1,70 +1,34 @@
 // Project:   scalo
 // File:      src/tls/client.rs
-// Purpose:   Client trust choice, CA files and mutual-TLS identity
+// Purpose:   The one client TLS builder: profile, trust choice, CA files, identity and pins
 // Language:  Rust
 //
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-//! Client TLS from a trust choice, CA files and an optional client identity.
+//! Client TLS from a profile, a trust choice, CA files, an optional client
+//! identity and key pins.
 //!
-//! [`ClientTls`] is what a transport's config maps onto. [`build_client_tls`]
-//! turns it into a rustls [`ClientConfig`], and `tonic_client_tls` (the
-//! `transport-grpc` and `transport-otlp` features) into tonic's client config,
-//! so every client reads its CA and identity files through the same code.
+//! [`ClientTls`] is what a transport's [`ClientTlsConfig`] maps onto, and
+//! [`build_client_tls`] turns it into a rustls [`ClientConfig`]. reqwest takes
+//! it as a preconfigured TLS config, the gRPC transports run it over each
+//! stream they dial, and syslog over its own socket.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::ServerCertVerifier;
-use rustls::client::{WantsClientCert, WebPkiServerVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::{ClientConfig, ConfigBuilder, RootCertStore};
+use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use serde::{Deserialize, Serialize};
 
-use super::pin::{self, SpkiPin};
-use super::{TlsError, posture_provider, protocol_versions};
-use crate::crypto::CryptoProfile;
-
-/// Which certificates a client accepts a server's certificate from.
-///
-/// Every choice trusts the CA files given beside it, and `bundle` trusts
-/// nothing else.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum TrustChoice {
-    /// The OS root store, read through `rustls-native-certs` and checked by
-    /// rustls.
-    #[default]
-    Native,
-    /// The OS verifier, through `rustls-platform-verifier`, so Windows and
-    /// macOS apply their own policy and revocation checks.
-    Platform,
-    /// Only the CA files given: an exclusive pin, with no OS root trusted.
-    Bundle,
-}
-
-impl TrustChoice {
-    /// The name config uses for this choice.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            Self::Platform => "platform",
-            Self::Bundle => "bundle",
-        }
-    }
-}
-
-impl std::fmt::Display for TrustChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+use super::TlsError;
+use super::pin;
+use super::profile::ProfileSettings;
+use crate::crypto::{CryptoProfile, KeyShare, TlsProfiles};
+use crate::tls_config::{ClientTlsConfig, SpkiPin, TrustChoice};
 
 /// A client certificate chain and its private key, both PEM, for mutual TLS.
 ///
@@ -77,13 +41,21 @@ pub struct ClientIdentity {
     pub key_path: PathBuf,
 }
 
-/// The trust and identity a client TLS config is built from.
+/// What a client TLS config is built from.
 ///
-/// The default is [`TrustChoice::Native`] with no CA file and no client
-/// certificate.
+/// The default is the `strong` profile, [`TrustChoice::Native`], no CA file,
+/// no client certificate and no pin, with the profile settings read from the
+/// cascade when the config is built.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ClientTls {
+    /// The profile the versions, suites and groups come from.
+    pub profile: CryptoProfile,
+    /// Per-profile settings. `None` reads the `tls.profiles` cascade section
+    /// when the config is built.
+    pub profiles: Option<TlsProfiles>,
+    /// The key share sent first.
+    pub key_share: KeyShare,
     /// Which certificates the client accepts the server's from.
     pub trust: TrustChoice,
     /// CA PEM files, each holding one certificate or a bundle.
@@ -93,6 +65,9 @@ pub struct ClientTls {
     /// Pins on the server's public key, checked after its chain verifies.
     /// Empty checks no key.
     pub pin_sha256: Vec<SpkiPin>,
+    /// The name the server's certificate is checked against, in place of the
+    /// endpoint's host.
+    pub server_name: Option<String>,
 }
 
 impl ClientTls {
@@ -138,64 +113,83 @@ impl ClientTls {
         self.pin_sha256.push(pin);
         self
     }
-}
 
-/// The config section a transport reads its client TLS from: a trust choice,
-/// one CA file, an optional client certificate and optional key pins.
-///
-/// ```yaml
-/// tls:
-///   trust: bundle
-///   ca_path: /etc/tls/ca.pem
-///   client_cert_path: /etc/tls/client.pem
-///   client_key_path: /etc/tls/client.key
-///   pin_sha256: ["47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="]
-/// ```
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "config-schema", derive(schemars::JsonSchema))]
-#[serde(default)]
-pub struct ClientTlsConfig {
-    /// `native` (default), `platform` or `bundle`, as in [`TrustChoice`].
-    pub trust: TrustChoice,
-    /// CA PEM file, trusted beside the OS store under `native` and
-    /// `platform`, and alone under `bundle`.
-    pub ca_path: Option<PathBuf>,
-    /// Client certificate PEM for mutual TLS, with `client_key_path`.
-    pub client_cert_path: Option<PathBuf>,
-    /// Client private key PEM for mutual TLS, with `client_cert_path`. May
-    /// name the same file when it holds both.
-    pub client_key_path: Option<PathBuf>,
-    /// SHA-256 pins on the server's public key, as in [`SpkiPin`]. Once the
-    /// chain verifies, the key must match one. Empty checks no key.
-    pub pin_sha256: Vec<SpkiPin>,
+    /// Build on `profile`.
+    #[must_use]
+    pub fn with_profile(mut self, profile: CryptoProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Take the per-profile settings from `profiles`, not the cascade.
+    #[must_use]
+    pub fn with_profiles(mut self, profiles: TlsProfiles) -> Self {
+        self.profiles = Some(profiles);
+        self
+    }
+
+    /// Send `key_share` first.
+    #[must_use]
+    pub fn with_key_share(mut self, key_share: KeyShare) -> Self {
+        self.key_share = key_share;
+        self
+    }
+
+    /// Check the server's certificate against `name`.
+    #[must_use]
+    pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
+    /// The profile with its settings applied.
+    ///
+    /// # Errors
+    ///
+    /// [`TlsError::Profiles`] when the settings come from a cascade section
+    /// that does not parse or is refused.
+    pub fn profile_settings(&self) -> Result<ProfileSettings, TlsError> {
+        let profiles = match self.profiles {
+            Some(profiles) => profiles,
+            None => TlsProfiles::from_cascade().map_err(TlsError::Profiles)?,
+        };
+        Ok(ProfileSettings::new(
+            self.profile,
+            &profiles,
+            self.key_share,
+        ))
+    }
 }
 
 impl ClientTlsConfig {
-    /// The [`ClientTls`] this section names.
+    /// The [`ClientTls`] this section names, with the profile settings read
+    /// from the cascade now.
     ///
     /// # Errors
     ///
     /// [`TlsError::Build`] when only one of the client certificate and key is
-    /// set.
+    /// set, and [`TlsError::Profiles`] for a `tls.profiles` section that does
+    /// not parse or is refused.
     pub fn client_tls(&self) -> Result<ClientTls, TlsError> {
-        let mut tls = ClientTls::new(self.trust);
-        if let Some(ca) = &self.ca_path {
-            tls = tls.with_ca(ca);
+        let profiles = TlsProfiles::from_cascade().map_err(TlsError::Profiles)?;
+        let mut tls = ClientTls {
+            profile: self.profile,
+            profiles: Some(profiles),
+            key_share: self.key_share,
+            trust: self.trust,
+            ca_paths: self.ca_paths.clone(),
+            identity: None,
+            pin_sha256: self.pin_sha256.clone(),
+            server_name: self.server_name.clone(),
+        };
+        if let Some((cert, key)) = self.identity_paths().map_err(TlsError::Build)? {
+            tls = tls.with_identity(cert, key);
         }
-        for pin in &self.pin_sha256 {
-            tls = tls.with_pin(*pin);
-        }
-        match (&self.client_cert_path, &self.client_key_path) {
-            (Some(cert), Some(key)) => Ok(tls.with_identity(cert, key)),
-            (None, None) => Ok(tls),
-            _ => Err(TlsError::Build(
-                "mutual TLS needs both client_cert_path and client_key_path".to_string(),
-            )),
-        }
+        Ok(tls)
     }
 }
 
-/// Build a rustls [`ClientConfig`] for `tls` on `profile`.
+/// Build a rustls [`ClientConfig`] for `tls`.
 ///
 /// Every file is read here, so a missing or wrong file fails the build and
 /// not the first handshake.
@@ -205,15 +199,14 @@ impl ClientTlsConfig {
 /// [`TlsError::PemRead`] or [`TlsError::NoCertsFound`] for a CA or certificate
 /// file, [`TlsError::InvalidPem`] for a key file with no key,
 /// [`TlsError::EmptyTrustStore`] when nothing is trusted (`bundle` with no CA
-/// file), and [`TlsError::Build`] when the OS verifier cannot start or the key
-/// does not match the certificate.
-pub fn build_client_tls(
-    profile: CryptoProfile,
-    tls: &ClientTls,
-) -> Result<Arc<ClientConfig>, TlsError> {
-    let provider = posture_provider(profile.pqc());
+/// file), [`TlsError::Profiles`] for refused profile settings, and
+/// [`TlsError::Build`] when the OS verifier cannot start or the key does not
+/// match the certificate.
+pub fn build_client_tls(tls: &ClientTls) -> Result<Arc<ClientConfig>, TlsError> {
+    let settings = tls.profile_settings()?;
+    let provider = settings.provider();
     let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_protocol_versions(protocol_versions(profile.tls_floor()))
+        .with_protocol_versions(settings.versions())
         .map_err(|e| TlsError::Build(e.to_string()))?;
     let verifier: Arc<dyn ServerCertVerifier> = match tls.trust {
         TrustChoice::Native => {
@@ -222,9 +215,9 @@ pub fn build_client_tls(
         TrustChoice::Bundle => webpki_verifier(root_store(&tls.ca_paths, Roots::Only)?, provider)?,
         TrustChoice::Platform => platform_verifier(&tls.ca_paths, provider)?,
     };
-    let builder: ConfigBuilder<ClientConfig, WantsClientCert> = builder
+    let builder = builder
         .dangerous()
-        .with_custom_certificate_verifier(pin::pinned(verifier, &tls.pin_sha256));
+        .with_custom_certificate_verifier(pin::checked(verifier, &tls.pin_sha256, tls.profile));
     let config = match &tls.identity {
         Some(identity) => {
             let (chain, key) = read_identity(identity)?;
@@ -235,11 +228,12 @@ pub fn build_client_tls(
         None => builder.with_no_client_auth(),
     };
     tracing::info!(
+        profile = settings.profile.as_str(),
+        allow_tls12 = settings.allow_tls12,
         trust = %tls.trust,
         ca_files = tls.ca_paths.len(),
         mutual_tls = tls.identity.is_some(),
         key_pins = tls.pin_sha256.len(),
-        profile = ?profile,
         "TLS client config built"
     );
     Ok(Arc::new(config))
@@ -271,7 +265,10 @@ fn root_store(paths: &[PathBuf], roots: Roots) -> Result<RootCertStore, TlsError
         add_native_roots(&mut store);
     }
     for path in paths {
-        super::add_pem_file_certs(&mut store, path)?;
+        let (added, _ignored) = store.add_parsable_certificates(read_certs(path)?);
+        if added == 0 {
+            return Err(TlsError::NoCertsFound { path: path.clone() });
+        }
     }
     if store.is_empty() {
         return Err(TlsError::EmptyTrustStore);
@@ -281,7 +278,7 @@ fn root_store(paths: &[PathBuf], roots: Roots) -> Result<RootCertStore, TlsError
 
 /// Add the OS root store to `store`, warning for each certificate it could not
 /// read.
-pub(super) fn add_native_roots(store: &mut RootCertStore) {
+fn add_native_roots(store: &mut RootCertStore) {
     let result = rustls_native_certs::load_native_certs();
     let (added, ignored) = store.add_parsable_certificates(result.certs);
     for err in result.errors {
@@ -297,7 +294,7 @@ fn platform_verifier(
 ) -> Result<Arc<rustls_platform_verifier::Verifier>, TlsError> {
     let mut cas = Vec::new();
     for path in paths {
-        cas.extend(read_certs(path)?.1);
+        cas.extend(read_certs(path)?);
     }
     let build = |e: rustls::Error| TlsError::Build(format!("OS certificate verifier: {e}"));
     let verifier = if cas.is_empty() {
@@ -327,7 +324,7 @@ fn platform_verifier_with_roots(
     ))
 }
 
-/// The bytes of the PEM file at `path` and the certificates parsed from it.
+/// The certificates parsed from the PEM file at `path`.
 ///
 /// Blocks that are not certificates, and text between blocks, are skipped, so
 /// a bundle carrying comments or a key still yields its certificates.
@@ -336,7 +333,8 @@ fn platform_verifier_with_roots(
 ///
 /// [`TlsError::PemRead`] when the file cannot be read, and
 /// [`TlsError::NoCertsFound`] when it holds no certificate.
-pub(super) fn read_certs(path: &Path) -> Result<(Vec<u8>, Vec<CertificateDer<'static>>), TlsError> {
+pub(super) fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
+    // Read as bytes: `pem_file_iter` loops forever on a directory (rustls/pki-types#98).
     let bytes = std::fs::read(path).map_err(|e| TlsError::PemRead {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -356,16 +354,16 @@ pub(super) fn read_certs(path: &Path) -> Result<(Vec<u8>, Vec<CertificateDer<'st
         });
     }
     tracing::debug!(path = %path.display(), certs = certs.len(), "TLS: certificate file read");
-    Ok((bytes, certs))
+    Ok(certs)
 }
 
-/// The bytes of the PEM key file at `path` and the key parsed from it.
+/// The key parsed from the PEM key file at `path`.
 ///
 /// # Errors
 ///
 /// [`TlsError::PemRead`] when the file cannot be read, and
 /// [`TlsError::InvalidPem`] when it holds no private key.
-pub(super) fn read_key(path: &Path) -> Result<(Vec<u8>, PrivateKeyDer<'static>), TlsError> {
+fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     let bytes = std::fs::read(path).map_err(|e| TlsError::PemRead {
         path: path.to_path_buf(),
         reason: e.to_string(),
@@ -375,15 +373,15 @@ pub(super) fn read_key(path: &Path) -> Result<(Vec<u8>, PrivateKeyDer<'static>),
         reason: format!("{}: {e}", path.display()),
     })?;
     tracing::debug!(path = %path.display(), "TLS: client key read");
-    Ok((bytes, key))
+    Ok(key)
 }
 
 /// The certificate chain and key of `identity`.
 fn read_identity(
     identity: &ClientIdentity,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
-    let (_, chain) = read_certs(&identity.cert_path)?;
-    let (_, key) = read_key(&identity.key_path)?;
+    let chain = read_certs(&identity.cert_path)?;
+    let key = read_key(&identity.key_path)?;
     Ok((chain, key))
 }
 

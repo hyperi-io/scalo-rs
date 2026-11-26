@@ -8,12 +8,28 @@
 
 //! The tonic channel the gRPC, Vector and OTLP clients dial, with the dial
 //! bounded and dead connections dropped.
+//!
+//! TLS is scalo's rustls client, run by [`TlsConnector`] over each dialled
+//! stream, so a gRPC client takes the same profile, trust, CA files and key
+//! pins as every other client. tonic's own TLS is not used: it builds its
+//! config from PEM bytes on rustls's defaults.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use hyper_util::rt::TokioIo;
+use rustls_pki_types::ServerName;
+use tokio::net::TcpStream;
 use tonic::codec::CompressionEncoding;
+use tonic::codegen::Service;
 
 use crate::compression::Codec;
+
+/// ALPN for HTTP/2, which every gRPC server agrees to.
+const ALPN_H2: &[u8] = b"h2";
 
 /// Default send limit of a gRPC client, and its HTTP/2 PING period when it
 /// has none.
@@ -45,7 +61,133 @@ pub(crate) fn encoding(codec: Codec) -> Option<CompressionEncoding> {
     }
 }
 
-/// A lazily dialled channel to `ep`, direct or through `proxy`.
+/// Client TLS a channel runs over each dialled stream: a rustls config
+/// offering ALPN `h2`, and the name the server's certificate is checked
+/// against.
+#[derive(Clone)]
+pub(crate) struct ChannelTls {
+    connector: tokio_rustls::TlsConnector,
+    server_name: ServerName<'static>,
+}
+
+impl ChannelTls {
+    /// `config` with ALPN `h2`, checking the server against `server_name`, a
+    /// DNS name or an IP address.
+    ///
+    /// # Errors
+    ///
+    /// When `server_name` is neither.
+    pub(crate) fn new(config: &rustls::ClientConfig, server_name: &str) -> Result<Self, String> {
+        let name = server_name.trim_matches(['[', ']']).to_string();
+        let server_name = ServerName::try_from(name)
+            .map_err(|e| format!("TLS server name {server_name:?}: {e}"))?;
+        let mut config = config.clone();
+        config.alpn_protocols = vec![ALPN_H2.to_vec()];
+        Ok(Self {
+            connector: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            server_name,
+        })
+    }
+}
+
+/// The endpoint for calls naming `origin`, dialling `dial` when set and
+/// `origin` otherwise.
+///
+/// With `tls`, `origin` must be `https://`. The dial URI is then written as
+/// `http://` with its port spelled out, so tonic hands the stream to
+/// [`TlsConnector`] rather than looking for TLS of its own, and calls still
+/// name `origin`'s scheme and authority.
+///
+/// # Errors
+///
+/// An invalid URI, or a scheme that does not match `tls`.
+pub(crate) fn endpoint(
+    origin: &str,
+    dial: Option<&str>,
+    tls: bool,
+) -> Result<tonic::transport::Endpoint, String> {
+    let invalid = |e: &dyn std::fmt::Display| format!("invalid endpoint: {e}");
+    let origin_uri: http::Uri = origin.parse().map_err(|e| invalid(&e))?;
+    let is_https = origin_uri.scheme_str() == Some("https");
+    if tls != is_https {
+        return Err(if tls {
+            "a tls section needs an https:// endpoint".to_string()
+        } else {
+            "an https:// endpoint needs TLS".to_string()
+        });
+    }
+    let dial_uri: http::Uri = dial.unwrap_or(origin).parse().map_err(|e| invalid(&e))?;
+    if !tls {
+        let endpoint = tonic::transport::Endpoint::from_shared(dial_uri.to_string())
+            .map_err(|e| invalid(&e))?;
+        return Ok(if dial.is_some() {
+            endpoint.origin(origin_uri)
+        } else {
+            endpoint
+        });
+    }
+    let authority = dial_uri
+        .authority()
+        .ok_or_else(|| "invalid endpoint: no host".to_string())?;
+    let port = authority.port_u16().unwrap_or(443);
+    let path = dial_uri.path_and_query().map_or("", |p| p.as_str());
+    let plain = format!("http://{}:{port}{path}", authority.host());
+    tonic::transport::Endpoint::from_shared(plain)
+        .map(|endpoint| endpoint.origin(origin_uri))
+        .map_err(|e| invalid(&e))
+}
+
+/// The host `origin` names, without brackets, the default TLS server name.
+///
+/// # Errors
+///
+/// An invalid URI, or one with no host.
+pub(crate) fn origin_host(origin: &str) -> Result<String, String> {
+    let uri: http::Uri = origin
+        .parse()
+        .map_err(|e| format!("invalid endpoint: {e}"))?;
+    uri.host()
+        .map(|host| host.trim_matches(['[', ']']).to_string())
+        .ok_or_else(|| "invalid endpoint: no host".to_string())
+}
+
+/// tonic's connector for a TLS channel: dials through the proxy connector,
+/// then runs the client handshake and requires ALPN `h2`.
+#[derive(Clone)]
+pub(crate) struct TlsConnector {
+    dial: crate::transport::proxy::Connector,
+    tls: ChannelTls,
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl Service<http::Uri> for TlsConnector {
+    type Response = TokioIo<tokio_rustls::client::TlsStream<TcpStream>>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.dial.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: http::Uri) -> Self::Future {
+        let dial = self.dial.call(uri);
+        let tls = self.tls.clone();
+        Box::pin(async move {
+            let tcp = dial.await?.into_inner();
+            let stream = tls.connector.connect(tls.server_name, tcp).await?;
+            if stream.get_ref().1.alpn_protocol() != Some(ALPN_H2) {
+                return Err(
+                    "TLS: the server did not agree to HTTP/2 (ALPN h2), which gRPC needs".into(),
+                );
+            }
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+/// A lazily dialled channel to `ep`, direct or through `proxy`, with `tls`
+/// run over each stream when set.
 ///
 /// A dial whose DNS lookup, TCP connect or TLS handshake is unfinished at nine
 /// tenths of `send_timeout_ms` is abandoned. A connection that has read nothing
@@ -57,6 +199,7 @@ pub(crate) fn lazy_channel(
     mut ep: tonic::transport::Endpoint,
     send_timeout_ms: u64,
     proxy: crate::transport::ProxyDialer,
+    tls: Option<ChannelTls>,
 ) -> tonic::transport::Channel {
     // A dial left running when its send gives up hands its failure to the
     // next send, so the dial ends at nine tenths of the limit.
@@ -78,8 +221,149 @@ pub(crate) fn lazy_channel(
     // handshake outruns the connect timeout, where connect_lazy() bounds the
     // TCP connect alone and the next send queues behind it.
     let mut tcp = hyper_util::client::legacy::connect::HttpConnector::new();
-    // tonic's own settings: an https URI passes through to its TLS layer.
     tcp.enforce_http(false);
     tcp.set_nodelay(true);
-    ep.connect_with_connector_lazy(crate::transport::proxy::Connector::new(proxy, tcp))
+    let dial = crate::transport::proxy::Connector::new(proxy, tcp);
+    match tls {
+        Some(tls) => ep.connect_with_connector_lazy(TlsConnector {
+            dial: dial.for_tls(),
+            tls,
+        }),
+        None => ep.connect_with_connector_lazy(dial),
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "transport-grpc-vector-compat",
+    feature = "transport-http"
+))]
+mod tests {
+    use std::net::SocketAddr;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::transport::grpc::{GrpcConfig, GrpcTransport};
+    use crate::transport::proxy::test_front::tls_front;
+    use crate::transport::vector_compat::proto::vector;
+
+    /// A Vector-compat server behind a TLS front offering `alpn`, the front's
+    /// address and the CA file to trust.
+    async fn tls_server(alpn: &[&[u8]]) -> (GrpcTransport, SocketAddr, tempfile::NamedTempFile) {
+        let server = GrpcTransport::new(&GrpcConfig::server("127.0.0.1:0").with_vector_compat())
+            .await
+            .unwrap();
+        let (front, ca) = tls_front(server.local_addr().unwrap(), alpn).await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(ca_file.path(), ca).await.unwrap();
+        (server, front, ca_file)
+    }
+
+    fn channel_tls(ca: &std::path::Path, name: &str) -> ChannelTls {
+        let tls =
+            crate::tls::ClientTls::pinned(ca).with_profiles(crate::tls::TlsProfiles::default());
+        let config = crate::tls::build_client_tls(&tls).unwrap();
+        ChannelTls::new(&config, name).unwrap()
+    }
+
+    async fn health(
+        origin: &str,
+        timeout_ms: u64,
+        proxy: crate::transport::ProxyDialer,
+        tls: ChannelTls,
+    ) -> Result<(), tonic::Status> {
+        let ep = endpoint(origin, None, true).unwrap();
+        let channel = lazy_channel(ep, timeout_ms, proxy, Some(tls));
+        vector::vector_client::VectorClient::new(channel)
+            .health_check(vector::HealthCheckRequest {})
+            .await
+            .map(drop)
+    }
+
+    /// A call over TLS reaches the server, and one to a server that does not
+    /// agree to `h2` fails naming ALPN.
+    #[tokio::test]
+    async fn a_tls_channel_calls_through_the_connector_and_needs_h2() {
+        let (_server, front, ca) = tls_server(&[b"h2"]).await;
+        let origin = format!("https://localhost:{}", front.port());
+        let direct = crate::transport::ProxyDialer::direct();
+        let name = origin_host(&origin).unwrap();
+        health(
+            &origin,
+            5_000,
+            direct.clone(),
+            channel_tls(ca.path(), &name),
+        )
+        .await
+        .expect("a health check over TLS");
+
+        // A server with no ALPN at all completes the handshake without one.
+        let (_server, front, ca) = tls_server(&[]).await;
+        let origin = format!("https://localhost:{}", front.port());
+        let error = health(&origin, 5_000, direct, channel_tls(ca.path(), "localhost"))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("ALPN h2"), "{error:?}");
+    }
+
+    /// A server that takes the TCP connection and never answers the
+    /// ClientHello is abandoned at the dial limit.
+    #[tokio::test]
+    async fn a_stalled_tls_handshake_ends_at_the_dial_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let ca = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(ca.path(), crate::tls::test_pki::TestCa::new("ca").pem())
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            health(
+                &format!("https://localhost:{}", addr.port()),
+                300,
+                crate::transport::ProxyDialer::direct(),
+                channel_tls(ca.path(), "localhost"),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Ok(Err(_))), "{result:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a 270 ms dial took {elapsed:?}"
+        );
+    }
+
+    /// A TLS channel reaches its server through a real Squid's CONNECT tunnel.
+    /// The target name resolves only inside Squid.
+    #[cfg(all(feature = "transport-proxy-test-support", unix))]
+    #[tokio::test]
+    async fn a_tls_channel_goes_through_a_connect_proxy() {
+        use crate::sensitive::SensitiveString;
+        use crate::transport::ProxyConfig;
+        use crate::transport::proxy::squid::{Squid, TARGET_HOST};
+
+        let Some(squid) = Squid::shared().await else {
+            return;
+        };
+        let (_server, front, ca) = tls_server(&[b"h2"]).await;
+        let proxy = ProxyConfig::Url(SensitiveString::new(squid.open()))
+            .dialer()
+            .unwrap();
+        health(
+            &format!("https://{TARGET_HOST}:{}", front.port()),
+            10_000,
+            proxy,
+            channel_tls(ca.path(), TARGET_HOST),
+        )
+        .await
+        .expect("a health check through the proxy");
+    }
 }

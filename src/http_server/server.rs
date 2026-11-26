@@ -70,10 +70,9 @@ impl HttpServer {
         Self::new(HttpServerConfig::new(address))
     }
 
-    /// Terminate TLS with `tls`, for a certificate from a secret, client
-    /// certificates, or one `ServerTls` shared with other listeners. Load it
-    /// with [`ServerTlsOptions::http`] so clients can negotiate HTTP/2.
-    /// `tls_cert_path` / `tls_key_path` must then be unset.
+    /// Terminate TLS with `tls`, for one `ServerTls` shared with other
+    /// listeners. Load it with [`ServerTlsOptions::http`] so clients can
+    /// negotiate HTTP/2. The config's `tls` section must then be unset.
     #[cfg(feature = "tls")]
     #[must_use]
     pub fn with_tls(mut self, tls: ServerTls) -> Self {
@@ -178,10 +177,10 @@ impl HttpServer {
     /// the first request.
     async fn prepare(self, listener: TcpListener, app: Router) -> Result<Prepared> {
         #[cfg(feature = "tls")]
-        let tls = match (self.tls.clone(), self.config.tls_files()) {
+        let tls = match (self.tls.clone(), self.config.tls.clone()) {
             (Some(_), Some(_)) => {
                 return Err(HttpServerError::TlsConfig(
-                    "TLS is set both by with_tls and by tls_cert_path / tls_key_path".to_string(),
+                    "TLS is set both by with_tls and by the tls section".to_string(),
                 ));
             }
             (Some(tls), None) => Some(tls),
@@ -727,9 +726,57 @@ mod tests {
             write(&cert, &leaf.cert_pem);
             write(&key, &leaf.key_pem);
             HttpServerConfig {
-                tls_cert_path: Some(cert.display().to_string()),
-                tls_key_path: Some(key.display().to_string()),
+                tls: Some(ServerTlsConfig {
+                    reload_interval_secs: 0,
+                    ..ServerTlsConfig::from_files(cert, key)
+                }),
                 ..HttpServerConfig::new("127.0.0.1:0")
+            }
+        }
+
+        /// The section's profile reaches the handshake: a strong client meets
+        /// a cnsa2 server on P-384, where a strong server agrees the hybrid.
+        #[tokio::test]
+        async fn the_tls_section_profile_reaches_the_handshake() {
+            let ca = TestCa::new("http profile ca");
+            for (profile, group) in [
+                (
+                    crate::crypto::CryptoProfile::Strong,
+                    rustls::NamedGroup::X25519MLKEM768,
+                ),
+                (
+                    crate::crypto::CryptoProfile::Cnsa2,
+                    rustls::NamedGroup::secp384r1,
+                ),
+            ] {
+                let dir = tempfile::TempDir::new().unwrap();
+                let mut config = tls_config(&dir, &ca);
+                if let Some(tls) = config.tls.as_mut() {
+                    tls.profile = profile;
+                }
+                let server = HttpServer::new(config);
+                let listener = server.bind_listener().await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let prepared = server.prepare(listener, Router::new()).await.unwrap();
+                let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+                let running = tokio::spawn(prepared.run(async move {
+                    let _ = stopped.await;
+                }));
+                let stream = connect(&connector(&ca.pem(), None, &[b"http/1.1"]), addr)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stream
+                        .get_ref()
+                        .1
+                        .negotiated_key_exchange_group()
+                        .map(|g| g.name()),
+                    Some(group),
+                    "{profile}"
+                );
+                drop(stream);
+                stop.send(()).unwrap();
+                running.await.unwrap().unwrap();
             }
         }
 
@@ -783,13 +830,8 @@ mod tests {
             let ca = TestCa::new("both ca");
             let dir = tempfile::TempDir::new().unwrap();
             let config = tls_config(&dir, &ca);
-            let files = config.tls_files().unwrap();
-            let tls = ServerTls::load(&ServerTlsConfig {
-                reload_interval_secs: 0,
-                ..files
-            })
-            .await
-            .unwrap();
+            let section = config.tls.clone().unwrap();
+            let tls = ServerTls::load(&section).await.unwrap();
             let result = HttpServer::new(config)
                 .with_tls(tls)
                 .serve_with_handle(Router::new())

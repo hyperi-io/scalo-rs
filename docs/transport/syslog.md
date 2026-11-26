@@ -23,7 +23,7 @@ transport:
       app_name: billing
       tls:
         trust: bundle
-        ca_path: /etc/tls/ca.pem
+        ca_paths: [/etc/tls/ca.pem]
         client_cert_path: /etc/tls/client.pem
         client_key_path: /etc/tls/client.key
 ```
@@ -71,7 +71,7 @@ One connection is held and reused, behind a lock, so concurrent sends go one aft
 | Receiver closed the connection while it was idle | reconnect before the batch, no loss |
 | Connect refused or timed out, DNS failed | `Backpressured` |
 | Write broke off mid-batch, or the deadline passed | `Backpressured`, the connection dropped, never `Ok` |
-| TLS refused the receiver's certificate or ours | `Fatal(Config)` |
+| TLS refused the receiver's certificate or ours, or found no version, suite or group in common | `Fatal(Config)`, naming the `TlsFailure` |
 | The proxy refused CONNECT | `Backpressured`, with the proxy's status and the receiver's port logged once per run and `is_healthy()` and the `transport:syslog` health check false until a send goes through: many proxies allow CONNECT to port 443 only |
 | RELP session lost mid-batch | reconnect once in the same call and send only the unanswered messages, then `Backpressured` if that fails too |
 | RELP answer other than `200` for a message | `Backpressured`, the session kept |
@@ -113,11 +113,13 @@ There is no maintained Rust RELP crate. The client is in `src/transport/syslog/r
 | `send_timeout_ms` | 30000 | one send with no deadline of its own |
 | `relp_window` | 128 | RELP messages in flight |
 | `proxy` | `none` | `none`, `system` or an `http://` proxy URL, for `tcp`, `tls` and `relp`: an HTTP CONNECT tunnel with TLS inside it ([http.md](http.md#proxy-redirects-and-logs)) |
+| `tls.profile` | `strong` | `strong`, `commercial` or `cnsa2` ([../tls-profiles.md](../tls-profiles.md)) |
 | `tls.trust` | `native` | `native`, `platform` or `bundle` ([../api/tls.md](../api/tls.md)) |
-| `tls.ca_path` | none | CA PEM file |
+| `tls.ca_paths` | none | CA PEM files, one path or a list |
 | `tls.client_cert_path`, `tls.client_key_path` | none | client certificate for mutual TLS, both or neither |
 | `tls.pin_sha256` | none | SHA-256 pins on the receiver's public key, checked after its chain ([key pins](../api/tls.md#client-trust)) |
 | `tls.server_name` | host of `address` | the name the receiver's certificate is checked against |
+| `tls.key_share` | `profile` | `classical` sends a classical key share first, for a receiver behind a middlebox that drops the larger one |
 | `filters_out` | none | outbound filters on each payload ([filter-engine.md](filter-engine.md)) |
 
 A `tls` section with `protocol: tcp` or `udp` is refused at build, and so are a `proxy` other than `none` with `udp`, an address with no port, a `max_message_bytes` under 480 or, for UDP, over 65507, and a `relp_window` of 0.

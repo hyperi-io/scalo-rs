@@ -35,9 +35,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
-pub use config::{
-    Facility, Severity, SyslogConfig, SyslogFormat, SyslogFraming, SyslogProtocol, SyslogTlsConfig,
-};
+pub use config::{Facility, Severity, SyslogConfig, SyslogFormat, SyslogFraming, SyslogProtocol};
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -114,17 +112,17 @@ impl SyslogTransport {
             let section = config.tls.clone().unwrap_or_default();
             let host = config::host_of(&config.address).unwrap_or_default();
             let name = section.server_name.as_deref().unwrap_or(host).to_string();
-            let name = ServerName::try_from(name.clone()).map_err(|e| {
+            let server_name = ServerName::try_from(name.clone()).map_err(|e| {
                 TransportError::Config(format!("syslog: TLS server name `{name}`: {e}"))
             })?;
-            let client = section
-                .client
-                .client_tls()
-                .and_then(|tls| {
-                    crate::tls::build_client_tls(crate::crypto::CryptoProfile::default(), &tls)
-                })
-                .map_err(|e| TransportError::Config(format!("syslog: {e}")))?;
-            Some((client, name))
+            let fail = |e: crate::tls::TlsError| TransportError::Config(format!("syslog: {e}"));
+            let client = section.client_tls().map_err(fail)?;
+            let settings = client.profile_settings().map_err(fail)?;
+            Some(stream::ConnectorTls {
+                config: crate::tls::build_client_tls(&client).map_err(fail)?,
+                server_name,
+                settings,
+            })
         } else {
             None
         };
@@ -170,7 +168,7 @@ impl SyslogTransport {
             framing = ?config.framing,
             tls = config.uses_tls(),
             proxy = config.proxy.kind(),
-            trust = config.tls.as_ref().map(|t| t.client.trust.as_str()),
+            trust = config.tls.as_ref().map(|t| t.trust.as_str()),
             guarantee = %transport.delivery_guarantee(),
             max_message_bytes = transport.limit,
             "syslog sender built"
