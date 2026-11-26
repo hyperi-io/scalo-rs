@@ -534,7 +534,8 @@ mod tests {
             config
         };
         // (case, config, built, text a refusal carries)
-        let cases = [
+        // Boxed: five TransportConfig values are over clippy's 16 KiB stack-array limit.
+        let cases = vec![
             (
                 "file under ack",
                 file(),
@@ -550,7 +551,8 @@ mod tests {
             ),
             ("pipe under flush", with(pipe(), Flush), true, ""),
             ("memory under ack", with(memory(), Ack), true, ""),
-        ];
+        ]
+        .into_boxed_slice();
         for (case, config, built, text) in cases {
             match AnySender::from_transport_config(&config).await {
                 Ok(sender) => {

@@ -47,6 +47,12 @@ pub struct GrpcConfig {
     /// When set, the transport accepts incoming Push RPCs.
     pub listen: Option<String>,
 
+    /// TLS for `listen`: the [`ServerTlsConfig`](crate::tls::ServerTlsConfig)
+    /// every listener reads, with its profile, certificate, key, client CAs,
+    /// `client_auth` and reload. Unset, `listen` serves plaintext. It needs
+    /// `listen`.
+    pub listen_tls: Option<crate::tls::ServerTlsConfig>,
+
     /// Client endpoint URI (e.g., "http://loader:6000"). When set, the
     /// transport can send messages to a remote server, over TLS when it is
     /// `https://`.
@@ -192,6 +198,7 @@ impl Default for GrpcConfig {
     fn default() -> Self {
         Self {
             listen: None,
+            listen_tls: None,
             endpoint: None,
             recv_buffer_size: 10_000,
             recv_timeout_ms: 100,
@@ -262,6 +269,29 @@ impl GrpcConfig {
             .map_err(|e| crate::transport::TransportError::Config(e.to_string()))
     }
 
+    /// `listen_tls`, which needs `listen`.
+    ///
+    /// # Errors
+    ///
+    /// `TransportError::Config` when `listen_tls` is set with no `listen`.
+    pub(crate) fn check_listen(&self) -> crate::transport::TransportResult<()> {
+        if self.listen_tls.is_some() && self.listen.is_none() {
+            return Err(crate::transport::TransportError::Config(
+                "gRPC: listen_tls needs listen".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether `listen` serves plaintext on a production deployment, which the
+    /// receive server logs once at bind. `is_production` is
+    /// [`crate::env::is_production`]'s answer, passed in so the rule can be
+    /// tested for both postures.
+    #[must_use]
+    pub(crate) fn warns_plaintext_listen(&self, is_production: bool) -> bool {
+        is_production && self.listen.is_some() && self.listen_tls.is_none()
+    }
+
     /// Set max message size.
     #[must_use]
     pub fn with_max_message_size(mut self, size: usize) -> Self {
@@ -308,13 +338,15 @@ mod tests {
     #[cfg(feature = "config")]
     #[test]
     fn the_tls_section_reaches_the_config_through_the_cascade() {
-        use crate::tls::{ClientTlsConfig, CryptoProfile, KeyShare, TrustChoice};
+        use crate::tls::{ClientTlsConfig, CryptoProfile, KeyShare, ServerTlsConfig, TrustChoice};
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("settings.yaml"),
-            "grpc:\n  endpoint: https://loader:6000\n  tls:\n    profile: cnsa2\n    \
-             trust: bundle\n    ca_paths: /etc/tls/ca.pem\n    server_name: loader\n",
+            "grpc:\n  listen: 0.0.0.0:6000\n  listen_tls:\n    cert_file: /etc/tls/push.pem\n    \
+             key_file: /etc/tls/push.key\n  endpoint: https://loader:6000\n  tls:\n    \
+             profile: cnsa2\n    trust: bundle\n    ca_paths: /etc/tls/ca.pem\n    \
+             server_name: loader\n",
         )
         .unwrap();
         temp_env::with_var("GRPCTLS__GRPC__TLS__KEY_SHARE", Some("classical"), || {
@@ -328,6 +360,13 @@ mod tests {
             .unwrap();
         });
         let config = GrpcConfig::from_cascade().unwrap();
+        assert_eq!(
+            config.listen_tls,
+            Some(ServerTlsConfig::from_files(
+                "/etc/tls/push.pem",
+                "/etc/tls/push.key"
+            ))
+        );
         assert_eq!(
             config.tls,
             Some(ClientTlsConfig {

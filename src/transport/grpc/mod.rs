@@ -67,6 +67,7 @@ mod coalesce;
 pub mod config;
 pub(crate) mod pending;
 pub mod proto;
+mod tls_incoming;
 pub mod token;
 
 pub use super::hold::{HoldLadder, HoldLadderError, Rung, hold_budget};
@@ -304,6 +305,24 @@ pub(crate) fn answer<T>(outcome: Outcome, response: T) -> Result<Response<T>, St
             "receiver shut down before its records were released -- retry",
         )),
     }
+}
+
+/// The server TLS for `listen_tls`, or `None` for a plaintext listener.
+///
+/// The client refuses a server that does not agree to h2 over ALPN, so the
+/// listener always offers it.
+async fn load_listen_tls(config: &GrpcConfig) -> TransportResult<Option<crate::tls::ServerTls>> {
+    let Some(section) = &config.listen_tls else {
+        return Ok(None);
+    };
+    let options = crate::tls::ServerTlsOptions {
+        alpn_protocols: vec![b"h2".to_vec()],
+        profiles: None,
+    };
+    crate::tls::ServerTls::load_with(section, options)
+        .await
+        .map(Some)
+        .map_err(|e| TransportError::Config(format!("gRPC listen_tls: {e}")))
 }
 
 /// The connections the receive server accepts, each with TCP_NODELAY on as the
@@ -750,6 +769,7 @@ impl GrpcTransport {
     async fn new_inner(options: GrpcTransportBuilder<'_>) -> TransportResult<Self> {
         let config = options.config;
         config.check_compression()?;
+        config.check_listen()?;
         let pending = options.hold_registry();
         #[cfg(feature = "governor")]
         let pressure = options.pressure;
@@ -778,6 +798,7 @@ impl GrpcTransport {
             let addr: std::net::SocketAddr = listen
                 .parse()
                 .map_err(|e| TransportError::Config(format!("invalid listen address: {e}")))?;
+            let listen_tls = load_listen_tls(config).await?;
 
             let (tx, rx) = mpsc::channel(config.recv_buffer_size);
             let (sd_tx, sd_rx) = oneshot::channel();
@@ -860,15 +881,25 @@ impl GrpcTransport {
             local_addr = Some(listener.local_addr().map_err(|e| {
                 TransportError::Config(format!("cannot read the address bound for {addr}: {e}"))
             })?);
-            let incoming = accepting(listener);
+            if config.warns_plaintext_listen(crate::env::is_production()) {
+                tracing::warn!(
+                    listen = %addr,
+                    "gRPC: the Push listener serves plaintext in production -- set listen_tls"
+                );
+            }
 
-            let handle = tokio::spawn(async move {
-                router
-                    .serve_with_incoming_shutdown(incoming, async {
-                        sd_rx.await.ok();
-                    })
-                    .await
-            });
+            let shutdown = async move {
+                sd_rx.await.ok();
+            };
+            let handle = match listen_tls {
+                Some(tls) => tokio::spawn(router.serve_with_incoming_shutdown(
+                    tls_incoming::TlsIncoming::new(listener, tls),
+                    shutdown,
+                )),
+                None => {
+                    tokio::spawn(router.serve_with_incoming_shutdown(accepting(listener), shutdown))
+                }
+            };
 
             receiver = Some(tokio::sync::Mutex::new(rx));
             shutdown_tx = Some(sd_tx);
@@ -2141,6 +2172,7 @@ mod tests {
         assert_eq!(config.max_message_size, 16 * 1024 * 1024);
         assert!(config.compression.is_none());
         assert!(config.tls.is_none());
+        assert!(config.listen_tls.is_none());
         assert_eq!(
             config.coalesce,
             CoalesceConfig {
@@ -2840,6 +2872,150 @@ mod tests {
                 rustls::NamedGroup::MLKEM1024
             )]
         );
+    }
+
+    /// `listen_tls` serves TLS from config. A client trusting the server's CA
+    /// is served, and one trusting another CA is refused at its handshake.
+    /// Under `client_auth: required` a client presenting a certificate from the
+    /// CA is served, and one presenting none is turned away.
+    #[tokio::test]
+    async fn the_push_listener_serves_tls_from_config() {
+        use crate::tls::test_pki::TestCa;
+        use crate::tls::{ClientAuth, ClientTlsConfig, ServerTlsConfig, TrustChoice};
+
+        enum Outcome {
+            Delivered,
+            Refused(&'static str),
+            Backpressured,
+        }
+
+        let ca = TestCa::new("push listener ca");
+        let other = TestCa::new("push listener other ca");
+        let leaf = ca.server("push");
+        let client_leaf = ca.client("push client");
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, pem: &str| -> std::path::PathBuf {
+            let path = dir.path().join(name);
+            std::fs::write(&path, pem).unwrap();
+            path
+        };
+        let cert = write("cert.pem", &leaf.cert_pem);
+        let key = write("key.pem", &leaf.key_pem);
+        let ca_file = write("ca.pem", &ca.pem());
+        let other_file = write("other.pem", &other.pem());
+        let client_cert = write("client.pem", &client_leaf.cert_pem);
+        let client_key = write("client.key", &client_leaf.key_pem);
+
+        let rows = [
+            (
+                "trusted CA",
+                ClientAuth::None,
+                &ca_file,
+                false,
+                Outcome::Delivered,
+            ),
+            (
+                "another CA",
+                ClientAuth::None,
+                &other_file,
+                false,
+                Outcome::Refused("does not chain to a trusted CA"),
+            ),
+            (
+                "required, client certificate",
+                ClientAuth::Required,
+                &ca_file,
+                true,
+                Outcome::Delivered,
+            ),
+            (
+                "required, no client certificate",
+                ClientAuth::Required,
+                &ca_file,
+                false,
+                Outcome::Backpressured,
+            ),
+        ];
+        for (name, client_auth, trust, identity, want) in rows {
+            let server_tls = ServerTlsConfig {
+                client_auth,
+                ca_files: match client_auth {
+                    ClientAuth::None => Vec::new(),
+                    _ => vec![ca_file.clone()],
+                },
+                reload_interval_secs: 0,
+                ..ServerTlsConfig::from_files(cert.clone(), key.clone())
+            };
+            let server = GrpcTransport::new(&GrpcConfig {
+                listen_tls: Some(server_tls),
+                ..GrpcConfig::server("127.0.0.1:0")
+            })
+            .await
+            .unwrap();
+            let port = server.local_addr().unwrap().port();
+
+            let mut config = GrpcConfig::client(&format!("https://localhost:{port}"));
+            config.send_timeout_ms = 5_000;
+            config.tls = Some(ClientTlsConfig {
+                trust: TrustChoice::Bundle,
+                ca_paths: vec![trust.clone()],
+                client_cert_path: identity.then(|| client_cert.clone()),
+                client_key_path: identity.then(|| client_key.clone()),
+                ..ClientTlsConfig::default()
+            });
+            let client = GrpcTransport::new(&config).await.unwrap();
+            let result = client.send("events", filled(8)).await;
+            match want {
+                Outcome::Delivered => {
+                    assert!(result.is_ok(), "{name}: {result:?}");
+                    assert_eq!(server.recv(10).await.unwrap().records.len(), 1, "{name}");
+                }
+                Outcome::Refused(text) => {
+                    let SendResult::Fatal(TransportError::Config(got)) = &result else {
+                        panic!("{name}: {result:?}");
+                    };
+                    assert!(got.contains(text), "{name}: {got}");
+                }
+                Outcome::Backpressured => {
+                    assert!(
+                        matches!(result, SendResult::Backpressured),
+                        "{name}: {result:?}"
+                    );
+                }
+            }
+            client.close().await.unwrap();
+            server.close().await.unwrap();
+        }
+    }
+
+    /// The build refuses `listen_tls` with no `listen`, and a plaintext
+    /// listener warns only where the deployment is production.
+    #[test]
+    fn listen_tls_needs_listen_and_plaintext_warns_in_production_only() {
+        let tls = Some(crate::tls::ServerTlsConfig::from_files("/c.pem", "/k.pem"));
+        let client = GrpcConfig::client("http://peer:6000");
+        let plaintext = GrpcConfig::server("127.0.0.1:6000");
+        let secured = GrpcConfig {
+            listen_tls: tls.clone(),
+            ..GrpcConfig::server("127.0.0.1:6000")
+        };
+        let orphan = GrpcConfig {
+            listen_tls: tls,
+            ..GrpcConfig::client("http://peer:6000")
+        };
+        let refusal = orphan.check_listen().unwrap_err().to_string();
+        assert!(refusal.contains("listen_tls needs listen"), "{refusal}");
+        assert!(secured.check_listen().is_ok());
+
+        for (name, config, production, want) in [
+            ("client only, dev", &client, false, false),
+            ("client only, production", &client, true, false),
+            ("plaintext, dev", &plaintext, false, false),
+            ("plaintext, production", &plaintext, true, true),
+            ("TLS, production", &secured, true, false),
+        ] {
+            assert_eq!(config.warns_plaintext_listen(production), want, "{name}");
+        }
     }
 
     /// Record headers, the dedup key among them, reach `recv` from a
