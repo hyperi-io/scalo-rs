@@ -36,6 +36,10 @@ quality:
     - tool: semgrep
       id: package_managers.renovate.renovate-missing-minimum-release-age.renovate-missing-minimum-release-age
       reason: "renovate.json gives rdkafka and rdkafka-sys minimumReleaseAge 0 days on purpose: docs/deployment/native-deps.md records that they take each release with no cooldown. Every other packageRule sets 7 days."
+    # Pre-GA, an API change consumers migrate in lockstep ships as a patch, listed in docs/migrations.md.
+    - tool: cargo-semver-checks
+      id: "2.14.41"
+      reason: "DecodeLimits gains max_records, the syslog receiver and sender gain config fields, and the file DLQ and output take max_age_days as an Option. Consumers move in lockstep per docs/migrations.md ## 2.14.41."
 test:
   enabled: true
   coverage: false

@@ -50,20 +50,20 @@ The library reads `files/contract.json` from the thin chart, not from itself, so
 
 A release pipeline runs these steps after it builds the image. Nothing here depends on a particular tool: they reproduce a thin chart by hand or in any language.
 
-1. **Validate the contract.** Pick `schema/deployment-contract.v<N>.schema.json` for the contract's `schema_version`. No such file means this library release cannot render that contract. The contract must validate against it without error.
-2. **Copy the skeleton.** Copy `skeleton/` to a directory named after the contract's `app_name`.
-3. **Write `files/contract.json`.** The contract, byte for byte as the service emitted or committed it.
-4. **Fill in `Chart.yaml`.** Set `name` to `app_name`, `version` to the service's release version, and `appVersion` to the image tag exactly as pushed, `v` included. Set `description` to the contract's when it has one. Replace `dependencies` with one entry: `name: scalo-service`, the library `version`, and the `repository` it is pulled from.
-5. **Find the dials.** A contract with no `config_schema`, or a null one, has none. Otherwise walk it from its root, carrying a dotted path:
+1. Validate the contract. Pick `schema/deployment-contract.v<N>.schema.json` for the contract's `schema_version`. No such file means this library release cannot render that contract. The contract must validate against it without error.
+2. Copy the skeleton. Copy `skeleton/` to a directory named after the contract's `app_name`.
+3. Write `files/contract.json`. The contract, byte for byte as the service emitted or committed it.
+4. Fill in `Chart.yaml`. Set `name` to `app_name`, `version` to the service's release version, and `appVersion` to the image tag exactly as pushed, `v` included. Set `description` to the contract's when it has one. Replace `dependencies` with one entry: `name: scalo-service`, the library `version`, and the `repository` it is pulled from.
+5. Find the dials. A contract with no `config_schema`, or a null one, has none. Otherwise walk it from its root, carrying a dotted path:
    - a node carrying `x-scalo-dial` is a dial at the current path, recorded once, and nothing beneath it is walked; its value must be `big` or `small`, and every name on its path must be one or more ASCII letters, digits, `_` or `-`, because each becomes a key in `values.yaml`
    - a `$ref` is followed to its target at the same path, at most once per reference along one branch
    - each `properties` entry is walked at `<path>.<name>`, in name order
    - each `allOf`, `anyOf` and `oneOf` branch is walked at the same path
 
    `scalo::deployment::dials` is this walk, and the test suite checks the fixtures against it.
-6. **Inline each dial.** Replace every local `$ref` inside a dial with its target, keys on the node beside the `$ref` winning. Keep every constraint (`minimum`, `maximum`, `enum`, `pattern`, `default`) and the `x-scalo-dial` marker.
-7. **Write `values.schema.json`.** Start from `skeleton/values.schema.json`, the fragment. Add `properties.config` as `{"type": "object"}`, and for each dial path `a.b.c` nest `properties.a` and `properties.b` as `{"type": "object"}` objects under it and set `properties.c` to the inlined dial. When the fragment has no top-level `$schema`, set it to the `$schema` of the contract's `config_schema`. A fragment that already declares `properties.config` is an error.
-8. **Write `values.yaml`.** `config: {}`, `image.digest` set to the digest built for the tag, and one comment line per dial, `# config.<path>: <default>  # <tier>`, so an operator sees what can be tuned without it being set.
+6. Inline each dial. Replace every local `$ref` inside a dial with its target, keys on the node beside the `$ref` winning. Keep every constraint (`minimum`, `maximum`, `enum`, `pattern`, `default`) and the `x-scalo-dial` marker.
+7. Write `values.schema.json`. Start from `skeleton/values.schema.json`, the fragment. Add `properties.config` as `{"type": "object"}`, and for each dial path `a.b.c` nest `properties.a` and `properties.b` as `{"type": "object"}` objects under it and set `properties.c` to the inlined dial. When the fragment has no top-level `$schema`, set it to the `$schema` of the contract's `config_schema`. A fragment that already declares `properties.config` is an error.
+8. Write `values.yaml`. `config: {}`, `image.digest` set to the digest built for the tag, and one comment line per dial, `# config.<path>: <default>  # <tier>`, so an operator sees what can be tuned without it being set.
 
 Write the files these steps derive (`Chart.yaml`, `values.schema.json`, `values.yaml`) with sorted keys and no timestamp, so one assembler given the same inputs writes the same bytes. Two assemblers may differ in comments and layout, never in what the chart renders.
 
