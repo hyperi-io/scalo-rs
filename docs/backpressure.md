@@ -35,6 +35,8 @@ paused the gate stays paused until pressure drops well below the pause
 threshold, not the instant it dips under it, or until the hold reaches
 `self_regulation.max_hold_secs` (default 30). Then every gate on the latch resumes once and stays open until a receive returns records, or 2 s pass, since a resumed Kafka consumer has to fetch before it returns anything. It pauses again after that if pressure is still at `pause_above` -- see [self-regulation.md](self-regulation.md).
 
+A Kafka rebalance follows the gate. A partition assigned while the gate holds is paused as it arrives, and one assigned after the gate opens fetches. librdkafka keeps a pause on a partition across a revoke and a later assign, so without this a partition lost during a hold and given back afterwards would never fetch again.
+
 ### The lossless caveat for the receiver
 
 Kafka and fetcher sources are pull-based: pausing the pull leaves the data at

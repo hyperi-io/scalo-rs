@@ -2597,16 +2597,9 @@ impl KafkaTransport {
         #[cfg(feature = "governor")]
         if let Some(ref gate) = self.inbound_gate {
             let _ = gate.evaluate();
-            // Level-triggered re-pause while held. The edge actuator pauses the
-            // assignment captured at the rising edge and never re-pauses while
-            // latched. A cooperative rebalance during the hold (routine under
-            // KEDA churn) then assigns NEW partitions UNPAUSED and ingest
-            // silently reopens at full rate while pressure is still high,
-            // defeating the brake. Re-applying pause to the CURRENT assignment
-            // each recv while held is idempotent for already-paused partitions
-            // and catches the newly assigned ones. The falling-edge resume()
-            // resumes the current assignment, so nothing is stranded paused.
-            // Off the per-record path -- once per recv, only while held.
+            // While held, re-pause the current assignment once per recv: the
+            // edge paused only what was assigned then. Assignments after the
+            // release are resumed by `StatsContext::post_rebalance`.
             if gate.is_held()
                 && let Ok(tpl) = consumer.assignment()
                 && tpl.count() > 0

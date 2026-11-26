@@ -832,17 +832,28 @@ mod broker {
     /// Write `{"seq":N}` to `topic` for each N in `seqs`, and wait for every
     /// delivery.
     pub(super) async fn produce(bootstrap: &str, topic: &str, seqs: Range<usize>) {
+        produce_into(bootstrap, topic, None, seqs).await;
+    }
+
+    /// As [`produce`], into `partition` when one is given.
+    pub(super) async fn produce_into(
+        bootstrap: &str,
+        topic: &str,
+        partition: Option<i32>,
+        seqs: Range<usize>,
+    ) {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap)
             .create()
             .expect("raw producer");
         for seq in seqs {
             let payload = format!("{{\"seq\":{seq}}}");
+            let mut record = FutureRecord::<(), str>::to(topic).payload(&payload);
+            if let Some(partition) = partition {
+                record = record.partition(partition);
+            }
             producer
-                .send(
-                    FutureRecord::<(), str>::to(topic).payload(&payload),
-                    Duration::from_secs(10),
-                )
+                .send(record, Duration::from_secs(10))
                 .await
                 .unwrap_or_else(|(e, _)| panic!("deliver record {seq}: {e}"));
         }
@@ -1481,7 +1492,7 @@ mod group_protocol {
     /// A classic-protocol, cooperative-sticky member of a group, polled on its
     /// own thread until it leaves -- the member a consumer that fell back to
     /// classic leaves behind in a roll.
-    struct ClassicMember {
+    pub(super) struct ClassicMember {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -1489,7 +1500,7 @@ mod group_protocol {
     impl ClassicMember {
         /// Join `group` on `topic`, polling on a thread of its own, and return
         /// once the member holds a partition, or at once when `wait` is false.
-        async fn join(bootstrap: &str, topic: &str, group: &str, wait: bool) -> Self {
+        pub(super) async fn join(bootstrap: &str, topic: &str, group: &str, wait: bool) -> Self {
             let consumer: BaseConsumer = ClientConfig::new()
                 .set("bootstrap.servers", bootstrap)
                 .set("group.id", group)
@@ -1534,7 +1545,7 @@ mod group_protocol {
         }
 
         /// Leave the group and wait until the member has closed.
-        async fn leave(mut self) {
+        pub(super) async fn leave(mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(thread) = self.thread.take() {
                 tokio::task::spawn_blocking(move || thread.join())
@@ -1877,6 +1888,89 @@ mod group_protocol {
             }
         }
         assert!(sender.is_healthy(), "delivered, so ready again");
+    }
+}
+
+/// The inbound gate across a rebalance. librdkafka keeps an application pause
+/// on a partition across a revoke and a later assign, so a partition lost
+/// while the gate holds, and given back after it releases, must fetch again.
+#[cfg(all(feature = "testcontainers", feature = "governor"))]
+mod gate_rebalance {
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    use scalo::transport::TransportReceiver;
+    use scalo::transport::kafka::{ConsumerProtocol, KafkaConfig, KafkaTransport};
+
+    use super::broker::{consumer_config, create_topic_with_partitions, produce_into, start_kafka};
+    use super::group_protocol::ClassicMember;
+
+    const PARTITIONS: i32 = 2;
+    const RECORDS: usize = 20;
+
+    /// The partitions of `topic` the member holds a lease on.
+    fn leased(member: &KafkaTransport, topic: &str) -> BTreeSet<i32> {
+        (0..PARTITIONS)
+            .filter(|partition| member.lease(topic, *partition).is_some())
+            .collect()
+    }
+
+    /// Receive until the member holds `count` partitions of `topic`, failing
+    /// after 60 s. Returns what it holds.
+    async fn receive_until_holding(
+        member: &KafkaTransport,
+        topic: &str,
+        count: usize,
+    ) -> BTreeSet<i32> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            member.recv(100).await.expect("recv");
+            let holding = leased(member, topic);
+            if holding.len() == count {
+                return holding;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "held {holding:?} of {topic} after 60 s, wanted {count} partitions"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_partition_lost_during_a_hold_reads_again_once_given_back() {
+        let Some((_node, bootstrap)) = start_kafka().await else {
+            return;
+        };
+        let (topic, group) = ("gate-rebalance", "gate-rebalance-group");
+        create_topic_with_partitions(&bootstrap, topic, PARTITIONS).await;
+        let config = KafkaConfig {
+            consumer_protocol: ConsumerProtocol::Classic,
+            ..consumer_config(&bootstrap, topic, group)
+        }
+        .with_override("partition.assignment.strategy", "cooperative-sticky");
+        let member = KafkaTransport::new(&config).await.expect("consumer");
+        receive_until_holding(&member, topic, 2).await;
+
+        member.gate_actuator().pause();
+        let second = ClassicMember::join(&bootstrap, topic, group, false).await;
+        let kept = receive_until_holding(&member, topic, 1).await;
+        member.gate_actuator().resume();
+        second.leave().await;
+        receive_until_holding(&member, topic, 2).await;
+
+        let lost = (0..PARTITIONS)
+            .find(|partition| !kept.contains(partition))
+            .expect("one partition was lost");
+        produce_into(&bootstrap, topic, Some(lost), 0..RECORDS).await;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut read = 0;
+        while read < RECORDS {
+            assert!(
+                Instant::now() < deadline,
+                "read {read} of {RECORDS} records from partition {lost} within 60 s"
+            );
+            read += member.recv(100).await.expect("recv").records.len();
+        }
     }
 }
 
