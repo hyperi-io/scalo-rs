@@ -3,6 +3,27 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.40](https://github.com/hyperi-io/scalo-rs/compare/v2.14.39...v2.14.40) (2026-11-26)
+
+### Bug Fixes
+
+* **deps:** raise jiff to 1.0.3, test timestamps ([#576](https://github.com/hyperi-io/scalo-rs/issues/576)) ([94dd715](https://github.com/hyperi-io/scalo-rs/commit/94dd715165fda19d5eafb942e27993ac45130b0e)), closes [BurntSushi/jiff#723](https://github.com/BurntSushi/jiff/issues/723)
+* **deps:** update dependencies, pin Rust 1.100 ([c09ade5](https://github.com/hyperi-io/scalo-rs/commit/c09ade51b1f7a2742ae2f88ccd22e5c23c9c3125))
+* **io:** use shared backoff for ndjson writer retries ([26a9df7](https://github.com/hyperi-io/scalo-rs/commit/26a9df7f1c3418c4e612ff27cec97a83b44d8a97))
+* **kafka:** resume partitions reassigned after a hold ([abbbad2](https://github.com/hyperi-io/scalo-rs/commit/abbbad24c6d8aaad2789c5e1f7f729069916b801))
+* **kafka:** wait for deleted topics to return ([45e81ba](https://github.com/hyperi-io/scalo-rs/commit/45e81ba43f912d86eddfe297c916f05811935634))
+* **logger:** support extra tracing layers ([60a9ad6](https://github.com/hyperi-io/scalo-rs/commit/60a9ad67cd9d915087ed1bba8df6d0013612f192)), closes [tokio-rs/tracing#2519](https://github.com/tokio-rs/tracing/issues/2519)
+* **metrics:** register metrics through one helper ([1845c26](https://github.com/hyperi-io/scalo-rs/commit/1845c262e887bca87caacba87b23e664c445c133))
+* **metrics:** report byte and time units over OTLP ([9be925a](https://github.com/hyperi-io/scalo-rs/commit/9be925a04932ccbc636926f07a4a13f3978f2d97))
+* **runtime:** stop three listener and drop bugs ([00a95bf](https://github.com/hyperi-io/scalo-rs/commit/00a95bff0652d8e76f19bf844bbf48ad51af5654))
+* **spool:** return a typed error for spools with live owners ([0df9af1](https://github.com/hyperi-io/scalo-rs/commit/0df9af17b89b9b4a487ad127dc90918707c862cc))
+* **tls:** set OPENSSL_CONF from the deployment contract ([77892cb](https://github.com/hyperi-io/scalo-rs/commit/77892cb43c312c93c3639c7c8816701cefe6f75b))
+* **tls:** use one tls section and profiles ([e8a3c79](https://github.com/hyperi-io/scalo-rs/commit/e8a3c79aeacfc5a5739368d29ff30de2661c5fff))
+* **transport:** add a syslog receiver ([92fa539](https://github.com/hyperi-io/scalo-rs/commit/92fa539819667b1332174364a2827144f011278b)), closes [#557](https://github.com/hyperi-io/scalo-rs/issues/557)
+* **transport:** add resolver and numbered rotation ([49f5a32](https://github.com/hyperi-io/scalo-rs/commit/49f5a324c469c1ec9b5b9c3f2c25a1ba99537a0d))
+* **transport:** share one held-bytes ledger across ack paths ([d4073a7](https://github.com/hyperi-io/scalo-rs/commit/d4073a7246529ed67a9b812bb8b70f56799546d5))
+* **worker:** register the worker config sections ([1748360](https://github.com/hyperi-io/scalo-rs/commit/17483605d67244c09187ffb8c2ef590db3b9e812))
+
 ## [2.14.39](https://github.com/hyperi-io/scalo-rs/compare/v2.14.38...v2.14.39) (2026-11-25)
 
 ### Bug Fixes
