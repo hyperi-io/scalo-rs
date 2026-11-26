@@ -14,7 +14,10 @@
 //! - Byte count reaches `max_bytes`
 //! - Time since last drain reaches `max_wait`
 //!
-//! Bounded -- pushers get an error when the channel is full (backpressure).
+//! Bounded -- `push` waits for room when the channel is full (backpressure),
+//! and `try_push` returns [`AccumulatorFull`] instead of waiting.
+//! A batch never exceeds `max_bytes` unless one item alone is larger, and
+//! that item goes out alone.
 //! Shutdown-safe -- `drain_remaining()` flushes buffered items.
 //!
 //! ## Example
@@ -81,14 +84,21 @@ pub struct BatchDrainer<T> {
     config: AccumulatorConfig,
     buffer: Vec<T>,
     buffer_bytes: usize,
+    /// An item that did not fit in the batch being returned. It opens the next one.
+    held: Option<(T, usize)>,
 }
 
-/// Error when the accumulator channel is full (backpressure).
+/// Error when the accumulator channel is full, from [`BatchAccumulator::try_push`].
 #[derive(Debug, thiserror::Error)]
 #[error("accumulator full -- backpressure active ({capacity} items buffered)")]
 pub struct AccumulatorFull {
     pub capacity: usize,
 }
+
+/// Error when the drainer has been dropped, from [`BatchAccumulator::push`].
+#[derive(Debug, thiserror::Error)]
+#[error("accumulator closed -- the drainer was dropped")]
+pub struct AccumulatorClosed;
 
 impl<T: Send + 'static> BatchAccumulator<T> {
     /// Create a new accumulator + drainer pair.
@@ -103,19 +113,33 @@ impl<T: Send + 'static> BatchAccumulator<T> {
             rx,
             buffer: Vec::with_capacity(config.max_items),
             buffer_bytes: 0,
+            held: None,
             config: config.clone(),
         };
         (Self { tx }, drainer)
     }
 
-    /// Push an item into the accumulator.
+    /// Push an item into the accumulator, waiting while the channel is full.
     ///
     /// `byte_size` is used for the bytes threshold. Pass `payload.len()`.
     ///
     /// # Errors
     ///
-    /// Returns `AccumulatorFull` if the channel is at capacity (backpressure).
-    pub async fn push(&self, item: T, byte_size: usize) -> Result<(), AccumulatorFull> {
+    /// Returns `AccumulatorClosed` if the drainer has been dropped.
+    pub async fn push(&self, item: T, byte_size: usize) -> Result<(), AccumulatorClosed> {
+        self.tx
+            .send((item, byte_size))
+            .await
+            .map_err(|_| AccumulatorClosed)
+    }
+
+    /// Push an item without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AccumulatorFull` if the channel is at capacity. A closed
+    /// drainer also returns `AccumulatorFull`.
+    pub fn try_push(&self, item: T, byte_size: usize) -> Result<(), AccumulatorFull> {
         self.tx
             .try_send((item, byte_size))
             .map_err(|_| AccumulatorFull {
@@ -161,6 +185,10 @@ impl<T> BatchDrainer<T> {
     /// Blocks until any threshold is met (items, bytes, or time). Returns
     /// an empty vec when the channel is closed (all producers dropped = shutdown).
     pub async fn next_batch(&mut self) -> Vec<T> {
+        // The item held back from the previous batch opens this one.
+        if let Some((item, size)) = self.held.take() {
+            self.append(item, size);
+        }
         // If buffer already meets a threshold, drain immediately
         if self.threshold_met() {
             return self.take_buffer();
@@ -197,10 +225,8 @@ impl<T> BatchDrainer<T> {
                 item = self.rx.recv() => {
                     match item {
                         Some((val, size)) => {
-                            self.buffer_bytes += size;
-                            self.buffer.push(val);
-                            if self.threshold_met() {
-                                return self.take_buffer();
+                            if let Some(batch) = self.offer(val, size) {
+                                return batch;
                             }
                         }
                         None => {
@@ -214,13 +240,38 @@ impl<T> BatchDrainer<T> {
     }
 
     /// Drain any remaining buffered items (for graceful shutdown).
+    ///
+    /// Returns everything still held as one `Vec`, past `max_items` and
+    /// `max_bytes`. [`next_batch`](Self::next_batch) keeps batches within
+    /// those bounds.
     pub fn drain_remaining(&mut self) -> Vec<T> {
+        if let Some((item, size)) = self.held.take() {
+            self.append(item, size);
+        }
         // Drain channel
         while let Ok((val, size)) = self.rx.try_recv() {
-            self.buffer_bytes += size;
-            self.buffer.push(val);
+            self.append(val, size);
         }
         self.take_buffer()
+    }
+
+    /// Add an item to the buffer, returning the batch it completes, if any.
+    ///
+    /// An item that would push a non-empty buffer past `max_bytes` is held
+    /// instead, and the buffer is returned. The held item opens the next batch.
+    fn offer(&mut self, val: T, size: usize) -> Option<Vec<T>> {
+        let overflows = self.buffer_bytes.saturating_add(size) > self.config.max_bytes;
+        if !self.buffer.is_empty() && overflows {
+            self.held = Some((val, size));
+            return Some(self.take_buffer());
+        }
+        self.append(val, size);
+        self.threshold_met().then(|| self.take_buffer())
+    }
+
+    fn append(&mut self, val: T, size: usize) {
+        self.buffer_bytes += size;
+        self.buffer.push(val);
     }
 
     fn threshold_met(&self) -> bool {
@@ -262,18 +313,141 @@ mod tests {
         let config = AccumulatorConfig {
             channel_capacity: 100,
             max_items: 1000, // won't trigger
-            max_bytes: 10,   // trigger at 10 bytes
+            max_bytes: 10,   // a batch holds at most 10 bytes
             max_wait: Duration::from_mins(1),
         };
         let (acc, mut drainer) = BatchAccumulator::new(config);
 
-        // Push items with size=3 each -- 4 items = 12 bytes > 10 threshold
+        // Four items of 3 bytes: three fit (9 bytes), the fourth would make 12.
         for i in 0..4 {
             acc.push(i, 3).await.unwrap();
         }
 
         let batch = drainer.next_batch().await;
-        assert_eq!(batch.len(), 4);
+        assert_eq!(batch, vec![0, 1, 2]);
+
+        // The held fourth item opens the next batch once the channel closes.
+        drop(acc);
+        let batch = drainer.next_batch().await;
+        assert_eq!(batch, vec![3]);
+    }
+
+    /// A batch never exceeds `max_bytes` unless one item alone is larger, and
+    /// that item goes out alone. Each case is (item sizes, expected batches).
+    #[tokio::test]
+    async fn test_batches_never_exceed_max_bytes() {
+        let cases: &[(&str, &[usize], &[&[usize]])] = &[
+            ("exact fill", &[5, 5, 5, 5], &[&[5, 5], &[5, 5]]),
+            ("fits before push", &[3, 3, 3, 3], &[&[3, 3, 3], &[3]]),
+            (
+                "oversized item goes alone",
+                &[3, 20, 3],
+                &[&[3], &[20], &[3]],
+            ),
+            ("oversized item first", &[20, 3], &[&[20], &[3]]),
+            (
+                "mixed sizes",
+                &[4, 7, 2, 9, 1, 1, 8],
+                &[&[4], &[7, 2], &[9, 1], &[1, 8]],
+            ),
+        ];
+
+        for (name, sizes, want) in cases {
+            let config = AccumulatorConfig {
+                channel_capacity: 100,
+                max_items: 1000,
+                max_bytes: 10,
+                max_wait: Duration::from_mins(1),
+            };
+            // Each item's byte size is its value.
+            let (acc, mut drainer) = BatchAccumulator::<usize>::new(config);
+            for &size in *sizes {
+                acc.push(size, size).await.unwrap();
+            }
+            drop(acc);
+
+            let mut got: Vec<Vec<usize>> = Vec::new();
+            loop {
+                let batch = drainer.next_batch().await;
+                if batch.is_empty() {
+                    break;
+                }
+                got.push(batch);
+            }
+
+            let want: Vec<Vec<usize>> = want.iter().map(|batch| batch.to_vec()).collect();
+            assert_eq!(got, want, "case: {name}");
+            for batch in &got {
+                let total: usize = batch.iter().sum();
+                assert!(
+                    total <= 10 || batch.len() == 1,
+                    "case {name}: batch {batch:?} holds {total} bytes"
+                );
+            }
+        }
+    }
+
+    /// An item held back from a full batch is returned by `drain_remaining`,
+    /// ahead of the items still in the channel.
+    #[tokio::test]
+    async fn test_drain_remaining_returns_a_held_item_first() {
+        let config = AccumulatorConfig {
+            channel_capacity: 100,
+            max_items: 1000,
+            max_bytes: 10,
+            max_wait: Duration::from_mins(1),
+        };
+        let (acc, mut drainer) = BatchAccumulator::<i32>::new(config);
+        for item in 1..=5 {
+            acc.push(item, 3).await.unwrap();
+        }
+
+        // 1, 2 and 3 make 9 bytes. Item 4 is held, and 5 stays in the channel.
+        let batch = drainer.next_batch().await;
+        assert_eq!(batch, vec![1, 2, 3]);
+
+        assert_eq!(drainer.drain_remaining(), vec![4, 5]);
+    }
+
+    /// `push` waits for room when the channel is full rather than failing.
+    #[tokio::test(start_paused = true)]
+    async fn test_push_waits_for_room_when_full() {
+        let config = AccumulatorConfig {
+            channel_capacity: 1,
+            max_items: 2,
+            max_bytes: usize::MAX,
+            max_wait: Duration::from_mins(1),
+        };
+        let (acc, mut drainer) = BatchAccumulator::<i32>::new(config);
+        acc.push(1, 1).await.unwrap();
+
+        let producer = acc.clone();
+        let second = tokio::spawn(async move { producer.push(2, 1).await });
+
+        // Nothing has drained, so the channel is still full and the push waits.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !second.is_finished(),
+            "push returned while the channel was full"
+        );
+
+        // next_batch takes item 1, freeing the slot, so the second push completes.
+        let batch = drainer.next_batch().await;
+        assert_eq!(batch, vec![1, 2]);
+        second.await.unwrap().unwrap();
+    }
+
+    /// `push` reports a closed drainer as `AccumulatorClosed`, not as full.
+    #[tokio::test]
+    async fn test_push_reports_a_dropped_drainer_as_closed() {
+        let (acc, drainer) = BatchAccumulator::<i32>::new(AccumulatorConfig::default());
+        drop(drainer);
+
+        let err = acc.push(1, 1).await.expect_err("drainer dropped -> closed");
+        assert_eq!(
+            err.to_string(),
+            "accumulator closed -- the drainer was dropped"
+        );
     }
 
     #[tokio::test]
@@ -311,7 +485,7 @@ mod tests {
         acc.push(3, 1).await.unwrap();
 
         // Next push should fail (backpressure)
-        let result = acc.push(4, 1).await;
+        let result = acc.try_push(4, 1);
         assert!(result.is_err());
     }
 
@@ -329,7 +503,7 @@ mod tests {
         acc.push(2, 1).await.unwrap();
         acc.push(3, 1).await.unwrap();
 
-        let err = acc.push(4, 1).await.expect_err("channel full -> error");
+        let err = acc.try_push(4, 1).expect_err("channel full -> error");
         // Reports the CONFIGURED capacity (3), not the remaining permits (0).
         assert_eq!(err.capacity, 3);
     }

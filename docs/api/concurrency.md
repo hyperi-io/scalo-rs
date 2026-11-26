@@ -97,6 +97,12 @@ for telemetry) and `Block` (`try_push` is rejected unconditionally,
 forcing callers to use `push_blocking`/`flush`, so pick this when the
 sink must never silently drop, e.g. billing).
 
+`BackgroundSinkConfig::max_bytes` (default `None`) caps the bytes one drain call
+receives. It counts each item by `SinkDrain::byte_size`, which defaults to 0, so
+a drain that sets `max_bytes` overrides `byte_size` too. An item that would take
+a batch past the cap goes into the next batch, and an item over the cap on its
+own goes out alone.
+
 `push_blocking()` waits for capacity (use sparingly, since the point of this
 primitive is `try_push` returning immediately). In `Block` mode it is
 the only push path -- `try_push` always returns `Err(Overflow)`.
@@ -203,6 +209,7 @@ join.join().await?;
 | `.try_push(msg)` | Hot-path push, returns immediately |
 | `.push_blocking(msg)` | Await capacity |
 | `.flush()` | Wait until every message queued before the call is written, then run `flush_durable`. `Err(SinkError::Drain)` with the first failure since the previous flush -- a size, tick, shutdown or barrier batch write, or `flush_durable`. Reported once: the next flush starts clean |
+| `SinkDrain::byte_size(&item)` | Bytes an item counts for against `max_bytes`. Default 0, so `max_bytes` never splits a batch |
 | `.dropped() -> u64` | Count of dropped messages (overflow) |
 | `.pending() -> usize` | Current queue depth |
 | `BackgroundSinkHandle::join()` | Await the actor task exit (single-owner) |

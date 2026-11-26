@@ -34,9 +34,10 @@
 //! consumer (many) --try_push--> mpsc bounded --> actor task --> drain.write_batch
 //! ```
 //!
-//! The actor batches messages by size (`batch_size`) or interval
-//! (`flush_interval`), whichever fires first, then hands the batch to
-//! the drain. Drain implementations supply backend-specific async I/O.
+//! The actor batches messages by count (`batch_size`), by bytes
+//! (`max_bytes`) or by interval (`flush_interval`), whichever fires
+//! first, then hands the batch to the drain. Drain implementations supply
+//! backend-specific async I/O.
 //!
 //! # Shutdown
 //!
@@ -69,6 +70,13 @@ pub struct BackgroundSinkConfig {
     /// Default 256.
     pub batch_size: usize,
 
+    /// Cap on the bytes one drain call receives, sized by
+    /// [`SinkDrain::byte_size`]. An item that would take the batch past
+    /// the cap is written with the batch before it, so a batch exceeds
+    /// the cap only by one item larger than the cap, which goes out
+    /// alone. `None` (the default) puts no byte bound on a batch.
+    pub max_bytes: Option<usize>,
+
     /// Flush a partial batch after this duration even if it's not full.
     /// Default 100 ms.
     pub flush_interval: Duration,
@@ -96,6 +104,7 @@ impl Default for BackgroundSinkConfig {
         Self {
             queue_capacity: 10_000,
             batch_size: 256,
+            max_bytes: None,
             flush_interval: Duration::from_millis(100),
             overflow: Overflow::Drop,
             metric_prefix: None,
@@ -180,6 +189,14 @@ pub trait SinkDrain<T: Send>: Send + 'static {
     /// unreported (a producer purged but not yet heard from) overrides it.
     fn settled(&self) -> bool {
         true
+    }
+
+    /// Bytes `item` counts for against [`BackgroundSinkConfig::max_bytes`].
+    ///
+    /// Default: 0, so `max_bytes` never splits a batch for a drain that
+    /// does not override this.
+    fn byte_size(&self, _item: &T) -> usize {
+        0
     }
 
     /// One-shot close at actor shutdown. Default: no-op.
@@ -427,6 +444,73 @@ impl<T: Send + 'static> BackgroundSink<T> {
     }
 }
 
+/// The items queued for the next write, with the bytes they count for.
+struct Batch<T> {
+    items: Vec<T>,
+    bytes: usize,
+}
+
+impl<T> Batch<T> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(capacity),
+            bytes: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Whether `size` more bytes would take the batch past `max_bytes`.
+    fn would_exceed(&self, size: usize, max_bytes: Option<usize>) -> bool {
+        max_bytes.is_some_and(|max| self.bytes.saturating_add(size) > max)
+    }
+
+    fn push(&mut self, item: T, size: usize) {
+        self.items.push(item);
+        self.bytes = self.bytes.saturating_add(size);
+    }
+
+    /// Whether the batch has reached `batch_size` items or `max_bytes`.
+    fn is_full(&self, config: &BackgroundSinkConfig) -> bool {
+        self.items.len() >= config.batch_size
+            || config.max_bytes.is_some_and(|max| self.bytes >= max)
+    }
+
+    /// Hand the queued items out for a write and start an empty batch.
+    fn take(&mut self) -> Vec<T> {
+        self.bytes = 0;
+        std::mem::take(&mut self.items)
+    }
+}
+
+/// Queue `item` on `batch`. A batch that `item` would push past `max_bytes`
+/// is written first, so a batch exceeds the bound only by a single item
+/// larger than the bound, which goes out alone.
+async fn admit<T, D: SinkDrain<T>>(
+    drain: &mut D,
+    batch: &mut Batch<T>,
+    item: T,
+    config: &BackgroundSinkConfig,
+    unreported: &mut Option<DrainError>,
+    pending: &AtomicUsize,
+    metric_prefix: Option<&'static str>,
+) where
+    T: Send,
+{
+    let size = drain.byte_size(&item);
+    if !batch.is_empty() && batch.would_exceed(size, config.max_bytes) {
+        let result = write_batch_with_metrics(drain, batch.take(), pending, metric_prefix).await;
+        hold_first_failure(unreported, result);
+    }
+    batch.push(item, size);
+    if batch.is_full(config) {
+        let result = write_batch_with_metrics(drain, batch.take(), pending, metric_prefix).await;
+        hold_first_failure(unreported, result);
+    }
+}
+
 async fn actor_loop<T, D>(
     mut rx: mpsc::Receiver<SinkMsg<T>>,
     mut drain: D,
@@ -438,7 +522,7 @@ async fn actor_loop<T, D>(
     T: Send + 'static,
     D: SinkDrain<T>,
 {
-    let mut batch: Vec<T> = Vec::with_capacity(config.batch_size);
+    let mut batch = Batch::with_capacity(config.batch_size);
     // First write failure since the last barrier. The next barrier reports it.
     let mut unreported: Option<DrainError> = None;
     let mut tick = interval(config.flush_interval);
@@ -458,7 +542,7 @@ async fn actor_loop<T, D>(
 
                 if !batch.is_empty() {
                     let result = write_batch_with_metrics(
-                        &mut drain, std::mem::take(&mut batch),
+                        &mut drain, batch.take(),
                         &pending, metric_prefix,
                     ).await;
                     hold_first_failure(&mut unreported, result);
@@ -466,25 +550,21 @@ async fn actor_loop<T, D>(
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
                         SinkMsg::Data(t) => {
-                            batch.push(t);
-                            if batch.len() >= config.batch_size {
-                                let result = write_batch_with_metrics(
-                                    &mut drain, std::mem::take(&mut batch),
-                                    &pending, metric_prefix,
-                                ).await;
-                                hold_first_failure(&mut unreported, result);
-                            }
+                            admit(
+                                &mut drain, &mut batch, t, &config, &mut unreported,
+                                &pending, metric_prefix,
+                            ).await;
                         }
                         SinkMsg::Barrier(ack) => {
                             let result = barrier_drain(
-                                &mut drain, std::mem::take(&mut batch),
+                                &mut drain, batch.take(),
                                 unreported.take(), &pending, metric_prefix,
                             ).await;
                             ack_barrier(ack, result, &mut unreported);
                         }
                         SinkMsg::Confirmed(items, ack) => {
                             let result = confirmed_write(
-                                &mut drain, std::mem::take(&mut batch), items,
+                                &mut drain, batch.take(), items,
                                 &mut unreported, &pending, metric_prefix,
                             ).await;
                             // A caller gone before its answer took nobody else's refusal with it.
@@ -495,7 +575,7 @@ async fn actor_loop<T, D>(
                 // No barrier can follow this write. Its failure is logged and counted.
                 if !batch.is_empty() {
                     let _ = write_batch_with_metrics(
-                        &mut drain, std::mem::take(&mut batch),
+                        &mut drain, batch.take(),
                         &pending, metric_prefix,
                     ).await;
                 }
@@ -507,25 +587,21 @@ async fn actor_loop<T, D>(
 
             msg = rx.recv() => match msg {
                 Some(SinkMsg::Data(t)) => {
-                    batch.push(t);
-                    if batch.len() >= config.batch_size {
-                        let result = write_batch_with_metrics(
-                            &mut drain, std::mem::take(&mut batch),
-                            &pending, metric_prefix,
-                        ).await;
-                        hold_first_failure(&mut unreported, result);
-                    }
+                    admit(
+                        &mut drain, &mut batch, t, &config, &mut unreported,
+                        &pending, metric_prefix,
+                    ).await;
                 }
                 Some(SinkMsg::Barrier(ack)) => {
                     let result = barrier_drain(
-                        &mut drain, std::mem::take(&mut batch),
+                        &mut drain, batch.take(),
                         unreported.take(), &pending, metric_prefix,
                     ).await;
                     ack_barrier(ack, result, &mut unreported);
                 }
                 Some(SinkMsg::Confirmed(items, ack)) => {
                     let result = confirmed_write(
-                        &mut drain, std::mem::take(&mut batch), items,
+                        &mut drain, batch.take(), items,
                         &mut unreported, &pending, metric_prefix,
                     ).await;
                     // A caller gone before its answer took nobody else's refusal with it.
@@ -535,7 +611,7 @@ async fn actor_loop<T, D>(
                     // No barrier can follow this write. Its failure is logged and counted.
                     if !batch.is_empty() {
                         let _ = write_batch_with_metrics(
-                            &mut drain, std::mem::take(&mut batch),
+                            &mut drain, batch.take(),
                             &pending, metric_prefix,
                         ).await;
                     }
@@ -549,7 +625,7 @@ async fn actor_loop<T, D>(
             _ = tick.tick() => {
                 if !batch.is_empty() {
                     let result = write_batch_with_metrics(
-                        &mut drain, std::mem::take(&mut batch),
+                        &mut drain, batch.take(),
                         &pending, metric_prefix,
                     ).await;
                     hold_first_failure(&mut unreported, result);
@@ -711,6 +787,7 @@ mod tests {
         BackgroundSinkConfig {
             queue_capacity: 1024,
             batch_size: 16,
+            max_bytes: None,
             flush_interval: Duration::from_millis(20),
             overflow: Overflow::Drop,
             metric_prefix: None,
@@ -745,6 +822,7 @@ mod tests {
         let cfg = BackgroundSinkConfig {
             queue_capacity: 4,
             batch_size: 16,
+            max_bytes: None,
             flush_interval: Duration::from_mins(1),
             overflow: Overflow::Drop,
             metric_prefix: None,
@@ -854,6 +932,7 @@ mod tests {
         let cfg = BackgroundSinkConfig {
             queue_capacity: 2,
             batch_size: 16,
+            max_bytes: None,
             flush_interval: Duration::from_mins(1),
             overflow: Overflow::Drop,
             metric_prefix: None,
@@ -891,6 +970,7 @@ mod tests {
         let cfg = BackgroundSinkConfig {
             queue_capacity: 100_000,
             batch_size: 256,
+            max_bytes: None,
             flush_interval: Duration::from_mins(1),
             overflow: Overflow::Drop,
             metric_prefix: None,
@@ -930,6 +1010,7 @@ mod tests {
         let cfg = BackgroundSinkConfig {
             queue_capacity: 100_000,
             batch_size: 1024,
+            max_bytes: None,
             flush_interval: Duration::from_millis(5),
             overflow: Overflow::Drop,
             metric_prefix: None,
@@ -1004,6 +1085,7 @@ mod tests {
         let cfg = BackgroundSinkConfig {
             queue_capacity: 10_000,
             batch_size: 16,
+            max_bytes: None,
             flush_interval: Duration::from_millis(5),
             overflow: Overflow::Drop,
             metric_prefix: None,
@@ -1400,5 +1482,70 @@ mod tests {
             "the written messages left the queue count"
         );
         shutdown.cancel();
+    }
+
+    /// Records every batch it is handed. An item's byte size is its value.
+    #[derive(Clone, Default)]
+    struct SizedDrain {
+        batches: Arc<std::sync::Mutex<Vec<Vec<u32>>>>,
+    }
+
+    impl SinkDrain<u32> for SizedDrain {
+        async fn write_batch(&mut self, batch: Vec<u32>) -> Result<(), DrainError> {
+            self.batches.lock().unwrap().push(batch);
+            Ok(())
+        }
+
+        fn byte_size(&self, item: &u32) -> usize {
+            *item as usize
+        }
+    }
+
+    /// A batch never exceeds `max_bytes` unless one item alone is larger, and
+    /// that item goes out alone. Each case is (item sizes, expected batches).
+    #[tokio::test]
+    async fn a_batch_never_exceeds_max_bytes() {
+        let cases: &[(&str, &[u32], &[&[u32]])] = &[
+            ("exact fill", &[5, 5, 5, 5], &[&[5, 5], &[5, 5]]),
+            ("fits before push", &[3, 3, 3, 3], &[&[3, 3, 3], &[3]]),
+            (
+                "oversized item goes alone",
+                &[3, 20, 3],
+                &[&[3], &[20], &[3]],
+            ),
+            (
+                "mixed sizes",
+                &[4, 7, 2, 9, 1, 1, 8],
+                &[&[4], &[7, 2], &[9, 1], &[1, 8]],
+            ),
+        ];
+
+        for (name, sizes, want) in cases {
+            let batches: Arc<std::sync::Mutex<Vec<Vec<u32>>>> = Arc::default();
+            let drain = SizedDrain {
+                batches: Arc::clone(&batches),
+            };
+            let cfg = BackgroundSinkConfig {
+                queue_capacity: 64,
+                batch_size: 1024,
+                max_bytes: Some(10),
+                // Only the barrier writes, so the batch boundaries are the bound's alone.
+                flush_interval: Duration::from_mins(1),
+                overflow: Overflow::Drop,
+                metric_prefix: None,
+            };
+            let shutdown = CancellationToken::new();
+            let (sink, _handle) = BackgroundSink::spawn(drain, cfg, shutdown.clone());
+
+            for &size in *sizes {
+                sink.try_push(size).unwrap();
+            }
+            sink.flush().await.unwrap();
+
+            let got = batches.lock().unwrap().clone();
+            let want: Vec<Vec<u32>> = want.iter().map(|batch| batch.to_vec()).collect();
+            assert_eq!(got, want, "case: {name}");
+            shutdown.cancel();
+        }
     }
 }
