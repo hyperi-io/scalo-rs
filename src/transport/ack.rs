@@ -674,9 +674,11 @@ struct TicketsInner {
 }
 
 impl TicketsInner {
+    /// Record the held gauges, never while unwinding: a ticket drops then, and
+    /// a recorder that panics would abort the process.
     fn publish_held(&self, count: usize) {
         #[cfg(feature = "metrics")]
-        {
+        if !std::thread::panicking() {
             metrics::gauge!("transport_ack_held", "transport" => self.transport).set(count as f64);
             metrics::gauge!("transport_ack_held_bytes", "transport" => self.transport)
                 .set(self.held_bytes.load(Ordering::Relaxed) as f64);
@@ -1044,6 +1046,26 @@ mod tests {
             .expect("admitted");
         let _never = ticket.piece();
         assert_eq!(ticket.outcome().await, TicketOutcome::Expired);
+    }
+
+    /// A recorder that panicked while a ticket drops during an unwind would
+    /// abort the process: nothing records then.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_ticket_dropped_during_an_unwind_records_no_metric() {
+        let tickets = Tickets::new("test", 1024);
+        let ticket = tickets
+            .admit(10, Instant::now() + Duration::from_secs(5))
+            .expect("admitted");
+        let _local = ::metrics::set_default_local_recorder(
+            &crate::metrics::test_recorder::PanickingRecorder::ALL,
+        );
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = ticket;
+            panic!("the request's handler panicked");
+        }));
+        assert!(caught.is_err(), "the first panic is caught, not aborted on");
+        assert_eq!(tickets.held().bytes, 0, "the drop still returned its bytes");
     }
 
     #[test]

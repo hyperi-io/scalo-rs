@@ -816,52 +816,6 @@ mod tests {
         drop(early);
     }
 
-    /// A recorder whose counters panic, as a caller's recorder might.
-    #[cfg(feature = "metrics")]
-    struct PanickingCounters;
-
-    #[cfg(feature = "metrics")]
-    impl metrics::Recorder for PanickingCounters {
-        fn describe_counter(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        fn describe_gauge(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        fn describe_histogram(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        fn register_counter(
-            &self,
-            _: &metrics::Key,
-            _: &metrics::Metadata<'_>,
-        ) -> metrics::Counter {
-            panic!("recorder refuses counters");
-        }
-        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
-            metrics::Gauge::noop()
-        }
-        fn register_histogram(
-            &self,
-            _: &metrics::Key,
-            _: &metrics::Metadata<'_>,
-        ) -> metrics::Histogram {
-            metrics::Histogram::noop()
-        }
-    }
-
     /// A panic caught around a release finds every sender answered and every
     /// byte returned: the state the registry relies on is settled before the
     /// one call that can panic, the metrics recorder.
@@ -873,7 +827,9 @@ mod tests {
         let second = held(&registry, 1, 1, 20);
 
         let caught = {
-            let _local = metrics::set_default_local_recorder(&PanickingCounters);
+            let _local = metrics::set_default_local_recorder(
+                &crate::metrics::test_recorder::PanickingRecorder::COUNTERS,
+            );
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 registry.release([0, 1], DeliveryStatus::Delivered);
             }))

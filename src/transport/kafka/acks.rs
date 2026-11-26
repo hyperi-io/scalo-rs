@@ -649,56 +649,6 @@ mod tests {
         assert_eq!(targets(&acks, &read_again[5..]), vec![20]);
     }
 
-    /// A recorder whose every metric panics.
-    #[cfg(feature = "metrics")]
-    struct PanickingRecorder;
-
-    #[cfg(feature = "metrics")]
-    impl ::metrics::Recorder for PanickingRecorder {
-        fn describe_counter(
-            &self,
-            _: ::metrics::KeyName,
-            _: Option<::metrics::Unit>,
-            _: ::metrics::SharedString,
-        ) {
-        }
-        fn describe_gauge(
-            &self,
-            _: ::metrics::KeyName,
-            _: Option<::metrics::Unit>,
-            _: ::metrics::SharedString,
-        ) {
-        }
-        fn describe_histogram(
-            &self,
-            _: ::metrics::KeyName,
-            _: Option<::metrics::Unit>,
-            _: ::metrics::SharedString,
-        ) {
-        }
-        fn register_counter(
-            &self,
-            _: &::metrics::Key,
-            _: &::metrics::Metadata<'_>,
-        ) -> ::metrics::Counter {
-            panic!("recorder refuses counters");
-        }
-        fn register_gauge(
-            &self,
-            _: &::metrics::Key,
-            _: &::metrics::Metadata<'_>,
-        ) -> ::metrics::Gauge {
-            panic!("recorder refuses gauges");
-        }
-        fn register_histogram(
-            &self,
-            _: &::metrics::Key,
-            _: &::metrics::Metadata<'_>,
-        ) -> ::metrics::Histogram {
-            panic!("recorder refuses histograms");
-        }
-    }
-
     /// Releases the tokens it holds `Errored` when dropped, as the pipeline's
     /// guard does for a block abandoned by a panic.
     #[cfg(feature = "metrics")]
@@ -723,7 +673,9 @@ mod tests {
     fn a_release_during_an_unwind_records_no_metric() {
         let acks = KafkaAcks::default();
         let tokens = register(&acks, 0, 0..3);
-        let _local = ::metrics::set_default_local_recorder(&PanickingRecorder);
+        let _local = ::metrics::set_default_local_recorder(
+            &crate::metrics::test_recorder::PanickingRecorder::ALL,
+        );
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = ReleasedOnDrop {
                 acks: &acks,

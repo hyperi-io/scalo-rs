@@ -36,6 +36,10 @@ pub struct HttpServer {
     ready: Arc<AtomicBool>,
     #[cfg(feature = "tls")]
     tls: Option<ServerTls>,
+    /// The server's health check, removed once the server and its serve
+    /// future are gone.
+    #[cfg(feature = "health")]
+    health: crate::health::HealthRegistration,
 }
 
 impl HttpServer {
@@ -45,22 +49,24 @@ impl HttpServer {
         let ready = Arc::new(AtomicBool::new(true));
 
         #[cfg(feature = "health")]
-        {
+        let health = {
             let r = Arc::clone(&ready);
-            crate::health::HealthRegistry::register("http_server", move || {
+            crate::health::HealthRegistry::register_scoped("http_server", move || {
                 if r.load(Ordering::Relaxed) {
                     crate::health::HealthStatus::Healthy
                 } else {
                     crate::health::HealthStatus::Unhealthy
                 }
-            });
-        }
+            })
+        };
 
         Self {
             config,
             ready,
             #[cfg(feature = "tls")]
             tls: None,
+            #[cfg(feature = "health")]
+            health,
         }
     }
 
@@ -199,6 +205,8 @@ impl HttpServer {
             shutdown_timeout: self.config.shutdown_timeout(),
             #[cfg(feature = "tls")]
             tls,
+            #[cfg(feature = "health")]
+            health: self.health,
         })
     }
 
@@ -261,6 +269,8 @@ struct Prepared {
     shutdown_timeout: Duration,
     #[cfg(feature = "tls")]
     tls: Option<ServerTls>,
+    #[cfg(feature = "health")]
+    health: crate::health::HealthRegistration,
 }
 
 impl Prepared {
@@ -268,6 +278,8 @@ impl Prepared {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
+        #[cfg(feature = "health")]
+        let _health = self.health;
         #[cfg(feature = "logger")]
         if let Ok(address) = self.listener.local_addr() {
             #[cfg(feature = "tls")]
@@ -542,6 +554,29 @@ mod tests {
         let response = app.oneshot(post_ingest(64 * 1024)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[cfg(feature = "health")]
+    #[tokio::test]
+    async fn the_health_check_lasts_as_long_as_the_server() {
+        let server = HttpServer::bind("127.0.0.1:0");
+        let id = server.health.id();
+        let (handle, serving) = server
+            .serve_with_handle(Router::new())
+            .await
+            .expect("bound");
+        assert!(crate::health::HealthRegistry::is_registered(id));
+        handle.shutdown();
+        serving.await.expect("a clean shutdown");
+        assert!(
+            !crate::health::HealthRegistry::is_registered(id),
+            "a stopped server still counts against readiness"
+        );
+
+        let dropped = HttpServer::bind("127.0.0.1:0");
+        let id = dropped.health.id();
+        drop(dropped);
+        assert!(!crate::health::HealthRegistry::is_registered(id));
     }
 
     #[tokio::test]
