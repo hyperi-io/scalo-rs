@@ -21,6 +21,8 @@ quality:
     feature_matrix:
       warnings: blocking
     feature_matrix_tests: blocking
+    # An all-features doc warning, such as a broken intra-doc link, fails the stage.
+    rustdoc: blocking
   # Jobs of .github/workflows/scalo-service.yml, repeated so a local check predicts them.
   local_gates:
     - name: scalo-service chart tests
