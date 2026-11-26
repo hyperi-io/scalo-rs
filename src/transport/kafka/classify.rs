@@ -62,11 +62,21 @@ pub(crate) fn classify_send_failure(err: &KafkaError) -> SendFailure {
         Some(RDKafkaErrorCode::QueueFull) => SendFailure::QueueFull,
         Some(RDKafkaErrorCode::MessageSizeTooLarge) => SendFailure::TooLarge,
         Some(code) if is_retryable(code) => SendFailure::Retryable,
-        Some(RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic) => {
-            SendFailure::MissingTopic
-        }
+        Some(code) if is_missing_topic(code) => SendFailure::MissingTopic,
         _ => SendFailure::Fatal,
     }
+}
+
+/// A topic that does not exist yet or has been deleted. librdkafka raises
+/// `UnknownPartition` for an assigned partition whose topic is gone, and it
+/// clears when the topic comes back or the group rebalances.
+fn is_missing_topic(code: RDKafkaErrorCode) -> bool {
+    matches!(
+        code,
+        RDKafkaErrorCode::UnknownTopicOrPartition
+            | RDKafkaErrorCode::UnknownTopic
+            | RDKafkaErrorCode::UnknownPartition
+    )
 }
 
 /// Codes that clear without operator action, so the message is worth retrying.
@@ -144,9 +154,7 @@ pub(crate) fn classify_recv_failure(err: &KafkaError, ctx: RecvContext) -> RecvF
             Some(code) if is_retryable(code) || is_consumer_retryable(code) => {
                 RecvFailure::Transient
             }
-            Some(RDKafkaErrorCode::UnknownTopicOrPartition | RDKafkaErrorCode::UnknownTopic) => {
-                RecvFailure::MissingTopic
-            }
+            Some(code) if is_missing_topic(code) => RecvFailure::MissingTopic,
             Some(code) if is_auth_failure(code) && ctx.credentials_proven => RecvFailure::Transient,
             Some(code) if is_auth_failure(code) => RecvFailure::Refused,
             Some(code) if is_recv_permanent(code) => RecvFailure::Permanent,
@@ -204,8 +212,6 @@ fn is_recv_permanent(code: RDKafkaErrorCode) -> bool {
         RDKafkaErrorCode::TopicAuthorizationFailed
             | RDKafkaErrorCode::GroupAuthorizationFailed
             | RDKafkaErrorCode::ClusterAuthorizationFailed
-            // A partition the topic does not have.
-            | RDKafkaErrorCode::UnknownPartition
             // Configuration the broker or client refuses.
             | RDKafkaErrorCode::InvalidArgument
             | RDKafkaErrorCode::InvalidConfig
@@ -948,13 +954,15 @@ mod tests {
         }
     }
 
-    /// A send to a topic that does not exist yet is retried, never fatal: a
-    /// topic ensure that failed or a rebuilt broker clears on its own.
+    /// A send to a topic that does not exist yet, or was deleted, is retried,
+    /// never fatal: a failed topic ensure, a rebuilt broker or a recreated
+    /// topic clears on its own.
     #[test]
     fn a_missing_destination_topic_is_retried() {
         for code in [
             RDKafkaErrorCode::UnknownTopicOrPartition,
             RDKafkaErrorCode::UnknownTopic,
+            RDKafkaErrorCode::UnknownPartition,
         ] {
             assert_eq!(
                 classify_send_failure(&KafkaError::MessageProduction(code)),
@@ -1044,7 +1052,6 @@ mod tests {
             RDKafkaErrorCode::TopicAuthorizationFailed,
             RDKafkaErrorCode::GroupAuthorizationFailed,
             RDKafkaErrorCode::ClusterAuthorizationFailed,
-            RDKafkaErrorCode::UnknownPartition,
             RDKafkaErrorCode::InvalidArgument,
             RDKafkaErrorCode::InvalidConfig,
             RDKafkaErrorCode::Fatal,
@@ -1135,12 +1142,14 @@ mod tests {
     }
 
     /// A missing topic is waited for, whether or not the consumer may create
-    /// it and whatever its history: nothing about it ends the consumer.
+    /// it and whatever its history: nothing about it ends the consumer. A
+    /// subscribed topic deleted under a live consumer raises `UnknownPartition`.
     #[test]
     fn a_missing_topic_is_waited_for() {
         for code in [
             RDKafkaErrorCode::UnknownTopicOrPartition,
             RDKafkaErrorCode::UnknownTopic,
+            RDKafkaErrorCode::UnknownPartition,
         ] {
             for ctx in [FIRST_CONTACT, PROVEN] {
                 let err = KafkaError::MessageConsumption(code);
