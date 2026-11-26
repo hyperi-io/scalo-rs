@@ -107,8 +107,10 @@ The `-no-tls` keys are the same self-hosted brokers on a TLS-off listener. Only 
   apply per record first. `Ok` means every record was confirmed or filtered.
   Otherwise it is the first `Backpressured`/`Fatal` in record order and part
   of the block may be on the broker -- retry it whole (at-least-once).
-  A record's `key` is its topic. Its own headers are not sent, and with
-  `transport-trace` it has the active span's `traceparent`.
+  A record's `key` is its topic. Its `timestamp_ms` is the message timestamp,
+  left to the producer's own time when it is unset or before the epoch, and
+  `send` sets none. Its own headers are not sent, and with `transport-trace`
+  it has the active span's `traceparent`.
 - Sink confirmation: `confirms_delivery()` is `Remote`. `dead_letter_reason` names a record over `message.max.bytes` less 128 bytes of framing, and an outbound `dlq` filter match, so the pipeline dead-letters them itself instead of taking the `FilteredDlq` answer as handled.
 - Topic creation: scalo's producers (the transport's, `KafkaProducer` and the Kafka DLQ's) set `allow.auto.create.topics: false`, where librdkafka's own producer default is `true`. A send to a missing topic backpressures until the topic exists, even on a broker with `auto.create.topics.enable` on. A producer that once wrote to a topic does not bring it back after a delete, which librdkafka's metadata refresh would otherwise do, idle or not. `allow_auto_create_topics: true` gives the broker's auto-create back, and a raw `librdkafka_overrides` or `sizing.producer_librdkafka` value wins over both. Consumers and admin clients are untouched, and librdkafka's consumer default is already `false`.
 

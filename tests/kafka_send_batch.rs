@@ -114,6 +114,15 @@ impl TransportSender for PerRecord<'_> {
 /// Every payload on `topic`, read from the beginning of each partition by a
 /// raw consumer until the high watermarks are reached.
 fn read_topic(bootstrap: &str, topic: &str) -> Vec<Vec<u8>> {
+    read_messages(bootstrap, topic)
+        .into_iter()
+        .map(|(payload, _)| payload)
+        .collect()
+}
+
+/// Every payload on `topic` with the message timestamp in milliseconds the
+/// broker holds for it, read as [`read_topic`] reads.
+fn read_messages(bootstrap: &str, topic: &str) -> Vec<(Vec<u8>, Option<i64>)> {
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", bootstrap)
         .set("group.id", format!("verify-{topic}"))
@@ -139,7 +148,10 @@ fn read_topic(bootstrap: &str, topic: &str) -> Vec<Vec<u8>> {
     let mut payloads = Vec::with_capacity(expected);
     while payloads.len() < expected && Instant::now() < deadline {
         match consumer.poll(Duration::from_millis(200)) {
-            Some(Ok(msg)) => payloads.push(msg.payload().unwrap_or_default().to_vec()),
+            Some(Ok(msg)) => payloads.push((
+                msg.payload().unwrap_or_default().to_vec(),
+                msg.timestamp().to_millis(),
+            )),
             Some(Err(e)) => panic!("verify consumer error on {topic}: {e}"),
             None => {}
         }
@@ -150,6 +162,14 @@ fn read_topic(bootstrap: &str, topic: &str) -> Vec<Vec<u8>> {
         "read every record up to the high watermarks of {topic}"
     );
     payloads
+}
+
+async fn read_messages_async(bootstrap: &str, topic: &str) -> Vec<(Vec<u8>, Option<i64>)> {
+    let bootstrap = bootstrap.to_string();
+    let topic = topic.to_string();
+    tokio::task::spawn_blocking(move || read_messages(&bootstrap, &topic))
+        .await
+        .expect("verify task")
 }
 
 async fn read_topic_async(bootstrap: &str, topic: &str) -> Vec<Vec<u8>> {
@@ -303,4 +323,55 @@ async fn send_batch_fails_a_partly_delivered_block() {
         counts.values().all(|times| *times == 1),
         "no record landed twice"
     );
+}
+
+/// A record's `timestamp_ms` is the Kafka message timestamp, so the time
+/// survives the hop. A record with none, or one before the epoch, gets the
+/// producer's own time, which is later than the fixed times below.
+#[tokio::test]
+async fn send_batch_sets_the_message_timestamp_from_the_record() {
+    if !require_docker() {
+        return;
+    }
+    const SET_MS: i64 = 1_791_756_855_003;
+    let bootstrap = shared_bootstrap().await;
+    let topic = common::unique("record-time");
+    create_topics(&bootstrap, &[topic.as_str()]).await;
+    let transport = KafkaTransport::new(&producer_config(&bootstrap))
+        .await
+        .expect("kafka transport");
+
+    let key: Arc<str> = Arc::from(topic.as_str());
+    // (payload, record timestamp_ms)
+    let cases: [(&str, Option<i64>); 3] = [
+        ("set", Some(SET_MS)),
+        ("unset", None),
+        ("before the epoch", Some(-5)),
+    ];
+    let records: Vec<Record> = cases
+        .iter()
+        .map(|(payload, timestamp_ms)| Record {
+            metadata: RecordMeta {
+                timestamp_ms: *timestamp_ms,
+                format: PayloadFormat::Json,
+            },
+            ..record(&key, (*payload).to_string())
+        })
+        .collect();
+    let result = transport.send_batch(&records).await;
+    assert!(result.is_ok(), "block failed: {result:?}");
+
+    let landed: HashMap<Vec<u8>, Option<i64>> = read_messages_async(&bootstrap, &topic)
+        .await
+        .into_iter()
+        .collect();
+    assert_eq!(landed.len(), cases.len(), "every record landed");
+    assert_eq!(landed[b"set".as_slice()], Some(SET_MS));
+    for payload in ["unset", "before the epoch"] {
+        let producer_time = landed[payload.as_bytes()];
+        assert!(
+            producer_time.is_some_and(|ms| ms > SET_MS),
+            "{payload}: {producer_time:?} is the producer's time"
+        );
+    }
 }
