@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use sigstore_verify::trust_root::TrustedRoot;
@@ -23,6 +23,7 @@ use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConf
 
 use super::config::WasmConfig;
 use super::host::HostCtx;
+use super::metrics;
 use super::plugin::{Plugin, World};
 use super::trust::{self, Evidence, Refusal, TrustPolicy};
 
@@ -37,6 +38,9 @@ pub(super) const UNSIGNED: &str = "unsigned";
 
 /// How often the ticker advances the epoch, and so the deadline's resolution.
 const EPOCH_TICK: Duration = Duration::from_millis(1);
+
+/// Ticks between pool gauge updates: about once a second.
+const POOL_METRICS_EVERY: u32 = 1_000;
 
 /// Pool slots one plugin instance may use, a component holding several core
 /// instances, memories and tables.
@@ -220,9 +224,14 @@ impl Ticker {
         let thread = std::thread::Builder::new()
             .name("wasm-epoch".to_string())
             .spawn(move || {
+                let mut ticks: u32 = 0;
                 while !flag.load(Ordering::Relaxed) {
                     std::thread::sleep(EPOCH_TICK);
                     engine.increment_epoch();
+                    ticks = ticks.wrapping_add(1);
+                    if ticks.is_multiple_of(POOL_METRICS_EVERY) {
+                        metrics::pool(&engine);
+                    }
                 }
             })?;
         Ok(Self {
@@ -270,11 +279,13 @@ impl EngineInner {
         if let Some(compiled) = self.components().get(&digest) {
             return Ok(compiled.component.clone());
         }
+        let started = Instant::now();
         let component =
             Component::from_binary(&self.engine, bytes).map_err(|e| LoadError::Compile {
                 name: name.to_string(),
                 detail: format!("{e:#}"),
             })?;
+        metrics::compiled(name, started.elapsed());
         let mut components = self.components();
         components.retain(|_, compiled| compiled.plugins > 0);
         components.entry(digest).or_insert(Compiled {
@@ -355,6 +366,23 @@ impl WasmEngine {
     /// than the engine's caps. Compiling is CPU-bound, so call this from a
     /// blocking thread, never an async task.
     pub fn load<W: World>(
+        &self,
+        source: PluginSource<'_>,
+        trust: &TrustPolicy,
+    ) -> Result<Arc<Plugin<W>>, LoadError> {
+        let name = match source {
+            PluginSource::Path(path) => plugin_name(path),
+            PluginSource::Bytes { name, .. } => name.to_string(),
+        };
+        let loaded = self.load_inner::<W>(source, trust);
+        metrics::load(
+            &name,
+            loaded.as_ref().map_or_else(LoadError::outcome, |_| "ok"),
+        );
+        loaded
+    }
+
+    fn load_inner<W: World>(
         &self,
         source: PluginSource<'_>,
         trust: &TrustPolicy,

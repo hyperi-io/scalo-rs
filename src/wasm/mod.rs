@@ -22,13 +22,14 @@
 //! [`TrustPolicy`] names: a keyless CI identity, or an operator's key. The
 //! check is offline against a pinned trusted root.
 //!
-//! wasmtime's own types are part of this API, re-exported as
-//! [`wasmtime`](crate::wasm::wasmtime), so a world's crate builds against the
-//! same copy. scalo holds wasmtime to its 48 LTS line.
+//! wasmtime's own types are part of this API, re-exported as [`wasmtime`],
+//! so a world's crate builds against the same copy. scalo holds wasmtime to
+//! its 48 LTS line. Guide: `docs/api/wasm.md`.
 
 mod config;
 mod engine;
 mod host;
+mod metrics;
 mod plugin;
 mod trust;
 

@@ -10,13 +10,15 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use wasmtime::component::{InstancePre, Linker};
 use wasmtime::{PoolConcurrencyLimitError, Store, Trap};
 
-use super::engine::EngineInner;
+use super::engine::{EngineInner, hex};
 use super::host::{HostCtx, LimitHit};
+use super::metrics::PluginMetrics;
 
 /// A WIT world scalo can host, wrapping what `wasmtime::component::bindgen!`
 /// generates for it.
@@ -136,6 +138,7 @@ pub struct Plugin<W: World> {
     pre: W::Pre,
     engine: Arc<EngineInner>,
     health: Health,
+    metrics: PluginMetrics,
 }
 
 impl<W: World> Plugin<W> {
@@ -148,7 +151,9 @@ impl<W: World> Plugin<W> {
     ) -> Self {
         let limit = engine.config.unhealthy_after_traps;
         engine.retain(&digest);
+        let metrics = PluginMetrics::new(&name, &hex(&digest), &signer);
         Self {
+            metrics,
             name,
             digest,
             signer,
@@ -204,15 +209,14 @@ impl<W: World> Plugin<W> {
     ) -> Result<Instance<W>, CallError> {
         self.health.check()?;
         let mut store = self.new_store(data);
-        match W::instantiate(&self.pre, &mut store) {
-            Ok(bindings) => Ok(Instance {
-                plugin: Arc::clone(self),
-                slot,
-                state: State::Ready { store, bindings },
-                calls: 0,
-            }),
-            Err(error) => Err(CallError::from_wasmtime(error)),
-        }
+        let bindings = W::instantiate(&self.pre, &mut store).map_err(CallError::from_wasmtime)?;
+        self.metrics.instantiated();
+        Ok(Instance {
+            plugin: Arc::clone(self),
+            slot,
+            state: State::Ready { store, bindings },
+            calls: 0,
+        })
     }
 
     fn new_store(&self, data: W::Data) -> Store<HostCtx<W::Data>> {
@@ -299,6 +303,17 @@ impl<W: World> Instance<W> {
         &mut self,
         f: impl FnOnce(&W::Bindings, &mut Store<HostCtx<W::Data>>) -> wasmtime::Result<R>,
     ) -> Result<R, CallError> {
+        let started = Instant::now();
+        let result = self.call_inner(f);
+        let outcome = result.as_ref().map_or_else(CallError::outcome, |_| "ok");
+        self.plugin.metrics.call(outcome, started.elapsed());
+        result
+    }
+
+    fn call_inner<R>(
+        &mut self,
+        f: impl FnOnce(&W::Bindings, &mut Store<HostCtx<W::Data>>) -> wasmtime::Result<R>,
+    ) -> Result<R, CallError> {
         self.follow_slot()?;
         self.plugin.health.check()?;
         let deadline = self.plugin.engine.deadline_ticks;
@@ -307,7 +322,10 @@ impl<W: World> Instance<W> {
             State::Idle(mut store) => {
                 store.set_epoch_deadline(deadline);
                 match W::instantiate(&self.plugin.pre, &mut store) {
-                    Ok(bindings) => (store, bindings),
+                    Ok(bindings) => {
+                        self.plugin.metrics.instantiated();
+                        (store, bindings)
+                    }
                     Err(error) => {
                         self.state = State::Idle(self.plugin.renew(store));
                         return Err(CallError::from_wasmtime(error));
@@ -321,6 +339,7 @@ impl<W: World> Instance<W> {
         store.data_mut().budget_mut().reset();
         let result = f(&bindings, &mut store);
         self.calls = self.calls.saturating_add(1);
+        self.plugin.metrics.memory(store.data().peak_memory_bytes());
 
         match result {
             Ok(value) => {

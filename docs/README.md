@@ -129,6 +129,7 @@ The runtime builds the worker pool and batch engine only when `worker-pool` or `
 | Pipeline | [pipeline/scaling.md](pipeline/scaling.md) | `ScalingPressure`, KEDA external scaler signal |
 | Other subsystems | [api/README.md](api/README.md) | Section landing |
 | Other subsystems | [api/auth.md](api/auth.md) | Credential acquisition and placement |
+| Other subsystems | [api/wasm.md](api/wasm.md) | WebAssembly component plugins under limits, loaded only when a trusted signer signed them |
 | Other subsystems | [api/secrets.md](api/secrets.md) | OpenBao/Vault, AWS Secrets Manager |
 | Other subsystems | [api/http-server.md](api/http-server.md) | axum server, probe wiring, route extensions |
 | Other subsystems | [api/tls.md](api/tls.md) | The one client and server TLS section, certificate reload from file or secret, handshake helper |
