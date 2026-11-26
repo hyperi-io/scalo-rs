@@ -61,7 +61,7 @@ const OPENSSL_IMAGE: &str =
 /// The broker image every Kafka test starts, as `image:tag@digest`.
 ///
 /// The JVM image: `apache/kafka-native` before 4.4.0 segfaults in `getpwuid` on ~2% of starts.
-/// The line the DFE stack deploys.
+/// The Kafka line the tests pin.
 ///
 /// renovate: datasource=docker depName=apache/kafka
 pub const KAFKA_IMAGE: &str =
@@ -84,7 +84,7 @@ pub const KAFKA_PORT: u16 = 9092;
 const SHARED_STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Where the broker's entrypoint waits for its start script.
-const KAFKA_START_SCRIPT: &str = "/opt/kafka/hyperi_start.sh";
+const KAFKA_START_SCRIPT: &str = "/opt/kafka/test-start.sh";
 
 /// One single-node KRaft broker, PLAINTEXT on [`KAFKA_PORT`], advertising
 /// the host port Docker publishes it on, or `host_port` when given.
@@ -230,7 +230,7 @@ pub fn require_docker() -> bool {
 }
 
 /// Directory inside the broker container the test's files are copied to.
-const BROKER_DIR: &str = "/dfe-test";
+const BROKER_DIR: &str = "/kafka-test";
 
 /// A JVM broker takes 5-12 s to become ready, a good deal longer on a busy runner.
 const START_DEADLINE: Duration = Duration::from_secs(240);
@@ -239,6 +239,7 @@ const START_DEADLINE: Duration = Duration::from_secs(240);
 const PULL_DEADLINE: Duration = Duration::from_secs(300);
 
 /// The SCRAM-SHA-512 user the broker is formatted with.
+// Kept: consumer suites may log in with this user, so a new value changes their broker login.
 pub const SCRAM_USER: &str = "dfe";
 
 /// Its password: random per test process, so no credential sits in the source.
@@ -681,6 +682,7 @@ mod tests {
     #[test]
     fn tls_broker_containers_take_the_suite_prefix_and_owner_labels() {
         let pid = std::process::id();
+        // The env name and labels are the shared harness contract (see shared_service), so they keep their spelling.
         for (prefix, base) in [(None, "r-test"), (Some("ci-42"), "ci-42")] {
             temp_env::with_var("HYPERI_TEST_CONTAINER_PREFIX", prefix, || {
                 for service in ["kafka", "openssl"] {

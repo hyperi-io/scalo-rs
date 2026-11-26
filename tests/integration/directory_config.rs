@@ -591,7 +591,7 @@ async fn test_yml_extension_supported() {
 async fn test_subdirectory_tables_loaded() {
     let tmp = tempfile::tempdir().unwrap();
     write_yaml(tmp.path(), "root-config", "name: root\n");
-    write_yaml(tmp.path(), "loaders/dfe-loader", "host: dfe\n");
+    write_yaml(tmp.path(), "loaders/event-loader", "host: event\n");
     write_yaml(tmp.path(), "loaders/csv-loader", "host: csv\n");
     write_yaml(tmp.path(), "sinks/kafka/primary", "brokers: b1\n");
 
@@ -604,7 +604,7 @@ async fn test_subdirectory_tables_loaded() {
         tables,
         vec![
             "loaders/csv-loader",
-            "loaders/dfe-loader",
+            "loaders/event-loader",
             "root-config",
             "sinks/kafka/primary",
         ]
@@ -616,30 +616,33 @@ async fn test_subdirectory_get() {
     let tmp = tempfile::tempdir().unwrap();
     write_yaml(
         tmp.path(),
-        "loaders/dfe-loader",
-        "host: dfe-host\nport: 9090\n",
+        "loaders/event-loader",
+        "host: event-host\nport: 9090\n",
     );
 
     let store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
 
-    let value = store.get_key("loaders/dfe-loader", "host").await.unwrap();
-    assert_eq!(value, serde_json::Value::String("dfe-host".to_string()));
+    let value = store.get_key("loaders/event-loader", "host").await.unwrap();
+    assert_eq!(value, serde_json::Value::String("event-host".to_string()));
 }
 
 #[tokio::test]
 async fn test_subdirectory_get_normalises_slashes() {
     let tmp = tempfile::tempdir().unwrap();
-    write_yaml(tmp.path(), "loaders/dfe-loader", "host: dfe-host\n");
+    write_yaml(tmp.path(), "loaders/event-loader", "host: event-host\n");
 
     let store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
 
     // Leading/trailing slashes should be stripped
-    let value = store.get_key("/loaders/dfe-loader/", "host").await.unwrap();
-    assert_eq!(value, serde_json::Value::String("dfe-host".to_string()));
+    let value = store
+        .get_key("/loaders/event-loader/", "host")
+        .await
+        .unwrap();
+    assert_eq!(value, serde_json::Value::String("event-host".to_string()));
 }
 
 #[tokio::test]
@@ -696,27 +699,31 @@ async fn test_subdirectory_set_deep_nesting() {
 #[tokio::test]
 async fn test_subdirectory_delete_key() {
     let tmp = tempfile::tempdir().unwrap();
-    write_yaml(tmp.path(), "loaders/dfe-loader", "host: dfe\nport: 9090\n");
+    write_yaml(
+        tmp.path(),
+        "loaders/event-loader",
+        "host: event\nport: 9090\n",
+    );
 
     let store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
         .unwrap();
 
     store
-        .delete_key("loaders/dfe-loader", "port", None)
+        .delete_key("loaders/event-loader", "port", None)
         .await
         .unwrap();
 
     // Key should be gone
-    let result = store.get_key("loaders/dfe-loader", "port").await;
+    let result = store.get_key("loaders/event-loader", "port").await;
     assert!(matches!(
         result.unwrap_err(),
         DirectoryConfigError::KeyNotFound { .. }
     ));
 
     // Other key remains
-    let host = store.get_key("loaders/dfe-loader", "host").await.unwrap();
-    assert_eq!(host, serde_json::Value::String("dfe".to_string()));
+    let host = store.get_key("loaders/event-loader", "host").await.unwrap();
+    assert_eq!(host, serde_json::Value::String("event".to_string()));
 }
 
 #[tokio::test]
@@ -786,7 +793,7 @@ async fn test_invalid_table_name_rejected() {
 #[tokio::test]
 async fn test_subdirectory_background_refresh() {
     let tmp = tempfile::tempdir().unwrap();
-    write_yaml(tmp.path(), "loaders/dfe", "version: 1\n");
+    write_yaml(tmp.path(), "loaders/event", "version: 1\n");
 
     let mut store = DirectoryConfigStore::new(test_config(tmp.path()))
         .await
@@ -794,11 +801,11 @@ async fn test_subdirectory_background_refresh() {
     store.start().await.unwrap();
 
     // Modify file on disk
-    write_yaml(tmp.path(), "loaders/dfe", "version: 2\n");
+    write_yaml(tmp.path(), "loaders/event", "version: 2\n");
 
-    eventually("loaders/dfe version 2", async || {
+    eventually("loaders/event version 2", async || {
         store
-            .get_key("loaders/dfe", "version")
+            .get_key("loaders/event", "version")
             .await
             .is_ok_and(|v| v == serde_json::Value::Number(2.into()))
     })
@@ -1059,10 +1066,10 @@ mod git_tests {
 
         let result = store
             .set(
-                "loaders/dfe-loader",
+                "loaders/event-loader",
                 "host",
-                serde_json::Value::String("dfe-host".to_string()),
-                Some("add dfe-loader config"),
+                serde_json::Value::String("event-host".to_string()),
+                Some("add event-loader config"),
             )
             .await
             .unwrap();
@@ -1072,10 +1079,10 @@ mod git_tests {
 
         // Verify commit message
         let latest = repo.head().unwrap().peel_to_commit().unwrap();
-        assert_eq!(latest.message().unwrap(), "add dfe-loader config");
+        assert_eq!(latest.message().unwrap(), "add event-loader config");
 
         // Verify file exists on disk
-        assert!(tmp.path().join("loaders/dfe-loader.yaml").exists());
+        assert!(tmp.path().join("loaders/event-loader.yaml").exists());
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@
 //! **control plane** (orchestration, APIs, integration), sharing the same
 //! config cascade, logging, metrics and resilience conventions.
 //!
+// The docs links name the repository, where the docs are published.
 //! Full reference docs live under [`docs/`](https://github.com/hyperi-io/scalo-rs/tree/main/docs).
 //! Start at [`docs/README.md`](https://github.com/hyperi-io/scalo-rs/blob/main/docs/README.md)
 //! for the entry-point index.

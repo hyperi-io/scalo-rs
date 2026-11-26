@@ -704,7 +704,7 @@ sasl.mechanism=SCRAM-SHA-512
     // ===================================================================
 
     #[test]
-    fn dfe_source_default_topics() {
+    fn source_default_topics() {
         let source = KafkaSource::new("syslog");
         assert_eq!(source.name(), "syslog");
         assert_eq!(source.input_topic(), "syslog_land");
@@ -712,14 +712,14 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_custom_suffixes() {
+    fn source_custom_suffixes() {
         let source = KafkaSource::with_suffixes("auth", "_raw", "_enriched");
         assert_eq!(source.input_topic(), "auth_raw");
         assert_eq!(source.output_topic(), "auth_enriched");
     }
 
     #[test]
-    fn dfe_source_cg_transform_default() {
+    fn source_cg_transform_default() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -730,7 +730,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_transform_with_pipeline() {
+    fn source_cg_transform_with_pipeline() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -746,7 +746,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_transform_empty_source_errors() {
+    fn source_cg_transform_empty_source_errors() {
         let source = KafkaSource::new("");
         assert!(
             source
@@ -756,7 +756,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_transform_empty_source_pipeline_rescues() {
+    fn source_cg_transform_empty_source_pipeline_rescues() {
         let source = KafkaSource::new("");
         assert_eq!(
             source
@@ -772,7 +772,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_universal() {
+    fn source_cg_universal() {
         let source = KafkaSource::new("netflow");
         assert_eq!(
             source
@@ -783,7 +783,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_universal_ignores_pipeline() {
+    fn source_cg_universal_ignores_pipeline() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -794,7 +794,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_override_wins() {
+    fn source_cg_override_wins() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -810,7 +810,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_cg_override_wins_universal() {
+    fn source_cg_override_wins_universal() {
         let source = KafkaSource::new("syslog");
         assert_eq!(
             source
@@ -895,7 +895,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_from_topic_land() {
+    fn source_from_topic_land() {
         assert_eq!(
             KafkaSource::source_from_topic("syslog_land"),
             Some("syslog")
@@ -904,7 +904,7 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_from_topic_load() {
+    fn source_from_topic_load() {
         assert_eq!(
             KafkaSource::source_from_topic("syslog_load"),
             Some("syslog")
@@ -916,14 +916,14 @@ sasl.mechanism=SCRAM-SHA-512
     }
 
     #[test]
-    fn dfe_source_from_topic_unknown() {
+    fn source_from_topic_unknown() {
         assert_eq!(KafkaSource::source_from_topic("unknown"), None);
         assert_eq!(KafkaSource::source_from_topic("events"), None);
         assert_eq!(KafkaSource::source_from_topic(""), None);
     }
 
     #[test]
-    fn dfe_source_from_topic_edge_cases() {
+    fn source_from_topic_edge_cases() {
         assert_eq!(KafkaSource::source_from_topic("_land"), Some(""));
         assert_eq!(KafkaSource::source_from_topic("a_load"), Some("a"));
     }

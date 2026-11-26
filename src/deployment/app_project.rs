@@ -128,15 +128,15 @@ mod tests {
 
     fn sample_project() -> AppProjectContract {
         AppProjectContract {
-            name: "hyperi-platform".into(),
-            description: "HyperI platform team".into(),
+            name: "platform".into(),
+            description: "Platform team".into(),
             source_repos: vec![
-                "https://github.com/hyperi-io/gitops".into(),
-                "oci://ghcr.io/hyperi-io/helm-charts".into(),
+                "https://github.com/example/gitops".into(),
+                "oci://registry.example.com/team/helm-charts".into(),
             ],
             destinations: vec![AppProjectDestination {
                 server: "https://kubernetes.default.svc".into(),
-                namespace: "hyperi-dfe".into(),
+                namespace: "apps".into(),
             }],
             cluster_resource_allow: vec!["kafka.strimzi.io:KafkaTopic".into()],
             namespace_resource_allow: vec!["*:*".into()],
@@ -148,21 +148,21 @@ mod tests {
     fn generate_produces_appproject_yaml() {
         let yaml = generate_argocd_app_project(&sample_project());
         assert!(yaml.contains("kind: AppProject"));
-        assert!(yaml.contains("name: hyperi-platform"));
+        assert!(yaml.contains("name: platform"));
     }
 
     #[test]
     fn includes_source_repos() {
         let yaml = generate_argocd_app_project(&sample_project());
-        assert!(yaml.contains("https://github.com/hyperi-io/gitops"));
-        assert!(yaml.contains("oci://ghcr.io/hyperi-io/helm-charts"));
+        assert!(yaml.contains("https://github.com/example/gitops"));
+        assert!(yaml.contains("oci://registry.example.com/team/helm-charts"));
     }
 
     #[test]
     fn includes_destinations() {
         let yaml = generate_argocd_app_project(&sample_project());
         assert!(yaml.contains("server: https://kubernetes.default.svc"));
-        assert!(yaml.contains("namespace: hyperi-dfe"));
+        assert!(yaml.contains("namespace: apps"));
     }
 
     #[test]

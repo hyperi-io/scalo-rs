@@ -364,6 +364,7 @@ struct CheckPayload {
 /// UUIDv5 namespace for platform-derived instance ids:
 /// `uuid5(NAMESPACE_DNS, "scalo.hyperi.io")`. Shared with scalo-py so both
 /// chassis derive the SAME id from the same platform material.
+// Fixed UUID: changing it re-keys every instance id reported to the version service.
 const INSTANCE_ID_NS: uuid::Uuid = uuid::uuid!("10ada713-52f0-5b77-aab7-7792712f92a0");
 
 /// Stable per-install instance id, derived from what the app is running on.
@@ -654,7 +655,7 @@ mod tests {
         // Free-form deployment strings carry operator-sensitive names, so
         // the payload struct must not have the field at all.
         let payload = CheckPayload {
-            product: "dfe-loader".into(),
+            product: "event-loader".into(),
             current_version: "1.0.0".into(),
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
@@ -672,7 +673,7 @@ mod tests {
     #[test]
     fn test_check_payload_serialization() {
         let payload = CheckPayload {
-            product: "dfe-loader".into(),
+            product: "event-loader".into(),
             current_version: "1.8.0".into(),
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
@@ -680,7 +681,7 @@ mod tests {
         };
 
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["product"], "dfe-loader");
+        assert_eq!(json["product"], "event-loader");
         assert_eq!(json["current_version"], "1.8.0");
         assert_eq!(json["os"], "linux");
         assert_eq!(json["arch"], "x86_64");
@@ -844,7 +845,7 @@ mod tests {
         let json = r#"{
             "latest_version": "1.9.0",
             "update_available": true,
-            "release_url": "https://github.com/hyperi-io/dfe-loader/releases/tag/v1.9.0",
+            "release_url": "https://github.com/example/event-loader/releases/tag/v1.9.0",
             "published_at": "2026-02-15T10:00:00Z",
             "message": null
         }"#;

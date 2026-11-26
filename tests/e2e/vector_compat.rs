@@ -368,7 +368,7 @@ async fn test_vector_and_native_coexist() {
     let client_config = GrpcConfig::client(&format!("http://127.0.0.1:{port}"));
     let client = GrpcTransport::new(&client_config)
         .await
-        .expect("failed to create native DFE client");
+        .expect("failed to create native client");
 
     for i in 0..3u32 {
         let payload = format!("native-{i}");

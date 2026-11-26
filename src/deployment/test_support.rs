@@ -79,6 +79,7 @@ pub mod shared_service;
 
 /// Last-resort mirror for Docker Hub test images, used when neither the
 /// cascade nor `DEPLOYMENT__TEST_IMAGE_MIRROR` names one.
+// A working registry path: the default pull source, so renaming it breaks pulls with no override set.
 pub const DEFAULT_TEST_IMAGE_MIRROR: &str = "ghcr.io/hyperi-io/mirror";
 
 /// The registry path Docker Hub test images are pulled through.

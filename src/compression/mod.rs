@@ -30,6 +30,7 @@
 //! front) and the stream form is the framed format [`Codec::extension`] names,
 //! so bytes written by one form are read by the same form only.
 //!
+// The link names the repository, where the docs are published.
 //! See [docs/compression.md](https://github.com/hyperi-io/scalo-rs/blob/main/docs/compression.md).
 
 use std::fmt;

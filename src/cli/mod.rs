@@ -33,7 +33,7 @@
 //!     type Config = MyConfig;
 //!
 //!     fn name(&self) -> &str { "my-service" }
-//!     fn env_prefix(&self) -> &str { "DFE_LOADER" }
+//!     fn env_prefix(&self) -> &str { "EVENT_LOADER" }
 //!     fn version_info(&self) -> VersionInfo {
 //!         VersionInfo::new("my-service", env!("CARGO_PKG_VERSION"))
 //!     }

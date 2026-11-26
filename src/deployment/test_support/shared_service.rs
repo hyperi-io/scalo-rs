@@ -710,6 +710,7 @@ fn now_secs() -> u64 {
 
 /// Labels on every container: suite, repo, service, run, owner and lease.
 #[must_use]
+// The io.hyperi.test.* keys are read back by the sweep, which runs across processes and hosts.
 pub fn labels(suite: &Suite, service: &str, owner_pid: u32) -> Vec<(String, String)> {
     let owner = Owner::of(owner_pid);
     vec![
@@ -1025,6 +1026,7 @@ pub fn run_owner_pid() -> u32 {
     }
 }
 
+// The HYPERI_TEST_* names are read from .env files and CI, so they are a contract.
 /// A `HYPERI_TEST_*` setting: the process environment, then the project
 /// `.env`, then the file named by `HYPERI_TEST_ENV_FILE`. Empty counts as unset.
 #[must_use]

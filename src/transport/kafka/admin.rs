@@ -770,6 +770,7 @@ mod tests {
     #[test]
     fn offset_query_consumer_takes_a_group_under_the_app_prefix() {
         let config = KafkaConfig {
+            // The broker ACL grants the dfe- prefix, so the test group names stay under it.
             group: "dfe-loader".to_string(),
             ..Default::default()
         };
@@ -786,6 +787,7 @@ mod tests {
     #[test]
     fn offset_query_group_id_wins_over_a_raw_override() {
         let config = KafkaConfig {
+            // The broker ACL grants the dfe- prefix, so the test group names stay under it.
             group: "dfe-archiver".to_string(),
             ..Default::default()
         };

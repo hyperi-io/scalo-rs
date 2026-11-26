@@ -150,6 +150,7 @@ mod tests {
     #[test]
     fn the_schema_names_no_vendor_or_product() {
         let text = contract_json_schema().to_string().to_ascii_lowercase();
+        // The brand terms no schema may carry. The list is the check itself.
         for term in ["dfe", "hyperi", "x-dfe-secret"] {
             assert!(
                 !text.contains(term),
