@@ -26,7 +26,9 @@
 //! svc.scaling_pressure(42.0);
 //! ```
 
-use super::manifest::{MetricDescriptor, MetricType};
+use metrics::Unit;
+
+use super::manifest::Series;
 
 /// Standard metric set: labelled counters, gauges, and histograms across
 /// transport, pipeline, records, scaling, spool, and security.
@@ -60,842 +62,432 @@ impl ServiceMetrics {
     pub fn register(manager: &super::MetricsManager) -> Self {
         let reg = manager.registry();
 
-        // --- Transport ---
-        metrics::describe_counter!(
-            "transport_sent_total",
-            "Messages successfully sent to transport"
-        );
-        metrics::describe_counter!(
-            "transport_send_errors_total",
-            "Messages that failed to send"
-        );
-        metrics::describe_counter!(
-            "transport_backpressured_total",
-            "Messages delayed due to backpressure"
-        );
-        metrics::describe_counter!(
-            "transport_refused_total",
-            "Messages refused by transport (circuit open, capacity)"
-        );
-        metrics::describe_gauge!(
-            "transport_healthy",
-            "Transport health (1=healthy, 0=unhealthy)"
-        );
-        metrics::describe_gauge!(
-            "transport_queue_size",
-            "Current number of messages in transport queue"
-        );
-        metrics::describe_gauge!(
-            "transport_queue_capacity",
-            "Maximum transport queue capacity"
-        );
-        metrics::describe_gauge!(
-            "transport_inflight",
-            "Messages currently in-flight (sent but not acked)"
-        );
-        metrics::describe_histogram!(
-            "transport_send_duration_seconds",
-            metrics::Unit::Seconds,
-            "Time to send a batch to transport"
-        );
-        // Byte/event throughput, incremented per batch. Bytes are raw wire
-        // bytes (summed payload.len() per WorkBatch), not decoded size.
-        metrics::describe_counter!(
-            "transport_sent_bytes_total",
-            metrics::Unit::Bytes,
-            "Raw bytes written to transport (egress)"
-        );
-        metrics::describe_counter!(
-            "transport_received_bytes_total",
-            metrics::Unit::Bytes,
-            "Raw bytes read from transport (ingress)"
-        );
-        metrics::describe_counter!(
-            "transport_received_events_total",
-            "Events received off the transport (ingress count)"
-        );
-        metrics::describe_counter!(
-            "transport_recv_errors_total",
-            "Receive failures by class (transient: retried, permanent: returned)"
-        );
-        metrics::describe_counter!(
-            "transport_commit_errors_total",
-            "Source commits that failed after the block was delivered"
-        );
-        metrics::describe_counter!(
-            "transport_message_too_large_total",
-            "Records over a sender's size ceiling, refused before sending or by the receiver"
-        );
-        metrics::describe_counter!(
-            "transport_truncated_total",
-            "Messages cut to a sender's size ceiling and sent"
-        );
-        metrics::describe_counter!(
-            "transport_coalesced_calls_total",
-            "gRPC RouteBatch calls that joined send_batch blocks"
-        );
-        metrics::describe_counter!(
-            "transport_coalesced_blocks_total",
-            "send_batch blocks the joined gRPC calls carried"
-        );
-        metrics::describe_counter!(
-            "transport_coalesced_records_total",
-            "Records the joined gRPC calls carried"
-        );
-        metrics::describe_counter!(
-            "transport_coalesced_timeouts_total",
-            "gRPC send_batch blocks answered at send_timeout_ms before their joined call did"
-        );
-        metrics::describe_counter!(
-            "transport_consumer_rebuilds_total",
-            "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
-        );
-        metrics::describe_counter!(
-            "transport_revoke_discarded_total",
-            "Records a revoke kept from a write, as the partition's next owner reads them again, by stage"
-        );
-
-        // Push transport descriptors into manifest registry. Labels are every
-        // key an emitter sets: `path` on gRPC RouteBatch sends, `reason` on
-        // pressure sheds.
-        for (name, desc, mt, labels) in [
-            (
-                "transport_sent_total",
-                "Messages successfully sent to transport",
-                MetricType::Counter,
-                &["transport", "path"][..],
-            ),
-            (
-                "transport_send_errors_total",
-                "Messages that failed to send",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_backpressured_total",
-                "Messages delayed due to backpressure",
-                MetricType::Counter,
-                &["transport", "reason"],
-            ),
-            (
-                "transport_refused_total",
-                "Messages refused by transport (circuit open, capacity)",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_healthy",
-                "Transport health (1=healthy, 0=unhealthy)",
-                MetricType::Gauge,
-                &["transport"],
-            ),
-            (
-                "transport_queue_size",
-                "Current number of messages in transport queue",
-                MetricType::Gauge,
-                &["transport"],
-            ),
-            (
-                "transport_queue_capacity",
-                "Maximum transport queue capacity",
-                MetricType::Gauge,
-                &["transport"],
-            ),
-            (
-                "transport_inflight",
-                "Messages currently in-flight (sent but not acked)",
-                MetricType::Gauge,
-                &["transport"],
-            ),
-            (
-                "transport_commit_errors_total",
-                "Source commits that failed after the block was delivered",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_message_too_large_total",
-                "Records over a sender's size ceiling, refused before sending or by the receiver",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_truncated_total",
-                "Messages cut to a sender's size ceiling and sent",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_coalesced_calls_total",
-                "gRPC RouteBatch calls that joined send_batch blocks",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_coalesced_blocks_total",
-                "send_batch blocks the joined gRPC calls carried",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_coalesced_records_total",
-                "Records the joined gRPC calls carried",
-                MetricType::Counter,
-                &["transport"],
-            ),
-            (
-                "transport_coalesced_timeouts_total",
-                "gRPC send_batch blocks answered at send_timeout_ms before their joined call did",
-                MetricType::Counter,
-                &["transport"],
-            ),
-        ] {
-            reg.push(MetricDescriptor {
-                name: name.into(),
-                metric_type: mt,
-                description: desc.into(),
-                unit: String::new(),
-                labels: labels.iter().map(|l| (*l).to_string()).collect(),
-                group: "platform".into(),
-                buckets: None,
-                use_cases: vec![],
-                dashboard_hint: None,
-            });
-        }
-        reg.push(MetricDescriptor {
-            name: "transport_recv_errors_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Receive failures by class (transient: retried, permanent: returned)"
-                .into(),
-            unit: String::new(),
-            labels: vec!["transport".into(), "class".into()],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        reg.push(MetricDescriptor {
-            name: "transport_consumer_rebuilds_total".into(),
-            metric_type: MetricType::Counter,
-            description:
-                "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with"
-                    .into(),
-            unit: String::new(),
-            labels: vec!["transport".into(), "protocol".into()],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        reg.push(MetricDescriptor {
-            name: "transport_revoke_discarded_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Records a revoke kept from a write, as the partition's next owner reads \
-                          them again, by stage: receive (left out by recv) or buffer (discarded \
-                          by the caller)"
-                .into(),
-            unit: String::new(),
-            labels: vec!["transport".into(), "stage".into()],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        reg.push(MetricDescriptor {
-            name: "transport_send_duration_seconds".into(),
-            metric_type: MetricType::Histogram,
-            description: "Time to send a batch to transport".into(),
-            unit: "seconds".into(),
-            labels: vec!["transport".into()],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        for (name, desc, unit, labels) in [
-            (
-                "transport_sent_bytes_total",
-                "Raw bytes written to transport (egress)",
-                "bytes",
-                &["transport"][..],
-            ),
-            (
-                "transport_received_bytes_total",
-                "Raw bytes read from transport (ingress)",
-                "bytes",
-                &["transport"],
-            ),
-            (
-                "transport_received_events_total",
-                "Events received off the transport (ingress count)",
-                "",
-                &["transport"],
-            ),
-        ] {
-            reg.push(MetricDescriptor {
-                name: name.into(),
-                metric_type: MetricType::Counter,
-                description: desc.into(),
-                unit: unit.into(),
-                labels: labels.iter().map(|l| (*l).to_string()).collect(),
-                group: "platform".into(),
-                buckets: None,
-                use_cases: vec![],
-                dashboard_hint: None,
-            });
-        }
-
-        // --- Pipeline ---
-        metrics::describe_gauge!(
-            "pipeline_ready",
-            "Pipeline readiness (1=ready, 0=not ready)"
-        );
-        metrics::describe_counter!(
-            "pipeline_stall_seconds_total",
-            "Cumulative seconds the pipeline was stalled"
-        );
-        metrics::describe_gauge!(
-            "pipeline_idle",
-            "Service has no work configured (1=idle, 0=working)"
-        );
-        metrics::describe_counter!(
-            "pipeline_retries_total",
-            "Run-loop steps retried after a transient source or sink failure"
-        );
-
-        reg.push(MetricDescriptor {
-            name: "pipeline_retries_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Run-loop steps retried after a transient source or sink failure".into(),
-            unit: String::new(),
-            labels: vec!["stage".into()],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        reg.push(MetricDescriptor {
-            name: "pipeline_idle".into(),
-            metric_type: MetricType::Gauge,
-            description: "Service has no work configured (1=idle, 0=working)".into(),
-            unit: String::new(),
-            labels: vec![],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        reg.push(MetricDescriptor {
-            name: "pipeline_ready".into(),
-            metric_type: MetricType::Gauge,
-            description: "Pipeline readiness (1=ready, 0=not ready)".into(),
-            unit: String::new(),
-            labels: vec![],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        reg.push(MetricDescriptor {
-            name: "pipeline_stall_seconds_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Cumulative seconds the pipeline was stalled".into(),
-            unit: "seconds".into(),
-            labels: vec![],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        // --- Source acknowledgements ---
-        for (name, desc, mt, unit, labels) in [
-            (
-                "pipeline_delivery_guarantee",
-                "Delivery guarantee the pipeline gives (1 = active), with the reason, and \
-                 the listener when the app names one",
-                MetricType::Gauge,
-                "",
-                &["guarantee", "reason", "listener"][..],
-            ),
-            (
-                "pipeline_dead_letters_dropped_total",
-                "Dead letters dropped with nowhere to go: no DLQ, a disabled DLQ, a record \
-                 a gRPC send_batch left out of a block, or one a downstream peer refused for good",
-                MetricType::Counter,
-                "",
-                &["reason"],
-            ),
-            (
-                "transport_ack_held",
-                "Records whose source acknowledgement is held until delivery",
-                MetricType::Gauge,
-                "",
-                &["transport"],
-            ),
-            (
-                "transport_ack_held_bytes",
-                "Payload bytes whose source acknowledgement is held until delivery",
-                MetricType::Gauge,
-                "bytes",
-                &["transport"],
-            ),
-            (
-                "transport_ack_withheld",
-                "Kafka offsets released Errored and still held: each pins its partition's \
-                 commit until a restart or a revoke",
-                MetricType::Gauge,
-                "",
-                &["transport"],
-            ),
-            (
-                "transport_ack_released_total",
-                "Records whose source acknowledgement was released, by outcome",
-                MetricType::Counter,
-                "",
-                &["transport", "outcome"],
-            ),
-            (
-                "transport_ack_refused_total",
-                "Requests refused before their acknowledgement was held, by reason",
-                MetricType::Counter,
-                "",
-                &["transport", "reason"],
-            ),
-            (
-                "transport_ack_latency_seconds",
-                "Time from receipt to the release of a source acknowledgement",
-                MetricType::Histogram,
-                "seconds",
-                &["transport", "outcome"],
-            ),
-            (
-                "transport_redelivered_total",
-                "Sends retried after the receiver may already have taken them",
-                MetricType::Counter,
-                "",
-                &["transport", "reason"],
-            ),
-        ] {
-            match mt {
-                MetricType::Gauge => metrics::describe_gauge!(name, desc),
-                MetricType::Histogram => {
-                    metrics::describe_histogram!(name, metrics::Unit::Seconds, desc);
-                }
-                MetricType::Counter => metrics::describe_counter!(name, desc),
-            }
-            reg.push(MetricDescriptor {
-                name: name.into(),
-                metric_type: mt,
-                description: desc.into(),
-                unit: unit.into(),
-                labels: labels.iter().map(|l| (*l).to_string()).collect(),
-                group: "platform".into(),
-                buckets: None,
-                use_cases: vec![],
-                dashboard_hint: None,
-            });
-        }
-
-        // --- Records ---
-        metrics::describe_counter!(
-            "records_received_total",
-            "Records received from all sources"
-        );
-        metrics::describe_counter!(
-            "records_delivered_total",
-            "Records successfully delivered to sink"
-        );
-        metrics::describe_counter!(
-            "records_filtered_total",
-            "Records dropped by filter/routing rules"
-        );
-        metrics::describe_counter!("records_dlq_total", "Records sent to dead letter queue");
-
-        for (name, desc) in [
-            (
-                "records_received_total",
-                "Records received from all sources",
-            ),
-            (
-                "records_delivered_total",
-                "Records successfully delivered to sink",
-            ),
-            (
-                "records_filtered_total",
-                "Records dropped by filter/routing rules",
-            ),
-            ("records_dlq_total", "Records sent to dead letter queue"),
-        ] {
-            reg.push(MetricDescriptor {
-                name: name.into(),
-                metric_type: MetricType::Counter,
-                description: desc.into(),
-                unit: String::new(),
-                labels: vec![],
-                group: "platform".into(),
-                buckets: None,
-                use_cases: vec![],
-                dashboard_hint: None,
-            });
-        }
-
-        // --- Scaling ---
-        metrics::describe_gauge!("scaling_pressure", "Normalised scaling pressure (0-100)");
-        metrics::describe_gauge!(
-            "scaling_circuit_open",
-            "Circuit breaker state (1=open, 0=closed)"
-        );
-        metrics::describe_gauge!("scaling_memory_pressure", "Memory pressure ratio (0.0-1.0)");
-
-        for (name, desc) in [
-            ("scaling_pressure", "Normalised scaling pressure (0-100)"),
-            (
-                "scaling_circuit_open",
-                "Circuit breaker state (1=open, 0=closed)",
-            ),
-            ("scaling_memory_pressure", "Memory pressure ratio (0.0-1.0)"),
-        ] {
-            reg.push(MetricDescriptor {
-                name: name.into(),
-                metric_type: MetricType::Gauge,
-                description: desc.into(),
-                unit: String::new(),
-                labels: vec![],
-                group: "platform".into(),
-                buckets: None,
-                use_cases: vec![],
-                dashboard_hint: None,
-            });
-        }
-
-        // --- Spool ---
-        describe_platform(
-            &reg,
+        // Labels are every key an emitter sets: `path` on gRPC RouteBatch
+        // sends, `reason` on pressure sheds.
+        let transport = ["transport"];
+        reg.describe(
+            "platform",
             &[
-                (
-                    "spool_bytes",
-                    "Current spool size in bytes",
-                    MetricType::Gauge,
-                    "",
-                    &[],
+                // --- Transport ---
+                Series::counter(
+                    "transport_sent_total",
+                    "Messages successfully sent to transport",
+                )
+                .labels(&["transport", "path"]),
+                Series::counter("transport_send_errors_total", "Messages that failed to send")
+                    .labels(&transport),
+                Series::counter(
+                    "transport_backpressured_total",
+                    "Messages delayed due to backpressure",
+                )
+                .labels(&["transport", "reason"]),
+                Series::counter(
+                    "transport_refused_total",
+                    "Messages refused by transport (circuit open, capacity)",
+                )
+                .labels(&transport),
+                Series::gauge(
+                    "transport_healthy",
+                    "Transport health (1=healthy, 0=unhealthy)",
+                )
+                .labels(&transport),
+                Series::gauge(
+                    "transport_queue_size",
+                    "Current number of messages in transport queue",
+                )
+                .labels(&transport),
+                Series::gauge(
+                    "transport_queue_capacity",
+                    "Maximum transport queue capacity",
+                )
+                .labels(&transport),
+                Series::gauge(
+                    "transport_inflight",
+                    "Messages currently in-flight (sent but not acked)",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_commit_errors_total",
+                    "Source commits that failed after the block was delivered",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_message_too_large_total",
+                    "Records over a sender's size ceiling, refused before sending or by the receiver",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_truncated_total",
+                    "Messages cut to a sender's size ceiling and sent",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_coalesced_calls_total",
+                    "gRPC RouteBatch calls that joined send_batch blocks",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_coalesced_blocks_total",
+                    "send_batch blocks the joined gRPC calls carried",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_coalesced_records_total",
+                    "Records the joined gRPC calls carried",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_coalesced_timeouts_total",
+                    "gRPC send_batch blocks answered at send_timeout_ms before their joined call did",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_recv_errors_total",
+                    "Receive failures by class (transient: retried, permanent: returned)",
+                )
+                .labels(&["transport", "class"]),
+                Series::counter(
+                    "transport_consumer_rebuilds_total",
+                    "Consumers replaced after librdkafka flagged them fatal, by the protocol rejoined with",
+                )
+                .labels(&["transport", "protocol"]),
+                Series::counter(
+                    "transport_revoke_discarded_total",
+                    "Records a revoke kept from a write, as the partition's next owner reads \
+                     them again, by stage: receive (left out by recv) or buffer (discarded \
+                     by the caller)",
+                )
+                .labels(&["transport", "stage"]),
+                Series::histogram(
+                    "transport_send_duration_seconds",
+                    "Time to send a batch to transport",
+                )
+                .labels(&transport),
+                // Byte/event throughput, incremented per batch. Bytes are raw
+                // wire bytes (summed payload.len() per WorkBatch), not decoded size.
+                Series::counter(
+                    "transport_sent_bytes_total",
+                    "Raw bytes written to transport (egress)",
+                )
+                .unit(Unit::Bytes)
+                .labels(&transport),
+                Series::counter(
+                    "transport_received_bytes_total",
+                    "Raw bytes read from transport (ingress)",
+                )
+                .unit(Unit::Bytes)
+                .labels(&transport),
+                Series::counter(
+                    "transport_received_events_total",
+                    "Events received off the transport (ingress count)",
+                )
+                .labels(&transport),
+                // --- Pipeline ---
+                Series::counter(
+                    "pipeline_retries_total",
+                    "Run-loop steps retried after a transient source or sink failure",
+                )
+                .labels(&["stage"]),
+                Series::gauge(
+                    "pipeline_idle",
+                    "Service has no work configured (1=idle, 0=working)",
                 ),
-                (
-                    "spool_messages",
-                    "Current spool message count",
-                    MetricType::Gauge,
-                    "",
-                    &[],
+                Series::gauge(
+                    "pipeline_ready",
+                    "Pipeline readiness (1=ready, 0=not ready)",
                 ),
-                (
+                Series::counter(
+                    "pipeline_stall_seconds_total",
+                    "Cumulative seconds the pipeline was stalled",
+                )
+                .manifest_unit("seconds"),
+                // --- Source acknowledgements ---
+                Series::gauge(
+                    "pipeline_delivery_guarantee",
+                    "Delivery guarantee the pipeline gives (1 = active), with the reason, and \
+                     the listener when the app names one",
+                )
+                .labels(&["guarantee", "reason", "listener"]),
+                Series::counter(
+                    "pipeline_dead_letters_dropped_total",
+                    "Dead letters dropped with nowhere to go: no DLQ, a disabled DLQ, a record \
+                     a gRPC send_batch left out of a block, or one a downstream peer refused for good",
+                )
+                .labels(&["reason"]),
+                Series::gauge(
+                    "transport_ack_held",
+                    "Records whose source acknowledgement is held until delivery",
+                )
+                .labels(&transport),
+                Series::gauge(
+                    "transport_ack_held_bytes",
+                    "Payload bytes whose source acknowledgement is held until delivery",
+                )
+                .manifest_unit("bytes")
+                .labels(&transport),
+                Series::gauge(
+                    "transport_ack_withheld",
+                    "Kafka offsets released Errored and still held: each pins its partition's \
+                     commit until a restart or a revoke",
+                )
+                .labels(&transport),
+                Series::counter(
+                    "transport_ack_released_total",
+                    "Records whose source acknowledgement was released, by outcome",
+                )
+                .labels(&["transport", "outcome"]),
+                Series::counter(
+                    "transport_ack_refused_total",
+                    "Requests refused before their acknowledgement was held, by reason",
+                )
+                .labels(&["transport", "reason"]),
+                Series::histogram(
+                    "transport_ack_latency_seconds",
+                    "Time from receipt to the release of a source acknowledgement",
+                )
+                .labels(&["transport", "outcome"]),
+                Series::counter(
+                    "transport_redelivered_total",
+                    "Sends retried after the receiver may already have taken them",
+                )
+                .labels(&["transport", "reason"]),
+                // --- Records ---
+                Series::counter(
+                    "records_received_total",
+                    "Records received from all sources",
+                ),
+                Series::counter(
+                    "records_delivered_total",
+                    "Records successfully delivered to sink",
+                ),
+                Series::counter(
+                    "records_filtered_total",
+                    "Records dropped by filter/routing rules",
+                ),
+                Series::counter("records_dlq_total", "Records sent to dead letter queue"),
+                // --- Scaling ---
+                Series::gauge("scaling_pressure", "Normalised scaling pressure (0-100)"),
+                Series::gauge(
+                    "scaling_circuit_open",
+                    "Circuit breaker state (1=open, 0=closed)",
+                ),
+                Series::gauge("scaling_memory_pressure", "Memory pressure ratio (0.0-1.0)"),
+                // --- Spool ---
+                Series::gauge("spool_bytes", "Current spool size in bytes"),
+                Series::gauge("spool_messages", "Current spool message count"),
+                Series::gauge(
                     "spool_disk_available",
                     "Available disk space for spool in bytes",
-                    MetricType::Gauge,
-                    "",
-                    &[],
                 ),
             ],
         );
         // A feature-gated series is described only in a build that can write it.
         #[cfg(feature = "tiered-sink")]
-        describe_platform(
-            &reg,
+        reg.describe(
+            "platform",
             &[
-                (
+                Series::counter(
                     "spool_hot_path_total",
                     "Records the tiered sink's sender took on the hot path",
-                    MetricType::Counter,
-                    "",
-                    &[],
                 ),
-                (
+                Series::counter(
                     "spool_cold_path_total",
                     "Tiered sink sends that ended on the spool path without error",
-                    MetricType::Counter,
-                    "",
-                    &[],
                 ),
-                (
+                Series::counter(
                     "spool_circuit_trips_total",
                     "Tiered sink hot-path sends that failed (backpressured or timed out), one per send",
-                    MetricType::Counter,
-                    "",
-                    &[],
                 ),
-                (
+                Series::gauge(
                     "spool_circuit_state",
                     "Tiered sink circuit breaker state at the last send (0=closed, 1=half-open, 2=open)",
-                    MetricType::Gauge,
-                    "",
-                    &[],
                 ),
-                (
+                Series::counter(
                     "tiered_sink_overflow_total",
                     "Records the tiered sink shed because the spool was full, by when_full policy",
-                    MetricType::Counter,
-                    "",
-                    &["policy"],
-                ),
-                (
+                )
+                .labels(&["policy"]),
+                Series::counter(
                     "tiered_sink_dropped_total",
                     "Records the tiered sink dropped on spool overflow, by when_full policy",
-                    MetricType::Counter,
-                    "",
-                    &["policy"],
-                ),
-                (
+                )
+                .labels(&["policy"]),
+                Series::counter(
                     "tiered_sink_dead_letters_total",
                     "Records the tiered sink's drain or full spool could not deliver, by reason and whether the DLQ took them",
-                    MetricType::Counter,
-                    "",
-                    &["reason", "outcome"],
-                ),
-                (
+                )
+                .labels(&["reason", "outcome"]),
+                Series::gauge(
                     "tiered_sink_drain_held",
                     "1 while a tiered sink's drain holds at a spilled entry its codec cannot read, else 0",
-                    MetricType::Gauge,
-                    "",
-                    &[],
                 ),
-                (
+                Series::gauge(
                     "spool_disk_available_bytes",
                     "Bytes free to unprivileged users on the tiered sink spool's filesystem",
-                    MetricType::Gauge,
-                    "bytes",
-                    &[],
-                ),
-                (
+                )
+                .manifest_unit("bytes"),
+                Series::gauge(
                     "spool_disk_total_bytes",
                     "Size of the tiered sink spool's filesystem in bytes",
-                    MetricType::Gauge,
-                    "bytes",
-                    &[],
-                ),
-                (
+                )
+                .manifest_unit("bytes"),
+                Series::counter(
                     "spool_dropped_without_shutdown_total",
                     "Tiered sinks dropped with records spooled and no completed shutdown",
-                    MetricType::Counter,
-                    "",
-                    &[],
                 ),
-                (
+                Series::counter(
                     "tiered_sink_drain_read_errors_total",
                     "Tiered sink drain passes whose spill read failed",
-                    MetricType::Counter,
-                    "",
-                    &[],
                 ),
-                (
+                Series::gauge(
                     "tiered_sink_drain_stalled",
                     "1 while the tiered sink's spool counts records its drain does not find, else 0",
-                    MetricType::Gauge,
-                    "",
-                    &[],
                 ),
             ],
         );
         #[cfg(any(feature = "spool", feature = "tiered-sink"))]
-        describe_platform(
-            &reg,
-            &[
-                (
-                    "spool_quarantined_total",
-                    "Spool caches moved aside into a corrupt-* subdirectory, by trigger",
-                    MetricType::Counter,
-                    "",
-                    &["trigger"],
-                ),
-                (
-                    "spool_bytes_in_total",
-                    "Bytes a spool took in, before compression",
-                    MetricType::Counter,
-                    "bytes",
-                    &["store", "codec"],
-                ),
-                (
-                    "spool_bytes_written_total",
-                    "Bytes a spool appended to its segment files",
-                    MetricType::Counter,
-                    "bytes",
-                    &["store", "codec"],
-                ),
-                (
-                    "spool_codec_microseconds_total",
-                    "Time a spool spent in its codec",
-                    MetricType::Counter,
-                    "microseconds",
-                    &["store", "codec", "op"],
-                ),
-                (
-                    "spool_disk_bytes",
-                    "Bytes a spool's segment files hold on disk",
-                    MetricType::Gauge,
-                    "bytes",
-                    &["store"],
-                ),
-                (
-                    "spool_disk_full_refused_bytes_total",
-                    "Bytes a spool refused because its disk was full",
-                    MetricType::Counter,
-                    "bytes",
-                    &["store"],
-                ),
-                (
-                    "spool_disk_full_wait_milliseconds_total",
-                    "Time a spool waited for its full disk to have room again",
-                    MetricType::Counter,
-                    "milliseconds",
-                    &["store"],
-                ),
-                (
-                    "spool_memory_reserved_bytes",
-                    "Bytes a spool's read holds reserved with the memory guard",
-                    MetricType::Gauge,
-                    "bytes",
-                    &["store"],
-                ),
-                (
-                    "spool_drain_cut_short_total",
-                    "Spool reads the memory guard stopped after their first record",
-                    MetricType::Counter,
-                    "",
-                    &["store"],
-                ),
-                (
-                    "spool_damaged_entries_total",
-                    "Spooled records dropped because they failed their CRC",
-                    MetricType::Counter,
-                    "",
-                    &["store"],
-                ),
-                (
-                    "spool_oldest_age_seconds",
-                    "Age of the oldest record a spool holds, 0 when it holds none",
-                    MetricType::Gauge,
-                    "seconds",
-                    &["store"],
-                ),
-                (
-                    "spool_sync_seconds",
-                    "Time one sync of a spool to disk took",
-                    MetricType::Histogram,
-                    "seconds",
-                    &["store"],
-                ),
-                (
-                    "spool_position_save_failures_total",
-                    "Saves of a spool's read position that failed",
-                    MetricType::Counter,
-                    "",
-                    &["store"],
-                ),
-                (
-                    "spool_segment_delete_failures_total",
-                    "Consumed spool segment files that could not be deleted",
-                    MetricType::Counter,
-                    "",
-                    &["store"],
-                ),
-                (
-                    "spool_torn_entries_cut_total",
-                    "Torn entries cut off the end of a spool when it opened",
-                    MetricType::Counter,
-                    "",
-                    &["store"],
-                ),
-            ],
-        );
+        {
+            let store = ["store"];
+            let store_codec = ["store", "codec"];
+            reg.describe(
+                "platform",
+                &[
+                    Series::counter(
+                        "spool_quarantined_total",
+                        "Spool caches moved aside into a corrupt-* subdirectory, by trigger",
+                    )
+                    .labels(&["trigger"]),
+                    Series::counter(
+                        "spool_bytes_in_total",
+                        "Bytes a spool took in, before compression",
+                    )
+                    .manifest_unit("bytes")
+                    .labels(&store_codec),
+                    Series::counter(
+                        "spool_bytes_written_total",
+                        "Bytes a spool appended to its segment files",
+                    )
+                    .manifest_unit("bytes")
+                    .labels(&store_codec),
+                    Series::counter(
+                        "spool_codec_microseconds_total",
+                        "Time a spool spent in its codec",
+                    )
+                    .manifest_unit("microseconds")
+                    .labels(&["store", "codec", "op"]),
+                    Series::gauge(
+                        "spool_disk_bytes",
+                        "Bytes a spool's segment files hold on disk",
+                    )
+                    .manifest_unit("bytes")
+                    .labels(&store),
+                    Series::counter(
+                        "spool_disk_full_refused_bytes_total",
+                        "Bytes a spool refused because its disk was full",
+                    )
+                    .manifest_unit("bytes")
+                    .labels(&store),
+                    Series::counter(
+                        "spool_disk_full_wait_milliseconds_total",
+                        "Time a spool waited for its full disk to have room again",
+                    )
+                    .manifest_unit("milliseconds")
+                    .labels(&store),
+                    Series::gauge(
+                        "spool_memory_reserved_bytes",
+                        "Bytes a spool's read holds reserved with the memory guard",
+                    )
+                    .manifest_unit("bytes")
+                    .labels(&store),
+                    Series::counter(
+                        "spool_drain_cut_short_total",
+                        "Spool reads the memory guard stopped after their first record",
+                    )
+                    .labels(&store),
+                    Series::counter(
+                        "spool_damaged_entries_total",
+                        "Spooled records dropped because they failed their CRC",
+                    )
+                    .labels(&store),
+                    Series::gauge(
+                        "spool_oldest_age_seconds",
+                        "Age of the oldest record a spool holds, 0 when it holds none",
+                    )
+                    .manifest_unit("seconds")
+                    .labels(&store),
+                    Series::histogram(
+                        "spool_sync_seconds",
+                        "Time one sync of a spool to disk took",
+                    )
+                    .labels(&store),
+                    Series::counter(
+                        "spool_position_save_failures_total",
+                        "Saves of a spool's read position that failed",
+                    )
+                    .labels(&store),
+                    Series::counter(
+                        "spool_segment_delete_failures_total",
+                        "Consumed spool segment files that could not be deleted",
+                    )
+                    .labels(&store),
+                    Series::counter(
+                        "spool_torn_entries_cut_total",
+                        "Torn entries cut off the end of a spool when it opened",
+                    )
+                    .labels(&store),
+                ],
+            );
+        }
         #[cfg(feature = "spool")]
-        describe_platform(
-            &reg,
-            &[(
+        reg.describe(
+            "platform",
+            &[Series::gauge(
                 "spool_queue_depth",
                 "Records in a standalone spool queue",
-                MetricType::Gauge,
-                "",
-                &[],
             )],
         );
         #[cfg(feature = "rules")]
-        describe_platform(
-            &reg,
+        reg.describe(
+            "platform",
             &[
-                (
+                Series::counter(
                     "rules_hits_total",
                     "Records a rule set row set its target on, by rule set and row id",
-                    MetricType::Counter,
-                    "",
-                    &["rule_set", "rule"],
-                ),
-                (
+                )
+                .labels(&["rule_set", "rule"]),
+                Series::counter(
                     "rules_clamped_total",
                     "Records whose clamped target the default replaced, by the row that set the refused value, or (record)",
-                    MetricType::Counter,
-                    "",
-                    &["rule_set", "rule"],
-                ),
+                )
+                .labels(&["rule_set", "rule"]),
             ],
         );
 
-        // --- DLQ ---
-        for (name, desc, labels) in [
-            (
-                "dlq_dropped_total",
-                "Dead letters no DLQ backend holds, by reason",
-                &["reason"][..],
-            ),
-            (
-                "dlq_cascade_fallthrough_total",
-                "Dead letters a later cascade backend took after an earlier one gave them up",
-                &["from", "to", "reason"],
-            ),
-            (
-                "dlq_payload_truncated_total",
-                "Dead letters whose payload was cut to max_payload_bytes",
-                &[],
-            ),
-        ] {
-            metrics::describe_counter!(name, desc);
-            reg.push(MetricDescriptor {
-                name: name.into(),
-                metric_type: MetricType::Counter,
-                description: desc.into(),
-                unit: String::new(),
-                labels: labels.iter().map(|l| (*l).to_string()).collect(),
-                group: "platform".into(),
-                buckets: None,
-                use_cases: vec![],
-                dashboard_hint: None,
-            });
-        }
-
-        // --- Security ---
-        metrics::describe_counter!("auth_failures_total", "Authentication failures by reason");
-        metrics::describe_counter!("validation_failures_total", "Validation failures by reason");
-
-        reg.push(MetricDescriptor {
-            name: "auth_failures_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Authentication failures by reason".into(),
-            unit: String::new(),
-            labels: vec!["reason".into()],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        reg.push(MetricDescriptor {
-            name: "validation_failures_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Validation failures by reason".into(),
-            unit: String::new(),
-            labels: vec!["reason".into()],
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
+        reg.describe(
+            "platform",
+            &[
+                // --- DLQ ---
+                Series::counter(
+                    "dlq_dropped_total",
+                    "Dead letters no DLQ backend holds, by reason",
+                )
+                .labels(&["reason"]),
+                Series::counter(
+                    "dlq_cascade_fallthrough_total",
+                    "Dead letters a later cascade backend took after an earlier one gave them up",
+                )
+                .labels(&["from", "to", "reason"]),
+                Series::counter(
+                    "dlq_payload_truncated_total",
+                    "Dead letters whose payload was cut to max_payload_bytes",
+                ),
+                // --- Security ---
+                Series::counter("auth_failures_total", "Authentication failures by reason")
+                    .labels(&["reason"]),
+                Series::counter("validation_failures_total", "Validation failures by reason")
+                    .labels(&["reason"]),
+            ],
+        );
 
         Self { _private: () }
     }
@@ -1096,32 +688,6 @@ impl ServiceMetrics {
     }
 }
 
-/// Describe each `(name, description, type, unit, label keys)` with the global
-/// recorder and push it into the manifest as a platform metric.
-fn describe_platform(
-    reg: &super::MetricRegistry,
-    series: &[(&'static str, &'static str, MetricType, &str, &[&str])],
-) {
-    for &(name, desc, mt, unit, labels) in series {
-        match mt {
-            MetricType::Gauge => metrics::describe_gauge!(name, desc),
-            MetricType::Counter => metrics::describe_counter!(name, desc),
-            MetricType::Histogram => metrics::describe_histogram!(name, desc),
-        }
-        reg.push(MetricDescriptor {
-            name: name.into(),
-            metric_type: mt,
-            description: desc.into(),
-            unit: unit.into(),
-            labels: labels.iter().map(|l| (*l).to_string()).collect(),
-            group: "platform".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,6 +794,8 @@ mod tests {
     #[cfg(feature = "tiered-sink")]
     #[tokio::test]
     async fn test_register_lists_tiered_sink_series() {
+        use crate::metrics::MetricType;
+
         let mgr = super::super::MetricsManager::new_for_test("test_app");
         let _dfe = ServiceMetrics::register(&mgr);
         let manifest = mgr.registry().manifest();

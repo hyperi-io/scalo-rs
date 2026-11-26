@@ -13,7 +13,7 @@ use std::sync::Arc;
 use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram};
 
 use super::super::MetricsManager;
-use super::super::manifest::{MetricDescriptor, MetricType};
+use super::super::Series;
 
 const LAG: &str = "consumer_lag";
 const PARTITIONS_ASSIGNED: &str = "consumer_partitions_assigned";
@@ -43,26 +43,22 @@ impl ConsumerMetrics {
     #[must_use]
     pub fn new(manager: &MetricsManager) -> Self {
         // BARE names -- the recorder prefix layer and registry apply the namespace.
-        describe(
-            manager,
-            LAG,
-            MetricType::Gauge,
-            "Kafka consumer lag per group/topic/partition",
-            &["group_id", "topic", "partition"],
-        );
-        describe(
-            manager,
-            PARTITIONS_ASSIGNED,
-            MetricType::Gauge,
-            "Current assigned partition count per group",
-            &["group_id"],
-        );
-        describe(
-            manager,
-            REBALANCES,
-            MetricType::Counter,
-            "Consumer group rebalance events per group",
-            &["group_id"],
+        manager.registry().describe(
+            "consumer",
+            &[
+                Series::gauge(LAG, "Kafka consumer lag per group/topic/partition").labels(&[
+                    "group_id",
+                    "topic",
+                    "partition",
+                ]),
+                Series::gauge(
+                    PARTITIONS_ASSIGNED,
+                    "Current assigned partition count per group",
+                )
+                .labels(&["group_id"]),
+                Series::counter(REBALANCES, "Consumer group rebalance events per group")
+                    .labels(&["group_id"]),
+            ],
         );
 
         Self {
@@ -115,33 +111,6 @@ impl ConsumerMetrics {
     pub fn record_offsets_committed(&self, count: u64) {
         self.offsets_committed.increment(count);
     }
-}
-
-/// Describe `name`, labelled by `labels`, to the recorder and the manifest,
-/// registering no series.
-fn describe(
-    manager: &MetricsManager,
-    name: &'static str,
-    metric_type: MetricType,
-    description: &'static str,
-    labels: &[&str],
-) {
-    match metric_type {
-        MetricType::Counter => metrics::describe_counter!(name, description),
-        MetricType::Gauge => metrics::describe_gauge!(name, description),
-        MetricType::Histogram => metrics::describe_histogram!(name, description),
-    }
-    manager.registry().push(MetricDescriptor {
-        name: name.into(),
-        metric_type,
-        description: description.into(),
-        unit: String::new(),
-        labels: labels.iter().map(|label| (*label).to_string()).collect(),
-        group: "consumer".into(),
-        buckets: None,
-        use_cases: vec![],
-        dashboard_hint: None,
-    });
 }
 
 /// A handle on the series `name` with no labels, registered at its first

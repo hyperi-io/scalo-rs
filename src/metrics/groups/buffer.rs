@@ -11,7 +11,7 @@
 use metrics::{Counter, Gauge, Histogram};
 
 use super::super::MetricsManager;
-use super::super::manifest::{MetricDescriptor, MetricType};
+use super::super::Series;
 
 /// Default histogram buckets for buffer flush duration.
 const BUFFER_FLUSH_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0];
@@ -32,19 +32,13 @@ impl BufferMetrics {
     pub fn new(manager: &MetricsManager) -> Self {
         // BARE names -- the recorder prefix layer and registry apply the namespace.
 
-        // buffer_flush_trigger_total -- label-based, register descriptor manually
-        metrics::describe_counter!("buffer_flush_trigger_total", "Buffer flush trigger reason");
-        manager.registry().push(MetricDescriptor {
-            name: "buffer_flush_trigger_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Buffer flush trigger reason".into(),
-            unit: String::new(),
-            labels: vec!["trigger".into()],
-            group: "buffer".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
+        manager.registry().describe(
+            "buffer",
+            &[
+                Series::counter("buffer_flush_trigger_total", "Buffer flush trigger reason")
+                    .labels(&["trigger"]),
+            ],
+        );
 
         Self {
             buffer_bytes: manager.gauge_with_labels(

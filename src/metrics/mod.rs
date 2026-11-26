@@ -99,7 +99,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use metrics::{Counter, Gauge, Histogram, Unit};
+use metrics::{Counter, Gauge, Histogram};
 use thiserror::Error;
 #[cfg(feature = "metrics")]
 use tokio::net::TcpListener;
@@ -146,6 +146,7 @@ pub use container::ContainerMetrics;
 pub use service::ServiceMetrics;
 #[cfg(feature = "service-metrics")]
 pub mod groups;
+pub(crate) use manifest::Series;
 pub use manifest::{ManifestResponse, MetricDescriptor, MetricRegistry, MetricType};
 pub use process::ProcessMetrics;
 
@@ -709,24 +710,7 @@ impl MetricsManager {
     /// with empty labels and `group = "custom"`.
     #[must_use]
     pub fn counter(&self, name: &str, description: &str) -> Counter {
-        // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder. The registry applies
-        // it to the manifest. So the manifest and the emitted names match.
-        let key = name.to_string();
-        let desc = description.to_string();
-        metrics::describe_counter!(key.clone(), desc.clone());
-        self.registry.push(MetricDescriptor {
-            name: key.clone(),
-            metric_type: MetricType::Counter,
-            description: desc,
-            unit: String::new(),
-            labels: vec![],
-            group: "custom".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        metrics::counter!(key)
+        self.counter_with_labels(name, description, &[], "custom")
     }
 
     /// Create a counter with label keys and group metadata for the manifest.
@@ -742,24 +726,11 @@ impl MetricsManager {
         labels: &[&str],
         group: &str,
     ) -> Counter {
-        // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder. The registry applies
-        // it to the manifest. So the manifest and the emitted names match.
-        let key = name.to_string();
-        let desc = description.to_string();
-        metrics::describe_counter!(key.clone(), desc.clone());
-        self.registry.push(MetricDescriptor {
-            name: key.clone(),
-            metric_type: MetricType::Counter,
-            description: desc,
-            unit: String::new(),
-            labels: labels.iter().map(|s| (*s).to_string()).collect(),
-            group: group.into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        metrics::counter!(key)
+        // The BARE name throughout: the prefix layer on the global recorder
+        // and the registry each apply the namespace once, so they match.
+        let series = Series::counter(name, description).labels(labels);
+        self.registry.describe(group, &[series]);
+        metrics::counter!(name.to_string())
     }
 
     /// Create a gauge metric.
@@ -768,24 +739,7 @@ impl MetricsManager {
     /// with empty labels and `group = "custom"`.
     #[must_use]
     pub fn gauge(&self, name: &str, description: &str) -> Gauge {
-        // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder. The registry applies
-        // it to the manifest. So the manifest and the emitted names match.
-        let key = name.to_string();
-        let desc = description.to_string();
-        metrics::describe_gauge!(key.clone(), desc.clone());
-        self.registry.push(MetricDescriptor {
-            name: key.clone(),
-            metric_type: MetricType::Gauge,
-            description: desc,
-            unit: String::new(),
-            labels: vec![],
-            group: "custom".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        metrics::gauge!(key)
+        self.gauge_with_labels(name, description, &[], "custom")
     }
 
     /// Create a gauge with label keys and group metadata for the manifest.
@@ -797,24 +751,9 @@ impl MetricsManager {
         labels: &[&str],
         group: &str,
     ) -> Gauge {
-        // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder. The registry applies
-        // it to the manifest. So the manifest and the emitted names match.
-        let key = name.to_string();
-        let desc = description.to_string();
-        metrics::describe_gauge!(key.clone(), desc.clone());
-        self.registry.push(MetricDescriptor {
-            name: key.clone(),
-            metric_type: MetricType::Gauge,
-            description: desc,
-            unit: String::new(),
-            labels: labels.iter().map(|s| (*s).to_string()).collect(),
-            group: group.into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        metrics::gauge!(key)
+        let series = Series::gauge(name, description).labels(labels);
+        self.registry.describe(group, &[series]);
+        metrics::gauge!(name.to_string())
     }
 
     /// Create a histogram metric with default buckets.
@@ -823,24 +762,7 @@ impl MetricsManager {
     /// with empty labels and `group = "custom"`.
     #[must_use]
     pub fn histogram(&self, name: &str, description: &str) -> Histogram {
-        // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder. The registry applies
-        // it to the manifest. So the manifest and the emitted names match.
-        let key = name.to_string();
-        let desc = description.to_string();
-        metrics::describe_histogram!(key.clone(), Unit::Seconds, desc.clone());
-        self.registry.push(MetricDescriptor {
-            name: key.clone(),
-            metric_type: MetricType::Histogram,
-            description: desc,
-            unit: "seconds".into(),
-            labels: vec![],
-            group: "custom".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        metrics::histogram!(key)
+        self.histogram_with_labels(name, description, &[], "custom", None)
     }
 
     /// Create a histogram with label keys, group, and optional buckets for the manifest.
@@ -853,24 +775,11 @@ impl MetricsManager {
         group: &str,
         buckets: Option<&[f64]>,
     ) -> Histogram {
-        // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder. The registry applies
-        // it to the manifest. So the manifest and the emitted names match.
-        let key = name.to_string();
-        let desc = description.to_string();
-        metrics::describe_histogram!(key.clone(), Unit::Seconds, desc.clone());
-        self.registry.push(MetricDescriptor {
-            name: key.clone(),
-            metric_type: MetricType::Histogram,
-            description: desc,
-            unit: "seconds".into(),
-            labels: labels.iter().map(|s| (*s).to_string()).collect(),
-            group: group.into(),
-            buckets: buckets.map(|b| b.to_vec()),
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        metrics::histogram!(key)
+        let series = Series::histogram(name, description)
+            .labels(labels)
+            .buckets(buckets);
+        self.registry.describe(group, &[series]);
+        metrics::histogram!(name.to_string())
     }
 
     /// Create a histogram metric with custom buckets.
@@ -885,24 +794,7 @@ impl MetricsManager {
         description: &str,
         buckets: &[f64],
     ) -> Histogram {
-        // Emit + describe + register the BARE name. Namespacing is applied
-        // once by the prefix layer on the global recorder. The registry applies
-        // it to the manifest. So the manifest and the emitted names match.
-        let key = name.to_string();
-        let desc = description.to_string();
-        metrics::describe_histogram!(key.clone(), Unit::Seconds, desc.clone());
-        self.registry.push(MetricDescriptor {
-            name: key.clone(),
-            metric_type: MetricType::Histogram,
-            description: desc,
-            unit: "seconds".into(),
-            labels: vec![],
-            group: "custom".into(),
-            buckets: Some(buckets.to_vec()),
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-        metrics::histogram!(key)
+        self.histogram_with_labels(name, description, &[], "custom", Some(buckets))
     }
 
     /// Get the Prometheus metrics output.

@@ -9,7 +9,7 @@
 //! Circuit breaker metrics.
 
 use super::super::MetricsManager;
-use super::super::manifest::{MetricDescriptor, MetricType};
+use super::super::Series;
 
 /// Circuit breaker metrics for per-target failure tracking.
 ///
@@ -24,39 +24,21 @@ impl CircuitBreakerMetrics {
     pub fn new(manager: &MetricsManager) -> Self {
         // BARE names -- the recorder prefix layer and registry apply the namespace.
 
-        // circuit_breaker_state -- label-based, register descriptor manually
-        metrics::describe_gauge!(
-            "circuit_breaker_state",
-            "Circuit breaker state (0=closed, 1=open, 2=half-open)"
+        manager.registry().describe(
+            "circuit_breaker",
+            &[
+                Series::gauge(
+                    "circuit_breaker_state",
+                    "Circuit breaker state (0=closed, 1=open, 2=half-open)",
+                )
+                .labels(&["target"]),
+                Series::counter(
+                    "circuit_breaker_transitions_total",
+                    "Circuit breaker state transitions",
+                )
+                .labels(&["target", "to_state"]),
+            ],
         );
-        manager.registry().push(MetricDescriptor {
-            name: "circuit_breaker_state".into(),
-            metric_type: MetricType::Gauge,
-            description: "Circuit breaker state (0=closed, 1=open, 2=half-open)".into(),
-            unit: String::new(),
-            labels: vec!["target".into()],
-            group: "circuit_breaker".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        // circuit_breaker_transitions_total -- label-based
-        metrics::describe_counter!(
-            "circuit_breaker_transitions_total",
-            "Circuit breaker state transitions"
-        );
-        manager.registry().push(MetricDescriptor {
-            name: "circuit_breaker_transitions_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Circuit breaker state transitions".into(),
-            unit: String::new(),
-            labels: vec!["target".into(), "to_state".into()],
-            group: "circuit_breaker".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
 
         Self { _private: () }
     }

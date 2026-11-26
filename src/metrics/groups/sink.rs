@@ -11,7 +11,7 @@
 use metrics::Gauge;
 
 use super::super::MetricsManager;
-use super::super::manifest::{MetricDescriptor, MetricType};
+use super::super::Series;
 
 /// Sink write metrics.
 ///
@@ -27,51 +27,15 @@ impl SinkMetrics {
         // All names are BARE -- the prefix layer on the global recorder and the
         // manifest registry apply the namespace.
 
-        // sink_duration_seconds -- label-based, register descriptor manually
-        metrics::describe_histogram!(
-            "sink_duration_seconds",
-            metrics::Unit::Seconds,
-            "Sink write latency"
+        manager.registry().describe(
+            "sink",
+            &[
+                Series::histogram("sink_duration_seconds", "Sink write latency")
+                    .labels(&["backend"]),
+                Series::counter("sink_errors_total", "Sink write errors").labels(&["backend"]),
+                Series::counter("bytes_sent_total", "Bytes sent to sink").labels(&["format"]),
+            ],
         );
-        manager.registry().push(MetricDescriptor {
-            name: "sink_duration_seconds".into(),
-            metric_type: MetricType::Histogram,
-            description: "Sink write latency".into(),
-            unit: "seconds".into(),
-            labels: vec!["backend".into()],
-            group: "sink".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        // sink_errors_total -- label-based
-        metrics::describe_counter!("sink_errors_total", "Sink write errors");
-        manager.registry().push(MetricDescriptor {
-            name: "sink_errors_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Sink write errors".into(),
-            unit: String::new(),
-            labels: vec!["backend".into()],
-            group: "sink".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
-
-        // bytes_sent_total -- label-based
-        metrics::describe_counter!("bytes_sent_total", "Bytes sent to sink");
-        manager.registry().push(MetricDescriptor {
-            name: "bytes_sent_total".into(),
-            metric_type: MetricType::Counter,
-            description: "Bytes sent to sink".into(),
-            unit: String::new(),
-            labels: vec!["format".into()],
-            group: "sink".into(),
-            buckets: None,
-            use_cases: vec![],
-            dashboard_hint: None,
-        });
 
         Self {
             concurrent_inserts: manager.gauge_with_labels(

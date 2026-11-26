@@ -6,7 +6,7 @@
 // License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
-use crate::metrics::{MetricDescriptor, MetricType, MetricsManager};
+use crate::metrics::{MetricsManager, Series};
 
 use super::config::WorkerPoolConfig;
 
@@ -75,20 +75,13 @@ pub fn describe(manager: &MetricsManager) {
 /// The scaler emits it only with a direction, so this registers no series:
 /// a handle from `manager.counter` would add an unlabelled one stuck at 0.
 fn describe_scale_events(manager: &MetricsManager) {
-    const NAME: &str = "worker_pool_scale_events_total";
-    const DESCRIPTION: &str = "Scaling events";
-    metrics::describe_counter!(NAME, DESCRIPTION);
-    manager.registry().push(MetricDescriptor {
-        name: NAME.into(),
-        metric_type: MetricType::Counter,
-        description: DESCRIPTION.into(),
-        unit: String::new(),
-        labels: vec!["direction".into()],
-        group: "custom".into(),
-        buckets: None,
-        use_cases: vec![],
-        dashboard_hint: None,
-    });
+    manager.registry().describe(
+        "custom",
+        &[
+            Series::counter("worker_pool_scale_events_total", "Scaling events")
+                .labels(&["direction"]),
+        ],
+    );
 }
 
 /// Emit threshold gauge values (called at startup and on config reload).
