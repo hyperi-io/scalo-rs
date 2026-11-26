@@ -4,69 +4,9 @@ API and behaviour changes that need a consumer adjustment, indexed by the
 scalo release where each first ships. Read the sections between your current
 release and the target before bumping.
 
+From 2.14.41 each release has its own file in [migrations/](migrations/): [2.14.41](migrations/2.14.41.md).
+
 ---
-
-## 2.14.41
-
-### The manifest lists every series scalo writes (BEHAVIOUR CHANGE)
-
-`/metrics/manifest` and the `metrics-manifest` and `generate-artefacts` output now describe the series scalo's modules write, as well as the ones an app pushed: `process_*`, `container_*`, TLS, Kafka client, syslog, DLQ, worker pool thresholds and fan-out, governor, rate limit, secrets, HTTP client, file writer and WASM series, each when its feature is compiled in. The `self_regulation_*` series, which the batch engine described, are described whenever `governor` is on, in group `platform`, with their label keys. `records_received_total` is `platform` however an app registers it, where `AppMetrics` alone listed it under `app`.
-
-**Consumer adjustment** -- none for the service. A dashboard or alert generator that reads the manifest sees more series, and one that panels every listed series gets panels for them.
-
-### The secret cache keys each source on what it reads (BEHAVIOUR CHANGE)
-
-A configured source's cache entry is keyed on its name and a digest of what it reads, not the name alone. Before, two apps sharing a cache directory, each with a source called `api_token`, read each other's secret from the disk tier until its TTL ran out.
-
-**Consumer adjustment** -- none. Disk entries written by an earlier release are no longer found, so each source is read from its backend once after the upgrade, then cached under the new key. Old files stay in the cache directory until it is cleared.
-
-### Kafka `send_batch` sets the message timestamp from the record (BEHAVIOUR CHANGE)
-
-A record's `timestamp_ms` is the Kafka message timestamp, so a record read from one hop keeps its time through the next. Before, the producer set it, as CreateTime, when the record was sent. A record with no `timestamp_ms`, or one before the epoch, still gets the producer's time, and `send(destination, payload)` has no record and sets none.
-
-**Consumer adjustment** -- none for the data. A reader that took the message timestamp as the send time reads the record's time instead, and a topic set to `message.timestamp.type=LogAppendTime` still stamps the broker's time.
-
-### The syslog sender stamps a record's `time_unix_nano` header (BEHAVIOUR CHANGE)
-
-A record with a `time_unix_nano` header, decimal nanoseconds since the epoch, gets that time as its RFC 5424 TIMESTAMP, floored to the microsecond, in place of `timestamp_ms`. `TIME_UNIX_NANO_HEADER` is exported as `scalo::transport::TIME_UNIX_NANO_HEADER`, and `scalo::transport::otlp::TIME_UNIX_NANO_HEADER` stays as the same constant.
-
-**Consumer adjustment** -- none unless a record already carries a header of that name that disagrees with its `timestamp_ms`. The syslog sender then writes the header's time, as the OTLP sender does.
-
-### Kafka carries record headers both ways (BEHAVIOUR CHANGE)
-
-`send_record` and `send_batch` put a record's headers on the message as Kafka headers, and `recv` puts every Kafka header on `Message::headers`. Before, a send dropped them and a receive kept none, so `time_unix_nano`, the syslog `hostname_header` and `msg_id_header` values and an application's own headers were lost across a hop. A record carries at most 64 headers and 64 KiB of names and values each way, and the rest are left off, counted in `transport_dropped_total{reason="headers_over_cap"}`. A received header whose key is not UTF-8 is left off and counted under `reason="header_key_not_utf8"`, where before it panicked the receive.
-
-**Consumer adjustment** -- none for the data. A reader that took `Message::headers` as empty from Kafka now sees the headers the producer set, `traceparent` included, and a sink that writes every header (OTLP attributes, a Kafka forward) writes them all.
-
-### `DecodeLimits` has a `max_records` field (API CHANGE)
-
-`framing::DecodeLimits` has a public `max_records: usize`. `Framing::decode` refuses a unit holding more records with `FramingError::TooManyRecords { max }`, at the first record past it. `DecodeLimits::UNBOUNDED` sets it to `usize::MAX`, and `DecodeLimits::DEFAULT_MAX_RECORDS` is 100000.
-
-**Consumer adjustment** -- a `DecodeLimits` struct literal sets `max_records`, to `DecodeLimits::DEFAULT_MAX_RECORDS` for input from outside, or ends in `..DecodeLimits::UNBOUNDED`. A caller that answers the sender maps `TooManyRecords` to a refusal it retries smaller, such as HTTP 413.
-
-### The HTTP receive side splits a body by `framing` (BEHAVIOUR CHANGE)
-
-A receiving `HttpTransport` reads `framing`, which only the send side read. `single`, the default, keeps one record per body. `json_array`, `ndjson` and any other framing split a body into records, slices of it, queued together. `json` takes a JSON array or NDJSON on one path, and a sender refuses it. A body of more than 100000 records is answered 413 naming the cap. An unknown framing name fails the build where a receive-only transport ignored it. `recv_buffer_size` counts requests, each with all its records, and each split record reserves its queued message's memory from `max_in_flight_bytes`. The rules are in [transport/http.md](transport/http.md#receiving-body-framing).
-
-**Consumer adjustment** -- a receiver whose config sets `framing` for its send side gets bodies split by it. One that must keep a body as one record sets `framing: { type: single }`. An app's own framing is registered before a receiver naming it is built.
-
-### `WorkBatch::from_ndjson` and `from_json_array` take `DecodeLimits` (API CHANGE)
-
-Both take `&DecodeLimits` after the blob. `from_ndjson` returns `Result<WorkBatch<T>, FramingError>`, as `from_json_array` does, where it returned a batch that was empty when the blob did not decode. A record over `max_record_bytes` is a `dlq_entries` entry holding its first `max_record_bytes`.
-
-**Consumer adjustment** -- pass `&DecodeLimits::UNBOUNDED` for a blob this process wrote, or limits with `max_records: DecodeLimits::DEFAULT_MAX_RECORDS` for one from outside. Handle the error from `from_ndjson`, and route `dlq_entries`.
-
-### The syslog receiver caps connections and closes silent ones (API and BEHAVIOUR CHANGE)
-
-`SyslogListenConfig` has public `first_byte_timeout_ms`, `max_connections` and `ip_filter` fields. A TCP or TLS connection that sends nothing for 30 s is closed, and one past 10000 open on a listener is closed as it is accepted. `ip_filter` is off by default. `transport-syslog` pulls `concurrency`, `quinn-udp`, `ipnet` and `ipnet-trie`.
-
-**Consumer adjustment** -- a `SyslogListenConfig` struct literal ends in `..SyslogListenConfig::default()`. A sender that connects well before its first message needs `first_byte_timeout_ms: 0` or a longer wait, and a listener with more than 10000 senders at once a larger `max_connections`.
-
-### `max_age_days` on the file DLQ and file output is an `Option`, and `SyslogConfig` has two header keys (API CHANGE)
-
-`FileDlqConfig::max_age_days` and `FileOutputConfig::max_age_days` are `Option<u32>`, unset by default. Unset, the writer keeps the old defaults under `naming: stamped` (30 days for the DLQ, 7 for the file output) and sets no age limit under `naming: numbered`, so both can now rotate by number. A config that sets the key loads as before. `SyslogConfig` has public `hostname_header` and `msg_id_header` fields, and `SyslogTransport::builder` takes a connect resolver.
-
-**Consumer adjustment** -- a struct literal writes `max_age_days: Some(n)` where it wrote `max_age_days: n`, and code reading the field handles `None`. A `SyslogConfig` struct literal ends in `..SyslogConfig::default()`.
 
 ## 2.14.40: syslog receiver and metric units
 
