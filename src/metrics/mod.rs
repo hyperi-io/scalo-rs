@@ -116,6 +116,8 @@ pub type ReadinessFn = Arc<dyn Fn() -> bool + Send + Sync>;
     allow(dead_code, reason = "only the metrics listener answers /readyz")
 )]
 mod readiness;
+#[cfg(all(test, feature = "metrics", feature = "transport"))]
+pub(crate) mod test_recorder;
 use readiness::ReadinessSlot;
 #[cfg(test)]
 use readiness::ReadyAnswer;
@@ -1323,30 +1325,35 @@ async fn run_server(
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             result = listener.accept() => {
-                if let Ok((stream, _)) = result {
-                    // Over the cap the connection is closed unanswered.
-                    let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
-                        metrics::counter!("metrics_server_connections_refused_total").increment(1);
+                let stream = match result {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        crate::accept::pause_after_error("metrics", &e).await;
                         continue;
-                    };
-                    let handle = handle.clone();
-                    let registry = registry.clone();
-                    let readiness_fn = readiness_fn.clone();
-                    #[cfg(feature = "scaling")]
-                    let scaling_pressure = scaling_pressure.clone();
-                    tasks.spawn(async move {
-                        let _permit = permit;
-                        handle_connection(
-                            stream,
-                            handle,
-                            registry,
-                            readiness_fn,
-                            #[cfg(feature = "scaling")]
-                            scaling_pressure,
-                        )
-                        .await;
-                    });
-                }
+                    }
+                };
+                // Over the cap the connection is closed unanswered.
+                let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
+                    metrics::counter!("metrics_server_connections_refused_total").increment(1);
+                    continue;
+                };
+                let handle = handle.clone();
+                let registry = registry.clone();
+                let readiness_fn = readiness_fn.clone();
+                #[cfg(feature = "scaling")]
+                let scaling_pressure = scaling_pressure.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    handle_connection(
+                        stream,
+                        handle,
+                        registry,
+                        readiness_fn,
+                        #[cfg(feature = "scaling")]
+                        scaling_pressure,
+                    )
+                    .await;
+                });
             }
         }
     }

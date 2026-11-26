@@ -10,7 +10,6 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -83,7 +82,7 @@ async fn accept_loop(
         let (stream, peer) = match listener.accept().await {
             Ok(connection) => connection,
             Err(e) => {
-                pause_after_accept_error(&e).await;
+                crate::accept::pause_after_error("tls", &e).await;
                 continue;
             }
         };
@@ -96,19 +95,4 @@ async fn accept_loop(
             }
         });
     }
-}
-
-/// A connection-level error is the client's and costs nothing. Anything
-/// else (out of file descriptors) backs off so the loop does not spin.
-async fn pause_after_accept_error(e: &io::Error) {
-    if matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionReset
-    ) {
-        return;
-    }
-    tracing::error!(error = %e, "TLS listener accept failed");
-    tokio::time::sleep(Duration::from_secs(1)).await;
 }

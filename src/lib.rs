@@ -182,6 +182,9 @@ pub mod logger;
 #[cfg_attr(docsrs, doc(cfg(any(feature = "metrics", feature = "otel-metrics"))))]
 pub mod metrics;
 
+#[cfg(any(feature = "metrics", all(feature = "http-server", feature = "tls")))]
+mod accept;
+
 #[cfg(any(feature = "otel-metrics", feature = "otel-tracing"))]
 mod otel_backoff;
 
