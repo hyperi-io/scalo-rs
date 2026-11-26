@@ -35,8 +35,10 @@ pub struct FileOutputConfig {
     /// File rotation period.
     pub rotation: RotationPeriod,
 
-    /// Auto-cleanup files older than this many days.
-    pub max_age_days: u32,
+    /// Delete rotated files older than this many days, at each rotation.
+    /// Unset: 7, or no age limit under `naming: numbered`, which refuses a set
+    /// value since its names carry no date.
+    pub max_age_days: Option<u32>,
 
     /// Codec for rotated files past the six newest: `none`, `gzip` or `zstd`.
     /// Default gzip.
@@ -54,12 +56,15 @@ impl Default for FileOutputConfig {
             path: PathBuf::from(DEFAULT_SPOOL_ROOT).join("output"),
             filename: "events.ndjson".to_string(),
             rotation: RotationPeriod::Hourly,
-            max_age_days: 7,
+            max_age_days: None,
             compress_rotated: Compression::new(Codec::Gzip),
             write: FileWriteOptions::default(),
         }
     }
 }
+
+/// The age limit of stamped file output with `max_age_days` unset.
+const DEFAULT_MAX_AGE_DAYS: u32 = 7;
 
 impl FileOutputConfig {
     /// Convert to the shared `FileWriterConfig` for use with `NdjsonWriter`.
@@ -68,7 +73,11 @@ impl FileOutputConfig {
         FileWriterConfig {
             path: self.path.clone(),
             rotation: self.rotation,
-            max_age_days: self.max_age_days,
+            max_age_days: crate::io::age_limit(
+                self.max_age_days,
+                DEFAULT_MAX_AGE_DAYS,
+                self.write.naming,
+            ),
             compress_rotated: self.compress_rotated,
             write: self.write,
         }
@@ -86,7 +95,8 @@ mod tests {
         assert_eq!(config.path, PathBuf::from("/var/spool/scalo/output"));
         assert_eq!(config.filename, "events.ndjson");
         assert_eq!(config.rotation, RotationPeriod::Hourly);
-        assert_eq!(config.max_age_days, 7);
+        assert_eq!(config.max_age_days, None);
+        assert_eq!(config.to_writer_config().max_age_days, 7);
         assert_eq!(config.compress_rotated, Compression::new(Codec::Gzip));
         assert_eq!(config.write, FileWriteOptions::default());
     }
@@ -98,7 +108,7 @@ mod tests {
             path: "/tmp/test-output".into(),
             filename: "data.ndjson".into(),
             rotation: RotationPeriod::Daily,
-            max_age_days: 30,
+            max_age_days: Some(30),
             compress_rotated: crate::compression::Compression::NONE,
             write: FileWriteOptions {
                 max_bytes: Some(4096),
@@ -112,5 +122,41 @@ mod tests {
         assert!(parsed.enabled);
         assert_eq!(parsed.filename, "data.ndjson");
         assert_eq!(parsed.rotation, RotationPeriod::Daily);
+        assert_eq!(parsed.max_age_days, Some(30));
+    }
+
+    /// Unset, `max_age_days` is 7 under `stamped` and no limit under
+    /// `numbered`, so a numbered output opens. A set value is kept, and
+    /// numbered refuses it. A config without the key still loads.
+    #[test]
+    fn numbered_naming_opens_with_no_age_limit() {
+        use crate::io::RotatedNaming::{Numbered, Stamped};
+        use crate::output::FileOutput;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = |naming, max_age_days| FileOutputConfig {
+            enabled: true,
+            path: dir.path().to_path_buf(),
+            max_age_days,
+            compress_rotated: Compression::NONE,
+            write: FileWriteOptions {
+                naming,
+                ..FileWriteOptions::default()
+            },
+            ..FileOutputConfig::default()
+        };
+        // (case, config, the writer's age limit with u32::MAX for none, opens)
+        let cases = [
+            ("stamped-unset", output(Stamped, None), 7, true),
+            ("stamped-set", output(Stamped, Some(5)), 5, true),
+            ("numbered-unset", output(Numbered, None), u32::MAX, true),
+            ("numbered-set", output(Numbered, Some(5)), 5, false),
+        ];
+        for (case, config, age, opens) in cases {
+            assert_eq!(config.to_writer_config().max_age_days, age, "{case}");
+            assert_eq!(FileOutput::new(&config, case).is_ok(), opens, "{case}");
+        }
+        let unset: FileOutputConfig = serde_json::from_str("{}").expect("deserialise");
+        assert_eq!(unset.max_age_days, None);
     }
 }

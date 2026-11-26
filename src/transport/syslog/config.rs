@@ -167,12 +167,20 @@ pub struct SyslogConfig {
     pub severity: Severity,
     /// HOSTNAME. Default the machine's host name.
     pub hostname: Option<String>,
+    /// The record header whose value is each message's HOSTNAME, in place of
+    /// `hostname`. A record without it, or whose value has no printable
+    /// ASCII, gets `-`.
+    pub hostname_header: Option<String>,
     /// APP-NAME, the TAG under RFC 3164. Default the executable's name.
     pub app_name: Option<String>,
     /// PROCID. Default the process id.
     pub proc_id: Option<String>,
     /// MSGID for a record with no key. A record's key is its MSGID. Default `-`.
     pub msg_id: Option<String>,
+    /// The record header whose value is each RFC 5424 message's MSGID, in
+    /// place of the key and `msg_id`. A record without it, or whose value has
+    /// no printable ASCII, gets `-`.
+    pub msg_id_header: Option<String>,
     /// RFC 5424 STRUCTURED-DATA on every message: SD-ID to its parameters.
     pub structured_data: BTreeMap<String, BTreeMap<String, String>>,
     /// The largest message, header included. UDP cuts a longer one, every
@@ -216,9 +224,11 @@ impl Default for SyslogConfig {
             facility: Facility::User,
             severity: Severity::Info,
             hostname: None,
+            hostname_header: None,
             app_name: None,
             proc_id: None,
             msg_id: None,
+            msg_id_header: None,
             structured_data: BTreeMap::new(),
             max_message_bytes: None,
             connect_timeout_ms: 5_000,
@@ -313,6 +323,16 @@ impl SyslogConfig {
         }
         if self.connect_timeout_ms == 0 || self.send_timeout_ms == 0 {
             return fail("connect_timeout_ms and send_timeout_ms must be above 0".to_string());
+        }
+        for (key, header) in [
+            ("hostname_header", &self.hostname_header),
+            ("msg_id_header", &self.msg_id_header),
+        ] {
+            if header.as_deref().is_some_and(str::is_empty) {
+                return fail(format!(
+                    "{key} is empty: name a record header, or leave it unset"
+                ));
+            }
         }
         for (id, params) in &self.structured_data {
             if !is_sd_name(id) {

@@ -236,6 +236,16 @@ impl Default for FileWriterConfig {
 /// The `max_age_days` that sets no age limit.
 pub(crate) const NO_AGE_LIMIT: u32 = u32::MAX;
 
+/// The age limit a writer runs: `set`, else `default` under `stamped` and none
+/// under `numbered`, whose names carry no date.
+#[cfg(any(feature = "dlq", feature = "output-file"))]
+pub(crate) fn age_limit(set: Option<u32>, default: u32, naming: RotatedNaming) -> u32 {
+    set.unwrap_or(match naming {
+        RotatedNaming::Stamped => default,
+        RotatedNaming::Numbered => NO_AGE_LIMIT,
+    })
+}
+
 impl FileWriterConfig {
     /// Refuse what `naming: numbered` can't apply.
     ///

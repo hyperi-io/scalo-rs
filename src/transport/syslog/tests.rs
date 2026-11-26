@@ -86,7 +86,11 @@ struct StreamPeer {
 
 impl StreamPeer {
     async fn start(tls: Option<ServerTls>, mode: StreamMode) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on("127.0.0.1:0".parse().unwrap(), tls, mode).await
+    }
+
+    async fn start_on(bind: SocketAddr, tls: Option<ServerTls>, mode: StreamMode) -> Self {
+        let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let received = Arc::new(std::sync::Mutex::new(Vec::new()));
         let close = Arc::new(Notify::new());
@@ -577,6 +581,207 @@ async fn udp_sends_one_datagram_per_message_and_cuts_long_ones() {
 }
 
 // ---------------------------------------------------------------------------
+// Connect resolver and per-record header values
+// ---------------------------------------------------------------------------
+
+/// Answers one host with an address the test moves between sends.
+struct Answer {
+    host: &'static str,
+    addr: std::sync::Mutex<Option<SocketAddr>>,
+}
+
+impl Answer {
+    fn new(host: &'static str, addr: &str) -> Arc<Self> {
+        Arc::new(Self {
+            host,
+            addr: std::sync::Mutex::new(Some(addr.parse().unwrap())),
+        })
+    }
+
+    fn point(&self, addr: Option<&str>) {
+        *self.addr.lock().unwrap() = addr.map(|a| a.parse().unwrap());
+    }
+}
+
+impl ConnectResolver for Answer {
+    fn resolve(&self, host: &str) -> Option<SocketAddr> {
+        (host == self.host)
+            .then(|| *self.addr.lock().unwrap())
+            .flatten()
+    }
+}
+
+/// A TLS receiver on `bind` whose certificate from `ca` names `host` alone.
+async fn named_receiver(ca: &TestCa, host: &str, dir: &std::path::Path, bind: &str) -> StreamPeer {
+    let leaf = ca.server_for("syslog receiver", host);
+    let (cert, key) = (
+        dir.join(format!("{host}.pem")),
+        dir.join(format!("{host}.key")),
+    );
+    write(&cert, &leaf.cert_pem);
+    write(&key, &leaf.key_pem);
+    let tls = ServerTls::load(&ServerTlsConfig {
+        reload_interval_secs: 0,
+        ..ServerTlsConfig::from_files(cert, key)
+    })
+    .await
+    .unwrap();
+    StreamPeer::start_on(bind.parse().unwrap(), Some(tls), StreamMode::Keep).await
+}
+
+/// A send to `named.example` over TLS dials where the resolver says, at the
+/// address's port, and checks the certificate against `named.example`. The
+/// connection is kept while the answer holds. No answer is a retry that ends
+/// the kept connection, and a moved answer takes the next batch.
+#[tokio::test]
+async fn tls_dials_where_the_resolver_says_and_checks_the_name() {
+    let ca = TestCa::new("syslog resolver CA");
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("ca.pem");
+    write(&ca_path, &ca.pem());
+    let named = named_receiver(&ca, "named.example", dir.path(), "127.0.0.1:0").await;
+    let other = named_receiver(&ca, "other.example", dir.path(), "127.0.0.1:0").await;
+    let answer = Answer::new("named.example", "127.0.0.1:0");
+    let resolver: Arc<dyn ConnectResolver> = answer.clone();
+    let sender_to = |port: u16| {
+        let cfg = SyslogConfig {
+            address: format!("named.example:{port}"),
+            tls: Some(ClientTlsConfig {
+                trust: TrustChoice::Bundle,
+                ca_paths: vec![ca_path.clone()],
+                ..ClientTlsConfig::default()
+            }),
+            ..config(named.addr, SyslogProtocol::Tls)
+        };
+        SyslogTransport::builder(&cfg)
+            .resolver(Arc::clone(&resolver))
+            .build()
+            .unwrap()
+    };
+    let sender = sender_to(named.addr.port());
+    let octets = SyslogFraming::OctetCounting;
+
+    for payload in ["one", "two"] {
+        let result = sender.send_batch(&records(&[payload])).await;
+        assert!(result.is_ok(), "{payload}: {result:?}");
+    }
+    assert_eq!(
+        named.messages(octets, 2).await,
+        vec![vec![message("one"), message("two")]],
+        "one connection while the answer holds"
+    );
+
+    answer.point(None);
+    let unanswered = sender.send_batch(&records(&["lost"])).await;
+    assert!(unanswered.is_backpressured(), "{unanswered:?}");
+    let ended = || tokio::time::timeout(Duration::from_secs(5), named.closed.notified());
+    assert!(ended().await.is_ok(), "no answer ends the kept connection");
+
+    answer.point(Some("127.0.0.1:0"));
+    assert!(sender.send_batch(&records(&["three"])).await.is_ok());
+    assert_eq!(
+        named.messages(octets, 3).await,
+        vec![vec![message("one"), message("two")], vec![message("three")]],
+        "a new connection once the answer is back"
+    );
+
+    // Any 127/8 address is loopback on Linux, so a second receiver can sit at
+    // the same port.
+    #[cfg(target_os = "linux")]
+    {
+        let bind = format!("127.0.0.2:{}", named.addr.port());
+        let moved = named_receiver(&ca, "named.example", dir.path(), &bind).await;
+        answer.point(Some("127.0.0.2:0"));
+        assert!(sender.send_batch(&records(&["four"])).await.is_ok());
+        assert_eq!(moved.messages(octets, 1).await, vec![vec![message("four")]]);
+        assert!(
+            ended().await.is_ok(),
+            "a moved answer ends the old connection"
+        );
+    }
+
+    answer.point(Some("127.0.0.1:0"));
+    let refused = sender_to(other.addr.port())
+        .send_batch(&records(&["x"]))
+        .await;
+    assert!(
+        matches!(&refused, SendResult::Fatal(e) if e.to_string().contains("TLS refused")),
+        "other.example's certificate fails the check against named.example: {refused:?}"
+    );
+}
+
+/// TCP, RELP and UDP dial where the resolver says, the healthcheck too, and
+/// each message takes HOSTNAME and MSGID from its record's headers. An IP
+/// address is dialled as written, and a proxy beside a resolver fails the
+/// build.
+#[tokio::test]
+async fn each_protocol_dials_where_the_resolver_says_with_per_record_headers() {
+    let answer = Answer::new("named.example", "127.0.0.1:0");
+    let resolver: Arc<dyn ConnectResolver> = answer.clone();
+    let tcp = StreamPeer::start(None, StreamMode::Keep).await;
+    let relp = RelpPeer::start(None, RelpMode::AckAll).await;
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let cfg = |addr: SocketAddr, protocol| SyslogConfig {
+        address: format!("named.example:{}", addr.port()),
+        hostname_header: Some("host.name".into()),
+        msg_id_header: Some("source.kind".into()),
+        proc_id: Some("-".into()),
+        ..config(addr, protocol)
+    };
+    let mut tagged = record("{\"a\":1}");
+    tagged.headers = vec![
+        ("host.name".into(), b"edge-7".to_vec()),
+        ("source.kind".into(), b"journald".to_vec()),
+    ];
+    let want = format!("<14>1 {STAMP} edge-7 app - journald - {{\"a\":1}}");
+    let cases = [
+        (SyslogProtocol::Tcp, tcp.addr),
+        (SyslogProtocol::Relp, relp.addr),
+        (SyslogProtocol::Udp, udp.local_addr().unwrap()),
+    ];
+    for (protocol, addr) in cases {
+        let sender = SyslogTransport::builder(&cfg(addr, protocol))
+            .resolver(Arc::clone(&resolver))
+            .build()
+            .unwrap();
+        sender.healthcheck().await.unwrap();
+        let result = sender.send_batch(std::slice::from_ref(&tagged)).await;
+        assert!(result.is_ok(), "{protocol:?}: {result:?}");
+    }
+    assert_eq!(
+        tcp.messages(SyslogFraming::OctetCounting, 1).await,
+        vec![vec![want.clone()]]
+    );
+    assert_eq!(relp.messages(), vec![vec![want.clone()]]);
+    let mut buf = vec![0u8; 2048];
+    let n = udp.recv(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), want);
+
+    answer.point(None);
+    let by_ip = SyslogTransport::builder(&config(tcp.addr, SyslogProtocol::Tcp))
+        .resolver(Arc::clone(&resolver))
+        .build()
+        .unwrap();
+    assert!(by_ip.send_batch(&records(&["ip"])).await.is_ok());
+
+    let proxied = SyslogConfig {
+        proxy: crate::transport::ProxyConfig::System,
+        ..cfg(tcp.addr, SyslogProtocol::Tcp)
+    };
+    let error = SyslogTransport::builder(&proxied)
+        .resolver(resolver)
+        .build()
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.contains("proxy system") && e.contains("proxy: none")),
+        "{error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Failures
 // ---------------------------------------------------------------------------
 
@@ -857,6 +1062,14 @@ fn configs_that_cannot_send_are_refused_at_build() {
             "relp_window",
         ),
         (
+            "empty header key",
+            SyslogConfig {
+                msg_id_header: Some(String::new()),
+                ..base()
+            },
+            "msg_id_header is empty",
+        ),
+        (
             "bad sd id",
             SyslogConfig {
                 structured_data: [("has space".to_string(), BTreeMap::default())].into(),
@@ -913,8 +1126,9 @@ fn every_key_reaches_the_config_through_the_cascade() {
         dir.path().join("settings.yaml"),
         "transport:\n  syslog:\n    address: logs.example:6514\n    protocol: relp\n    \
          framing: lf\n    format: rfc3164\n    passthrough: true\n    facility: local3\n    \
-         severity: warning\n    hostname: h1\n    app_name: a1\n    proc_id: p1\n    \
-         msg_id: m1\n    structured_data:\n      meta@1:\n        k: v\n    \
+         severity: warning\n    hostname: h1\n    hostname_header: host.name\n    \
+         app_name: a1\n    proc_id: p1\n    msg_id: m1\n    msg_id_header: source.kind\n    \
+         structured_data:\n      meta@1:\n        k: v\n    \
          max_message_bytes: 4096\n    connect_timeout_ms: 7\n    send_timeout_ms: 8\n    \
          relp_window: 9\n    proxy: system\n    tls:\n      trust: bundle\n      ca_paths: /etc/tls/ca.pem\n      \
          client_cert_path: /etc/tls/c.pem\n      client_key_path: /etc/tls/c.key\n      \
@@ -949,9 +1163,11 @@ fn every_key_reaches_the_config_through_the_cascade() {
         facility: Facility::Local3,
         severity: Severity::Err,
         hostname: Some("h1".into()),
+        hostname_header: Some("host.name".into()),
         app_name: Some("a1".into()),
         proc_id: Some("p1".into()),
         msg_id: Some("m1".into()),
+        msg_id_header: Some("source.kind".into()),
         structured_data: [(
             "meta@1".to_string(),
             [("k".to_string(), "v".to_string())].into(),
@@ -980,6 +1196,59 @@ fn every_key_reaches_the_config_through_the_cascade() {
     };
     assert_eq!(cfg, want);
     assert_eq!(cfg.filters_out.len(), 1);
+}
+
+/// `hostname_header` and `msg_id_header` load from YAML alone and from the
+/// environment alone.
+#[cfg(feature = "config")]
+#[test]
+fn the_header_keys_load_from_yaml_and_from_the_environment() {
+    let yaml = tempfile::tempdir().unwrap();
+    std::fs::write(
+        yaml.path().join("settings.yaml"),
+        "transport:\n  syslog:\n    hostname_header: host.name\n    msg_id_header: source.kind\n",
+    )
+    .unwrap();
+    let bare = tempfile::tempdir().unwrap();
+    let env = [
+        (
+            "SYSLOGH__TRANSPORT__SYSLOG__HOSTNAME_HEADER",
+            Some("host.name"),
+        ),
+        (
+            "SYSLOGH__TRANSPORT__SYSLOG__MSG_ID_HEADER",
+            Some("source.kind"),
+        ),
+    ];
+    // (source, config folder, variables set)
+    let cases = [
+        ("yaml", yaml.path(), &env[..0]),
+        ("env", bare.path(), &env[..]),
+    ];
+    for (source, folder, vars) in cases {
+        let loaded: SyslogConfig = temp_env::with_vars(vars, || {
+            crate::config::Config::new(crate::config::ConfigOptions {
+                env_prefix: "SYSLOGH".to_string(),
+                config_paths: vec![folder.to_path_buf()],
+                search_standard_paths: false,
+                load_dotenv: false,
+                ..crate::config::ConfigOptions::default()
+            })
+            .unwrap()
+            .unmarshal_key("transport.syslog")
+            .unwrap()
+        });
+        assert_eq!(
+            loaded.hostname_header.as_deref(),
+            Some("host.name"),
+            "{source}"
+        );
+        assert_eq!(
+            loaded.msg_id_header.as_deref(),
+            Some("source.kind"),
+            "{source}"
+        );
+    }
 }
 
 #[tokio::test]

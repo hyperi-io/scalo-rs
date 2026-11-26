@@ -12,6 +12,12 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use super::config::{SyslogConfig, SyslogFormat};
+use crate::transport::work_batch::Record;
+
+/// The longest RFC 5424 HOSTNAME.
+const HOSTNAME_MAX: usize = 255;
+/// The longest RFC 5424 MSGID.
+const MSG_ID_MAX: usize = 32;
 
 /// Writes one record as one syslog message.
 #[derive(Debug, Clone)]
@@ -22,9 +28,13 @@ pub(super) struct Formatter {
     /// Send an LF inside a message as `#012`, for LF framing.
     escape_lf: bool,
     hostname: String,
+    /// The record header HOSTNAME is read from, in place of `hostname`.
+    hostname_header: Option<String>,
     app_name: String,
     proc_id: String,
     msg_id: String,
+    /// The record header MSGID is read from, in place of the key and `msg_id`.
+    msg_id_header: Option<String>,
     /// The STRUCTURED-DATA field, `-` when there is none.
     structured_data: String,
     /// The zone RFC 3164 timestamps are written in.
@@ -45,80 +55,89 @@ impl Formatter {
             .proc_id
             .clone()
             .unwrap_or_else(|| std::process::id().to_string());
-        let (host_max, app_max) = match config.format {
-            SyslogFormat::Rfc5424 => (255, 48),
+        let app_max = match config.format {
+            SyslogFormat::Rfc5424 => 48,
             // RFC 3164 caps the TAG at 32 alphanumerics.
-            SyslogFormat::Rfc3164 => (255, 32),
+            SyslogFormat::Rfc3164 => 32,
         };
         Self {
             format: config.format,
             pri,
             passthrough: config.passthrough,
             escape_lf,
-            hostname: header(&hostname, host_max),
+            hostname: header(&hostname, HOSTNAME_MAX),
+            hostname_header: config.hostname_header.clone(),
             app_name: match config.format {
                 SyslogFormat::Rfc5424 => header(&app_name, app_max),
                 SyslogFormat::Rfc3164 => tag(&app_name, app_max),
             },
             proc_id: header(&proc_id, 128),
-            msg_id: header(config.msg_id.as_deref().unwrap_or(""), 32),
+            msg_id: header(config.msg_id.as_deref().unwrap_or(""), MSG_ID_MAX),
+            msg_id_header: config.msg_id_header.clone(),
             structured_data: structured_data(config),
             zone,
         }
     }
 
-    /// Append the message for `payload` to `out`. `msg_id` replaces the
-    /// configured MSGID when set, and `millis` is the record's time, else now.
-    pub(super) fn write(
-        &self,
-        payload: &[u8],
-        msg_id: Option<&str>,
-        millis: Option<i64>,
-        out: &mut Vec<u8>,
-    ) {
-        let payload = trim_line_end(payload);
+    /// Append the message for `record` to `out`, stamped with its time, else
+    /// now.
+    pub(super) fn write(&self, record: &Record, out: &mut Vec<u8>) {
+        let payload = trim_line_end(&record.payload);
         if self.passthrough && has_pri(payload) {
             self.write_body(payload, out);
             return;
         }
-        let when = millis
+        let when = record
+            .metadata
+            .timestamp_ms
             .and_then(|ms| Timestamp::from_millisecond(ms).ok())
             .unwrap_or_else(Timestamp::now);
         // A write to a Vec cannot fail.
-        let _ = match self.format {
+        match self.format {
             SyslogFormat::Rfc5424 => {
-                let msg_id = msg_id
-                    .filter(|id| !id.is_empty())
-                    .map_or_else(|| self.msg_id.clone(), |id| header(id, 32));
-                write!(
+                let _ = write!(
                     out,
-                    "<{}>1 {} {} {} {} {} {}",
+                    "<{}>1 {} ",
                     self.pri,
-                    when.strftime("%Y-%m-%dT%H:%M:%S%.6fZ"),
-                    self.hostname,
-                    self.app_name,
-                    self.proc_id,
-                    msg_id,
-                    self.structured_data,
-                )
+                    when.strftime("%Y-%m-%dT%H:%M:%S%.6fZ")
+                );
+                self.write_hostname(record, out);
+                let _ = write!(out, " {} {} ", self.app_name, self.proc_id);
+                self.write_msg_id(record, out);
+                out.push(b' ');
+                out.extend_from_slice(self.structured_data.as_bytes());
             }
             SyslogFormat::Rfc3164 => {
                 let local = when.to_zoned_datetime(self.zone.clone());
-                write!(
-                    out,
-                    "<{}>{} {} {}[{}]:",
-                    self.pri,
-                    local.strftime("%b %e %H:%M:%S"),
-                    self.hostname,
-                    self.app_name,
-                    self.proc_id,
-                )
+                let _ = write!(out, "<{}>{} ", self.pri, local.strftime("%b %e %H:%M:%S"));
+                self.write_hostname(record, out);
+                let _ = write!(out, " {}[{}]:", self.app_name, self.proc_id);
             }
-        };
+        }
         if !payload.is_empty() {
             out.push(b' ');
             self.write_body(payload, out);
         }
+    }
+
+    fn write_hostname(&self, record: &Record, out: &mut Vec<u8>) {
+        match &self.hostname_header {
+            Some(name) => write_field(header_value(record, name), HOSTNAME_MAX, out),
+            None => out.extend_from_slice(self.hostname.as_bytes()),
+        }
+    }
+
+    fn write_msg_id(&self, record: &Record, out: &mut Vec<u8>) {
+        let key = record.key.as_deref().filter(|key| !key.is_empty());
+        let value = match (&self.msg_id_header, key) {
+            (Some(name), _) => header_value(record, name),
+            (None, Some(key)) => key.as_bytes(),
+            (None, None) => {
+                out.extend_from_slice(self.msg_id.as_bytes());
+                return;
+            }
+        };
+        write_field(value, MSG_ID_MAX, out);
     }
 
     fn write_body(&self, body: &[u8], out: &mut Vec<u8>) {
@@ -159,19 +178,30 @@ pub(super) fn has_pri(payload: &[u8]) -> bool {
         .is_some_and(|pri| pri <= 191)
 }
 
-/// A header field: printable ASCII with no spaces, at most `max` long, `-`
-/// when empty.
-fn header(value: &str, max: usize) -> String {
-    let field: String = value
-        .chars()
-        .filter(char::is_ascii_graphic)
-        .take(max)
-        .collect();
-    if field.is_empty() {
-        "-".to_string()
-    } else {
-        field
+/// The value of `record`'s first header named `name`, empty when it has none.
+fn header_value<'a>(record: &'a Record, name: &str) -> &'a [u8] {
+    record
+        .headers
+        .iter()
+        .find(|(key, _)| key == name)
+        .map_or_default(|(_, value)| value.as_slice())
+}
+
+/// Append `value` as a header field: its printable ASCII with no spaces, at
+/// most `max` of it, or `-` when that leaves nothing.
+fn write_field(value: &[u8], max: usize, out: &mut Vec<u8>) {
+    let begin = out.len();
+    out.extend(value.iter().copied().filter(u8::is_ascii_graphic).take(max));
+    if out.len() == begin {
+        out.push(b'-');
     }
+}
+
+/// [`write_field`] into a string.
+fn header(value: &str, max: usize) -> String {
+    let mut field = Vec::with_capacity(value.len().min(max));
+    write_field(value.as_bytes(), max, &mut field);
+    String::from_utf8_lossy(&field).into_owned()
 }
 
 /// An RFC 3164 TAG: alphanumerics, `-`, `_` and `.`, at most `max` long.
@@ -233,6 +263,7 @@ mod tests {
 
     /// 2026-10-11T22:14:15.003Z
     const WHEN: i64 = 1_791_756_855_003;
+    const STAMP: &str = "2026-10-11T22:14:15.003000Z";
 
     fn config(format: SyslogFormat) -> SyslogConfig {
         SyslogConfig {
@@ -243,6 +274,22 @@ mod tests {
             app_name: Some("billing".into()),
             proc_id: Some("4242".into()),
             ..SyslogConfig::default()
+        }
+    }
+
+    /// A record of `payload` at [`WHEN`] with `key` and `headers`.
+    fn record(payload: &[u8], key: Option<&str>, headers: &[(&str, &[u8])]) -> Record {
+        Record {
+            payload: bytes::Bytes::copy_from_slice(payload),
+            key: key.map(std::sync::Arc::from),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), value.to_vec()))
+                .collect(),
+            metadata: crate::transport::work_batch::RecordMeta {
+                timestamp_ms: Some(WHEN),
+                format: crate::transport::PayloadFormat::Json,
+            },
         }
     }
 
@@ -329,7 +376,76 @@ mod tests {
         for (case, config, escape, payload, key, want) in cases {
             let formatter = Formatter::new(&config, escape, TimeZone::UTC);
             let mut out = Vec::new();
-            formatter.write(payload, key, Some(WHEN), &mut out);
+            formatter.write(&record(payload, key, &[]), &mut out);
+            assert_eq!(String::from_utf8_lossy(&out), want, "{case}");
+        }
+    }
+
+    /// `hostname_header` and `msg_id_header` take HOSTNAME and MSGID from each
+    /// record, sanitised as every header field is, and `-` where a record has
+    /// nothing to give. Unset, a record's headers change nothing.
+    #[test]
+    fn header_keys_take_hostname_and_msgid_from_each_record() {
+        let per_record = |format| SyslogConfig {
+            hostname_header: Some("host.name".into()),
+            msg_id_header: Some("source.kind".into()),
+            proc_id: Some("-".into()),
+            ..config(format)
+        };
+        let (long_host, long_kind) = ("h".repeat(300), "k".repeat(40));
+        // (case, config, record key, record headers, wire)
+        #[allow(clippy::type_complexity, reason = "a case table")]
+        let cases: Vec<(&str, SyslogConfig, Option<&str>, Vec<(&str, &[u8])>, String)> = vec![
+            (
+                "unset, the headers change nothing",
+                config(SyslogFormat::Rfc5424),
+                None,
+                vec![("host.name", b"other"), ("source.kind", b"other")],
+                format!("<165>1 {STAMP} web01.example billing 4242 - - x"),
+            ),
+            (
+                "from the headers, the key aside",
+                per_record(SyslogFormat::Rfc5424),
+                Some("audit"),
+                vec![
+                    ("host.name", b"\xffweb 02\x01.example"),
+                    ("source.kind", b"file tail"),
+                ],
+                format!("<165>1 {STAMP} web02.example billing - filetail - x"),
+            ),
+            (
+                "missing or no printable ASCII is nil, never the host name",
+                per_record(SyslogFormat::Rfc5424),
+                Some("audit"),
+                vec![("source.kind", "\u{e9} ".as_bytes())],
+                format!("<165>1 {STAMP} - billing - - - x"),
+            ),
+            (
+                "cut to 255 and 32",
+                per_record(SyslogFormat::Rfc5424),
+                None,
+                vec![
+                    ("host.name", long_host.as_bytes()),
+                    ("source.kind", long_kind.as_bytes()),
+                ],
+                format!(
+                    "<165>1 {STAMP} {} billing - {} - x",
+                    "h".repeat(255),
+                    "k".repeat(32)
+                ),
+            ),
+            (
+                "3164 takes the hostname",
+                per_record(SyslogFormat::Rfc3164),
+                None,
+                vec![("host.name", b"edge-7"), ("source.kind", b"unused")],
+                "<165>Oct 11 22:14:15 edge-7 billing[-]: x".into(),
+            ),
+        ];
+        for (case, config, key, headers, want) in cases {
+            let formatter = Formatter::new(&config, false, TimeZone::UTC);
+            let mut out = Vec::new();
+            formatter.write(&record(b"x", key, &headers), &mut out);
             assert_eq!(String::from_utf8_lossy(&out), want, "{case}");
         }
     }
@@ -338,7 +454,9 @@ mod tests {
     fn defaults_fill_hostname_app_and_procid_from_the_host() {
         let formatter = Formatter::new(&SyslogConfig::default(), false, TimeZone::UTC);
         let mut out = Vec::new();
-        formatter.write(b"m", None, None, &mut out);
+        let mut now = record(b"m", None, &[]);
+        now.metadata.timestamp_ms = None;
+        formatter.write(&now, &mut out);
         let text = String::from_utf8(out).unwrap();
         let fields: Vec<&str> = text.split(' ').collect();
         assert_eq!(fields[0], "<14>1", "user.info");

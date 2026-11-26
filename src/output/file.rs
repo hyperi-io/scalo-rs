@@ -193,7 +193,7 @@ mod tests {
             path: dir.to_path_buf(),
             filename: "events.ndjson".into(),
             rotation: RotationPeriod::Daily,
-            max_age_days: 1,
+            max_age_days: Some(1),
             compress_rotated: crate::compression::Compression::NONE,
             ..FileOutputConfig::default()
         }

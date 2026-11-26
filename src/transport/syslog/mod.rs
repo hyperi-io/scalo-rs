@@ -11,7 +11,9 @@
 //!
 //! Each record's payload is the MSG, after an RFC 5424 or RFC 3164 header
 //! built from config, or as it is when `passthrough` is set and it already
-//! starts with a `<PRI>`. A record's key is its RFC 5424 MSGID.
+//! starts with a `<PRI>`. A record's key is its RFC 5424 MSGID. With
+//! `hostname_header` or `msg_id_header` set, that record header's value is
+//! the HOSTNAME or MSGID instead.
 //!
 //! | Protocol | Wire | Guarantee |
 //! |---|---|---|
@@ -26,7 +28,9 @@
 //! reconnects once within the call and sends again only the messages not yet
 //! answered. TCP and TLS have no answer, so a receiver that fails after the
 //! write loses what it held. `proxy` sends `tcp`, `tls` and `relp` through an
-//! HTTP CONNECT tunnel. The guide is `docs/transport/syslog.md`.
+//! HTTP CONNECT tunnel. A [`ConnectResolver`] given to the
+//! [builder](SyslogTransport::builder) picks the address each connection
+//! dials. The guide is `docs/transport/syslog.md`.
 
 mod config;
 mod format;
@@ -40,6 +44,7 @@ mod tests;
 pub use config::{Facility, Severity, SyslogConfig, SyslogFormat, SyslogFraming, SyslogProtocol};
 pub use receive::{IpFilterConfig, IpFilterMode, SyslogListenConfig, SyslogReceiver, SyslogToken};
 
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +62,7 @@ use super::core::{Lifecycle, Meter};
 use super::delivery::DeliveryGuarantee;
 use super::error::{TransportError, TransportResult};
 use super::filter::{TransportFilterEngine, TransportFilterTierConfig};
+use super::resolver::ConnectResolver;
 use super::traits::{TransportBase, TransportSender};
 use super::types::{BlockOutcome, PayloadFormat, SendResult};
 use super::work_batch::{Record, RecordMeta};
@@ -69,16 +75,77 @@ enum Session {
     Udp(UdpSocket),
 }
 
+impl Session {
+    /// End the session: a RELP session with its `close` command, a stream
+    /// shut down.
+    async fn end(self) {
+        match self {
+            Self::Relp(session) => session.close().await,
+            Self::Stream(mut stream) => {
+                if let Err(e) = stream.shutdown().await {
+                    tracing::debug!(error = %e, "syslog: stream shutdown");
+                }
+            }
+            Self::Udp(_) => {}
+        }
+    }
+}
+
 /// Buffers reused from batch to batch, and the connection.
 #[derive(Default)]
 struct State {
     session: Option<Session>,
+    /// The resolver's answer `session` was opened to.
+    dialled: Option<SocketAddr>,
     /// The batch's messages, back to back.
     messages: Vec<u8>,
     /// Where each message sits in `messages`.
     ranges: Vec<Range<usize>>,
     /// The framed batch, for TCP and TLS.
     wire: Vec<u8>,
+}
+
+/// Builds a [`SyslogTransport`] with what [`SyslogConfig`] does not carry: a
+/// connect resolver.
+///
+/// ```rust,ignore
+/// let transport = SyslogTransport::builder(&config)
+///     .resolver(Arc::new(proven_routes))
+///     .build()?;
+/// ```
+#[must_use = "the transport is made only when `build` is called"]
+pub struct SyslogTransportBuilder<'a> {
+    config: &'a SyslogConfig,
+    resolver: Option<Arc<dyn ConnectResolver>>,
+}
+
+impl std::fmt::Debug for SyslogTransportBuilder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyslogTransportBuilder")
+            .field("config", self.config)
+            .field("resolver", &self.resolver.is_some())
+            .finish()
+    }
+}
+
+impl SyslogTransportBuilder<'_> {
+    /// Dial where `resolver` says, asked before every batch. The connection
+    /// is kept while the answer holds, and replaced at the next batch when it
+    /// changes. TLS still checks the address's host name. A `proxy` other than
+    /// `none` fails [`build`](Self::build). See [`ConnectResolver`].
+    pub fn resolver(mut self, resolver: Arc<dyn ConnectResolver>) -> Self {
+        self.resolver = Some(resolver);
+        self
+    }
+
+    /// Build the sender.
+    ///
+    /// # Errors
+    ///
+    /// As [`SyslogTransport::new`], and a resolver beside a proxy.
+    pub fn build(self) -> TransportResult<SyslogTransport> {
+        SyslogTransport::new_inner(self.config, self.resolver)
+    }
 }
 
 /// Sends records to one syslog receiver. Build it from a [`SyslogConfig`].
@@ -110,7 +177,25 @@ impl SyslogTransport {
     /// setting out of range, a TLS file that cannot be read, or an outbound
     /// filter that does not compile.
     pub fn new(config: &SyslogConfig) -> TransportResult<Self> {
+        Self::builder(config).build()
+    }
+
+    /// A builder for the settings `config` does not carry.
+    pub fn builder(config: &SyslogConfig) -> SyslogTransportBuilder<'_> {
+        SyslogTransportBuilder {
+            config,
+            resolver: None,
+        }
+    }
+
+    fn new_inner(
+        config: &SyslogConfig,
+        resolver: Option<Arc<dyn ConnectResolver>>,
+    ) -> TransportResult<Self> {
         config.validate()?;
+        if resolver.is_some() {
+            super::resolver::refuse_proxy(&config.proxy, "syslog")?;
+        }
         let tls = if config.uses_tls() {
             let section = config.tls.clone().unwrap_or_default();
             let host = config::host_of(&config.address).unwrap_or_default();
@@ -137,6 +222,7 @@ impl SyslogTransport {
         let refusals = crate::transport::proxy::Refusals::default();
         let escape_lf = matches!(config.protocol, SyslogProtocol::Tcp | SyslogProtocol::Tls)
             && config.framing == SyslogFraming::Lf;
+        let has_resolver = resolver.is_some();
         let transport = Self {
             address: config.address.clone(),
             protocol: config.protocol,
@@ -155,6 +241,7 @@ impl SyslogTransport {
                 Duration::from_millis(config.connect_timeout_ms),
                 tls,
                 config.proxy.dialer()?,
+                resolver,
             ),
             filter_engine,
             state: Mutex::new(State::default()),
@@ -171,6 +258,9 @@ impl SyslogTransport {
             framing = ?config.framing,
             tls = config.uses_tls(),
             proxy = config.proxy.kind(),
+            resolver = has_resolver,
+            hostname_header = config.hostname_header.as_deref(),
+            msg_id_header = config.msg_id_header.as_deref(),
             trust = config.tls.as_ref().map(|t| t.trust.as_str()),
             guarantee = %transport.delivery_guarantee(),
             max_message_bytes = transport.limit,
@@ -199,12 +289,7 @@ impl SyslogTransport {
                 continue;
             }
             let begin = state.messages.len();
-            self.formatter.write(
-                &record.payload,
-                record.key.as_deref(),
-                record.metadata.timestamp_ms,
-                &mut state.messages,
-            );
+            self.formatter.write(record, &mut state.messages);
             let len = state.messages.len() - begin;
             if len > self.limit {
                 if self.protocol == SyslogProtocol::Udp {
@@ -234,10 +319,12 @@ impl SyslogTransport {
     }
 
     /// Send the formatted messages over the open session, opening one first
-    /// when there is none or the receiver closed it.
+    /// when there is none, the receiver closed it, or the resolver's answer
+    /// moved off it.
     async fn deliver(&self, state: &mut State) -> SendResult {
         let State {
             session,
+            dialled,
             messages,
             ranges,
             wire,
@@ -246,14 +333,34 @@ impl SyslogTransport {
         // Taken out for the send and put back only after it, so a send dropped
         // at its deadline drops the connection with it, never one cut mid-frame.
         let current = session.take();
+        let target = self.connector.target();
+        let current = match (current, &target) {
+            (Some(kept), Ok(now)) if *now == *dialled => Some(kept),
+            (Some(moved), _) => {
+                tracing::info!(
+                    address = %self.address,
+                    from = ?dialled,
+                    to = ?target.as_ref().ok().copied().flatten(),
+                    "syslog: the resolver's answer changed, reconnecting"
+                );
+                moved.end().await;
+                None
+            }
+            (None, _) => None,
+        };
+        let target = match target {
+            Ok(target) => target,
+            Err(e) => return self.connect_failed(&e),
+        };
         let (result, kept) = match self.protocol {
             SyslogProtocol::Tcp | SyslogProtocol::Tls => {
-                self.deliver_stream(current, &messages, wire).await
+                self.deliver_stream(current, &messages, wire, target).await
             }
-            SyslogProtocol::Relp => self.deliver_relp(current, &messages).await,
-            SyslogProtocol::Udp => self.deliver_udp(current, &messages).await,
+            SyslogProtocol::Relp => self.deliver_relp(current, &messages, target).await,
+            SyslogProtocol::Udp => self.deliver_udp(current, &messages, target).await,
         };
         *session = kept;
+        *dialled = target;
         if result.is_ok() {
             self.refusals.clear("syslog");
         }
@@ -265,6 +372,7 @@ impl SyslogTransport {
         current: Option<Session>,
         messages: &[&[u8]],
         wire: &mut Vec<u8>,
+        target: Option<SocketAddr>,
     ) -> (SendResult, Option<Session>) {
         wire.clear();
         let _ = match self.framing {
@@ -286,7 +394,7 @@ impl SyslogTransport {
         };
         let mut stream = match open {
             Some(stream) => stream,
-            None => match self.connect().await {
+            None => match self.connect(target).await {
                 Ok(stream) => stream,
                 Err(e) => return (self.connect_failed(&e), None),
             },
@@ -314,6 +422,7 @@ impl SyslogTransport {
         &self,
         current: Option<Session>,
         messages: &[&[u8]],
+        target: Option<SocketAddr>,
     ) -> (SendResult, Option<Session>) {
         let mut answers: Vec<Option<Answer>> = vec![None; messages.len()];
         let mut session = match current {
@@ -334,7 +443,7 @@ impl SyslogTransport {
         loop {
             let mut open = match session.take() {
                 Some(open) => open,
-                None => match self.open_relp().await {
+                None => match self.open_relp(target).await {
                     Ok(open) => open,
                     Err(result) => return (result, None),
                 },
@@ -395,10 +504,11 @@ impl SyslogTransport {
         &self,
         current: Option<Session>,
         messages: &[&[u8]],
+        target: Option<SocketAddr>,
     ) -> (SendResult, Option<Session>) {
         let socket = match current {
             Some(Session::Udp(socket)) => socket,
-            _ => match self.bind_udp().await {
+            _ => match self.bind_udp(target).await {
                 Ok(socket) => socket,
                 Err(e) => {
                     tracing::warn!(address = %self.address, error = %e, "syslog: UDP socket failed");
@@ -421,19 +531,24 @@ impl SyslogTransport {
         (SendResult::Ok, Some(Session::Udp(socket)))
     }
 
-    async fn connect(&self) -> Result<Stream, ConnectError> {
-        let stream = self.connector.connect().await?;
+    /// A connection to `target`, else to the address by name.
+    async fn connect(&self, target: Option<SocketAddr>) -> Result<Stream, ConnectError> {
+        let stream = self.connector.connect(target).await?;
         tracing::info!(
             address = %self.address,
             protocol = self.protocol.as_str(),
+            resolved = ?target,
             "syslog: connected"
         );
         Ok(stream)
     }
 
     /// A new RELP session, or the result to answer the batch with.
-    async fn open_relp(&self) -> Result<RelpSession, SendResult> {
-        let stream = self.connect().await.map_err(|e| self.connect_failed(&e))?;
+    async fn open_relp(&self, target: Option<SocketAddr>) -> Result<RelpSession, SendResult> {
+        let stream = self
+            .connect(target)
+            .await
+            .map_err(|e| self.connect_failed(&e))?;
         let opening = tokio::time::timeout(self.connector.timeout(), RelpSession::open(stream));
         match opening.await {
             Ok(Ok(session)) => Ok(session),
@@ -457,11 +572,15 @@ impl SyslogTransport {
         }
     }
 
-    async fn bind_udp(&self) -> std::io::Result<UdpSocket> {
-        let target = tokio::net::lookup_host(&self.address)
-            .await?
-            .next()
-            .ok_or_else(|| std::io::Error::other("the address resolved to nothing"))?;
+    /// A socket sending to `target`, else to the address looked up by name.
+    async fn bind_udp(&self, target: Option<SocketAddr>) -> std::io::Result<UdpSocket> {
+        let target = match target {
+            Some(target) => target,
+            None => tokio::net::lookup_host(&self.address)
+                .await?
+                .next()
+                .ok_or_else(|| std::io::Error::other("the address resolved to nothing"))?,
+        };
         let local = if target.is_ipv4() {
             "0.0.0.0:0"
         } else {
@@ -509,14 +628,8 @@ impl TransportBase for SyslogTransport {
     async fn close(&self) -> TransportResult<()> {
         self.lifecycle.close();
         let session = self.state.lock().await.session.take();
-        match session {
-            Some(Session::Relp(session)) => session.close().await,
-            Some(Session::Stream(mut stream)) => {
-                if let Err(e) = stream.shutdown().await {
-                    tracing::debug!(error = %e, "syslog: stream shutdown");
-                }
-            }
-            Some(Session::Udp(_)) | None => {}
+        if let Some(session) = session {
+            session.end().await;
         }
         Ok(())
     }
@@ -546,19 +659,25 @@ impl TransportBase for SyslogTransport {
         if state.session.is_some() {
             return Ok(());
         }
+        let target = self.connector.target().map_err(|e| fail(e.to_string()))?;
         state.session = Some(match self.protocol {
-            SyslogProtocol::Tcp | SyslogProtocol::Tls => {
-                Session::Stream(self.connect().await.map_err(|e| fail(e.to_string()))?)
-            }
+            SyslogProtocol::Tcp | SyslogProtocol::Tls => Session::Stream(
+                self.connect(target)
+                    .await
+                    .map_err(|e| fail(e.to_string()))?,
+            ),
             SyslogProtocol::Relp => Session::Relp(
-                self.open_relp()
+                self.open_relp(target)
                     .await
                     .map_err(|result| fail(format!("{result:?}")))?,
             ),
-            SyslogProtocol::Udp => {
-                Session::Udp(self.bind_udp().await.map_err(|e| fail(e.to_string()))?)
-            }
+            SyslogProtocol::Udp => Session::Udp(
+                self.bind_udp(target)
+                    .await
+                    .map_err(|e| fail(e.to_string()))?,
+            ),
         });
+        state.dialled = target;
         Ok(())
     }
 }
@@ -663,12 +782,7 @@ impl TransportSender for SyslogTransport {
             return None;
         }
         let mut message = Vec::with_capacity(record.payload.len() + 128);
-        self.formatter.write(
-            &record.payload,
-            record.key.as_deref(),
-            record.metadata.timestamp_ms,
-            &mut message,
-        );
+        self.formatter.write(record, &mut message);
         (message.len() > self.limit).then_some(DeadLetterReason::TooLarge {
             bytes: message.len(),
             limit: self.limit,

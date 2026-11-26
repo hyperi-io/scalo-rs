@@ -33,6 +33,8 @@ mod rotating;
 
 #[cfg(feature = "transport-file")]
 pub(crate) use config::NO_AGE_LIMIT;
+#[cfg(any(feature = "dlq", feature = "output-file"))]
+pub(crate) use config::age_limit;
 #[cfg(feature = "config-schema")]
 pub(crate) use config::compress_rotated_schema;
 pub use config::{
