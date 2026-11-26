@@ -60,13 +60,16 @@ pub trait GateActuator: Send + Sync {
 /// With the `health` feature it also registers a `self_regulation:<source>`
 /// health component that is `Unhealthy` while the source is paused, so
 /// `/readyz` reports not ready instead of ready while nothing is consumed.
-/// The component holds a weak reference, so a dropped gate reads healthy.
+/// Dropping the actuator removes its health component.
 pub struct ObservingActuator {
     inner: Box<dyn GateActuator>,
     /// Stable source label for the log line (e.g. `"kafka"`, `"http"`).
     source: &'static str,
     /// Whether the last edge was a pause, read by the health component.
     paused: Arc<AtomicBool>,
+    /// Keeps the `self_regulation:<source>` component registered for this actuator's life.
+    #[cfg(feature = "health")]
+    _health: crate::health::HealthRegistration,
 }
 
 impl ObservingActuator {
@@ -75,17 +78,19 @@ impl ObservingActuator {
     pub fn new(source: &'static str, inner: Box<dyn GateActuator>) -> Self {
         let paused = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "health")]
-        {
-            let seen = Arc::downgrade(&paused);
-            crate::health::HealthRegistry::register(
+        let health = {
+            let paused = Arc::clone(&paused);
+            crate::health::HealthRegistry::register_scoped(
                 format!("self_regulation:{source}"),
-                move || paused_health(seen.upgrade().is_some_and(|p| p.load(Ordering::Acquire))),
-            );
-        }
+                move || paused_health(paused.load(Ordering::Acquire)),
+            )
+        };
         Self {
             inner,
             source,
             paused,
+            #[cfg(feature = "health")]
+            _health: health,
         }
     }
 }
@@ -719,8 +724,34 @@ mod tests {
         drop(gate);
         assert_eq!(
             status(),
-            Some(HealthStatus::Healthy),
+            None,
             "a dropped gate must not hold readiness red for the life of the process"
         );
+    }
+
+    /// A rebuilt actuator replaces its health component instead of adding a second.
+    #[cfg(feature = "health")]
+    #[test]
+    fn rebuilding_an_actuator_keeps_one_health_component() {
+        use crate::health::HealthRegistry;
+
+        let component = "self_regulation:rebuild-probe";
+        let count = || {
+            HealthRegistry::components()
+                .iter()
+                .filter(|(name, _)| name == component)
+                .count()
+        };
+        let mut actuator = ObservingActuator::new("rebuild-probe", Box::new(NoopActuator));
+        assert_eq!(count(), 1);
+
+        for rebuild in 1..=5 {
+            // The replacement registers before the old actuator drops, as a rebuild does.
+            actuator = ObservingActuator::new("rebuild-probe", Box::new(NoopActuator));
+            assert_eq!(count(), 1, "rebuild {rebuild} left a component behind");
+        }
+
+        drop(actuator);
+        assert_eq!(count(), 0);
     }
 }

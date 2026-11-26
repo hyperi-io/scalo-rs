@@ -204,7 +204,7 @@ live in [backpressure.md](backpressure.md).
 With the `health` feature, each gate registers a
 `self_regulation:<source>` health component that is `Unhealthy` while
 the source is paused, so `/readyz` answers 503 while nothing is consumed.
-A dropped gate reads healthy.
+Dropping the gate removes the component.
 
 The gate fires each edge once (`ObservingActuator` in `src/governor/gate.rs`) and logs a brake-reason line on each:
 
