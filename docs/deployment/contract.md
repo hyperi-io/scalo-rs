@@ -102,7 +102,7 @@ flowchart LR
     class producers group
 ```
 
-*Figure 1. L4 Detail -- Contract to chart. Dashed boxes are the services that write the contract.* Up: [L3 Components -- scalo](../README.md).
+*Figure 1. L4 Detail -- Contract to chart. The Producers group holds the services that write the contract.* Up: [L3 Components -- scalo](../README.md).
 
 | Producer | Emits |
 | ---------- | -------- |

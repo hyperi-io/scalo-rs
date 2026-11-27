@@ -48,7 +48,7 @@ sequenceDiagram
     run->>app: run_service(config, runtime)
 ```
 
-*Figure 1. L4 Detail -- Service startup wiring. Solid arrows are calls, the dashed arrow is the return.* Up: [L3 Components -- scalo](README.md).
+*Figure 1. L4 Detail -- Service startup wiring. Each arrow is a call, except the ServiceRuntime handed back to run_app.* Up: [L3 Components -- scalo](README.md).
 
 With the `lifecycle` feature, `run_app` asks `work_state` before the hand-over and parks a workless config ([core-pillars/lifecycle.md](core-pillars/lifecycle.md)).
 

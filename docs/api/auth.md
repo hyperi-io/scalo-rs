@@ -40,7 +40,7 @@ flowchart LR
     class cached core
 ```
 
-*Figure 1. L4 Detail -- Credential acquisition and placement. The blue box holds, renews and single-flights the credential.* Up: [Other subsystems](README.md).
+*Figure 1. L4 Detail -- Credential acquisition and placement. Cached holds, renews and single-flights the credential.* Up: [Other subsystems](README.md).
 
 **Acquisition.** An `Exchange` obtains one credential, once, over one
 protocol. It holds no state and does no caching. `Cached` wraps any

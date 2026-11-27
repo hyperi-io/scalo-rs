@@ -100,7 +100,7 @@ flowchart LR
     classDef default fill:#F8FAFC,stroke:#64748B,stroke-width:1px,color:#0F172A
 ```
 
-*Figure 1. L4 Detail -- Memory structures on the hot path. Dotted arrows are reads and updates of shared state.* Up: [L3 Components -- scalo](README.md).
+*Figure 1. L4 Detail -- Memory structures on the hot path. The ArcSwap config and the atomic counters are shared state the worker pool reads and updates.* Up: [L3 Components -- scalo](README.md).
 
 All of it sits on the jemalloc global allocator -- that's the one structure that
 touches every box.

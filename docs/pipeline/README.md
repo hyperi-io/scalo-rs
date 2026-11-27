@@ -8,7 +8,7 @@ The through-line is that no stage drops data silently. A stage that cannot keep
 up applies backpressure upstream, a sink that fails spills to disk, and a record
 no sink can take goes to the DLQ rather than being discarded.
 
-The batch engine hands processed records to the app's sink, a tiered sink or a sink stack around a transport sender, and dotted arrows carry spool writes and dead letters.
+The batch engine hands processed records to the app's sink, a tiered sink or a sink stack around a transport sender, and two side paths carry spool writes and dead letters.
 
 ```mermaid
 flowchart LR
@@ -42,7 +42,7 @@ flowchart LR
     class destination ext
 ```
 
-*Figure 1. L4 Detail -- Pipeline stages. Dotted arrows are the spill to the spool and the dead letters `with_dlq` writes.* Up: [L3 Components -- scalo](../README.md). Down: [L4 Detail -- Batch engine stages](batch-engine.md), [L4 Detail -- Tiered sink delivery](tiered-sink.md), [L4 Detail -- Sink stack layer order](sink-stack.md).
+*Figure 1. L4 Detail -- Pipeline stages. The paths to the spool and the DLQ are the spill and the dead letters `with_dlq` writes.* Up: [L3 Components -- scalo](../README.md). Down: [L4 Detail -- Batch engine stages](batch-engine.md), [L4 Detail -- Tiered sink delivery](tiered-sink.md), [L4 Detail -- Sink stack layer order](sink-stack.md).
 
 The engine runs the transform on the `AdaptiveWorkerPool`. A tiered sink and a sink stack are two ways to wrap the sender: the tiered sink adds the spill and a circuit breaker, the sink stack timeouts, limits and retries.
 
