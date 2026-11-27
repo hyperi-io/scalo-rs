@@ -3,6 +3,30 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.42](https://github.com/hyperi-io/scalo-rs/compare/v2.14.41...v2.14.42) (2026-11-27)
+
+### Bug Fixes
+
+* **chart:** let an overlay replace a platform's env in scalo-service ([6ea34da](https://github.com/hyperi-io/scalo-rs/commit/6ea34dab7214ed0a24c8f50674629c6a022dd520))
+* **chart:** spread scalo-service pods across nodes by default ([331efd5](https://github.com/hyperi-io/scalo-rs/commit/331efd59e5e0acc70cea0d30ae84e2122e08b06d))
+* **config:** snapshot version with its config ([57c5975](https://github.com/hyperi-io/scalo-rs/commit/57c5975813058312ff6ccc2af665b1ac1777ebe2)), closes [#427](https://github.com/hyperi-io/scalo-rs/issues/427)
+* **deployment:** add memory profiles to contracts ([eccd9ba](https://github.com/hyperi-io/scalo-rs/commit/eccd9baca92dc1673e2854784417a394ae05f31a)), closes [#384](https://github.com/hyperi-io/scalo-rs/issues/384)
+* **engine:** run process off the runtime worker ([1f6239f](https://github.com/hyperi-io/scalo-rs/commit/1f6239f1383a5c836bb65934d9e4f5778fda06b7)), closes [#431](https://github.com/hyperi-io/scalo-rs/issues/431)
+* **file:** save the read position in file order ([da08148](https://github.com/hyperi-io/scalo-rs/commit/da08148f4a190b4e7bf26fea790c11014b768bf2)), closes [#270](https://github.com/hyperi-io/scalo-rs/issues/270)
+* **file:** wait at EOF before returning an empty batch ([342721c](https://github.com/hyperi-io/scalo-rs/commit/342721c5a7951dc9f27fc53db47e46c92a7918af)), closes [#619](https://github.com/hyperi-io/scalo-rs/issues/619)
+* **governor:** remove gate health entry on drop ([f970c88](https://github.com/hyperi-io/scalo-rs/commit/f970c8830ebb62b1245d1f4d8c27daffd7916028)), closes [#428](https://github.com/hyperi-io/scalo-rs/issues/428)
+* **governor:** use the start budget for release window receives ([f1ef789](https://github.com/hyperi-io/scalo-rs/commit/f1ef7897e5e20b53d601cfeaedc54c008b41267b))
+* **grpc:** serve TLS on the Push listener ([4f095af](https://github.com/hyperi-io/scalo-rs/commit/4f095af7ec377f1beea4a079de1f678312044c4b))
+* **http:** hold POST responses until records are released ([16c0801](https://github.com/hyperi-io/scalo-rs/commit/16c0801969579f7dd38f283908c77897fb241108)), closes [#270](https://github.com/hyperi-io/scalo-rs/issues/270)
+* **kafka:** hold acknowledged offsets as ranges ([68f34c8](https://github.com/hyperi-io/scalo-rs/commit/68f34c8669164ddbd6499821be755ef24cb7b809)), closes [#208](https://github.com/hyperi-io/scalo-rs/issues/208)
+* **kafka:** rebuild the consumer on the blocking pool ([4d2dfae](https://github.com/hyperi-io/scalo-rs/commit/4d2dfae2ebf16ea7bdffc8d02d437b1940b9d297)), closes [#230](https://github.com/hyperi-io/scalo-rs/issues/230)
+* **metrics:** add per-org ingest usage group ([966179e](https://github.com/hyperi-io/scalo-rs/commit/966179e83387f07d384e493656ba93dc207b5fc1)), closes [#373](https://github.com/hyperi-io/scalo-rs/issues/373)
+* **metrics:** expire idle counters and histograms ([259030a](https://github.com/hyperi-io/scalo-rs/commit/259030a2793e5b023e02e7f1dea976f0f9d99f07)), closes [#432](https://github.com/hyperi-io/scalo-rs/issues/432)
+* replace DFE and HyperI example names ([4a56137](https://github.com/hyperi-io/scalo-rs/commit/4a561373de631ad0cf0a341a5bcf93fdb1223338))
+* **shutdown:** add a drain deadline and a second signal exit ([321df2a](https://github.com/hyperi-io/scalo-rs/commit/321df2a271f65ed250bad77effd7065c96ebb153))
+* **tls:** let an app set the TLS profile defaults ([d512e0b](https://github.com/hyperi-io/scalo-rs/commit/d512e0b250df8f5d3109b87e67876e67020a7b06))
+* **tls:** warn about TLS 1.2 once an hour per role and profile ([c84bd32](https://github.com/hyperi-io/scalo-rs/commit/c84bd32f3a7ba2c3e46a28cb58081d009b1af3b0))
+
 ## [2.14.41](https://github.com/hyperi-io/scalo-rs/compare/v2.14.40...v2.14.41) (2026-11-26)
 
 ### Bug Fixes
