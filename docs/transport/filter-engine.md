@@ -180,7 +180,7 @@ instead -- see [Where it's embedded](#where-its-embedded).
 
 `transport.filter_tiers.budget` bounds Tier 2/3 cost: `max_ast_nodes` (default 200) and `max_iteration_depth` (default 2) are checked at startup, and `max_payload_bytes` (default 1 MiB) at evaluation. A payload over `max_payload_bytes` skips the CEL rule and counts in `transport_filter_cel_payload_skip_total` (with the `metrics` feature). A payload the rule can't evaluate (a field missing, a type mismatch, a result that isn't a bool) counts in `transport_filter_cel_eval_errors_total`. A screened record counts each once, at the send, or at the screen when a `dlq` rule takes it out.
 
-`transport.filter_tiers.cel_on_error` sets what a skipped or unevaluable payload does. `pass`, the default, lets it through as if the rule didn't match. `match` takes the rule's action, so an allow-list written as a negated drop, such as `!(severity == "high")` with `action: drop`, never passes a record it couldn't judge, and a `dlq` rule dead-letters it.
+`transport.filter_tiers.cel_on_error` sets what a skipped or unevaluable payload does. `pass`, the default, lets it through as if the rule didn't match. `match` takes the rule's action, so an allow-list written as a negated drop, such as `!(severity == "high")` with `action: drop`, never passes a record it couldn't judge, MsgPack included, and a `dlq` rule dead-letters it.
 
 ### `expression.*` -- the app-wide CEL function profile
 
@@ -307,7 +307,7 @@ per-message overhead beyond the inlined `has_*_filters` check.
 
 The engine targets JSON. When `apply_*` sees a payload that looks
 like MsgPack (heuristic detection of MsgPack signature bytes), it
-short-circuits to `Pass`. The first bypass in each direction logs a
+short-circuits to `Pass`, unless a CEL rule runs under `cel_on_error: match`: the first such rule's action is taken instead. The first bypass in each direction logs a
 warning, and every bypass counts in
 `transport_filter_msgpack_bypass_total{direction}` (with the `metrics`
 feature).
@@ -326,7 +326,7 @@ converts it to JSON upstream.
 | String comparison is not constant-time | A timing attack on a high-entropy field value is possible, at low risk |
 | Expressions are logged as written | Each rule's text is logged at INFO at startup, so treat expressions as non-secret |
 | `field == "value"` has no pre-quoted bytes fast path | `has` and `!has` use a pre-compiled `memmem::Finder`, and equality extracts the field and compares strings |
-| MsgPack payloads pass unfiltered | A one-shot warning per direction and `transport_filter_msgpack_bypass_total` make the bypass visible |
+| MsgPack payloads pass unfiltered | A one-shot warning per direction and `transport_filter_msgpack_bypass_total` make the bypass visible. A CEL rule under `cel_on_error: match` takes its action on them |
 | Tier 2/3 CEL has no time budget | `transport.filter_tiers.budget` caps AST size and iteration depth at startup and payload size at evaluation. `program.execute(&ctx)` runs with no time cap, so a costly filter within those caps can hold the ingest thread. A time cap needs support in the upstream `cel` crate |
 
 A pipeline that mixes JSON and MsgPack should read the MsgPack row.

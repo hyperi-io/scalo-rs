@@ -429,32 +429,40 @@ fn ensure_dir_private(dir: &std::path::Path, mode: Option<u32>) -> SecretsResult
     Ok(())
 }
 
-/// Atomic-write `bytes` to `path`. Chmod to `mode` on Unix when
-/// `mode` is `Some`. Sets perms BEFORE rename so the file is never
-/// visible at the umask default even briefly.
+/// Atomic-write `bytes` to `path`. On Unix with `mode` set, the temp file is
+/// set to `mode` before any bytes are written, a temp file left by an earlier
+/// write included, so its contents are never readable beyond `mode`.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn write_private_file_atomic(
     path: &std::path::Path,
     bytes: &[u8],
     mode: Option<u32>,
 ) -> SecretsResult<()> {
+    use std::io::Write;
+
     let temp_path = path.with_extension("json.tmp");
-    std::fs::write(&temp_path, bytes).map_err(|e| {
-        SecretsError::CacheError(format!(
-            "failed to write cache temp {}: {e}",
-            temp_path.display()
-        ))
-    })?;
+    let failed = |what: &str, e: std::io::Error| {
+        SecretsError::CacheError(format!("failed to {what} {}: {e}", temp_path.display()))
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if let Some(m) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(m);
+    }
+    let mut file = options
+        .open(&temp_path)
+        .map_err(|e| failed("open cache temp", e))?;
     #[cfg(unix)]
     if let Some(m) = mode {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(m)).map_err(|e| {
-            SecretsError::CacheError(format!(
-                "failed to set cache file permissions on {}: {e}",
-                temp_path.display()
-            ))
-        })?;
+        file.set_permissions(std::fs::Permissions::from_mode(m))
+            .map_err(|e| failed("set cache file permissions on", e))?;
     }
+    file.write_all(bytes)
+        .map_err(|e| failed("write cache temp", e))?;
+    drop(file);
     std::fs::rename(&temp_path, path).map_err(|e| {
         SecretsError::CacheError(format!(
             "failed to rename cache temp into place {}: {e}",

@@ -120,6 +120,15 @@ pub(crate) fn describe_library(registry: &MetricRegistry) {
     );
     #[cfg(feature = "wasm")]
     wasm(registry);
+    #[cfg(feature = "service-metrics")]
+    registry.describe(
+        "usage",
+        &[Series::counter(
+            "usage_ingested_bytes_total",
+            "Payload bytes accepted for delivery, by the org each record was stamped with",
+        )
+        .labels(&["org_id"])],
+    );
 }
 
 /// Process gauges, written while `metrics.enable_process_metrics` is on, and
@@ -452,16 +461,16 @@ fn transport_filter(registry: &MetricRegistry) {
         &[
             Series::counter(
                 "transport_filter_msgpack_bypass_total",
-                "Records the filter passed without decoding, by direction",
+                "MsgPack records the filters could not read, by direction",
             )
             .labels(&["direction"]),
             Series::counter(
                 "transport_filter_cel_payload_skip_total",
-                "Records a CEL filter skipped because its expression reads no payload field",
+                "Records a CEL filter skipped because the payload is over the size cap",
             ),
             Series::counter(
                 "transport_filter_cel_eval_errors_total",
-                "Records a CEL filter could not evaluate: a missing field, a type mismatch, a non-bool result or a payload over the size cap",
+                "Records a CEL filter could not evaluate: a missing field, a type mismatch or a non-bool result",
             ),
         ],
     );
@@ -556,15 +565,6 @@ fn kafka(registry: &MetricRegistry) {
     );
     #[cfg(all(feature = "service-metrics", feature = "metrics"))]
     registry.describe("consumer", &super::groups::consumer_series());
-    #[cfg(feature = "service-metrics")]
-    registry.describe(
-        "usage",
-        &[Series::counter(
-            "usage_ingested_bytes_total",
-            "Payload bytes accepted for delivery, by the org each record was stamped with",
-        )
-        .labels(&["org_id"])],
-    );
 }
 
 #[cfg(feature = "transport-syslog")]

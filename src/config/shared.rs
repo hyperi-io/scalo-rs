@@ -151,17 +151,23 @@ impl<T: Clone + Send + Sync + 'static> SharedConfig<T> {
     /// This will:
     /// 1. Acquire write lock and replace the config
     /// 2. Increment the version counter, still under the lock
-    /// 3. Notify all subscribers via the watch channel, still under the lock
+    /// 3. Notify all subscribers via the watch channel, after the lock drops
     pub fn update(&self, new_config: T) {
         let new_version = {
             let mut guard = self.inner.write();
             *guard = new_config;
             // Under the lock, so `snapshot` never pairs a config with another reload's version.
-            let version = self.version.fetch_add(1, Ordering::AcqRel) + 1;
-            // Notify subscribers (ignore error if no receivers)
-            let _ = self.watch_tx.send(version);
-            version
+            self.version.fetch_add(1, Ordering::AcqRel) + 1
         };
+        // After the lock, as a subscriber holding `borrow()` may be waiting on it. Two
+        // racing updates can arrive out of order, so the channel keeps the higher version.
+        self.watch_tx.send_if_modified(|seen| {
+            let newer = new_version > *seen;
+            if newer {
+                *seen = new_version;
+            }
+            newer
+        });
 
         debug!(version = new_version, "Configuration updated");
     }
@@ -412,6 +418,37 @@ mod tests {
         }
         reloader.join().expect("reloader thread panicked");
         assert_eq!(shared.snapshot().0, RELOADS);
+    }
+
+    #[test]
+    fn test_update_completes_while_a_subscriber_holds_its_borrow() {
+        let shared = SharedConfig::new(TestConfig::default());
+        let rx = shared.subscribe();
+        let reader = shared.clone();
+        let writer = shared.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let subscriber = std::thread::spawn(move || {
+            let seen = rx.borrow();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = reader.get();
+            drop(seen);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::spawn(move || {
+            writer.update(TestConfig {
+                name: "next".into(),
+                value: 1,
+            });
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "update blocked on a subscriber's borrow"
+        );
+        subscriber.join().expect("subscriber thread panicked");
+        assert_eq!(*shared.subscribe().borrow(), 1);
     }
 
     #[tokio::test]

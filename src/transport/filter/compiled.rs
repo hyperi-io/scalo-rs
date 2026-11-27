@@ -379,6 +379,21 @@ impl CompiledFilter {
         }
     }
 
+    /// The action this filter takes on a payload it can't read at all: a CEL
+    /// rule's under `cel_on_error: match`, otherwise none.
+    #[cfg(feature = "expression")]
+    #[must_use]
+    pub(super) fn unreadable_action(&self) -> Option<FilterAction> {
+        match self {
+            Self::CelExpression {
+                action,
+                on_error: CelOnError::Match,
+                ..
+            } => Some(*action),
+            _ => None,
+        }
+    }
+
     /// Get the filter's performance tier.
     #[must_use]
     pub fn tier(&self) -> FilterTier {

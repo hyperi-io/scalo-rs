@@ -149,8 +149,9 @@ pub enum KeyShare {
 #[serde(deny_unknown_fields)]
 pub struct ProfileOptions {
     /// Negotiate TLS 1.2 with a peer that has no TLS 1.3, using only the
-    /// profile's own TLS 1.2 suites and groups. Each TLS 1.2 handshake logs a
-    /// warning and counts `tls_tls12_handshakes_total`.
+    /// profile's own TLS 1.2 suites and groups. Each TLS 1.2 handshake counts
+    /// `tls_tls12_handshakes_total`, and a warning is logged once an hour per
+    /// role and profile.
     pub allow_tls12: bool,
 }
 

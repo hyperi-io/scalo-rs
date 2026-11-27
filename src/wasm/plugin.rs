@@ -312,7 +312,7 @@ impl<W: World> Instance<W> {
     /// Call into the guest through `f`, which gets bindgen's bindings and the
     /// store.
     ///
-    /// The call gets `call_timeout_ms` of CPU and a fresh import budget. A
+    /// The call gets `call_timeout_ms` of elapsed time and a fresh import budget. A
     /// trap replaces the instance before the next call and counts toward
     /// `unhealthy_after_traps`. The caller owns any retry or dead-lettering.
     pub fn call<R>(

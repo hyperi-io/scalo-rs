@@ -31,8 +31,8 @@ pub struct WasmConfig {
     /// Guest stack, in bytes. Default 512 KiB.
     pub max_stack_bytes: usize,
 
-    /// CPU time one call may take, in milliseconds, measured in 1 ms epoch
-    /// ticks. Default 1,000.
+    /// Elapsed time one call may take, in milliseconds, measured in 1 ms epoch
+    /// ticks. Time the thread spends preempted counts. Default 1,000.
     pub call_timeout_ms: u64,
 
     /// Host import calls one guest call may make. Default 100,000.

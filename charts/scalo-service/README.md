@@ -156,7 +156,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `podSecurityContext` | from contract `security` | Merged over; `enabled: false` drops it |
 | `containerSecurityContext` | from contract `security` | Merged over |
 | `nodeSelector`, `tolerations`, `topologySpreadConstraints`, `priorityClassName` | none | Scheduling |
-| `affinity` | a preferred pod anti-affinity on `kubernetes.io/hostname`, weight 100, when more than one pod can run (replicaCount above 1, KEDA or the HPA), none for a singleton | Scheduling. A value set here replaces the default, unmerged |
+| `affinity` | a preferred pod anti-affinity on `kubernetes.io/hostname`, weight 100, when more than one pod can run (replicaCount above 1, KEDA or the HPA), none for a singleton | Scheduling. A non-empty value set here replaces the default, unmerged. `{}` counts as unset |
 | `workingDir`, `args` | none, contract `entrypoint_args` | Container |
 | `startupProbe`, `livenessProbe`, `readinessProbe` | derived | Merged over each probe |
 | `config` | `{}` | App config file; dials are validated, other keys pass, and a key set to null is left out so the app's default applies |

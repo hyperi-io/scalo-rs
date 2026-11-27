@@ -45,7 +45,7 @@ let out = instance.call(|bindings, store| bindings.call_enrich(store, &record))?
 Every call runs under these, and hitting one traps the guest, never the host. The trap replaces the guest before the next call.
 
 | `WasmConfig` key | Default | On hit, `outcome` |
-|---|---|---|
+| --- | --- | --- |
 | `call_timeout_ms` | 1,000, in 1 ms epoch ticks | `timeout` |
 | `max_memory_bytes` | 128 MiB per memory | `memory` |
 | `max_table_elements` | 10,000 | `table` |
@@ -105,7 +105,7 @@ let plugin = engine.load::<EnrichWorld>(
 The pull returns bytes and no verdict. `load` runs every check in the section above on them.
 
 | Layer media type | Carries | Field of `Pulled` |
-|---|---|---|
+| --- | --- | --- |
 | `application/wasm` | the `.wasm` | `wasm`, exactly one layer |
 | `application/vnd.dev.sigstore.bundle.v0.3+json` | a keyless Sigstore bundle | `bundle`, at most one |
 | `application/vnd.scalo.wasm.signature.v1` | a key signature, the bytes of a `name.wasm.sig` file | `signature`, at most one |
@@ -124,7 +124,7 @@ A manifest with no wasm layer, or with two, is refused. Layers of other media ty
 Bare names, labelled by `plugin`.
 
 | Metric | Type | Labels |
-|---|---|---|
+| --- | --- | --- |
 | `wasm_plugin_calls_total` | counter | `plugin`, `outcome`: `ok`, `trap`, `timeout`, `memory`, `table`, `budget`, `capacity`, `unhealthy`, `poisoned` |
 | `wasm_plugin_call_duration_seconds` | histogram | `plugin` |
 | `wasm_plugin_loads_total` | counter | `plugin`, `outcome`: `ok`, `unsigned`, `bad_signature`, `untrusted_signer`, `digest_mismatch`, `precompiled`, `not_wasm`, `too_large`, `forbidden_import`, `over_limits`, `compile_error`, `bad_policy`, `read_error` |
