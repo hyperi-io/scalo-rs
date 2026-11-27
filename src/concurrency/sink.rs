@@ -74,7 +74,8 @@ pub struct BackgroundSinkConfig {
     /// [`SinkDrain::byte_size`]. An item that would take the batch past
     /// the cap is written with the batch before it, so a batch exceeds
     /// the cap only by one item larger than the cap, which goes out
-    /// alone. `None` (the default) puts no byte bound on a batch.
+    /// alone. The items of one [`BackgroundSink::write_confirmed`] go out in
+    /// one call whatever their size. `None` (the default) puts no byte bound on a batch.
     pub max_bytes: Option<usize>,
 
     /// Flush a partial batch after this duration even if it's not full.

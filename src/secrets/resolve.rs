@@ -160,8 +160,9 @@ fn one_off_source_name(spec: &str) -> String {
 
 /// Turn the cache off for a one-off lookup.
 ///
-/// The manager is discarded after the single read, so a cache entry can only be
-/// read back by a different spec or a different process.
+/// A `file:` manager is discarded after the single read, and a shared `vault:` or
+/// `aws:` manager reads through its provider each time, so a secret rotated at
+/// the source is never served from a cached copy.
 fn without_cache(config: &mut super::SecretsConfig) {
     config.cache = super::CacheConfig {
         enabled: false,

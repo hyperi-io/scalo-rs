@@ -319,20 +319,30 @@ impl TransportFilterEngine {
     /// Whether an outbound `dlq` filter takes `payload`: the answer a sender's
     /// `dead_letter_reason` gives for a filter match.
     ///
-    /// Counted in `transport_filtered_total` and
-    /// `transport_filter_cel_payload_skip_total` and
-    /// `transport_filter_cel_eval_errors_total` only when it answers `true`,
+    /// Counted in `transport_filtered_total`,
+    /// `transport_filter_cel_payload_skip_total`,
+    /// `transport_filter_cel_eval_errors_total` and
+    /// `transport_filter_msgpack_bypass_total` only when it answers `true`,
     /// as the record is then taken out before the send. Any other outcome is
     /// the send's to count when it filters the record.
     #[must_use]
     pub fn outbound_dead_letter(&self, payload: &[u8]) -> bool {
-        if !self.has_dlq_filters_out() || is_likely_msgpack(payload) {
+        if !self.has_dlq_filters_out() {
             return false;
         }
-        let (matched, misses) =
-            compiled::holding_misses(|| first_match(payload, &self.filters_out));
+        let msgpack = is_likely_msgpack(payload);
+        let (matched, misses) = compiled::holding_misses(|| {
+            if msgpack {
+                unreadable_action(&self.filters_out)
+            } else {
+                first_match(payload, &self.filters_out)
+            }
+        });
         let dead_lettered = matched == Some(FilterAction::Dlq);
         if dead_lettered {
+            if msgpack {
+                count_msgpack_bypass(FilterDirection::Out);
+            }
             self.metrics.record(FilterDirection::Out, FilterAction::Dlq);
             compiled::count_cel_misses(misses);
         }
@@ -398,22 +408,16 @@ impl TransportFilterEngine {
             return FilterDisposition::Pass;
         }
 
-        // MsgPack bypasses filters (SIMD extraction is JSON-only).
-        // Warn once per direction so operators don't silently pass
-        // every MsgPack message. Emit a metric every time so the
-        // bypass rate is visible.
-        if is_likely_msgpack(payload) {
-            #[cfg(feature = "metrics")]
-            ::metrics::counter!(
-                "transport_filter_msgpack_bypass_total",
-                "direction" => direction.to_string()
-            )
-            .increment(1);
-            warn_msgpack_bypass_once(direction);
-            return FilterDisposition::Pass;
-        }
+        // MsgPack bypasses filters (SIMD extraction is JSON-only), except a CEL
+        // rule under `cel_on_error: match`.
+        let matched = if is_likely_msgpack(payload) {
+            count_msgpack_bypass(direction);
+            unreadable_action(filters)
+        } else {
+            first_match(payload, filters)
+        };
 
-        match first_match(payload, filters) {
+        match matched {
             None => FilterDisposition::Pass,
             Some(action) => {
                 self.metrics.record(direction, action);
@@ -474,6 +478,29 @@ impl TransportFilterEngine {
 /// The action of the first of `filters` that `payload` matches, uncounted.
 fn first_match(payload: &[u8], filters: &[CompiledFilter]) -> Option<FilterAction> {
     filters.iter().find_map(|filter| filter.evaluate(payload))
+}
+
+/// The action of the first of `filters` that takes a payload no filter can read.
+#[cfg(feature = "expression")]
+fn unreadable_action(filters: &[CompiledFilter]) -> Option<FilterAction> {
+    filters.iter().find_map(CompiledFilter::unreadable_action)
+}
+
+#[cfg(not(feature = "expression"))]
+fn unreadable_action(_filters: &[CompiledFilter]) -> Option<FilterAction> {
+    None
+}
+
+/// Count a MsgPack payload the filters can't read, and warn once per direction
+/// so operators don't silently pass every MsgPack message.
+fn count_msgpack_bypass(direction: FilterDirection) {
+    #[cfg(feature = "metrics")]
+    ::metrics::counter!(
+        "transport_filter_msgpack_bypass_total",
+        "direction" => direction.to_string()
+    )
+    .increment(1);
+    warn_msgpack_bypass_once(direction);
 }
 
 /// Log a one-shot warning per direction when filters skip MsgPack.
@@ -697,18 +724,54 @@ mod tests {
 
     #[test]
     fn engine_msgpack_payload_passes_through() {
-        let rules = vec![FilterRule {
-            expression: "has(_table)".into(),
-            action: FilterAction::Drop,
-        }];
-        let engine =
-            TransportFilterEngine::new(&rules, &[], &TransportFilterTierConfig::default()).unwrap();
         // MsgPack fixmap header (0x81)
         let msgpack = &[
             0x81, 0xa6, 0x5f, 0x74, 0x61, 0x62, 0x6c, 0x65, 0xa6, 0x65, 0x76, 0x65, 0x6e, 0x74,
             0x73,
         ];
-        assert_eq!(engine.apply_inbound(msgpack), FilterDisposition::Pass);
+        // (expression, cel_on_error, disposition)
+        let mut cases = vec![("has(_table)", CelOnError::Match, FilterDisposition::Pass)];
+        if cfg!(feature = "expression") {
+            cases.extend([
+                (
+                    r#"!(_table == "events")"#,
+                    CelOnError::Pass,
+                    FilterDisposition::Pass,
+                ),
+                (
+                    r#"!(_table == "events")"#,
+                    CelOnError::Match,
+                    FilterDisposition::Drop,
+                ),
+            ]);
+        }
+        for (expression, cel_on_error, want) in cases {
+            let rules = vec![FilterRule {
+                expression: expression.into(),
+                action: FilterAction::Drop,
+            }];
+            let dlq_out = vec![FilterRule {
+                expression: expression.into(),
+                action: FilterAction::Dlq,
+            }];
+            let tiers = TransportFilterTierConfig {
+                allow_cel_filters_in: true,
+                allow_cel_filters_out: true,
+                cel_on_error,
+                ..TransportFilterTierConfig::default()
+            };
+            let engine = TransportFilterEngine::new(&rules, &dlq_out, &tiers).unwrap();
+            assert_eq!(
+                engine.apply_inbound(msgpack),
+                want,
+                "{expression} under {cel_on_error:?}"
+            );
+            assert_eq!(
+                engine.outbound_dead_letter(msgpack),
+                want == FilterDisposition::Drop,
+                "dead letter: {expression} under {cel_on_error:?}"
+            );
+        }
     }
 
     #[test]

@@ -122,8 +122,11 @@ pub struct TransportFilterTierConfig {
 
     /// What a CEL rule does with a payload it can't evaluate: a field missing,
     /// a type mismatch, a result that isn't a bool, or a payload over the
-    /// budget's size cap. Default `pass`. Counted in
-    /// `transport_filter_cel_eval_errors_total` either way.
+    /// budget's size cap. `match` takes the action for a MsgPack payload too,
+    /// which the filters can't read. Default `pass`. Either way an over-cap
+    /// payload counts in `transport_filter_cel_payload_skip_total`, an
+    /// evaluation error in `transport_filter_cel_eval_errors_total` and a
+    /// MsgPack payload in `transport_filter_msgpack_bypass_total`.
     #[serde(default)]
     pub cel_on_error: CelOnError,
 }
