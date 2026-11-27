@@ -176,7 +176,7 @@ A condition reads its `path` from values. A path under `config.` reads the confi
 | `extraPorts[{name, port, protocol, appProtocol, public}]` | `[]` | Ports beside the contract's, on the container and Services |
 | `extraObjects` | `[]` | Extra documents, maps or strings, through `tpl` |
 | `otel.endpoint`, `otel.protocol`, `otel.serviceName` | none, `grpc`, fullname | OTLP export env |
-| `telemetry.prometheus.scrape` | true | Scrape annotations |
+| `telemetry.prometheus.scrape` | true | Scrape annotations. Set it `false` wherever the app's own config turns `/metrics` off, or a collector scrapes 404 and records `up=0` |
 | `versionCheck.enabled`, `sendInstanceId`, `apiUrl`, `instanceId` | unset | Version-check env, each only when set |
 | `reload.enabled`, `reload.secrets`, `reload.configmaps` | off | Stakater Reloader annotations |
 
