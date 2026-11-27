@@ -326,6 +326,20 @@ mod tests {
         .await
         .expect("a health check over TLS");
 
+        // `platform` trust verifies through the OS verifier, with the CA file beside it.
+        let platform = crate::tls::ClientTls::new(crate::tls::TrustChoice::Platform)
+            .with_ca(ca.path())
+            .with_profiles(crate::tls::TlsProfiles::default());
+        let config = crate::tls::build_client_tls(&platform).unwrap();
+        health(
+            &origin,
+            5_000,
+            direct.clone(),
+            ChannelTls::new(&config, &name).unwrap(),
+        )
+        .await
+        .expect("a health check over TLS with platform trust");
+
         // A server with no ALPN at all completes the handshake without one.
         let (_server, front, ca) = tls_server(&[]).await;
         let origin = format!("https://localhost:{}", front.port());
