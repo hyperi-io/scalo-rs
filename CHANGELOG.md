@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.45](https://github.com/hyperi-io/scalo-rs/compare/v2.14.44...v2.14.45) (2026-11-27)
+
+### Bug Fixes
+
+* **grpc:** limit a listener's queued bytes, streams and requests ([027fdfa](https://github.com/hyperi-io/scalo-rs/commit/027fdfa01098e85c4410b3078f35e093c548e4ca)), closes [#651](https://github.com/hyperi-io/scalo-rs/issues/651)
+* **kafka:** keep a sender ready while another topic delivers ([6ba3bc1](https://github.com/hyperi-io/scalo-rs/commit/6ba3bc1519c478e6957c43f2967f34d4c46e5a44)), closes [#650](https://github.com/hyperi-io/scalo-rs/issues/650)
+
 ## [2.14.44](https://github.com/hyperi-io/scalo-rs/compare/v2.14.43...v2.14.44) (2026-11-27)
 
 ### Bug Fixes
