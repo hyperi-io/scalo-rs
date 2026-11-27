@@ -747,11 +747,20 @@ async fn a_config_that_cannot_listen_is_refused() {
         (
             "no queue",
             SyslogListenConfig {
-                tcp_address: local,
+                tcp_address: local.clone(),
                 recv_buffer_size: 0,
                 ..SyslogListenConfig::default()
             },
             "must be above 0",
+        ),
+        (
+            "a UDP batch past recvmmsg's limit",
+            SyslogListenConfig {
+                tcp_address: local,
+                udp_batch_size: 1025,
+                ..SyslogListenConfig::default()
+            },
+            "at most 1024",
         ),
     ];
     for (case, config, want) in cases {

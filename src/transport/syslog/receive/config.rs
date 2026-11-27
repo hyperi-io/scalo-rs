@@ -81,7 +81,8 @@ pub struct SyslogListenConfig {
     /// UDP socket receive buffer (`SO_RCVBUF`), in bytes. The kernel may grant
     /// less, and the listener logs what it got. Default 8 MiB.
     pub udp_recv_buffer_bytes: usize,
-    /// Most datagrams read in one wake. Default 64.
+    /// Most datagrams read in one wake, 1 to 1024. Each takes a 64 KiB buffer
+    /// at bind. Default 64.
     pub udp_batch_size: usize,
     /// Records queued for `recv`. A full queue stops TCP and TLS reads, and
     /// drops datagrams, counted. Default 10000.
@@ -182,9 +183,15 @@ impl SyslogListenConfig {
         if self.max_message_bytes == 0 || self.recv_buffer_size == 0 || self.udp_batch_size == 0 {
             return fail("max_message_bytes, recv_buffer_size and udp_batch_size must be above 0");
         }
+        if self.udp_batch_size > MAX_UDP_BATCH {
+            return fail("udp_batch_size must be at most 1024");
+        }
         Ok(addresses)
     }
 }
+
+/// The most datagrams one read takes, `recvmmsg`'s vector limit on Linux.
+const MAX_UDP_BATCH: usize = 1024;
 
 /// `ms` as a duration, `None` for 0.
 pub(super) fn millis(ms: u64) -> Option<Duration> {
