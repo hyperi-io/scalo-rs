@@ -721,15 +721,23 @@ impl FileTransport {
     }
 
     /// Read up to `max` lines past those already handed out, following a
-    /// rotation once the renamed file is delivered.
+    /// rotation once the renamed file is delivered and reading the new file in
+    /// the same pass.
     async fn read_pass(&self, state: &mut ReadState, max: usize) -> TransportResult<Vec<ReadLine>> {
         // Seen before the read, so the read ends the renamed file.
-        let renamed = match self.holding() {
-            Some(_) => FileId::at(Path::new(&self.config.path))
-                .await
-                .is_some_and(|live| Some(live) != state.file),
-            None => false,
+        let renamed = self.renamed(state).await;
+        let lines = self.read_once(state, max).await?;
+        let Some(acks) = self.holding().filter(|_| renamed && lines.is_empty()) else {
+            return Ok(lines);
         };
+        if !self.follow_rotation(acks, state).await? {
+            return Ok(lines);
+        }
+        self.read_once(state, max).await
+    }
+
+    /// Read up to `max` lines from the open file past those already handed out.
+    async fn read_once(&self, state: &mut ReadState, max: usize) -> TransportResult<Vec<ReadLine>> {
         // A dropped read leaves a partial line in the decoder, and `pending`
         // holds finished lines, so a dropped call resumes here.
         let ReadState {
@@ -791,30 +799,40 @@ impl FileTransport {
         // A call with a smaller `max` than the dropped one leaves the rest queued.
         let rest = pending.split_off(pending.len().min(max));
         let lines = std::mem::replace(pending, rest);
-        if let Some(acks) = self.holding() {
-            if !lines.is_empty() {
-                acks.held
-                    .lock()
-                    .hand_out(lines.iter().map(ReadLine::offset));
-            } else if renamed {
-                self.follow_rotation(acks, state).await?;
-            }
+        if let Some(acks) = self.holding()
+            && !lines.is_empty()
+        {
+            acks.held
+                .lock()
+                .hand_out(lines.iter().map(ReadLine::offset));
         }
         Ok(lines)
+    }
+
+    /// Whether a holding reader's file is no longer the one at the path.
+    async fn renamed(&self, state: &ReadState) -> bool {
+        self.holding().is_some()
+            && FileId::at(Path::new(&self.config.path))
+                .await
+                .is_some_and(|live| Some(live) != state.file)
     }
 
     /// Move a holding reader at the end of a file rotation renamed onto the
     /// new file at the path, once every line handed out of the old one is
     /// released delivered.
-    async fn follow_rotation(&self, acks: &FileAcks, state: &mut ReadState) -> TransportResult<()> {
+    async fn follow_rotation(
+        &self,
+        acks: &FileAcks,
+        state: &mut ReadState,
+    ) -> TransportResult<bool> {
         let path = Path::new(&self.config.path);
         if !acks.held.lock().lines.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let file = match tokio::fs::File::open(path).await {
             Ok(file) => file,
             // Renamed away and not yet created again.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => {
                 return Err(TransportError::Connection(format!(
                     "failed to open '{}' for reading: {e}",
@@ -841,7 +859,7 @@ impl FileTransport {
             path = %self.config.path,
             "File transport: the rotated file is delivered, reading the new one"
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Save `offset` in `file` unless a later position is saved already.
@@ -1217,14 +1235,23 @@ mod tests {
 
     /// A rotation renames the file under the reader: it finishes the renamed
     /// file, reads nothing new until that file's last line is released, then
-    /// saves 0 in the new file and reads it from its start.
+    /// saves 0 in the new file and reads it from its start. With no receive
+    /// wait, each recv is one pass, so the move and the read share one.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_rotation_is_followed_once_the_renamed_file_is_delivered() {
         let dir = TempDir::new().unwrap();
         let live = dir.path().join("in.ndjson");
         std::fs::write(&live, "a\nb\n").unwrap();
-        let reader = holding(&dir, "in.ndjson").await;
+        let reader = FileTransport::new(&FileTransportConfig {
+            path: live.to_str().unwrap().to_string(),
+            append: true,
+            recv_timeout_ms: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .with_acknowledgements(AcknowledgementsConfig::new(true));
         let first = reader.recv(1).await.unwrap();
         std::fs::rename(&live, dir.path().join("in.ndjson.1")).unwrap();
         std::fs::write(&live, "c\n").unwrap();
