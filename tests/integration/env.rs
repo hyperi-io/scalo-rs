@@ -143,15 +143,6 @@ mod kafka_env {
     }
 
     #[test]
-    fn test_kafka_from_env_ssl_skip_verify() {
-        temp_env::with_var("KAFKA_SSL_SKIP_VERIFY", Some("true"), || {
-            let config = KafkaConfig::from_env_standard();
-
-            assert!(config.ssl_skip_verify);
-        });
-    }
-
-    #[test]
     fn test_kafka_from_env_profile() {
         temp_env::with_var("KAFKA_PROFILE", Some("devtest"), || {
             let config = KafkaConfig::from_env_standard();
@@ -160,8 +151,6 @@ mod kafka_env {
                 config.profile,
                 scalo::transport::kafka::KafkaProfile::DevTest
             );
-            // DevTest should auto-enable ssl_skip_verify
-            assert!(config.ssl_skip_verify);
         });
     }
 }

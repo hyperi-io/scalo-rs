@@ -4,7 +4,7 @@ API and behaviour changes that need a consumer adjustment, indexed by the
 scalo release where each first ships. Read the sections between your current
 release and the target before bumping.
 
-From 2.14.41 each release has its own file in [migrations/](migrations/): [2.14.41](migrations/2.14.41.md), [2.14.42](migrations/2.14.42.md), [2.14.43](migrations/2.14.43.md), [2.14.45](migrations/2.14.45.md).
+From 2.14.41 each release has its own file in [migrations/](migrations/): [2.14.41](migrations/2.14.41.md), [2.14.42](migrations/2.14.42.md), [2.14.43](migrations/2.14.43.md), [2.14.45](migrations/2.14.45.md), [2.14.46](migrations/2.14.46.md).
 
 ---
 

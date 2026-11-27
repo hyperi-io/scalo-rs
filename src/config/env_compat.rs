@@ -304,12 +304,6 @@ pub mod kafka {
             .with_description("Path to SSL CA certificate")
     }
 
-    /// Kafka SSL skip verify.
-    pub fn ssl_skip_verify() -> EnvVar {
-        kafka_var("SSL_SKIP_VERIFY", &["KAFKA_SSL_INSECURE", "KAFKA_INSECURE"])
-            .with_description("Skip SSL certificate verification")
-    }
-
     /// Kafka profile (production, devtest).
     pub fn profile() -> EnvVar {
         kafka_var("PROFILE", &[]).with_description("Kafka profile (production, devtest)")
