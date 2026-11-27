@@ -3,6 +3,16 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.47](https://github.com/hyperi-io/scalo-rs/compare/v2.14.46...v2.14.47) (2026-11-27)
+
+### Bug Fixes
+
+* **grpc:** reserve coalescer room before framing a block ([b24e30f](https://github.com/hyperi-io/scalo-rs/commit/b24e30ff795d6e413b95ed2db989bccdc8afd625)), closes [#523](https://github.com/hyperi-io/scalo-rs/issues/523)
+* **http:** add a request body timeout ([4afcb4e](https://github.com/hyperi-io/scalo-rs/commit/4afcb4ec5083e7629ecc6bdea40fedeee31084ac)), closes [#643](https://github.com/hyperi-io/scalo-rs/issues/643)
+* **metrics:** reuse recorder and warn on settings mismatch ([71813d4](https://github.com/hyperi-io/scalo-rs/commit/71813d40f5fb6a9313a7f34dadb81f8547f94912)), closes [#645](https://github.com/hyperi-io/scalo-rs/issues/645)
+* **syslog:** cap the UDP batch and count cut-off TCP frames ([6542c9e](https://github.com/hyperi-io/scalo-rs/commit/6542c9ee0db93fe341e97adbd8cb117b1dd7ed72)), closes [#644](https://github.com/hyperi-io/scalo-rs/issues/644)
+* **test:** check that slow processes run off the worker ([dbfe5bd](https://github.com/hyperi-io/scalo-rs/commit/dbfe5bddee8bcc5be62a9e5dea4240bcd0b2a3eb)), closes [#642](https://github.com/hyperi-io/scalo-rs/issues/642)
+
 ## [2.14.46](https://github.com/hyperi-io/scalo-rs/compare/v2.14.45...v2.14.46) (2026-11-27)
 
 ### Bug Fixes
