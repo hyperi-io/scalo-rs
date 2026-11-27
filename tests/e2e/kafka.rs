@@ -1853,8 +1853,10 @@ mod group_protocol {
 
     /// A send to a topic that does not exist yet backpressures: the caller
     /// keeps the record, readiness is false, and once the topic is created the
-    /// same record is delivered and the transport is ready again. The client
-    /// asks for no auto-creation, as against a broker that refuses it.
+    /// same record is delivered and the transport is ready again. A sender
+    /// that another topic delivers for stays ready, listing the missing one.
+    /// The client asks for no auto-creation, as against a broker that refuses
+    /// it.
     #[tokio::test]
     async fn a_sender_backpressures_until_its_topic_is_created() {
         use scalo::transport::{SendResult, TransportSender};
@@ -1879,6 +1881,16 @@ mod group_protocol {
         );
         assert!(!sender.is_healthy(), "not ready while the topic is missing");
 
+        let present = "present-sent-topic";
+        create_topic(&bootstrap, present).await;
+        let mixed = KafkaTransport::sender(&config).await.expect("kafka sender");
+        let delivered = mixed.send(present, record()).await;
+        assert!(matches!(delivered, SendResult::Ok), "{delivered:?}");
+        let refused = mixed.send(topic, record()).await;
+        assert!(matches!(refused, SendResult::Backpressured), "{refused:?}");
+        assert!(mixed.is_healthy(), "another topic delivers, so still ready");
+        assert_eq!(mixed.missing_destinations(), [topic]);
+
         create_topic(&bootstrap, topic).await;
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
@@ -1895,6 +1907,14 @@ mod group_protocol {
             }
         }
         assert!(sender.is_healthy(), "delivered, so ready again");
+        while !matches!(mixed.send(topic, record()).await, SendResult::Ok) {
+            assert!(
+                Instant::now() < deadline,
+                "the mixed sender never delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(mixed.missing_destinations(), Vec::<String>::new());
     }
 }
 
