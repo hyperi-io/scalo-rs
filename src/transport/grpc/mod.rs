@@ -67,6 +67,7 @@ mod coalesce;
 pub mod config;
 pub(crate) use super::pending;
 pub mod proto;
+pub(crate) mod queue_bytes;
 mod tls_incoming;
 pub mod token;
 
@@ -158,7 +159,7 @@ impl OversizeSlot {
 
 /// The answer to a push the receive queue has no room for: `ResourceExhausted`,
 /// which a sender retries.
-fn receiver_full() -> Status {
+pub(crate) fn receiver_full() -> Status {
     GrpcTransport::count_backpressured();
     Status::resource_exhausted("receiver buffer full")
 }
@@ -350,6 +351,9 @@ pub struct GrpcTransport {
 
     /// A `RouteBatch` too large for the receiver channel, waiting for `recv`.
     oversize: Arc<OversizeSlot>,
+
+    /// Payload bytes queued for `recv`, against `max_queued_bytes`.
+    queue_bytes: Arc<queue_bytes::QueueBytes>,
 
     /// Responses held until their records are released (None if client-only
     /// mode).
@@ -620,6 +624,25 @@ impl GrpcTransportBuilder<'_> {
     }
 }
 
+/// A receive server builder with `config`'s stream, connection and keepalive
+/// limits. A zero leaves that limit off.
+fn server_builder(config: &GrpcConfig) -> tonic::transport::Server {
+    let millis = |ms: u64| (ms > 0).then(|| Duration::from_millis(ms));
+    let mut builder = tonic::transport::Server::builder()
+        .max_concurrent_streams(
+            (config.max_concurrent_streams > 0).then_some(config.max_concurrent_streams),
+        )
+        .http2_keepalive_interval(millis(config.http2_keepalive_interval_ms))
+        .http2_keepalive_timeout(millis(config.http2_keepalive_timeout_ms));
+    if config.max_requests_per_connection > 0 {
+        builder = builder.concurrency_limit_per_connection(config.max_requests_per_connection);
+    }
+    if let Some(timeout) = millis(config.request_timeout_ms) {
+        builder = builder.timeout(timeout);
+    }
+    builder
+}
+
 /// The native service, reading and answering in every encoding this build
 /// compiles, within `max_message_size` both ways.
 fn native_server(
@@ -781,6 +804,7 @@ impl GrpcTransport {
         let mut local_addr = None;
         let sequence = Arc::new(AtomicU64::new(0));
         let oversize = Arc::new(OversizeSlot::default());
+        let queue_bytes = Arc::new(queue_bytes::QueueBytes::new(config.max_queued_bytes));
 
         // Set up client (lazy connection -- doesn't fail until first RPC)
         let wire = config
@@ -820,6 +844,7 @@ impl GrpcTransport {
                 sender: tx.clone(),
                 sequence: sequence.clone(),
                 oversize: Arc::clone(&oversize),
+                queue_bytes: Arc::clone(&queue_bytes),
                 pending: pending.clone(),
                 #[cfg(feature = "governor")]
                 pressure: pressure.clone(),
@@ -828,7 +853,7 @@ impl GrpcTransport {
             let transport_server = native_server(transport_svc, config.max_message_size);
 
             // Build server with optional Vector compat
-            let mut builder = tonic::transport::Server::builder();
+            let mut builder = server_builder(config);
 
             #[cfg(feature = "transport-grpc-vector-compat")]
             let router = if config.vector_compat {
@@ -836,7 +861,8 @@ impl GrpcTransport {
                     tx,
                     sequence.clone(),
                     pending.clone(),
-                );
+                )
+                .with_queue_bytes(Arc::clone(&queue_bytes));
                 let mut vector_server =
                     super::vector_compat::proto::vector::vector_server::VectorServer::new(
                         vector_svc,
@@ -929,6 +955,7 @@ impl GrpcTransport {
             coalesce,
             receiver,
             oversize,
+            queue_bytes,
             pending,
             acknowledgements: options.acknowledgements,
             drain_deadline: options.drain_deadline,
@@ -1739,6 +1766,9 @@ impl TransportReceiver for GrpcTransport {
             }
         }
 
+        self.queue_bytes
+            .release(messages.iter().map(|m| m.payload.len() as u64).sum());
+
         // Apply inbound filters via the shared partition helper. DLQ entries
         // are returned in the RecvBatch for the caller to route onward.
         let batch = self.filter_engine.partition_batch(
@@ -1823,6 +1853,8 @@ struct TransportServiceImpl {
     sequence: Arc<AtomicU64>,
     /// Where a `RouteBatch` too large for `sender` waits for `recv`.
     oversize: Arc<OversizeSlot>,
+    /// Payload bytes queued for `recv`.
+    queue_bytes: Arc<queue_bytes::QueueBytes>,
     /// Responses held until their records are released.
     pending: Option<Arc<PendingRegistry>>,
     /// Optional pressure governor (`governor` feature). `None` -> handlers
@@ -1911,6 +1943,9 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             headers: Vec::new(),
         };
 
+        if !self.queue_bytes.admit(payload_len as u64) {
+            return Err(self.refused(receiver_full()));
+        }
         match self.sender.try_send(msg) {
             Ok(()) => {
                 GrpcTransport::count_received(1, payload_len as u64);
@@ -1923,8 +1958,12 @@ impl proto::transport_server::Transport for TransportServiceImpl {
                     );
                 }
             }
-            Err(mpsc::error::TrySendError::Full(_)) => return Err(self.refused(receiver_full())),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.queue_bytes.release(payload_len as u64);
+                return Err(self.refused(receiver_full()));
+            }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.queue_bytes.release(payload_len as u64);
                 return Err(self.refused(receiver_closed()));
             }
         }
@@ -1991,12 +2030,17 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             .zip(base..)
             .map(|(record, seq)| Self::message(record, seq));
 
+        if !self.queue_bytes.admit(batch_bytes as u64) {
+            return Err(self.refused(receiver_full()));
+        }
+        let refused = |status| {
+            self.queue_bytes.release(batch_bytes as u64);
+            self.refused(status)
+        };
         // A batch the channel can never hold at once waits whole in its own
         // slot, admitted in one step or refused, like one that fits.
         if count > self.sender.max_capacity() {
-            self.oversize
-                .admit(messages.collect())
-                .map_err(|status| self.refused(status))?;
+            self.oversize.admit(messages.collect()).map_err(refused)?;
         } else {
             // ATOMICITY: reserve channel capacity for the WHOLE batch via
             // `try_reserve_many` BEFORE enqueuing ANY record. Cannot fit ->
@@ -2006,10 +2050,10 @@ impl proto::transport_server::Transport for TransportServiceImpl {
             let permits = match self.sender.try_reserve_many(count) {
                 Ok(permits) => permits,
                 Err(mpsc::error::TrySendError::Full(())) => {
-                    return Err(self.refused(receiver_full()));
+                    return Err(refused(receiver_full()));
                 }
                 Err(mpsc::error::TrySendError::Closed(())) => {
-                    return Err(self.refused(receiver_closed()));
+                    return Err(refused(receiver_closed()));
                 }
             };
 
@@ -3092,6 +3136,41 @@ mod tests {
             "only the at-limit record reaches the receiver"
         );
         assert_eq!(got[0].payload.len(), at);
+
+        client.close().await.unwrap();
+        server.close().await.unwrap();
+    }
+
+    /// A push past `max_queued_bytes` is refused as busy while the queue is
+    /// full, a push into an empty queue lands even over the budget, and a
+    /// receive frees the room again.
+    #[tokio::test]
+    async fn a_push_past_the_queued_byte_budget_waits_for_a_receive() {
+        let (server, endpoint) = receiver(GrpcConfig {
+            max_queued_bytes: 100,
+            ..GrpcConfig::server("127.0.0.1:0")
+        })
+        .await;
+        let client = GrpcTransport::new(&GrpcConfig::client(&endpoint))
+            .await
+            .unwrap();
+
+        let first = client.send("events", filled(80)).await;
+        assert!(first.is_ok(), "within the budget: {first:?}");
+        let refused = client.send("events", filled(80)).await;
+        assert!(refused.is_backpressured(), "past the budget: {refused:?}");
+
+        assert_eq!(server.recv(10).await.unwrap().records.len(), 1);
+        let over = client.send("events", filled(150)).await;
+        assert!(
+            over.is_ok(),
+            "an empty queue takes one over the budget: {over:?}"
+        );
+        let refused = client.send("events", filled(1)).await;
+        assert!(refused.is_backpressured(), "{refused:?}");
+        assert_eq!(server.recv(10).await.unwrap().records.len(), 1);
+        let again = client.send("events", filled(80)).await;
+        assert!(again.is_ok(), "drained, so room again: {again:?}");
 
         client.close().await.unwrap();
         server.close().await.unwrap();

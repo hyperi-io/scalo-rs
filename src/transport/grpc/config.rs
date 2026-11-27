@@ -85,6 +85,34 @@ pub struct GrpcConfig {
     /// Maximum message size in bytes (both send and receive).
     pub max_message_size: usize,
 
+    /// Payload bytes the receive queue holds before a push is refused with
+    /// `ResourceExhausted`, or `Unavailable` for a Vector push, which senders
+    /// retry. A push into an empty queue is always taken. `0` turns it off.
+    /// Default 64 MiB.
+    pub max_queued_bytes: u64,
+
+    /// Streams one client connection may have open at once. Each open stream
+    /// can reserve up to `max_message_size` before its body arrives. `0`
+    /// leaves the HTTP/2 default. Default 64.
+    pub max_concurrent_streams: u32,
+
+    /// Requests the server works on at once per connection. `0` is no limit.
+    /// Default 64.
+    pub max_requests_per_connection: usize,
+
+    /// How often the server PINGs an idle connection, in milliseconds. `0`
+    /// turns the PING off. Default 60 s.
+    pub http2_keepalive_interval_ms: u64,
+
+    /// How long a PING may go unanswered before the server closes the
+    /// connection, in milliseconds. Default 20 s.
+    pub http2_keepalive_timeout_ms: u64,
+
+    /// A deadline on each received request, in milliseconds, past which the
+    /// server answers `Cancelled`. Keep it above an armed receiver's
+    /// `max_hold_ms`. `0` (default) sets none.
+    pub request_timeout_ms: u64,
+
     /// Codec the client sends requests with: `none` (default), `gzip` or
     /// `zstd` with the `compression` feature, with no level. The server reads
     /// what the build compiles on every connection.
@@ -204,6 +232,12 @@ impl Default for GrpcConfig {
             recv_timeout_ms: 100,
             send_timeout_ms: DEFAULT_SEND_TIMEOUT_MS,
             max_message_size: 16 * 1024 * 1024, // 16 MB
+            max_queued_bytes: 64 * 1024 * 1024,
+            max_concurrent_streams: 64,
+            max_requests_per_connection: 64,
+            http2_keepalive_interval_ms: 60_000,
+            http2_keepalive_timeout_ms: 20_000,
+            request_timeout_ms: 0,
             compression: Compression::NONE,
             tls: None,
             proxy: crate::transport::ProxyConfig::None,

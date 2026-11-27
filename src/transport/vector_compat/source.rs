@@ -17,6 +17,7 @@ use super::proto::vector;
 use crate::transport::core::Meter;
 use crate::transport::finalizer::DeliveryStatus;
 use crate::transport::grpc::pending::PendingRegistry;
+use crate::transport::grpc::queue_bytes::QueueBytes;
 use crate::transport::grpc::{
     GrpcToken, GrpcTransport, admit, answer, note_refusal, receiver_closed, sender_deadline,
 };
@@ -57,6 +58,8 @@ pub struct VectorCompatService {
     /// registry settles every entry, byte and sender before the metrics
     /// recorder, its only call that can panic.
     pending: AssertUnwindSafe<Option<Arc<PendingRegistry>>>,
+    /// The native server's queued-byte budget, when it has one.
+    queue_bytes: Option<Arc<QueueBytes>>,
 }
 
 impl VectorCompatService {
@@ -69,6 +72,7 @@ impl VectorCompatService {
             sender,
             sequence,
             pending: AssertUnwindSafe(None),
+            queue_bytes: None,
         }
     }
 
@@ -83,6 +87,35 @@ impl VectorCompatService {
             sender,
             sequence,
             pending: AssertUnwindSafe(pending),
+            queue_bytes: None,
+        }
+    }
+
+    /// Count queued payload bytes against the native server's budget.
+    pub(crate) fn with_queue_bytes(mut self, queue_bytes: Arc<QueueBytes>) -> Self {
+        self.queue_bytes = Some(queue_bytes);
+        self
+    }
+
+    /// Count `bytes` in, or the `Unavailable` Vector retries when the queue's
+    /// byte budget is spent.
+    fn admit_bytes(&self, bytes: usize) -> Result<(), Status> {
+        if self
+            .queue_bytes
+            .as_ref()
+            .is_none_or(|q| q.admit(bytes as u64))
+        {
+            return Ok(());
+        }
+        note_refusal(self.pending.as_deref(), "full");
+        GrpcTransport::count_backpressured();
+        Err(Status::unavailable("receiver byte budget full -- retry"))
+    }
+
+    /// Count out `bytes` that were never queued.
+    fn release_bytes(&self, bytes: usize) {
+        if let Some(queue_bytes) = &self.queue_bytes {
+            queue_bytes.release(bytes as u64);
         }
     }
 
@@ -154,9 +187,11 @@ impl vector::vector_server::Vector for VectorCompatService {
             bytes as u64,
             floor,
         )?;
+        self.admit_bytes(bytes)?;
 
         if count > self.sender.max_capacity() {
             // Too many to reserve at once: queue as room frees up.
+            let mut unsent = bytes;
             for (index, payload) in (0_u64..).zip(payloads) {
                 let bytes = payload.len();
                 if self
@@ -168,19 +203,20 @@ impl vector::vector_server::Vector for VectorCompatService {
                     if let Some(held) = held.as_mut() {
                         held.refuse_from(index);
                     }
+                    self.release_bytes(unsent);
                     return Err(self.closed());
                 }
+                unsent -= bytes;
                 if let Some(held) = held.as_mut() {
                     held.advance();
                 }
                 GrpcTransport::count_received(1, bytes as u64);
             }
         } else {
-            let permits = self
-                .sender
-                .reserve_many(count)
-                .await
-                .map_err(|_| self.closed())?;
+            let permits = self.sender.reserve_many(count).await.map_err(|_| {
+                self.release_bytes(bytes);
+                self.closed()
+            })?;
             // Room is held for every event, so queueing cannot fail part-way.
             for (permit, (payload, seq)) in permits.zip(payloads.into_iter().zip(base..)) {
                 permit.send(Self::message(payload, seq));
