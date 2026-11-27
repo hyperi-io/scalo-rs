@@ -52,6 +52,7 @@
 mod acks;
 mod admin;
 mod classify;
+mod destinations;
 mod headers;
 mod metrics;
 mod openssl_floor;
@@ -281,7 +282,8 @@ impl Roles {
 ///
 /// Unhealthy until a broker has accepted every client role (a broker `UP` in
 /// its statistics, a delivered record or a received one), so a pod that cannot
-/// reach Kafka is not ready from the start. Then as [`TransportBase::is_healthy`].
+/// reach Kafka is not ready from the start. Then as [`TransportBase::is_healthy`],
+/// and degraded while some destination topics are missing and another delivers.
 /// A role with statistics off is not waited on, since no broker `UP` can prove
 /// it while idle.
 #[cfg(feature = "health")]
@@ -289,17 +291,20 @@ fn registry_status(
     healthy: &AtomicBool,
     roles: &Roles,
     topic_missing: &AtomicBool,
-    missing_destinations: &parking_lot::Mutex<std::collections::HashSet<String>>,
+    destinations: &parking_lot::Mutex<destinations::Destinations>,
 ) -> crate::health::HealthStatus {
     let reached = roles.each().all(RoleAuth::reached);
-    if healthy.load(Ordering::Relaxed)
-        && reached
-        && !topic_missing.load(Ordering::Relaxed)
-        && missing_destinations.lock().is_empty()
+    let destinations = destinations.lock().health();
+    if !healthy.load(Ordering::Relaxed)
+        || !reached
+        || topic_missing.load(Ordering::Relaxed)
+        || destinations == destinations::DestinationHealth::AllMissing
     {
-        crate::health::HealthStatus::Healthy
-    } else {
         crate::health::HealthStatus::Unhealthy
+    } else if destinations == destinations::DestinationHealth::SomeMissing {
+        crate::health::HealthStatus::Degraded
+    } else {
+        crate::health::HealthStatus::Healthy
     }
 }
 
@@ -381,9 +386,9 @@ pub struct KafkaTransport {
     /// Set while a subscribed topic is missing and the consumer holds no
     /// partition, which fails readiness: nothing can be consumed.
     topic_missing: Arc<AtomicBool>,
-    /// Destination topics a send found missing and no send has delivered to
-    /// since. Readiness fails while any is listed.
-    missing_destinations: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    /// Destination topics a send found missing, and those delivered to since.
+    /// Readiness fails only while every destination written to is missing.
+    destinations: Arc<parking_lot::Mutex<destinations::Destinations>>,
     /// Latches the missing-destination warn to the first of a run.
     destination_latch: classify::DegradedLatch,
     /// Topics we're subscribed to (for cache warming and Debug).
@@ -1624,8 +1629,9 @@ impl KafkaTransport {
 
         let healthy = Arc::new(AtomicBool::new(true));
         let topic_missing = Arc::new(AtomicBool::new(false));
-        let missing_destinations =
-            Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let destinations = Arc::new(parking_lot::Mutex::new(
+            destinations::Destinations::default(),
+        ));
 
         let filter_engine = super::filter::TransportFilterEngine::new(
             &config.filters_in,
@@ -1638,9 +1644,9 @@ impl KafkaTransport {
             let h = Arc::clone(&healthy);
             let roles = auth.clone();
             let missing = Arc::clone(&topic_missing);
-            let destinations = Arc::clone(&missing_destinations);
+            let tracked = Arc::clone(&destinations);
             crate::health::HealthRegistry::register_scoped("transport:kafka", move || {
-                registry_status(&h, &roles, &missing, &destinations)
+                registry_status(&h, &roles, &missing, &tracked)
             })
         };
 
@@ -1694,7 +1700,7 @@ impl KafkaTransport {
             recv_state: classify::RecvState::default(),
             deferred_recv_error: parking_lot::Mutex::new(None),
             topic_missing,
-            missing_destinations,
+            destinations,
             destination_latch: classify::DegradedLatch::default(),
             subscribed_topics: parking_lot::RwLock::new(subscribed_topics),
             #[cfg(feature = "governor")]
@@ -2107,6 +2113,13 @@ impl KafkaTransport {
         Ok(())
     }
 
+    /// The destination topics a send found missing and no send has delivered
+    /// to since, sorted. Records for them come back `Backpressured`.
+    #[must_use]
+    pub fn missing_destinations(&self) -> Vec<String> {
+        self.destinations.lock().missing_topics()
+    }
+
     /// Get the consumer's metrics snapshot.
     ///
     /// Returns statistics collected via librdkafka callbacks. Includes
@@ -2371,9 +2384,7 @@ impl KafkaTransport {
                     "transport" => "kafka"
                 )
                 .increment(1);
-                self.missing_destinations
-                    .lock()
-                    .insert(destination.to_string());
+                self.destinations.lock().missing(destination);
                 if self.destination_latch.enter() {
                     tracing::warn!(
                         destination,
@@ -2391,11 +2402,13 @@ impl KafkaTransport {
         }
     }
 
-    /// A delivery to `destination` proves the topic exists: readiness no
-    /// longer fails on it.
+    /// A delivery to `destination` proves the topic exists.
     fn destination_delivered(&self, destination: &str) {
-        let mut missing = self.missing_destinations.lock();
-        if missing.remove(destination) && missing.is_empty() && self.destination_latch.clear() {
+        let mut destinations = self.destinations.lock();
+        if destinations.delivered(destination)
+            && !destinations.any_missing()
+            && self.destination_latch.clear()
+        {
             tracing::info!(
                 destination,
                 "kafka: the missing destination topic is being written"
@@ -2425,7 +2438,7 @@ impl TransportBase for KafkaTransport {
         self.healthy.load(Ordering::Relaxed)
             && !self.auth.is_refused()
             && !self.topic_missing.load(Ordering::Relaxed)
-            && self.missing_destinations.lock().is_empty()
+            && self.destinations.lock().health() != destinations::DestinationHealth::AllMissing
     }
 
     async fn healthcheck(&self) -> TransportResult<()> {
@@ -5555,12 +5568,7 @@ mod tests {
     /// What `t`'s `transport:kafka` health check reports.
     #[cfg(feature = "health")]
     fn readiness(t: &KafkaTransport) -> crate::health::HealthStatus {
-        registry_status(
-            &t.healthy,
-            &t.auth,
-            &t.topic_missing,
-            &t.missing_destinations,
-        )
+        registry_status(&t.healthy, &t.auth, &t.topic_missing, &t.destinations)
     }
 
     /// A refused client sees every record time out, queue up or go with a
@@ -5661,15 +5669,23 @@ mod tests {
         transport.auth.producer_auth().mark_proven();
         assert_eq!(status(&transport), crate::health::HealthStatus::Healthy);
 
-        transport
-            .missing_destinations
-            .lock()
-            .insert("absent".to_string());
+        transport.destinations.lock().delivered("present");
+        transport.destinations.lock().missing("absent");
+        assert_eq!(
+            status(&transport),
+            crate::health::HealthStatus::Degraded,
+            "one missing topic beside a delivering one degrades the pod, leaving it ready"
+        );
+        assert!(transport.is_healthy(), "the other topic still delivers");
+        assert_eq!(transport.missing_destinations(), ["absent"]);
+
+        transport.destinations.lock().missing("present");
         assert_eq!(
             status(&transport),
             crate::health::HealthStatus::Unhealthy,
-            "a reached broker does not mask a later fault"
+            "a reached broker does not mask every topic going missing"
         );
+        assert!(!transport.is_healthy());
     }
 
     /// While a broker refuses the client, the watch replaces the producer and
@@ -6002,10 +6018,11 @@ mod tests {
         );
     }
 
-    /// A missing destination backpressures and fails readiness until a send
-    /// to that same topic is delivered. A delivery elsewhere does not clear it.
+    /// A missing destination backpressures and fails readiness while nothing
+    /// else delivers. A delivery elsewhere restores readiness and leaves the
+    /// topic listed, and only a delivery to that topic clears it.
     #[tokio::test]
-    async fn a_missing_destination_fails_readiness_until_it_is_written() {
+    async fn a_missing_destination_is_listed_until_it_is_written() {
         let transport = KafkaTransport::sender(&unreachable_config())
             .await
             .expect("a sender constructs broker-free");
@@ -6033,12 +6050,18 @@ mod tests {
             "a missing destination fails readiness"
         );
         assert!(delivered("other").is_ok());
-        assert!(
-            !transport.is_healthy(),
+        assert!(transport.is_healthy(), "another topic delivers");
+        assert_eq!(
+            transport.missing_destinations(),
+            ["absent"],
             "another topic's delivery leaves it missing"
         );
         assert!(delivered("absent").is_ok());
-        assert!(transport.is_healthy(), "a delivery to it clears it");
+        assert_eq!(
+            transport.missing_destinations(),
+            Vec::<String>::new(),
+            "a delivery to it clears it"
+        );
     }
 
     #[test]
