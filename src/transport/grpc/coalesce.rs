@@ -64,6 +64,11 @@ impl Deadline {
         Self((send_timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(send_timeout_ms)))
     }
 
+    /// Whether the deadline has passed.
+    fn passed(self) -> bool {
+        self.0.is_some_and(|at| Instant::now() >= at)
+    }
+
     /// `work`'s output, or `None` once the deadline has passed.
     pub(super) async fn bound<T>(self, work: impl Future<Output = T>) -> Option<T> {
         match self.0 {
@@ -117,6 +122,8 @@ struct Item {
     /// `MIN_BLOCK_BYTES`.
     charge: u64,
     reply: oneshot::Sender<Joined>,
+    /// Past it, the stage withdraws the block rather than send it.
+    deadline: Deadline,
     /// Set once, by the stage taking the block or by its caller withdrawing it
     /// at the deadline, so exactly one of the two happens.
     settled: Arc<AtomicBool>,
@@ -246,6 +253,9 @@ impl Coalescer {
                 Some(Err(_)) => return SendResult::Backpressured,
                 Some(Ok(slot)) => slot,
             };
+            if deadline.passed() {
+                return timed_out();
+            }
             let records = held.unwrap_or_else(again);
             // Boxed, as it runs only here, so every send_batch future stays small.
             Box::pin(
@@ -298,6 +308,7 @@ impl Coalescer {
             framed,
             charge,
             reply,
+            deadline,
             settled: Arc::clone(&settled),
             room: Some(room),
             #[cfg(feature = "transport-trace")]
@@ -390,11 +401,19 @@ async fn next_live(
 }
 
 /// Count `item` out of the queue, give its room back and take it for a call.
-/// `None`, the block unsent, when its caller has gone or withdrawn it.
+/// `None`, the block unsent, when its caller has gone or withdrawn it, or its
+/// deadline passed before the caller was polled, which is answered here.
 fn leave_queue(mut item: Item, queued: &AtomicU64) -> Option<Item> {
     queued.fetch_sub(item.charge, Ordering::AcqRel);
     item.room = None;
-    (!item.reply.is_closed() && settle(&item.settled)).then_some(item)
+    if item.reply.is_closed() || !settle(&item.settled) {
+        return None;
+    }
+    if item.deadline.passed() {
+        let _ = item.reply.send(Joined::Answered(timed_out()));
+        return None;
+    }
+    Some(item)
 }
 
 /// Settle a block for the stage taking it or its caller withdrawing it:
@@ -1493,17 +1512,19 @@ mod tests {
         assert_eq!(calls.payloads(), [["x"], ["a"]]);
     }
 
-    /// The stage takes a block only if its caller has not withdrawn it, and a
-    /// block it has taken can no longer be withdrawn.
-    #[test]
-    fn a_withdrawn_block_is_never_taken() {
-        let item = |withdrawn: bool| {
+    /// The stage takes a block only if its caller has not withdrawn it and its
+    /// deadline has not passed, and a block it has taken can no longer be
+    /// withdrawn. One past its deadline is answered `Backpressured` at once.
+    #[tokio::test]
+    async fn a_withdrawn_or_expired_block_is_never_taken() {
+        let item = |withdrawn: bool, deadline: super::Deadline| {
             let (reply, answer) = tokio::sync::oneshot::channel();
             let item = super::Item {
                 records: Vec::new(),
                 framed: 0,
                 charge: super::MIN_BLOCK_BYTES,
                 reply,
+                deadline,
                 settled: Arc::new(std::sync::atomic::AtomicBool::new(withdrawn)),
                 room: None,
                 #[cfg(feature = "transport-trace")]
@@ -1511,13 +1532,24 @@ mod tests {
             };
             (item, answer)
         };
-        let queued = std::sync::atomic::AtomicU64::new(2 * super::MIN_BLOCK_BYTES);
-        let (withdrawn, _waiting) = item(true);
+        let queued = std::sync::atomic::AtomicU64::new(3 * super::MIN_BLOCK_BYTES);
+        let never = super::Deadline::after(0);
+        let (withdrawn, _waiting) = item(true, never);
         assert!(
             super::leave_queue(withdrawn, &queued).is_none(),
             "a withdrawn block was taken"
         );
-        let (live, _waiting) = item(false);
+        let (expired, waiting) = item(false, super::Deadline::after(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            super::leave_queue(expired, &queued).is_none(),
+            "a block past its deadline was taken"
+        );
+        assert!(matches!(
+            waiting.await,
+            Ok(super::Joined::Answered(SendResult::Backpressured))
+        ));
+        let (live, _waiting) = item(false, never);
         let settled = Arc::clone(&live.settled);
         assert!(super::leave_queue(live, &queued).is_some());
         assert!(!super::settle(&settled), "a taken block was withdrawn");
