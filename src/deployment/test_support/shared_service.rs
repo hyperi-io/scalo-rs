@@ -599,9 +599,51 @@ fn open_tunnel(target: &str, port: Option<u16>, container: &SharedContainer) -> 
         .unwrap_or_else(|_| panic!("no pid for the ssh tunnel to {target}"))
 }
 
+/// Pull attempts for an image not yet on the daemon.
+const PULL_ATTEMPTS: u32 = 4;
+
+/// The wait between pull attempts: 2 s doubling to 16 s.
+const PULL_BACKOFF: crate::backoff::Backoff =
+    crate::backoff::Backoff::new(Duration::from_secs(2), Duration::from_secs(16));
+
+/// Pull `image` through `run` unless the daemon has it, retrying a failed pull
+/// [`PULL_ATTEMPTS`] times in all, so one registry error doesn't fail the run.
+/// The last failure's output, when every attempt failed.
+fn pull_with(
+    image: &str,
+    pause: impl Fn(Duration),
+    mut run: impl FnMut(&[&str]) -> Output,
+) -> Result<(), Output> {
+    if run(&["image", "inspect", "--format", "{{.Id}}", image])
+        .status
+        .success()
+    {
+        return Ok(());
+    }
+    let mut failures = 0;
+    loop {
+        let out = run(&["pull", "--quiet", image]);
+        if out.status.success() {
+            return Ok(());
+        }
+        failures += 1;
+        if failures >= PULL_ATTEMPTS {
+            return Err(out);
+        }
+        pause(PULL_BACKOFF.delay(failures));
+    }
+}
+
 /// Create the container. False when another process created it first.
 fn create(suite: &Suite, spec: &ServiceSpec, name: &str, daemon: &Daemon, owner: u32) -> bool {
     reap_dead_owners(suite);
+    if let Err(out) = pull_with(&spec.image, std::thread::sleep, docker) {
+        panic!(
+            "pull {} after {PULL_ATTEMPTS} attempts: {}",
+            spec.image,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let (bind, _) = daemon.binding(suite);
     let mut args: Vec<String> = vec!["create".into(), "--name".into(), name.into()];
     for (key, value) in labels(suite, spec.service, owner) {
@@ -1078,6 +1120,60 @@ pub fn docker(args: &[&str]) -> Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A docker run that exits `ok` or not, saying `stderr`.
+    fn exit(ok: bool, stderr: &str) -> Output {
+        #[cfg(unix)]
+        let status = std::os::unix::process::ExitStatusExt::from_raw(if ok { 0 } else { 256 });
+        #[cfg(windows)]
+        let status = std::os::windows::process::ExitStatusExt::from_raw(u32::from(!ok));
+        Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// An image on the daemon is not pulled. One the registry fails once is
+    /// pulled on the retry, after one pause. One that fails every attempt
+    /// returns the last failure after `PULL_ATTEMPTS` pulls.
+    #[test]
+    fn a_failed_pull_is_retried_and_a_present_image_is_not_pulled() {
+        let cases: [(&str, bool, usize, Result<(), &str>, usize); 3] = [
+            ("present", true, 0, Ok(()), 0),
+            ("one 502", false, 1, Ok(()), 1),
+            ("down", false, usize::MAX, Err("502 Bad Gateway"), 3),
+        ];
+        for (case, present, failing_pulls, want, want_pauses) in cases {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let pauses = std::cell::Cell::new(0);
+            let result = pull_with(
+                "img:1",
+                |_| pauses.set(pauses.get() + 1),
+                |args| {
+                    calls.borrow_mut().push(args[0].to_string());
+                    if args[0] == "image" {
+                        return exit(present, "");
+                    }
+                    let pulls = calls.borrow().iter().filter(|c| *c == "pull").count();
+                    exit(pulls > failing_pulls, "502 Bad Gateway")
+                },
+            );
+            let pulls = calls.borrow().iter().filter(|c| *c == "pull").count();
+            match want {
+                Ok(()) => assert!(result.is_ok(), "{case}"),
+                Err(text) => {
+                    let out = result.expect_err(case);
+                    assert!(
+                        String::from_utf8_lossy(&out.stderr).contains(text),
+                        "{case}"
+                    );
+                    assert_eq!(pulls, PULL_ATTEMPTS as usize, "{case}");
+                }
+            }
+            assert_eq!(pauses.get(), want_pauses, "{case}: pauses");
+        }
+    }
 
     const SUITE: Suite = Suite {
         repo: "r",
