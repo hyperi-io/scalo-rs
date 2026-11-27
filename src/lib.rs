@@ -218,6 +218,9 @@ pub mod transport;
 #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
 pub mod http_client;
 
+#[cfg(any(feature = "auth", feature = "transport-otlp"))]
+mod response_body;
+
 #[cfg(feature = "auth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "auth")))]
 pub mod auth;

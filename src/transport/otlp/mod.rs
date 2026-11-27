@@ -68,6 +68,10 @@ use record::OtlpResource;
 /// The most characters of a collector's error text a result carries.
 const MAX_DETAIL_CHARS: usize = 512;
 
+/// The most of a collector's HTTP response body that is read, a partial
+/// success or an error text.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// Sends records as OTLP log records to one collector, and metrics through
 /// [`OtlpMetricExporter`].
 ///
@@ -481,7 +485,7 @@ impl OtlpTransport {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.contains("protobuf"));
-        let body = response.bytes().await;
+        let body = crate::response_body::read_capped(response, MAX_RESPONSE_BYTES).await;
         if status.is_success() {
             // A body that cannot be read or decoded still follows a status that took the export.
             let refused = body.ok().and_then(|b| signal.refused(&b));

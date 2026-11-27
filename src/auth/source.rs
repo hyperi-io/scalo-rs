@@ -953,22 +953,29 @@ async fn post_form(
     json_body(response, url).await
 }
 
+/// The most a token endpoint's response is read to. A real one, a JWT with
+/// its claims, runs to tens of KiB.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
+
 /// The response body as JSON, or the refusal named.
 async fn json_body(response: reqwest::Response, url: &str) -> Result<Value, AuthError> {
     let endpoint = endpoint_name(url);
     let status = response.status();
+    let body = crate::response_body::read_capped(response, MAX_TOKEN_RESPONSE_BYTES).await;
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = body.unwrap_or_default();
         return Err(AuthError::Refused {
             url: endpoint,
             status: status.as_u16(),
-            detail: refusal_detail(&body),
+            detail: refusal_detail(&String::from_utf8_lossy(&body)),
         });
     }
-    response.json().await.map_err(|e| AuthError::Malformed {
-        url: endpoint,
-        reason: e.without_url().to_string(),
-    })
+    let malformed = |reason: String| AuthError::Malformed {
+        url: endpoint.clone(),
+        reason,
+    };
+    let body = body.map_err(|e| malformed(e.to_string()))?;
+    serde_json::from_slice(&body).map_err(|e| malformed(e.to_string()))
 }
 
 /// What a refusal is allowed to carry: the error fields RFC 6749 s5.2 names,
