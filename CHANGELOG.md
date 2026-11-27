@@ -3,6 +3,12 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.43](https://github.com/hyperi-io/scalo-rs/compare/v2.14.42...v2.14.43) (2026-11-27)
+
+### Bug Fixes
+
+* config deadlock, CEL MsgPack filtering, docs ([e4e4318](https://github.com/hyperi-io/scalo-rs/commit/e4e4318c283d3d3b8b978ef7b9172e8009b6a977))
+
 ## [2.14.42](https://github.com/hyperi-io/scalo-rs/compare/v2.14.41...v2.14.42) (2026-11-27)
 
 ### Bug Fixes
