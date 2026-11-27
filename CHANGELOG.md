@@ -3,6 +3,19 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.46](https://github.com/hyperi-io/scalo-rs/compare/v2.14.45...v2.14.46) (2026-11-27)
+
+### Bug Fixes
+
+* **config:** add load_typed_strict for misspelt keys ([b6079d3](https://github.com/hyperi-io/scalo-rs/commit/b6079d334aa55b4dc2910724deae82e6f93618cd)), closes [#517](https://github.com/hyperi-io/scalo-rs/issues/517)
+* **deployment:** build runtime images on ubuntu:26.04 ([25444ea](https://github.com/hyperi-io/scalo-rs/commit/25444ea3c347fc98539ace77125cbc71b54ae723)), closes [#519](https://github.com/hyperi-io/scalo-rs/issues/519)
+* **deployment:** retry image pulls before creating test containers ([b511d46](https://github.com/hyperi-io/scalo-rs/commit/b511d46bc3590c0954f8208cf10a17da5ee23279)), closes [#435](https://github.com/hyperi-io/scalo-rs/issues/435)
+* **dlq:** mark DlqError non_exhaustive ([0737480](https://github.com/hyperi-io/scalo-rs/commit/0737480e2f9d566bce8fb04aeb0901bab79567e5)), closes [#518](https://github.com/hyperi-io/scalo-rs/issues/518)
+* **grpc:** withdraw expired joined blocks ([f6e4230](https://github.com/hyperi-io/scalo-rs/commit/f6e42303327232c5ccc645285fc7f6b62a540da6)), closes [#523](https://github.com/hyperi-io/scalo-rs/issues/523)
+* **kafka:** remove ssl_skip_verify ([9ecbcc9](https://github.com/hyperi-io/scalo-rs/commit/9ecbcc9cff2b14e3da29af27c88419be041d29fa))
+* **shutdown:** read the shutdown section at the first signal ([dc4732a](https://github.com/hyperi-io/scalo-rs/commit/dc4732a2e0b014e676f108358260426713ddfc54))
+* **transport:** read the new file on the first pass after rotation ([59f954d](https://github.com/hyperi-io/scalo-rs/commit/59f954d96cd6fdc85fcaaba5fe22d30e457e0f6e))
+
 ## [2.14.45](https://github.com/hyperi-io/scalo-rs/compare/v2.14.44...v2.14.45) (2026-11-27)
 
 ### Bug Fixes
