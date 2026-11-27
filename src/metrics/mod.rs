@@ -369,6 +369,39 @@ pub fn shutdown_otel_export() {
 #[cfg(feature = "metrics")]
 static INSTALLED_PROM: std::sync::OnceLock<PrometheusHandle> = std::sync::OnceLock::new();
 
+/// The namespace and idle timeout of the first manager to install.
+#[cfg(feature = "metrics")]
+static INSTALLED_SHAPE: std::sync::OnceLock<(String, Option<Duration>)> =
+    std::sync::OnceLock::new();
+
+/// Whether `config` asks for another namespace or idle timeout than the
+/// installed recorder has.
+#[cfg(feature = "metrics")]
+fn unlike_installed(
+    installed: Option<&(String, Option<Duration>)>,
+    config: &MetricsConfig,
+) -> bool {
+    installed.is_some_and(|(namespace, idle)| {
+        *namespace != config.namespace || *idle != config.idle_timeout
+    })
+}
+
+/// Warn once when a later manager asks for settings the installed recorder
+/// doesn't have.
+#[cfg(feature = "metrics")]
+fn warn_if_unlike_installed(config: &MetricsConfig) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if unlike_installed(INSTALLED_SHAPE.get(), config)
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            namespace = %config.namespace,
+            "a second metrics manager renders the first one's recorder, whose namespace or \
+             idle_timeout differs: its own settings and OTLP push are not used"
+        );
+    }
+}
+
 /// Install `recorder` globally and return the handle a manager renders: its
 /// own `handle` when the install took, the installed one when an earlier
 /// manager's did.
@@ -461,6 +494,19 @@ fn install_recorders(
     config: &MetricsConfig,
     #[cfg(feature = "transport-otlp")] transport: Option<Arc<crate::transport::OtlpTransport>>,
 ) -> RecorderSetup {
+    // A recorder installs once per process, so a later manager renders it and
+    // builds no OTLP push or meter provider of its own.
+    #[cfg(feature = "metrics")]
+    if let Some(installed) = INSTALLED_PROM.get() {
+        warn_if_unlike_installed(config);
+        return RecorderSetup {
+            prom_handle: Some(installed.clone()),
+            #[cfg(feature = "otel-metrics")]
+            otel_provider: None,
+        };
+    }
+    #[cfg(feature = "metrics")]
+    let _ = INSTALLED_SHAPE.set((config.namespace.clone(), config.idle_timeout));
     // --- Prometheus only (no OTel) ---
     #[cfg(all(feature = "metrics", not(feature = "otel-metrics")))]
     {
@@ -1669,6 +1715,32 @@ mod tests {
                 rendered.contains("second_manager_probe_total"),
                 "{name} rendered: {rendered:?}"
             );
+        }
+    }
+
+    /// A later manager's settings are unlike the installed ones when its
+    /// namespace or idle timeout differs, and never when nothing is installed.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn a_second_manager_is_unlike_the_installed_one_only_when_its_settings_differ() {
+        let installed = (String::from("app"), None);
+        let config = |namespace: &str, idle: Option<Duration>| MetricsConfig {
+            idle_timeout: idle,
+            ..MetricsConfig::offline(namespace)
+        };
+        let cases = [
+            ("same", Some(&installed), config("app", None), false),
+            ("namespace", Some(&installed), config("other", None), true),
+            (
+                "idle",
+                Some(&installed),
+                config("app", Some(Duration::from_secs(5))),
+                true,
+            ),
+            ("nothing installed", None, config("other", None), false),
+        ];
+        for (case, installed, config, want) in cases {
+            assert_eq!(unlike_installed(installed, &config), want, "{case}");
         }
     }
 
