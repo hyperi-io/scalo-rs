@@ -397,7 +397,7 @@ fn build_apt_block(
             "# WARNING: could not derive the distro release from base image '{base_image}'.\n\
              # Assumed {release}. State it explicitly with either\n\
              # `deployment.base_distro` in the config cascade, or the env var\n\
-             # DEPLOYMENT__BASE_DISTRO=trixie|bookworm|noble|jammy|focal.\n",
+             # DEPLOYMENT__BASE_DISTRO=resolute|trixie|bookworm|noble|jammy|focal.\n",
         ));
     }
     if let Some(base_image) = &deps.contradicted_base_image {

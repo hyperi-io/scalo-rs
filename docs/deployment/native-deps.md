@@ -50,7 +50,7 @@ as a `BaseDistro` directly, and `for_scalo_features()` resolves it, in order:
 1. `deployment.base_distro` in the config cascade, if set and recognised.
 2. The env var `DEPLOYMENT__BASE_DISTRO` - the same key's ENV-layer spelling.
 3. The base image tag, if it positively names a release.
-4. Otherwise the default (`trixie`), recorded in
+4. Otherwise the default (`resolute`), recorded in
    `unresolved_base_image` so the generated Dockerfile has a warning.
 
 Step 2 sets the release where no config file does. `generate-artefacts` loads
@@ -75,7 +75,7 @@ number counts only on the `debian` and `ubuntu` images themselves, because
 `postgres:13-bookworm` is postgres 13 on bookworm, not Debian 13. A
 digest-pinned or rolling tag (`ghcr.io/org/base@sha256:...`, `:stable`), or a
 version tag on some other image (`ghcr.io/org/base:13`), names no release and
-reaches step 4. The default base, `debian:trixie-slim@sha256:...`, keeps its
+reaches step 4. The default base, `ubuntu:26.04@sha256:...`, keeps its
 tag beside the digest, so it resolves at step 3. Pinning a digest is what the
 container standard asks for, so with a digest-only reference state the release
 alongside it:

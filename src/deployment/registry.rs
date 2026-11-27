@@ -51,22 +51,22 @@ use super::native_deps::BaseDistro;
 
 /// Default base image for the runtime stage.
 ///
-/// Pulled from Docker Hub (no registry prefix). Debian "trixie" slim: smaller
-/// and fewer CVEs than a full ubuntu base, and its glibc matches the debian
-/// trixie CI builders so binaries built on CI run as-is. Override via
-/// `deployment.base_image` in the YAML cascade (keep glibc(runtime) >=
-/// glibc(build). musl/alpine unsupported -- see docs/deployment/native-deps.md).
+/// Pulled from Docker Hub (no registry prefix). Ubuntu 26.04 LTS "resolute",
+/// with glibc 2.43, so a binary built against an older glibc runs on it.
+/// Override via `deployment.base_image` in the YAML cascade (keep
+/// glibc(runtime) >= glibc(build). musl/alpine unsupported -- see
+/// docs/deployment/native-deps.md).
 ///
 /// Pinned to the multi-arch index digest so every build of one scalo release
 /// gets the same bytes on amd64 and arm64. Renovate refreshes the digest.
-// renovate: datasource=docker depName=debian
+// renovate: datasource=docker depName=ubuntu
 pub const DEFAULT_BASE_IMAGE: &str =
-    "debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0";
+    "ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db";
 
 /// Default distro release the generated runtime package names target.
 ///
 /// Kept in step with [`DEFAULT_BASE_IMAGE`]: change one, change the other.
-pub const DEFAULT_BASE_DISTRO: BaseDistro = BaseDistro::Trixie;
+pub const DEFAULT_BASE_DISTRO: BaseDistro = BaseDistro::Resolute;
 
 /// Read the publish-target image registry from the config cascade.
 ///
@@ -168,8 +168,8 @@ mod tests {
     fn default_base_image_is_pinned_by_digest() {
         // Asserts the shape rather than the digest, which Renovate moves.
         let digest = DEFAULT_BASE_IMAGE
-            .strip_prefix("debian:trixie-slim@sha256:")
-            .unwrap_or_else(|| panic!("not a digest-pinned trixie-slim: {DEFAULT_BASE_IMAGE}"));
+            .strip_prefix("ubuntu:26.04@sha256:")
+            .unwrap_or_else(|| panic!("not a digest-pinned ubuntu:26.04: {DEFAULT_BASE_IMAGE}"));
         assert_eq!(digest.len(), 64, "sha256 digest is 64 hex chars: {digest}");
         assert!(
             digest
