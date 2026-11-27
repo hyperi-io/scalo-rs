@@ -142,7 +142,8 @@ pub fn trigger() {
 /// acknowledged, once `shutdown.drain_deadline_secs` has passed since the
 /// first signal (default 35, under a 45 s termination grace), or at once on a
 /// second signal. `ServiceRuntime` sets the default from the app's deployment
-/// contract instead.
+/// contract instead. The `shutdown` section is read when the first signal
+/// arrives, so the handler can be installed before `config::setup`.
 ///
 /// Returns the token for use in `tokio::select!` or other async
 /// shutdown coordination.
@@ -156,16 +157,15 @@ pub fn install_signal_handler() -> CancellationToken {
 pub(crate) fn install_signal_handler_with_grace(grace: Duration) -> CancellationToken {
     let t = token();
     let cancel = t.clone();
-    let config = ShutdownConfig::from_cascade().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "The shutdown section does not parse, so its defaults apply");
-        ShutdownConfig::default()
-    });
-    let deadline = config.drain_deadline(grace);
     let mut signals = Signals::listen();
 
     tokio::spawn(async move {
         signals.next().await;
-        if let Some(deadline) = deadline {
+        let config = ShutdownConfig::from_cascade().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "The shutdown section does not parse, so its defaults apply");
+            ShutdownConfig::default()
+        });
+        if let Some(deadline) = config.drain_deadline(grace) {
             start_drain_deadline(deadline);
         }
         tokio::select! {
