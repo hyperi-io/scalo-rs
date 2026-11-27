@@ -14,8 +14,10 @@ use thiserror::Error;
 
 use super::entry::DlqEntry;
 
-/// Errors from DLQ operations.
+/// Errors from DLQ operations. Matches need a wildcard arm, as variants are
+/// added.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DlqError {
     /// File backend I/O error.
     #[error("file DLQ I/O error: {0}")]
