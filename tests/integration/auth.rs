@@ -485,6 +485,75 @@ async fn a_response_without_a_token_is_refused() {
     );
 }
 
+/// A token endpoint that answers one exchange with `head` and then `body` in
+/// 64 KiB writes, whatever was asked.
+async fn raw_token_endpoint(head: String, body: Vec<u8>) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await;
+        let _ = stream.write_all(head.as_bytes()).await;
+        for piece in body.chunks(64 * 1024) {
+            if stream.write_all(piece).await.is_err() {
+                return;
+            }
+        }
+    });
+    addr
+}
+
+/// A token response over 256 KiB is refused unread past the cap, whether it
+/// declares its length or streams without one, and a refusal that large
+/// names no detail.
+#[tokio::test]
+async fn an_oversized_token_response_is_refused_at_the_cap() {
+    const OVER: usize = 256 * 1024 + 1;
+    let json = format!("{{\"access_token\":\"{}\"}}", "x".repeat(OVER));
+    let chunked = |status: &str, payload: &str| {
+        let mut body = format!("{:x}\r\n", payload.len()).into_bytes();
+        body.extend_from_slice(payload.as_bytes());
+        body.extend_from_slice(b"\r\n0\r\n\r\n");
+        (
+            format!("HTTP/1.1 {status}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"),
+            body,
+        )
+    };
+    let refusal = format!(
+        "{{\"error\":\"invalid_client\",\"pad\":\"{}\"}}",
+        "x".repeat(OVER)
+    );
+    let cases = [
+        (
+            "declared length",
+            (
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    json.len()
+                ),
+                json.clone().into_bytes(),
+            ),
+            "over 262144 bytes",
+        ),
+        ("streamed", chunked("200 OK", &json), "over 262144 bytes"),
+        (
+            "oversized refusal",
+            chunked("400 Bad Request", &refusal),
+            "the body named no error",
+        ),
+    ];
+    for (case, (head, body), expected) in cases {
+        let addr = raw_token_endpoint(head, body).await;
+        let error = Cached::new(client_credentials(addr, "raw"))
+            .credential()
+            .await
+            .expect_err(case);
+        assert!(error.to_string().contains(expected), "{case}: {error}");
+    }
+}
+
 /// Two placements over one shared source land on one request and cost one
 /// exchange, which is what a provider wanting two headers needs.
 #[tokio::test]
