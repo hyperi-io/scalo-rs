@@ -163,8 +163,8 @@ impl Listener {
     }
 }
 
-/// Count a datagram dropped in `transport_dropped_total`.
-fn count_dropped(reason: &'static str) {
+/// Count a datagram or frame dropped in `transport_dropped_total`.
+pub(super) fn count_dropped(reason: &'static str) {
     metrics::counter!(
         "transport_dropped_total",
         "transport" => "syslog",

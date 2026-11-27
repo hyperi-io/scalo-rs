@@ -322,6 +322,7 @@ async fn drain(decoder: &mut StreamDecoder, peer: SocketAddr, inbox: &Inbox) -> 
             Ok(None) => break,
             Err(e) => {
                 tracing::debug!(%peer, error = %e, "syslog: a frame cut off at the end of the input");
+                super::udp::count_dropped("cut_off");
                 break;
             }
         };
