@@ -77,7 +77,9 @@ pub mod registry;
 pub mod sensitive;
 mod yaml_file;
 
-pub use load::{Loaded, load_typed, load_typed_cascade, load_typed_managed, log_deferred};
+pub use load::{
+    Loaded, load_typed, load_typed_cascade, load_typed_managed, load_typed_strict, log_deferred,
+};
 pub use managed::ManagedSource;
 
 #[cfg(feature = "config-reload")]
