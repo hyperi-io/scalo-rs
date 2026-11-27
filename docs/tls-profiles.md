@@ -19,6 +19,8 @@ tls:
       allow_tls12: true
 ```
 
+An app sets the defaults for a profile the section leaves out with `TlsProfiles::set_app_default`, once and before any TLS config is built. A site's `tls.profiles` still wins for each profile it sets, and a profile it leaves out keeps the app's setting. A second call returns `AppDefaultError::AlreadySet`.
+
 The connection keys themselves (trust, CA files, client certificate, pins) are in [api/tls.md](api/tls.md).
 
 ## The profiles

@@ -137,7 +137,8 @@ async fn cnsa2_refuses_a_p256_server_naming_the_next_profile() {
 
 /// A TLS 1.2-only server is refused by the default strong client with the
 /// typed error that names allow_tls12, and agreed with once the profile sets
-/// it, on strong's own TLS 1.2 suite and a classical group.
+/// it, on strong's own TLS 1.2 suite and a classical group. A client with no
+/// profile settings of its own agrees the same handshake from the app default.
 #[tokio::test]
 async fn a_tls12_peer_is_refused_by_default_and_agreed_with_allow_tls12() {
     use rustls_pki_types::pem::PemObject;
@@ -171,7 +172,10 @@ async fn a_tls12_peer_is_refused_by_default_and_agreed_with_allow_tls12() {
     );
 
     let allowed = TlsProfiles::default().with_tls12(CryptoProfile::Strong, true);
-    let agreed = handshake(&client(&ca_file, CryptoProfile::Strong, allowed), server);
+    let agreed = handshake(
+        &client(&ca_file, CryptoProfile::Strong, allowed),
+        Arc::clone(&server),
+    );
     assert_eq!(
         agreed,
         Ok(Agreed {
@@ -180,6 +184,13 @@ async fn a_tls12_peer_is_refused_by_default_and_agreed_with_allow_tls12() {
             group: Some(G::secp384r1),
         })
     );
+
+    TlsProfiles::set_app_default(allowed).unwrap();
+    let from_app_default = handshake(
+        &ClientTls::pinned(&ca_file).with_profile(CryptoProfile::Strong),
+        server,
+    );
+    assert_eq!(from_app_default, agreed);
 }
 
 /// A scalo server on strong refuses a TLS 1.2-only client by default and

@@ -845,8 +845,9 @@ pub(super) fn set_tls(client_config: &mut ClientConfig, config: &KafkaConfig) {
         .iter()
         .any(|p| config.security_protocol.trim().eq_ignore_ascii_case(p));
     if runs_tls {
-        // validate refuses a section that does not parse, so the defaults stand in only here.
-        let profiles = crate::crypto::TlsProfiles::from_cascade().unwrap_or_default();
+        // validate refuses a section that does not parse, so the app default stands in only here.
+        let profiles = crate::crypto::TlsProfiles::from_cascade()
+            .unwrap_or_else(|_| crate::crypto::TlsProfiles::app_default());
         let tls12 = tls.profile.has_tls12() && profiles.options(tls.profile).allow_tls12;
         openssl_floor::apply(tls.profile, tls12);
         let lists = OpenSslLists::of(tls.profile);

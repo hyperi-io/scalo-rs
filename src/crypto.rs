@@ -34,6 +34,8 @@
 //! what each connects to. FIPS 140-3 is a build mode, not a profile: `fips`
 //! fails at config load on a build without it, and no scalo build has it yet.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 /// A named TLS profile. `strong` is the default.
@@ -179,16 +181,50 @@ impl Default for TlsProfiles {
     }
 }
 
+/// The app default, set once by [`TlsProfiles::set_app_default`].
+static APP_DEFAULT: OnceLock<TlsProfiles> = OnceLock::new();
+
+/// Why [`TlsProfiles::set_app_default`] refused its settings.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AppDefaultError {
+    /// The app default was already set, and the first call stands.
+    #[error("TLS profiles app default is already set")]
+    AlreadySet,
+    /// The settings fail [`TlsProfiles::validate`].
+    #[error("{0}")]
+    Invalid(String),
+}
+
 /// The `tls` cascade section, of which `profiles` is the only key.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct TlsSection {
-    profiles: TlsProfiles,
+    profiles: SiteProfiles,
+}
+
+/// The profiles a `tls.profiles` section sets. A profile it leaves out keeps the app default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SiteProfiles {
+    strong: Option<ProfileOptions>,
+    commercial: Option<ProfileOptions>,
+    cnsa2: Option<ProfileOptions>,
+}
+
+impl SiteProfiles {
+    /// `base` with each profile this section sets replaced.
+    fn over(self, base: TlsProfiles) -> TlsProfiles {
+        TlsProfiles {
+            strong: self.strong.unwrap_or(base.strong),
+            commercial: self.commercial.unwrap_or(base.commercial),
+            cnsa2: self.cnsa2.unwrap_or(base.cnsa2),
+        }
+    }
 }
 
 impl TlsProfiles {
-    /// The settings under the `tls` cascade key, or the defaults when the
-    /// cascade is not set up or the key is absent.
+    /// The settings under the `tls` cascade key, over the app default. The
+    /// app default applies when the cascade is not set up or the key is absent.
     ///
     /// # Errors
     ///
@@ -196,8 +232,34 @@ impl TlsProfiles {
     pub fn from_cascade() -> Result<Self, String> {
         let section: TlsSection =
             crate::cascade::section("tls").map_err(|e| format!("TLS profiles: {e}"))?;
-        section.profiles.validate()?;
-        Ok(section.profiles)
+        let profiles = section.profiles.over(Self::app_default());
+        profiles.validate()?;
+        Ok(profiles)
+    }
+
+    /// Set the settings the cascade falls back to for every profile the
+    /// `tls.profiles` section leaves out. The built-in defaults apply where
+    /// this is never called.
+    ///
+    /// Call it once, before any TLS config or transport is built: a config
+    /// built earlier keeps the settings it read. A site's `tls.profiles`
+    /// still wins over these.
+    ///
+    /// # Errors
+    ///
+    /// [`AppDefaultError::Invalid`] when [`validate`](Self::validate) refuses
+    /// the settings, and [`AppDefaultError::AlreadySet`] on a second call.
+    /// Neither leaves the app default changed.
+    pub fn set_app_default(profiles: Self) -> Result<(), AppDefaultError> {
+        profiles.validate().map_err(AppDefaultError::Invalid)?;
+        APP_DEFAULT
+            .set(profiles)
+            .map_err(|_| AppDefaultError::AlreadySet)
+    }
+
+    /// The app default, or the built-in defaults when none was set.
+    pub(crate) fn app_default() -> Self {
+        APP_DEFAULT.get().copied().unwrap_or_default()
     }
 
     /// Refuse settings no profile can honour.
@@ -266,17 +328,13 @@ mod tests {
         assert!(!defaults.options(CryptoProfile::Cnsa2).allow_tls12);
     }
 
-    /// `allow_tls12` reaches a profile through the cascade, the others keep
-    /// their defaults, and cnsa2 refuses it.
+    /// Load a `settings.yaml` holding `yaml` as the cascade. The config is
+    /// read here, so the temporary directory can go. A test that sets a
+    /// process global runs in its own process under nextest.
     #[cfg(feature = "config")]
-    #[test]
-    fn allow_tls12_reaches_a_profile_through_the_cascade() {
+    fn setup_cascade(yaml: &str) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("settings.yaml"),
-            "tls:\n  profiles:\n    strong:\n      allow_tls12: true\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("settings.yaml"), yaml).unwrap();
         crate::config::setup(crate::config::ConfigOptions {
             env_prefix: "TLSPROFILECFG".to_string(),
             config_paths: vec![dir.path().to_path_buf()],
@@ -285,6 +343,14 @@ mod tests {
             ..crate::config::ConfigOptions::default()
         })
         .unwrap();
+    }
+
+    /// `allow_tls12` reaches a profile through the cascade, the others keep
+    /// their defaults, and cnsa2 refuses it.
+    #[cfg(feature = "config")]
+    #[test]
+    fn allow_tls12_reaches_a_profile_through_the_cascade() {
+        setup_cascade("tls:\n  profiles:\n    strong:\n      allow_tls12: true\n");
         let profiles = TlsProfiles::from_cascade().unwrap();
         assert_eq!(
             profiles,
@@ -297,6 +363,48 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .contains("cnsa2 is TLS 1.3 only")
+        );
+    }
+
+    /// The app default is set once, settings no profile can honour are
+    /// refused without taking the slot, and a second call names the error.
+    #[test]
+    fn app_default_is_set_once_and_refuses_invalid_settings() {
+        let refused = TlsProfiles::default().with_tls12(CryptoProfile::Cnsa2, true);
+        assert!(matches!(
+            TlsProfiles::set_app_default(refused),
+            Err(AppDefaultError::Invalid(_))
+        ));
+
+        let allow = TlsProfiles::default().with_tls12(CryptoProfile::Strong, true);
+        assert_eq!(TlsProfiles::set_app_default(allow), Ok(()));
+        assert_eq!(
+            TlsProfiles::set_app_default(TlsProfiles::default()),
+            Err(AppDefaultError::AlreadySet)
+        );
+        assert_eq!(TlsProfiles::app_default(), allow);
+    }
+
+    /// The app default fills each profile a `tls.profiles` section leaves
+    /// out, and the section's own setting for a profile it sets.
+    #[cfg(feature = "config")]
+    #[test]
+    fn the_cascade_section_wins_over_the_app_default_per_profile() {
+        TlsProfiles::set_app_default(
+            TlsProfiles::default()
+                .with_tls12(CryptoProfile::Strong, true)
+                .with_tls12(CryptoProfile::Commercial, false),
+        )
+        .unwrap();
+        setup_cascade("tls:\n  profiles:\n    strong:\n      allow_tls12: false\n");
+
+        // strong from the section, commercial from the app default (the built-in is true).
+        let profiles = TlsProfiles::from_cascade().unwrap();
+        assert_eq!(
+            profiles,
+            TlsProfiles::default()
+                .with_tls12(CryptoProfile::Strong, false)
+                .with_tls12(CryptoProfile::Commercial, false)
         );
     }
 }
