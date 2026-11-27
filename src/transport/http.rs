@@ -167,6 +167,10 @@ fn default_send_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_body_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_max_body_bytes() -> usize {
     16 * 1024 * 1024
 }
@@ -299,6 +303,12 @@ pub struct HttpTransportConfig {
     #[serde(default = "default_max_in_flight_bytes")]
     pub max_in_flight_bytes: usize,
 
+    /// Longest a request's body may take to arrive once its headers have, in
+    /// ms (receive side). A slower body fails the request and frees the bytes
+    /// it reserved. Default 30000. `0` sets none.
+    #[serde(default = "default_body_timeout_ms")]
+    pub body_timeout_ms: u64,
+
     /// Longest a response is held for its records' delivery, in ms, once
     /// acknowledgements hold it, after which it is answered 503. Default
     /// 25000. A sender's own timeout must be longer.
@@ -384,6 +394,7 @@ impl Default for HttpTransportConfig {
             connect_timeout_ms: default_connect_timeout_ms(),
             send_timeout_ms: default_send_timeout_ms(),
             max_body_bytes: default_max_body_bytes(),
+            body_timeout_ms: default_body_timeout_ms(),
             max_in_flight_bytes: default_max_in_flight_bytes(),
             max_hold_ms: default_max_hold_ms(),
             max_held_bytes: default_max_held_bytes(),
@@ -421,6 +432,7 @@ impl std::fmt::Debug for HttpTransportConfig {
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("send_timeout_ms", &self.send_timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
+            .field("body_timeout_ms", &self.body_timeout_ms)
             .field("max_in_flight_bytes", &self.max_in_flight_bytes)
             .field("max_hold_ms", &self.max_hold_ms)
             .field("max_held_bytes", &self.max_held_bytes)
@@ -753,6 +765,7 @@ impl HttpTransport {
                     pressure: pressure.clone(),
                 },
                 &recv_path,
+                config.body_timeout_ms,
             );
 
             let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
@@ -936,15 +949,27 @@ fn in_flight_budget(config: &HttpTransportConfig) -> TransportResult<tokio::sync
 
 /// Build the axum router for the receive side.
 #[cfg(feature = "http-server")]
-fn build_receiver_router(state: ReceiverState, recv_path: &str) -> axum::Router {
+fn build_receiver_router(
+    state: ReceiverState,
+    recv_path: &str,
+    body_timeout_ms: u64,
+) -> axum::Router {
     use axum::routing::post;
 
     let max_body_bytes = state.max_body_bytes;
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(recv_path, post(ingest_handler))
         // Reject oversized bodies with 413 before the handler buffers them.
-        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
-        .with_state(state)
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes));
+    // Bounds the body read alone, so a held answer can still wait max_hold_ms.
+    let router = if body_timeout_ms > 0 {
+        router.layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
+            std::time::Duration::from_millis(body_timeout_ms),
+        ))
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 /// The receive queue, and the rest of the request `recv` last took part of.
@@ -3000,6 +3025,35 @@ mod tests {
             .expect("answered at the drop")
             .expect("post task");
         assert_eq!(code, 503);
+    }
+
+    /// A body that stalls past `body_timeout_ms` fails its request and frees
+    /// the bytes it reserved, so the next request is admitted.
+    #[cfg(feature = "http-server")]
+    #[tokio::test]
+    async fn a_stalled_body_frees_its_budget_at_the_body_timeout() {
+        let receiver = HttpTransport::new(&HttpTransportConfig {
+            max_body_bytes: 64,
+            max_in_flight_bytes: 64,
+            body_timeout_ms: 300,
+            ..receiver_config(100)
+        })
+        .await
+        .expect("receiver");
+        let addr = receiver.local_addr().expect("receiver bound");
+        let mut stalled = partial_post(addr, &[b'x'; 60], 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (code, _) = post(&receiver, "{\"a\":1}").await.expect("post task");
+        assert_eq!(code, 503, "the stalled body holds the budget");
+
+        let line = status_line(&mut stalled).await;
+        assert!(
+            !line.contains(" 200 "),
+            "a stalled body was answered {line}"
+        );
+        let (code, _) = post(&receiver, "{\"a\":1}").await.expect("post task");
+        assert_eq!(code, 200, "the budget came back at the body timeout");
+        receiver.close().await.unwrap();
     }
 
     /// `close()` stops the server even while a client holds a request open,

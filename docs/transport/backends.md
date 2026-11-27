@@ -453,6 +453,7 @@ transport:
       recv_buffer_size: 10000       # requests queued, each with all its records
       max_body_bytes: 16777216      # one request's body, 413 above it
       max_in_flight_bytes: 67108864 # bodies read and queued at once
+      body_timeout_ms: 30000        # a body slower than this fails and frees its bytes
       max_hold_ms: 25000            # longest a held response waits, then 503
       max_held_bytes: 268435456     # bodies held for their answer at once
       acknowledgements:             # absent: off, answered at enqueue
