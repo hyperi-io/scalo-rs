@@ -40,6 +40,10 @@
 //! newline never yields that line. A line over `max_line_bytes` is never held
 //! whole: it comes back as a dead letter carrying its first `max_line_bytes`.
 //!
+//! At the end of the file `recv` reads again every 10 ms for up to
+//! `recv_timeout_ms` (default 100) before it returns empty, so a loop over it
+//! does not spin.
+//!
 //! ## Example
 //!
 //! ```rust,ignore
@@ -130,11 +134,24 @@ pub struct FileTransportConfig {
     /// a dead letter carrying its first `max_line_bytes`.
     #[serde(default = "default_max_line_bytes")]
     pub max_line_bytes: usize,
+
+    /// Longest `recv` waits at the end of the file for a new line, in ms,
+    /// checking for one every 10 ms, before it returns empty. Default 100. 0
+    /// returns empty at once.
+    #[serde(default = "default_recv_timeout_ms")]
+    pub recv_timeout_ms: u64,
 }
 
 fn default_append() -> bool {
     true
 }
+
+fn default_recv_timeout_ms() -> u64 {
+    100
+}
+
+/// How often a `recv` waiting at the end of the file reads it again.
+const EOF_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 fn default_rotation() -> RotationPeriod {
     RotationPeriod::Never
@@ -156,6 +173,7 @@ impl Default for FileTransportConfig {
             filters_in: Vec::new(),
             filters_out: Vec::new(),
             max_line_bytes: default_max_line_bytes(),
+            recv_timeout_ms: default_recv_timeout_ms(),
         }
     }
 }
@@ -702,6 +720,89 @@ impl FileTransport {
         None
     }
 
+    /// Read up to `max` lines past those already handed out, following a
+    /// rotation once the renamed file is delivered.
+    async fn read_pass(&self, state: &mut ReadState, max: usize) -> TransportResult<Vec<ReadLine>> {
+        // Seen before the read, so the read ends the renamed file.
+        let renamed = match self.holding() {
+            Some(_) => FileId::at(Path::new(&self.config.path))
+                .await
+                .is_some_and(|live| Some(live) != state.file),
+            None => false,
+        };
+        // A dropped read leaves a partial line in the decoder, and `pending`
+        // holds finished lines, so a dropped call resumes here.
+        let ReadState {
+            reader,
+            base,
+            decoder,
+            pending,
+            ..
+        } = &mut *state;
+        let cap = self.config.max_line_bytes;
+
+        for _ in pending.len()..max {
+            // EOF, or a line the writer has not finished: the decoder keeps
+            // the partial bytes for the next call.
+            let Some(frame) = decoder
+                .read(reader)
+                .await
+                .map_err(|e| TransportError::Recv(format!("read failed: {e}")))?
+            else {
+                break;
+            };
+            let offset = *base + decoder.taken();
+            match frame {
+                Frame::Oversize { head, len } => {
+                    #[cfg(feature = "logger")]
+                    tracing::warn!(
+                        offset,
+                        line_bytes = len,
+                        max_line_bytes = cap,
+                        "File transport: a line over max_line_bytes is returned as a dead letter"
+                    );
+                    Self::count_too_large();
+                    pending.push(ReadLine::TooLong(
+                        super::filter::FilteredDlqEntry {
+                            payload: head,
+                            key: None,
+                            reason: format!(
+                                "line of {len} bytes exceeds max_line_bytes {cap}; the first {cap} \
+                                 bytes are kept"
+                            ),
+                        },
+                        FileToken { offset },
+                    ));
+                }
+                Frame::Record(payload) => {
+                    let format = PayloadFormat::detect(&payload);
+                    let timestamp_ms = crate::clock::epoch_millis();
+                    pending.push(ReadLine::Record(Message {
+                        key: None,
+                        payload,
+                        token: FileToken { offset },
+                        timestamp_ms: Some(timestamp_ms),
+                        format,
+                        headers: Vec::new(),
+                    }));
+                }
+            }
+        }
+        // A call with a smaller `max` than the dropped one leaves the rest queued.
+        let rest = pending.split_off(pending.len().min(max));
+        let lines = std::mem::replace(pending, rest);
+        if let Some(acks) = self.holding() {
+            if !lines.is_empty() {
+                acks.held
+                    .lock()
+                    .hand_out(lines.iter().map(ReadLine::offset));
+            } else if renamed {
+                self.follow_rotation(acks, state).await?;
+            }
+        }
+        Ok(lines)
+    }
+
     /// Move a holding reader at the end of a file rotation renamed onto the
     /// new file at the path, once every line handed out of the old one is
     /// released delivered.
@@ -887,83 +988,20 @@ impl TransportReceiver for FileTransport {
             .as_mut()
             .ok_or_else(|| TransportError::Internal("reader not initialised".into()))?;
 
-        // Seen before the read, so the read ends the renamed file.
-        let renamed = match self.holding() {
-            Some(_) => FileId::at(Path::new(&self.config.path))
-                .await
-                .is_some_and(|live| Some(live) != state.file),
-            None => false,
+        let wait_until = (self.config.recv_timeout_ms > 0 && max > 0).then(|| {
+            tokio::time::Instant::now()
+                + std::time::Duration::from_millis(self.config.recv_timeout_ms)
+        });
+        let lines = loop {
+            let lines = self.read_pass(state, max).await?;
+            let now = tokio::time::Instant::now();
+            match wait_until {
+                Some(until) if lines.is_empty() && now < until && !self.lifecycle.is_closed() => {
+                    tokio::time::sleep(EOF_POLL.min(until - now)).await;
+                }
+                _ => break lines,
+            }
         };
-        // A dropped read leaves a partial line in the decoder, and `pending`
-        // holds finished lines, so a dropped call resumes here.
-        let ReadState {
-            reader,
-            base,
-            decoder,
-            pending,
-            ..
-        } = &mut *state;
-        let cap = self.config.max_line_bytes;
-
-        for _ in pending.len()..max {
-            // EOF, or a line the writer has not finished: the decoder keeps
-            // the partial bytes for the next call.
-            let Some(frame) = decoder
-                .read(reader)
-                .await
-                .map_err(|e| TransportError::Recv(format!("read failed: {e}")))?
-            else {
-                break;
-            };
-            let offset = *base + decoder.taken();
-            match frame {
-                Frame::Oversize { head, len } => {
-                    #[cfg(feature = "logger")]
-                    tracing::warn!(
-                        offset,
-                        line_bytes = len,
-                        max_line_bytes = cap,
-                        "File transport: a line over max_line_bytes is returned as a dead letter"
-                    );
-                    Self::count_too_large();
-                    pending.push(ReadLine::TooLong(
-                        super::filter::FilteredDlqEntry {
-                            payload: head,
-                            key: None,
-                            reason: format!(
-                                "line of {len} bytes exceeds max_line_bytes {cap}; the first {cap} \
-                                 bytes are kept"
-                            ),
-                        },
-                        FileToken { offset },
-                    ));
-                }
-                Frame::Record(payload) => {
-                    let format = PayloadFormat::detect(&payload);
-                    let timestamp_ms = crate::clock::epoch_millis();
-                    pending.push(ReadLine::Record(Message {
-                        key: None,
-                        payload,
-                        token: FileToken { offset },
-                        timestamp_ms: Some(timestamp_ms),
-                        format,
-                        headers: Vec::new(),
-                    }));
-                }
-            }
-        }
-        // A call with a smaller `max` than the dropped one leaves the rest queued.
-        let rest = pending.split_off(pending.len().min(max));
-        let lines = std::mem::replace(pending, rest);
-        if let Some(acks) = self.holding() {
-            if !lines.is_empty() {
-                acks.held
-                    .lock()
-                    .hand_out(lines.iter().map(ReadLine::offset));
-            } else if renamed {
-                self.follow_rotation(acks, state).await?;
-            }
-        }
         drop(guard);
 
         let mut messages = Vec::with_capacity(lines.len());
@@ -1101,7 +1139,6 @@ mod tests {
     }
 
     /// The payloads of `batch`, as text.
-    #[cfg(unix)]
     fn texts(batch: &WorkBatch<FileToken>) -> Vec<String> {
         batch
             .records
@@ -1210,13 +1247,10 @@ mod tests {
             std::fs::read_to_string(&pos).unwrap().split(' ').next(),
             Some("4")
         );
-        assert!(
-            reader.recv(10).await.unwrap().is_empty(),
-            "the move reads nothing"
-        );
-        assert_eq!(saved(&dir, "in.ndjson"), 0, "0 in the new file");
+        // The waiting recv moves to the new file and reads it in one call.
         let new = reader.recv(10).await.unwrap();
         assert_eq!(texts(&new), ["c"]);
+        assert_eq!(saved(&dir, "in.ndjson"), 0, "0 in the new file");
         reader
             .release(&new.commit_tokens, DeliveryStatus::Delivered)
             .await
@@ -1481,6 +1515,63 @@ mod tests {
     async fn file_token_display() {
         let token = FileToken { offset: 42 };
         assert_eq!(format!("{token}"), "file:42");
+    }
+
+    /// A reader of `filename` whose `recv` waits `recv_timeout_ms` at the end.
+    async fn waiting(dir: &TempDir, filename: &str, recv_timeout_ms: u64) -> FileTransport {
+        FileTransport::new(&FileTransportConfig {
+            path: dir.path().join(filename).display().to_string(),
+            recv_timeout_ms,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// At the end of the file `recv` waits up to `recv_timeout_ms` for a line,
+    /// so a loop over it receives a handful of times in 600 ms rather than
+    /// thousands, and returns a line appended while it waits. 0 returns empty
+    /// at once.
+    #[tokio::test]
+    async fn recv_at_the_end_of_the_file_waits_for_a_line() {
+        use std::time::{Duration, Instant};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("eof.ndjson");
+        std::fs::write(&path, "a\n").unwrap();
+        // (recv_timeout_ms, fewest and most receives in 600 ms)
+        for (timeout, fewest, most) in [(200, 2, 4), (0, 100, usize::MAX)] {
+            let reader = waiting(&dir, "eof.ndjson", timeout).await;
+            assert_eq!(reader.recv(10).await.unwrap().records.len(), 1);
+            let started = Instant::now();
+            let mut receives = 0;
+            while started.elapsed() < Duration::from_millis(600) {
+                assert!(reader.recv(10).await.unwrap().is_empty());
+                receives += 1;
+            }
+            assert!(
+                (fewest..=most).contains(&receives),
+                "timeout {timeout}: {receives} receives in 600 ms at the end of the file"
+            );
+        }
+
+        let reader = waiting(&dir, "eof.ndjson", 5_000).await;
+        assert_eq!(reader.recv(10).await.unwrap().records.len(), 1);
+        let appender = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            std::io::Write::write_all(&mut file, b"b\n").unwrap();
+        });
+        let started = Instant::now();
+        let batch = reader.recv(10).await.unwrap();
+        assert_eq!(texts(&batch), ["b"], "the appended line");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "returned on the line, not the timeout"
+        );
+        appender.await.unwrap();
     }
 
     #[tokio::test]
