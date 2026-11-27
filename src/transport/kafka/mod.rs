@@ -864,9 +864,6 @@ pub(super) fn set_tls(client_config: &mut ClientConfig, config: &KafkaConfig) {
             client_config.set("ssl.sigalgs.list", sigalgs);
         }
     }
-    if config.ssl_skip_verify {
-        client_config.set("enable.ssl.certificate.verification", "false");
-    }
 }
 
 /// A profile in OpenSSL's names, for librdkafka.
@@ -1046,10 +1043,15 @@ pub(crate) mod client_gate {
             (
                 KafkaConfig {
                     security_protocol: "ssl".to_string(),
-                    ssl_skip_verify: true,
+                    librdkafka_overrides: [(
+                        "enable.ssl.certificate.verification".to_string(),
+                        "false".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
                     ..unreachable()
                 },
-                "ssl_skip_verify",
+                "disables TLS certificate verification",
             ),
             (unreachable(), "security_protocol='plaintext'"),
             // Only the provider preset makes this plaintext: `ssl` as written passes.

@@ -890,7 +890,7 @@ const SECURITY_PROTOCOL_KEYS: &[&str] = &["security.protocol"];
 /// librdkafka's two names for the SASL mechanism.
 const SASL_MECHANISM_KEYS: &[&str] = &["sasl.mechanism", "sasl.mechanisms"];
 
-/// The key every client builder sets to `false` for `ssl_skip_verify`.
+/// librdkafka's certificate check, off when set to `false`.
 const CERTIFICATE_VERIFICATION_KEYS: &[&str] = &["enable.ssl.certificate.verification"];
 
 /// librdkafka's broker hostname check, off when set to `none`.
@@ -1278,11 +1278,15 @@ pub struct KafkaConfig {
     #[cfg_attr(feature = "config-schema", schemars(skip))]
     pub ssl_key_location: crate::tls_config::Removed,
 
-    /// Skip SSL certificate verification.
-    ///
-    /// Automatically enabled for `devtest` profile.
-    #[serde(default)]
-    pub ssl_skip_verify: bool,
+    /// Removed: trust the broker's CA with `tls.ca_paths`.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_ssl_skip_verify"
+    )]
+    #[cfg_attr(feature = "config-schema", schemars(skip))]
+    pub ssl_skip_verify: crate::tls_config::Removed,
 
     /// Deliberately permit an unencrypted transport (`plaintext` /
     /// `sasl_plaintext`) in production. Default `false`: production
@@ -1467,7 +1471,6 @@ impl fmt::Debug for KafkaConfig {
             .field("sasl_username", &self.sasl_username)
             .field("sasl_password", &self.sasl_password)
             .field("tls", &self.tls)
-            .field("ssl_skip_verify", &self.ssl_skip_verify)
             .field("allow_insecure_transport", &self.allow_insecure_transport)
             .field("allow_auto_create_topics", &self.allow_auto_create_topics)
             .field("auth_refusal_grace_secs", &self.auth_refusal_grace_secs)
@@ -1569,6 +1572,7 @@ crate::tls_config::removed_keys! {
     removed_ssl_ca_location: "ssl_ca_location" => "tls.ca_paths with tls.trust: bundle";
     removed_ssl_certificate_location: "ssl_certificate_location" => "tls.client_cert_path";
     removed_ssl_key_location: "ssl_key_location" => "tls.client_key_path";
+    removed_ssl_skip_verify: "ssl_skip_verify" => "tls.ca_paths to trust the broker's CA";
 }
 
 impl Default for KafkaConfig {
@@ -1598,7 +1602,7 @@ impl Default for KafkaConfig {
             ssl_ca_location: crate::tls_config::Removed,
             ssl_certificate_location: crate::tls_config::Removed,
             ssl_key_location: crate::tls_config::Removed,
-            ssl_skip_verify: false,
+            ssl_skip_verify: crate::tls_config::Removed,
             allow_insecure_transport: false,
             allow_auto_create_topics: false,
             auth_refusal_grace_secs: default_auth_refusal_grace_secs(),
@@ -1629,13 +1633,10 @@ impl KafkaConfig {
     }
 
     /// Create a config with the devtest profile.
-    ///
-    /// Automatically enables SSL skip verify.
     #[must_use]
     pub fn devtest() -> Self {
         Self {
             profile: KafkaProfile::DevTest,
-            ssl_skip_verify: true,
             ..Default::default()
         }
     }
@@ -1648,7 +1649,6 @@ impl KafkaConfig {
             brokers: vec![brokers.to_string()],
             group: group.to_string(),
             topics,
-            ssl_skip_verify: true,
             ..Default::default()
         }
     }
@@ -1657,9 +1657,6 @@ impl KafkaConfig {
     #[must_use]
     pub fn with_profile(mut self, profile: KafkaProfile) -> Self {
         self.profile = profile;
-        if profile == KafkaProfile::DevTest {
-            self.ssl_skip_verify = true;
-        }
         self
     }
 
@@ -1876,16 +1873,6 @@ impl KafkaConfig {
         Ok(())
     }
 
-    /// Skip SSL certificate verification.
-    ///
-    /// **WARNING**: Only use in development/test environments! Rejected in
-    /// production by [`validate`](Self::validate).
-    #[must_use]
-    pub fn with_ssl_skip_verify(mut self) -> Self {
-        self.ssl_skip_verify = true;
-        self
-    }
-
     /// Resolve the provider preset: if [`provider`](Self::provider) is set, derive
     /// `security_protocol` + `sasl_mechanism` from it (never hand-set). No-op when
     /// `provider` is `None`. Call BEFORE [`validate`](Self::validate).
@@ -1970,11 +1957,7 @@ impl KafkaConfig {
 
     /// Validate the Kafka config against the deployment profile.
     ///
-    /// `ssl_skip_verify` disables TLS certificate verification (MITM-exposed),
-    /// and is set by the `devtest`/`for_testing` profiles by design. It is
-    /// permitted only in dev/test. Under a production profile this returns an
-    /// error. Every constructor that builds an rdkafka client from a config
-    /// runs this with [`crate::env::is_production`], after
+    /// Every constructor that builds an rdkafka client from a config runs this with [`crate::env::is_production`], after
     /// [`apply_provider`](Self::apply_provider). Call it directly to check a
     /// config without building a client.
     ///
@@ -1988,9 +1971,6 @@ impl KafkaConfig {
     /// one config can run both values and the weaker one decides. Keys and
     /// values match in any letter case, and values are trimmed.
     ///
-    /// NOTE: `ssl_skip_verify` is slated for removal at GA -- supply the broker
-    /// CA via `tls.ca_paths` (private-CA trust) instead.
-    ///
     /// # Errors
     ///
     /// Returns `Err` (in ANY environment) when the SASL mechanism is `PLAIN`
@@ -1999,7 +1979,7 @@ impl KafkaConfig {
     /// cannot honour (a pin, `server_name`, a classical `key_share`,
     /// `platform` off Windows, `bundle` with no CA file, half an identity).
     /// Additionally, when `is_production`, returns `Err`
-    /// if `ssl_skip_verify` is set, a raw map turns certificate or hostname
+    /// if a raw map turns certificate or hostname
     /// verification off, an unencrypted transport (`plaintext`/`sasl_plaintext`) is
     /// configured without the explicit `allow_insecure_transport` opt-in, a raw
     /// map gives `sasl.oauthbearer.token.endpoint.url` a URL that is not
@@ -2042,13 +2022,6 @@ impl KafkaConfig {
         self.validate_tls()?;
         if !is_production {
             return Ok(());
-        }
-        if self.ssl_skip_verify {
-            return Err(
-                "kafka: ssl_skip_verify (TLS verification disabled) is not permitted \
-                 in production -- configure tls.ca_paths for private-CA trust instead"
-                    .to_string(),
-            );
         }
         if let Some(unverified) =
             raw_settings(&raw_maps, CERTIFICATE_VERIFICATION_KEYS).find(SecuritySetting::is_false)
@@ -2103,18 +2076,6 @@ impl KafkaConfig {
             ));
         }
         Ok(())
-    }
-
-    /// Enable SSL but accept any certificate (for dev/test with self-signed certs).
-    #[must_use]
-    pub fn with_ssl_insecure(mut self) -> Self {
-        if self.security_protocol == "plaintext" {
-            self.security_protocol = "ssl".to_string();
-        } else if self.security_protocol == "sasl_plaintext" {
-            self.security_protocol = "sasl_ssl".to_string();
-        }
-        self.ssl_skip_verify = true;
-        self
     }
 
     // ========================================================================
@@ -2205,7 +2166,7 @@ impl KafkaConfig {
     /// - `{PREFIX}_SASL_MECHANISM` -> sasl_mechanism
     /// - `{PREFIX}_SASL_USERNAME` -> sasl_username (legacy: `{PREFIX}_SASL_USER`)
     /// - `{PREFIX}_SASL_PASSWORD` -> sasl_password
-    /// - `{PREFIX}_SSL_SKIP_VERIFY` -> ssl_skip_verify
+    /// - `{PREFIX}_SSL_SKIP_VERIFY` -> removed: warned of and ignored
     /// - `{PREFIX}_TOPICS` -> topics (comma-separated)
     ///
     /// Also supports standard `KAFKA_*` environment variables as fallback
@@ -2231,9 +2192,6 @@ impl KafkaConfig {
             && let Ok(profile) = val.parse()
         {
             config.profile = profile;
-            if config.profile == KafkaProfile::DevTest {
-                config.ssl_skip_verify = true;
-            }
         }
 
         if let Some(brokers) = prefixed("BOOTSTRAP_SERVERS", &["BROKERS"]).get_list() {
@@ -2306,8 +2264,14 @@ impl KafkaConfig {
             config.tls.ca_paths = vec![val.into()];
         }
 
-        if let Some(val) = prefixed("SSL_SKIP_VERIFY", &["SSL_INSECURE", "INSECURE"]).get_bool() {
-            config.ssl_skip_verify = val;
+        if prefixed("SSL_SKIP_VERIFY", &["SSL_INSECURE", "INSECURE"])
+            .get()
+            .is_some()
+        {
+            tracing::warn!(
+                "{prefix}_SSL_SKIP_VERIFY is removed and ignored, so certificates are verified: \
+                 trust the broker's CA with {prefix}_SSL_CA_LOCATION or tls.ca_paths"
+            );
         }
 
         if let Some(topics) = prefixed("TOPICS", &["TOPIC"]).get_list() {
@@ -2328,7 +2292,6 @@ impl KafkaConfig {
     /// - `KAFKA_SECURITY_PROTOCOL`
     /// - `KAFKA_SASL_MECHANISM`
     /// - `KAFKA_SASL_PASSWORD`
-    /// - `KAFKA_SSL_SKIP_VERIFY`
     /// - `KAFKA_TOPICS`
     /// - `KAFKA_GROUP_ID`
     /// - `KAFKA_CLIENT_ID`
@@ -2448,23 +2411,20 @@ mod tests {
         );
     }
 
+    /// `ssl_skip_verify` fails the load in every environment, naming
+    /// `tls.ca_paths`, and a TLS-verifying config validates in production.
     #[test]
-    fn validate_rejects_ssl_skip_verify_in_production() {
-        // devtest sets ssl_skip_verify -- fine in dev, rejected in prod.
-        let dev = KafkaConfig::devtest();
-        assert!(dev.ssl_skip_verify);
-        assert!(dev.validate(false).is_ok(), "dev allows skip_verify");
-        assert!(
-            dev.validate(true).is_err(),
-            "production must reject ssl_skip_verify"
-        );
-
-        // A TLS-verifying config validates in production.
+    fn ssl_skip_verify_fails_the_load_and_verified_tls_validates() {
+        for value in ["true", "false"] {
+            let error =
+                serde_json::from_str::<KafkaConfig>(&format!(r#"{{"ssl_skip_verify": {value}}}"#))
+                    .expect_err("a removed key");
+            assert!(error.to_string().contains("tls.ca_paths"), "{error}");
+        }
         let prod = KafkaConfig {
             security_protocol: "ssl".to_string(),
             ..Default::default()
         };
-        assert!(!prod.ssl_skip_verify);
         assert!(prod.validate(true).is_ok());
     }
 

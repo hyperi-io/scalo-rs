@@ -39,21 +39,18 @@ fn test_kafka_profile_default_is_production() {
 fn test_kafka_profile_production() {
     let config = KafkaConfig::production();
     assert_eq!(config.profile, KafkaProfile::Production);
-    assert!(!config.ssl_skip_verify);
 }
 
 #[test]
 fn test_kafka_profile_devtest() {
     let config = KafkaConfig::devtest();
     assert_eq!(config.profile, KafkaProfile::DevTest);
-    assert!(config.ssl_skip_verify); // Auto-enabled for devtest
 }
 
 #[test]
 fn test_kafka_profile_with_profile() {
     let config = KafkaConfig::default().with_profile(KafkaProfile::DevTest);
     assert_eq!(config.profile, KafkaProfile::DevTest);
-    assert!(config.ssl_skip_verify);
 }
 
 #[test]
@@ -229,31 +226,6 @@ fn test_kafka_config_with_client_cert() {
         config.tls.client_key_path,
         Some(std::path::PathBuf::from("/path/key.pem"))
     );
-}
-
-#[test]
-fn test_kafka_config_with_ssl_skip_verify() {
-    let config = KafkaConfig::default().with_ssl_skip_verify();
-
-    assert!(config.ssl_skip_verify);
-}
-
-#[test]
-fn test_kafka_config_with_ssl_insecure() {
-    let config = KafkaConfig::default().with_ssl_insecure();
-
-    assert_eq!(config.security_protocol, "ssl");
-    assert!(config.ssl_skip_verify);
-}
-
-#[test]
-fn test_kafka_config_with_ssl_insecure_upgrades_sasl() {
-    let config = KafkaConfig::default()
-        .with_scram("PLAIN", "user", crate::common::test_password())
-        .with_ssl_insecure();
-
-    assert_eq!(config.security_protocol, "sasl_ssl");
-    assert!(config.ssl_skip_verify);
 }
 
 #[test]
@@ -436,7 +408,6 @@ fn test_kafka_config_from_env() {
                 config.sasl_password.as_ref().map(|p| p.expose()),
                 Some(crate::common::test_password())
             );
-            assert!(config.ssl_skip_verify);
             assert_eq!(config.topics, vec!["topic1", "topic2", "topic3"]);
         },
     );
@@ -465,7 +436,6 @@ fn test_kafka_config_from_env_with_profile() {
             let config = KafkaConfig::from_env("TESTAPP2");
 
             assert_eq!(config.profile, KafkaProfile::DevTest);
-            assert!(config.ssl_skip_verify); // Auto-enabled for devtest
             assert_eq!(config.brokers, vec!["kafka:9092"]);
         },
     );
