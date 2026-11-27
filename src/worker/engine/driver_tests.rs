@@ -5384,7 +5384,7 @@ enum SlowLoop {
 /// What a heartbeat on the same runtime should do while `process` spins.
 #[derive(Debug, Clone, Copy)]
 enum Beat {
-    KeepsInterval,
+    TicksDuringProcess,
     WaitsOnProcess,
 }
 
@@ -5520,9 +5520,11 @@ async fn heartbeat_under_slow_process(run_loop: SlowLoop) -> Heartbeat {
 }
 
 /// On a multi-thread runtime a run loop's slow `process` leaves the worker to
-/// its other tasks, so a heartbeat beside it keeps its interval. A
+/// its other tasks, so a heartbeat beside it ticks while `process` runs. A
 /// current-thread runtime runs `process` inline: the heartbeat waits, and the
-/// run still completes. Every block commits in order either way.
+/// run still completes. Every block commits in order either way. An inline
+/// `process` admits no tick at all, so one tick proves the offload, whatever
+/// a loaded host does to the interval.
 #[test]
 fn a_slow_process_leaves_the_worker_to_its_other_tasks() {
     let one_worker = || {
@@ -5541,7 +5543,11 @@ fn a_slow_process_leaves_the_worker_to_its_other_tasks() {
     let in_order: Vec<u64> = (0_u64..).take(SLOW_BLOCKS).collect();
     for run_loop in [SlowLoop::Pipeline, SlowLoop::Workbatch, SlowLoop::Streaming] {
         for (flavor, runtime, beat) in [
-            ("one-worker multi-thread", one_worker(), Beat::KeepsInterval),
+            (
+                "one-worker multi-thread",
+                one_worker(),
+                Beat::TicksDuringProcess,
+            ),
             ("current-thread", current_thread(), Beat::WaitsOnProcess),
         ] {
             let heartbeat = runtime.block_on(heartbeat_under_slow_process(run_loop));
@@ -5556,9 +5562,9 @@ fn a_slow_process_leaves_the_worker_to_its_other_tasks() {
                 "{seen}: every block commits, in order"
             );
             match beat {
-                Beat::KeepsInterval => assert!(
-                    heartbeat.ticks_during_process >= 2 * SLOW_BLOCKS,
-                    "{seen}: the heartbeat keeps ticking while process runs"
+                Beat::TicksDuringProcess => assert!(
+                    heartbeat.ticks_during_process > 0,
+                    "{seen}: the heartbeat ticks while process runs"
                 ),
                 Beat::WaitsOnProcess => assert_eq!(
                     heartbeat.ticks_during_process, 0,
