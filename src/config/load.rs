@@ -65,7 +65,32 @@ pub fn load_typed<T>(path: Option<&str>, env_prefix: &str) -> Result<T, ConfigEr
 where
     T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
 {
-    load(path, env_prefix, None)
+    load(path, env_prefix, None, Unknown::Note)
+}
+
+/// [`load_typed`] on the file at `path`, refusing a nested key no field of `T`
+/// takes, such as a misspelt one, instead of logging it and loading the rest.
+/// A top-level key no field takes is still logged, as a runtime section may
+/// read it.
+///
+/// # Errors
+///
+/// As [`load_typed`], plus [`ConfigError::InvalidValue`] naming the first
+/// unknown nested key and the file.
+pub fn load_typed_strict<T>(path: &str, env_prefix: &str) -> Result<T, ConfigError>
+where
+    T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
+{
+    load(Some(path), env_prefix, None, Unknown::Refuse)
+}
+
+/// What a read does with a nested key no field takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unknown {
+    /// Log it and load the rest.
+    Note,
+    /// Fail the read.
+    Refuse,
 }
 
 /// [`load_typed`], with the store `managed` names merged after the file and
@@ -84,7 +109,7 @@ pub fn load_typed_managed<T>(
 where
     T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
 {
-    load(path, env_prefix, Some(managed))
+    load(path, env_prefix, Some(managed), Unknown::Note)
 }
 
 /// An app's config struct and the cascade it was read from.
@@ -117,7 +142,7 @@ pub fn load_typed_cascade<T>(
 where
     T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
 {
-    let (cascade, read) = read_typed(path, env_prefix, managed)?;
+    let (cascade, read) = read_typed(path, env_prefix, managed, Unknown::Note)?;
     let config = finish(read?, env_prefix)?;
     Ok(Loaded { config, cascade })
 }
@@ -126,11 +151,12 @@ fn load<T>(
     path: Option<&str>,
     env_prefix: &str,
     source: Option<&ManagedSource>,
+    unknown: Unknown,
 ) -> Result<T, ConfigError>
 where
     T: DeserializeOwned + Serialize + ApplyFlatEnv + Normalize,
 {
-    let (cascade, read) = read_typed(path, env_prefix, source)?;
+    let (cascade, read) = read_typed(path, env_prefix, source, unknown)?;
     // The first cascade set up is kept, so a reload leaves it in place.
     let _ = CONFIG.set(cascade);
     finish(read?, env_prefix)
@@ -143,6 +169,7 @@ fn read_typed<T>(
     path: Option<&str>,
     env_prefix: &str,
     source: Option<&ManagedSource>,
+    unknown: Unknown,
 ) -> Result<(Config, Result<T, ConfigError>), ConfigError>
 where
     T: DeserializeOwned + Serialize,
@@ -157,7 +184,9 @@ where
     };
     // The file is read first so its errors are `Yaml`, located, before the
     // cascade refuses the same file.
-    let from_file: Option<T> = path.map(|path| read_file(Path::new(path))).transpose()?;
+    let from_file: Option<T> = path
+        .map(|path| read_file(Path::new(path), unknown))
+        .transpose()?;
     let layer = managed::read(source)?;
     let cascade = Config::build(options, layer.as_ref())?;
     let read = match from_file {
@@ -195,10 +224,19 @@ where
     Ok(merged)
 }
 
-/// Parse the named file into `T`, logging the keys it skipped and the lints.
-fn read_file<T: DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
+/// Parse the named file into `T`, logging the keys it skipped and the lints,
+/// or refusing an unknown nested key under [`Unknown::Refuse`].
+fn read_file<T: DeserializeOwned>(path: &Path, unknown: Unknown) -> Result<T, ConfigError> {
     let loaded = yaml::from_path_reporting::<T>(path, Profile::Config)?;
     let file = path.display().to_string();
+    if unknown == Unknown::Refuse
+        && let Some(key) = loaded.unknown_keys.iter().find(|key| key.contains('.'))
+    {
+        return Err(ConfigError::InvalidValue {
+            key: key.clone(),
+            reason: format!("no config field takes this key in {file}; check its spelling"),
+        });
+    }
     for key in loaded.unknown_keys {
         let path = file.clone();
         if key.contains('.') {
@@ -431,7 +469,11 @@ mod tests {
         let (_dir, path) = file("name: from-file\nkafka:\n  brokers: [a]\n  password: hunter2\n");
         let dict: figment::value::Dict = [("name".to_string(), "from-policy".into())].into();
         let layer = ManagedLayer::new("test".into(), dict);
-        let app: App = overlay(read_file(Path::new(&path)).unwrap(), Some(&layer)).unwrap();
+        let app: App = overlay(
+            read_file(Path::new(&path), Unknown::Note).unwrap(),
+            Some(&layer),
+        )
+        .unwrap();
         assert_eq!(app.name, "from-policy");
         assert_eq!(app.kafka.brokers, ["a"]);
         assert_eq!(app.kafka.password.expose(), "hunter2");
@@ -594,6 +636,21 @@ mod tests {
                 .with_writer(move || Sink(Arc::clone(&writer))),
         );
         (subscriber, buf)
+    }
+
+    /// A strict load refuses a misspelt nested key, naming it and the file,
+    /// and takes a top-level key no field takes. The default load takes both.
+    #[test]
+    fn a_strict_load_refuses_a_misspelt_nested_key() {
+        let (_dir, misspelt) = file("name: a\nkafka:\n  brokerz: [b]\n");
+        let error = load_typed_strict::<App>(&misspelt, "LOADTEST").unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("kafka.brokerz"), "{text}");
+        assert!(text.contains(&misspelt), "{text}");
+        assert!(load_typed::<App>(Some(&misspelt), "LOADTEST").is_ok());
+
+        let (_dir, runtime) = file("name: a\nmetrics:\n  port: 9090\n");
+        assert!(load_typed_strict::<App>(&runtime, "LOADTEST").is_ok());
     }
 
     /// With no subscriber the note is held, and `log_deferred` logs it once a
