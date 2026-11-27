@@ -67,7 +67,7 @@ flowchart LR
     class artefacts store
 ```
 
-*Figure 1. L3 Components -- scalo. The dashed box is the app built on scalo.* Up: top of scalo-rs. Down: [L4 Detail -- Module layers](architecture.md), [L4 Detail -- Service lifecycle](runtime/service-runtime.md), [L4 Detail -- Self-regulation loop](self-regulation.md), [L4 Detail -- Pipeline stages](pipeline/README.md), [L4 Detail -- Transport traits](transport/README.md), [L4 Detail -- Contract to chart](deployment/contract.md).
+*Figure 1. L3 Components -- scalo. Your ServiceApp is the app built on scalo, outside the library.* Up: top of scalo-rs. Down: [L4 Detail -- Module layers](architecture.md), [L4 Detail -- Service lifecycle](runtime/service-runtime.md), [L4 Detail -- Self-regulation loop](self-regulation.md), [L4 Detail -- Pipeline stages](pipeline/README.md), [L4 Detail -- Transport traits](transport/README.md), [L4 Detail -- Contract to chart](deployment/contract.md).
 
 The runtime builds the worker pool and batch engine only when `worker-pool` or `worker-batch` is on. Transports, the tiered sink and the DLQ are built by the app in `run_service`.
 

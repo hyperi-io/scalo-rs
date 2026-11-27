@@ -156,7 +156,7 @@ flowchart LR
     class latch core
 ```
 
-*Figure 1. L4 Detail -- Self-regulation loop. The dotted source is attached only by a gRPC receive server built with a governor.* Up: [L3 Components -- scalo](README.md).
+*Figure 1. L4 Detail -- Self-regulation loop. The held-answers source is attached only by a gRPC receive server built with a governor.* Up: [L3 Components -- scalo](README.md).
 
 - The latch (`UnifiedPressure`, `src/governor/source.rs`) arms at
   `pause_above` and releases at `resume_below`. A hold is bounded in time:

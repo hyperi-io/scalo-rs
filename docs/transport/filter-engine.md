@@ -54,7 +54,7 @@ flowchart LR
     class classify decision
 ```
 
-*Figure 1. L4 Detail -- Filter tiers. A dotted arrow is the gate a tier needs, under `transport.filter_tiers`.* Up: [Transport](README.md).
+*Figure 1. L4 Detail -- Filter tiers. Each tier's arrow to a gate is the gate that tier needs, under `transport.filter_tiers`.* Up: [Transport](README.md).
 
 | Tier | Operations | Config gate |
 | ------ | ------------ | ------------- |

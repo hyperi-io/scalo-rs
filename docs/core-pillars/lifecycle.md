@@ -70,7 +70,7 @@ flowchart LR
     class state decision
 ```
 
-*Figure 1. L4 Detail -- Idle gate. The dotted arrows are the wake, which re-reads the config before asking again.* Up: [Core pillars](README.md).
+*Figure 1. L4 Detail -- Idle gate. A config change wakes the park, and the reload re-reads the config before the gate asks again.* Up: [Core pillars](README.md).
 
 ---
 

@@ -120,7 +120,7 @@ flowchart LR
     class last decision
 ```
 
-*Figure 1. L4 Detail -- Streaming sub-blocks. The dotted arrow takes the next sub-block.* Up: [L3 Components -- scalo](README.md).
+*Figure 1. L4 Detail -- Streaming sub-blocks. The `no` branch loops back to lease the next sub-block.* Up: [L3 Components -- scalo](README.md).
 
 Each sub-block's ingress lease is released BEFORE the next is leased, so peak
 in-flight ingress memory is bounded to ONE sub-block (`~sub_block_bytes`), not
