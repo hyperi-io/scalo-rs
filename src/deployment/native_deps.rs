@@ -123,8 +123,10 @@ pub struct AptRepoContract {
 // break every downstream exhaustive match.
 #[non_exhaustive]
 pub enum BaseDistro {
-    /// Debian 13 "trixie" -- the org default.
+    /// Ubuntu 26.04 "resolute" -- the org default.
     #[default]
+    Resolute,
+    /// Debian 13 "trixie".
     Trixie,
     /// Debian 12 "bookworm".
     Bookworm,
@@ -141,6 +143,7 @@ impl BaseDistro {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Resolute => "resolute",
             Self::Trixie => "trixie",
             Self::Bookworm => "bookworm",
             Self::Noble => "noble",
@@ -153,6 +156,7 @@ impl BaseDistro {
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "resolute" | "ubuntu26.04" | "ubuntu-26.04" => Some(Self::Resolute),
             "trixie" | "debian13" | "debian-13" => Some(Self::Trixie),
             "bookworm" | "debian12" | "debian-12" => Some(Self::Bookworm),
             "noble" | "ubuntu24.04" | "ubuntu-24.04" => Some(Self::Noble),
@@ -204,6 +208,7 @@ impl BaseDistro {
     /// Match a single tag component against a release codename.
     fn from_codename(part: &str) -> Option<Self> {
         match part {
+            "resolute" => Some(Self::Resolute),
             "trixie" => Some(Self::Trixie),
             "bookworm" => Some(Self::Bookworm),
             "noble" => Some(Self::Noble),
@@ -226,6 +231,7 @@ impl BaseDistro {
             },
             // Ubuntu versions ARE `major.minor` -- do not truncate these.
             "ubuntu" => match part {
+                "26.04" => Some(Self::Resolute),
                 "24.04" => Some(Self::Noble),
                 "22.04" => Some(Self::Jammy),
                 "20.04" => Some(Self::Focal),
@@ -238,12 +244,12 @@ impl BaseDistro {
     /// The libgit2 runtime package (`directory-config-git`).
     ///
     /// The library version is baked into the package name and there is no
-    /// virtual provider, so this has to track each release: trixie 1.9,
-    /// bookworm 1.5, noble 1.7, jammy 1.1, focal 0.28.
+    /// virtual provider, so this has to track each release: resolute 1.9,
+    /// trixie 1.9, bookworm 1.5, noble 1.7, jammy 1.1, focal 0.28.
     #[must_use]
     pub const fn libgit2_package(self) -> &'static str {
         match self {
-            Self::Trixie => "libgit2-1.9",
+            Self::Resolute | Self::Trixie => "libgit2-1.9",
             Self::Bookworm => "libgit2-1.5",
             Self::Noble => "libgit2-1.7",
             Self::Jammy => "libgit2-1.1",
@@ -701,6 +707,7 @@ mod tests {
     fn distro_package_names_are_release_specific() {
         // Soname-versioned packages do not alias, so a wrong release is a hard
         // build failure rather than a silent downgrade.
+        assert_eq!(BaseDistro::Resolute.libgit2_package(), "libgit2-1.9");
         assert_eq!(BaseDistro::Trixie.libgit2_package(), "libgit2-1.9");
         assert_eq!(BaseDistro::Bookworm.libgit2_package(), "libgit2-1.5");
         assert_eq!(BaseDistro::Noble.libgit2_package(), "libgit2-1.7");

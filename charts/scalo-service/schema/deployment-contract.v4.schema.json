@@ -113,7 +113,7 @@
     "base_image": {
       "description": "Base container image for the runtime stage.",
       "type": "string",
-      "default": "debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0"
+      "default": "ubuntu:26.04@sha256:d66b366dac61b575bee2aef07e9c26e8070096fbe84a3d4d3eb0da069b5d76db"
     },
     "native_deps": {
       "description": "Runtime native dependencies for the container image.\n\nUse [`NativeDepsContract::for_scalo_features`] to auto-populate from\nscalo feature flags. The Dockerfile generator emits the correct\nAPT repo setup and package installation commands.",
@@ -619,7 +619,12 @@
       "description": "A distro release we can generate runtime package names for.\n\nRuntime package names are release-specific: soname-versioned packages bake\nthe library version into the package name (`libgit2-1.9` vs `libgit2-1.7`)\nand do not alias, so installing the wrong one fails the build outright.\n\nThis is an explicit contract value, NOT something inferred from the base\nimage on every use. [`from_base_image`](Self::from_base_image) is a\nbest-effort convenience for the recognisable cases only: a digest-pinned\nreference (`debian@sha256:...`) carries no codename at all, and a rolling\nalias (`debian:stable-slim`) means a different release every couple of\nyears. Both return `None` so the caller falls back to a stated default\ninstead of silently borrowing another distro's package names.",
       "oneOf": [
         {
-          "description": "Debian 13 \"trixie\" -- the org default.",
+          "description": "Ubuntu 26.04 \"resolute\" -- the org default.",
+          "type": "string",
+          "const": "resolute"
+        },
+        {
+          "description": "Debian 13 \"trixie\".",
           "type": "string",
           "const": "trixie"
         },
