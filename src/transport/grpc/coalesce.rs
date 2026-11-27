@@ -215,31 +215,34 @@ impl Coalescer {
         })
     }
 
-    /// Whether the stage joins `records`: a block under the joining cap,
-    /// encoded. A larger one goes out on its own, split within
+    /// Whether the stage joins a block of `framed` encoded bytes: one under the
+    /// joining cap. A larger one goes out on its own, split within
     /// `max_message_size`.
-    pub(super) fn joins(&self, records: &[Framed]) -> bool {
-        records.iter().map(|r| r.len).sum::<usize>() < self.limits.cap
+    pub(super) fn joins(&self, framed: usize) -> bool {
+        framed < self.limits.cap
     }
 
-    /// Send `records` in the next call a slot frees for, and return that call's
-    /// result once it returns. `again` frames the block once more for a resend
+    /// Send the block `frame` builds, of `framed` encoded bytes, in the next
+    /// call a slot frees for, and return that call's result once it returns.
+    /// `frame` runs once the block holds its room and queue slot, so a waiting
+    /// caller holds no framed copy. `again` frames the block once more for a resend
     /// on its own. Until a call takes the block, `deadline` withdraws it unsent
     /// and the answer is `Backpressured`. A block in a call gets that call's
     /// answer, which `send_timeout_ms` bounds per request. Once the transport
     /// closes, the answer is `Backpressured`.
     pub(super) async fn send(
         &self,
-        records: Vec<Framed>,
+        framed: usize,
+        frame: impl FnOnce() -> Vec<Framed> + Send,
         deadline: Deadline,
         again: impl FnOnce() -> Vec<Framed>,
     ) -> SendResult {
-        if records.is_empty() {
+        if framed == 0 {
             return SendResult::Ok;
         }
         let mut closing = self.closing.subscribe();
         let sent = async move {
-            let held = match self.submit(records, deadline).await {
+            let held = match self.submit(framed, frame, deadline).await {
                 Ok(Joined::Answered(result)) => return result,
                 // Refused beside other blocks, and the stage keeps no copy.
                 Ok(Joined::Alone) => None,
@@ -280,10 +283,14 @@ impl Coalescer {
         self.task.abort();
     }
 
-    /// Queue `records`, within `deadline` until a call takes them, and wait for
-    /// the answer of that call.
-    async fn submit(&self, records: Vec<Framed>, deadline: Deadline) -> Result<Joined, Unsent> {
-        let framed: usize = records.iter().map(|r| r.len).sum();
+    /// Queue the block `frame` builds, of `framed` encoded bytes, within
+    /// `deadline` until a call takes it, and wait for the answer of that call.
+    async fn submit(
+        &self,
+        framed: usize,
+        frame: impl FnOnce() -> Vec<Framed>,
+        deadline: Deadline,
+    ) -> Result<Joined, Unsent> {
         // Capped at the whole room, so a block always fits once the room drains.
         let charge = (framed as u64).max(MIN_BLOCK_BYTES).min(self.room_bytes);
         let permits = u32::try_from(charge).unwrap_or(u32::MAX);
@@ -292,14 +299,15 @@ impl Coalescer {
             .await
         {
             None => return Err(Unsent::Expired),
-            Some(Err(_)) => return Err(Unsent::Gone(records)),
+            Some(Err(_)) => return Err(Unsent::Gone(frame())),
             Some(Ok(room)) => room,
         };
         let slot = match deadline.bound(self.queue.reserve()).await {
             None => return Err(Unsent::Expired),
-            Some(Err(_)) => return Err(Unsent::Gone(records)),
+            Some(Err(_)) => return Err(Unsent::Gone(frame())),
             Some(Ok(slot)) => slot,
         };
+        let records = frame();
         let (reply, mut answer) = oneshot::channel();
         let settled = Arc::new(AtomicBool::new(false));
         self.queued.fetch_add(charge, Ordering::AcqRel);
@@ -744,8 +752,11 @@ mod tests {
                 prepared.fetch_add(1, Ordering::SeqCst);
                 vec![as_field(&record(&name))]
             };
-            let block = vec![as_field(&record(&name))];
-            stage.send(block, super::Deadline::after(0), again).await
+            let block = || vec![as_field(&record(&name))];
+            let framed = as_field(&record(&name)).len;
+            stage
+                .send(framed, block, super::Deadline::after(0), again)
+                .await
         })
     }
 

@@ -1374,15 +1374,16 @@ fn as_field(record: &Record) -> Framed {
     Framed { record, len }
 }
 
-/// `record` as a field of a `Batch` body, or `None`, warned and counted, when
-/// it is over `limit` on its own: the same bytes are refused on every retry.
-fn frame(record: &Record, limit: usize) -> Option<Framed> {
-    let framed = as_field(record);
-    if framed.len > limit {
+/// `record`'s encoded length as a field of a `Batch` body, or `None`, warned
+/// and counted, when it is over `limit` on its own: the same bytes are refused
+/// on every retry.
+fn sized(record: &Record, limit: usize) -> Option<usize> {
+    let len = batch::record_field_len(record);
+    if len > limit {
         GrpcTransport::count_too_large();
         tracing::warn!(
-            destination = framed.record.key.as_str(),
-            encoded_len = framed.len,
+            destination = record.key.as_deref().unwrap_or(""),
+            encoded_len = len,
             limit,
             "gRPC send_batch: a record over max_message_size on its own is left out of the \
              block; the block's other records are sent and this one is dropped. Screen the \
@@ -1390,7 +1391,15 @@ fn frame(record: &Record, limit: usize) -> Option<Framed> {
         );
         return None;
     }
-    Some(framed)
+    Some(len)
+}
+
+/// `record` as a field of a `Batch` body, or `None` as [`sized`] says.
+fn frame(record: &Record, limit: usize) -> Option<Framed> {
+    sized(record, limit).map(|len| Framed {
+        record: batch::record_ref_to_proto(record),
+        len,
+    })
 }
 
 /// `records` framed for `limit` again, for a block framed once before: a record
@@ -1447,11 +1456,30 @@ fn batches_within(records: Vec<&Record>, limit: usize) -> (Vec<proto::Batch>, u6
     (batches, left_out)
 }
 
-/// `records` framed for `limit`, in order, and the count left out.
-fn framed_within(records: Vec<&Record>, limit: usize) -> (Vec<Framed>, u64) {
+/// `records` within `limit` with their encoded lengths, in order, and the
+/// count left out.
+fn sized_within(records: Vec<&Record>, limit: usize) -> (Vec<(&Record, usize)>, u64) {
     let mut left_out = 0_u64;
-    let framed = frames(records, limit, &mut left_out).collect();
-    (framed, left_out)
+    let sized = records
+        .into_iter()
+        .filter_map(|record| {
+            let len = sized(record, limit);
+            left_out += u64::from(len.is_none());
+            Some((record, len?))
+        })
+        .collect();
+    (sized, left_out)
+}
+
+/// `sized` records framed, their lengths taken as counted.
+fn framed_from(sized: &[(&Record, usize)]) -> Vec<Framed> {
+    sized
+        .iter()
+        .map(|&(record, len)| Framed {
+            record: batch::record_ref_to_proto(record),
+            len,
+        })
+        .collect()
 }
 
 /// Count records `send_batch` left out of a block: they were dropped, not
@@ -1492,16 +1520,19 @@ impl GrpcTransport {
     ) -> (SendResult, u64) {
         // Records over the ceiling on their own are left out here, so a joined
         // call carries only records within max_message_size.
-        let (framed, left_out) = framed_within(to_send, self.max_message_size);
-        let result = if stage.joins(&framed) {
+        let (sized, left_out) = sized_within(to_send, self.max_message_size);
+        let framed: usize = sized.iter().map(|&(_, len)| len).sum();
+        let result = if stage.joins(framed) {
             let deadline = coalesce::Deadline::after(wire.send_timeout_ms);
             // Runs only for a resend after a refused joined call, so no copy of
             // the block is kept.
             let again = || reframed(self.outbound(records).0, self.max_message_size);
-            stage.send(framed, deadline, again).await
+            stage
+                .send(framed, || framed_from(&sized), deadline, again)
+                .await
         } else {
             // A block over the ceiling goes as several requests in order.
-            wire.send_bodies(bodies_within(framed, self.max_message_size))
+            wire.send_bodies(bodies_within(framed_from(&sized), self.max_message_size))
                 .await
         };
         (result, left_out)

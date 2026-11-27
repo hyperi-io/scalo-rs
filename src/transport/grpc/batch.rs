@@ -107,6 +107,47 @@ pub(crate) fn record_ref_to_proto(record: &Record) -> proto::Record {
     )
 }
 
+/// The bytes `record` adds to a `Batch` body as its field 1, as
+/// `prost::encoding::message::encoded_len(1, &record_ref_to_proto(record))`
+/// counts them, without building the proto record.
+pub(crate) fn record_field_len(record: &Record) -> usize {
+    use prost::encoding::{encoded_len_varint, key_len};
+    // A length-delimited field: its key, its length, then its bytes. Proto3
+    // leaves out an empty one.
+    let delimited = |tag: u32, len: usize| {
+        if len == 0 {
+            0
+        } else {
+            key_len(tag) + encoded_len_varint(len as u64) + len
+        }
+    };
+    let headers: usize = record
+        .headers
+        .iter()
+        .map(|(key, value)| {
+            let header = delimited(1, key.len()) + delimited(2, value.len());
+            key_len(3) + encoded_len_varint(header as u64) + header
+        })
+        .sum();
+    let timestamp = match record.metadata.timestamp_ms {
+        Some(0) => key_len(5) + 1,
+        Some(ts) => key_len(4) + encoded_len_varint(ts.cast_unsigned()) + key_len(5) + 1,
+        None => 0,
+    };
+    let format = format_to_proto(record.metadata.format) as i32;
+    let format = if format == 0 {
+        0
+    } else {
+        key_len(6) + encoded_len_varint(i64::from(format).cast_unsigned())
+    };
+    let body = delimited(1, record.payload.len())
+        + delimited(2, record.key.as_deref().map_or(0, str::len))
+        + headers
+        + timestamp
+        + format;
+    key_len(1) + encoded_len_varint(body as u64) + body
+}
+
 /// The proto [`Record`](proto::Record) of its parts.
 fn proto_record(
     payload: Bytes,
@@ -200,6 +241,59 @@ mod tests {
                 timestamp_ms: Some(1_717_000_000_123),
                 format: PayloadFormat::Json,
             },
+        }
+    }
+
+    /// `record_field_len` counts what prost encodes for every field shape:
+    /// empty and set, a zero, negative and absent timestamp, each format, an
+    /// empty header key or value, and a payload past one varint byte of length.
+    #[test]
+    fn record_field_len_matches_what_prost_encodes() {
+        let with = |f: &dyn Fn(&mut Record)| {
+            let mut record = full_record();
+            f(&mut record);
+            record
+        };
+        let cases = [
+            ("full", full_record()),
+            (
+                "empty",
+                Record {
+                    payload: Bytes::new(),
+                    key: None,
+                    headers: Vec::new(),
+                    metadata: RecordMeta {
+                        timestamp_ms: None,
+                        format: PayloadFormat::Auto,
+                    },
+                },
+            ),
+            (
+                "zero timestamp",
+                with(&|r| r.metadata.timestamp_ms = Some(0)),
+            ),
+            (
+                "negative timestamp",
+                with(&|r| r.metadata.timestamp_ms = Some(-5)),
+            ),
+            (
+                "msgpack",
+                with(&|r| r.metadata.format = PayloadFormat::MsgPack),
+            ),
+            ("auto", with(&|r| r.metadata.format = PayloadFormat::Auto)),
+            ("empty key", with(&|r| r.key = Some(Arc::from("")))),
+            (
+                "empty header parts",
+                with(&|r| r.headers = vec![(String::new(), Vec::new()), ("k".into(), Vec::new())]),
+            ),
+            (
+                "large payload",
+                with(&|r| r.payload = Bytes::from(vec![7_u8; 70_000])),
+            ),
+        ];
+        for (case, record) in cases {
+            let want = prost::encoding::message::encoded_len(1, &record_ref_to_proto(&record));
+            assert_eq!(record_field_len(&record), want, "{case}");
         }
     }
 
