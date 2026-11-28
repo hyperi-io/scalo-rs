@@ -146,4 +146,5 @@ fn main() {
         guard.current_bytes(),
         guard.reserved_bytes()
     );
+    scalo::logger::flush();
 }

@@ -42,5 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::debug!(debug_mode, "Configuration loaded");
 
     tracing::info!("Quickstart complete");
+    logger::flush();
     Ok(())
 }

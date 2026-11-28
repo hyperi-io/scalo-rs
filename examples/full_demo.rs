@@ -186,6 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Graceful shutdown
     manager.stop_server().await?;
     tracing::info!("Metrics server stopped");
+    logger::flush();
 
     println!("\n=== Demo Complete ===");
     Ok(())

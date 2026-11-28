@@ -11,6 +11,8 @@ it explicitly if you must. JSON lines are enriched with `service` /
 [`env::runtime_context`](../../src/env.rs). Those K8s fields are absent on bare
 metal.
 
+One writer thread writes every line to stderr. A logging thread formats and masks its line, hands it to a queue of 16,384 lines and carries on, so a stalled stderr pipe never blocks it. When the queue is full the line is dropped and counted: `log_lines_dropped_total` with `metrics` on, and a WARN line naming the count at most every 10 seconds once the writer catches up. At process exit and before a panic message the logger waits up to 1 second for the queue to empty. A process that ends by `abort`, `_exit` or a fatal signal skips that wait, so call `logger::flush()` first there.
+
 ---
 
 ## Setup
@@ -207,6 +209,7 @@ collapse into one.
 | `logger::setup_with_layers(opts, layers)` | `setup` with extra `Box<dyn Layer<Registry> + Send + Sync>` layers, each seeing every level. See [Setup](#setup) |
 | `LoggerOptions` | `level`, `format`, `add_source`, `enable_masking`, `sensitive_fields`, `span_events`, `throttle`, `service_name`, `service_version` |
 | `LogFormat::{Json, Text, Auto}` | Format. `Auto` resolves on `setup` |
+| `logger::flush()` | Wait up to 1 second for queued lines to reach stderr. Runs at exit and on panic by itself |
 | `logger::level_handle() -> Option<LevelHandle>` | `set(level)` and `current()` on the running level of the printed output and the span export |
 | `LoggerSettings` | `level`, `format`, `color` under the `logger` config key, read by `LoggerSettings::from_cascade()` |
 | `ThrottleConfig` | `enabled`, `burst`, `rate`, `max_signatures`, `excluded_fields` |

@@ -59,7 +59,7 @@ runtime = ["dirs"]
 config = ["figment", "dotenvy", "yaml", "serde_json", "dirs", "tracing", "dep:windows-registry", "dep:plist"]
 
 yaml = ["dep:serde-saphyr", "dep:serde_ignored", "serde_json"]
-logger = ["tracing", "tracing-subscriber", "owo-colors", "serde_json", "tracing-throttle"]
+logger = ["tracing", "tracing-subscriber", "owo-colors", "serde_json", "tracing-throttle", "libc"]
 
 # docs/api/concurrency.md
 concurrency = ["tokio", "tokio-util", "tracing", "metrics-core"]
