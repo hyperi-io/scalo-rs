@@ -3,6 +3,22 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [2.14.48](https://github.com/hyperi-io/scalo-rs/compare/v2.14.47...v2.14.48) (2026-11-28)
+
+### Bug Fixes
+
+* **auth:** take tokio Instant for credential renewal ([94c83e3](https://github.com/hyperi-io/scalo-rs/commit/94c83e3e21a1ed61a42113d5fa4264b1c5f8385d)), closes [#678](https://github.com/hyperi-io/scalo-rs/issues/678)
+* **governor:** wait for rate limit tokens on tokio's timer ([f871176](https://github.com/hyperi-io/scalo-rs/commit/f87117682a3dce803614db3ecc0094f55e50a287)), closes [#679](https://github.com/hyperi-io/scalo-rs/issues/679)
+* **http:** compress outbound bodies off the runtime worker ([9ae7cf8](https://github.com/hyperi-io/scalo-rs/commit/9ae7cf8fdcc8f6a84d779d397f793a420e47fad1)), closes [#672](https://github.com/hyperi-io/scalo-rs/issues/672)
+* **http:** move body splitting off the runtime worker ([43700b1](https://github.com/hyperi-io/scalo-rs/commit/43700b1112bd844cee498c6a3d045077e65ff811)), closes [#673](https://github.com/hyperi-io/scalo-rs/issues/673)
+* **kafka:** find a released offset's run by binary search ([eb9f58c](https://github.com/hyperi-io/scalo-rs/commit/eb9f58c38ac57557aa3aea5729ebf0a975554ffe)), closes [#676](https://github.com/hyperi-io/scalo-rs/issues/676)
+* **logger:** write log lines from one thread ([8e41d6c](https://github.com/hyperi-io/scalo-rs/commit/8e41d6ca148c87c34482727f8331f77303a92fb1)), closes [#674](https://github.com/hyperi-io/scalo-rs/issues/674)
+* **metrics:** refresh process gauges off the runtime worker ([8b694a1](https://github.com/hyperi-io/scalo-rs/commit/8b694a145b1ed35c1b6b6ccc63afce0186567a3b)), closes [#677](https://github.com/hyperi-io/scalo-rs/issues/677)
+* **runtime:** refuse to start below the x86_64 CPU floor ([661f191](https://github.com/hyperi-io/scalo-rs/commit/661f19104ccb2696685b25d7ce1b0fbdce78a2ac))
+* **test:** add tokio compatibility checks ([cefa07c](https://github.com/hyperi-io/scalo-rs/commit/cefa07cc5a426f89380243f452e88625a6be297b))
+* **transport:** take tokio Instant for deadlines ([4932b45](https://github.com/hyperi-io/scalo-rs/commit/4932b45d91da0367352c4af292c41cad90c2ba8a)), closes [#678](https://github.com/hyperi-io/scalo-rs/issues/678)
+* **worker:** lease the pool semaphore per split ([eab390c](https://github.com/hyperi-io/scalo-rs/commit/eab390ce701c96c73b589a2cc5f6b94620e3f383)), closes [#671](https://github.com/hyperi-io/scalo-rs/issues/671)
+
 ## [2.14.47](https://github.com/hyperi-io/scalo-rs/compare/v2.14.46...v2.14.47) (2026-11-27)
 
 ### Bug Fixes
