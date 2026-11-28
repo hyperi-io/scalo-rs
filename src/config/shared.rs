@@ -106,7 +106,9 @@ impl<T: Clone + Send + Sync + 'static> SharedConfig<T> {
     ///
     /// Use when you need to hold the config across await points or pass it
     /// to other functions. For read-only access in synchronous code, prefer
-    /// `read()` or `with()`.
+    /// `read()` or `with()`. Each call takes a shared lock that every reader
+    /// touches, so on a hot path take one `get()` per batch, typically of an
+    /// `Arc`, not one per record.
     #[must_use]
     pub fn get(&self) -> T {
         self.inner.read().clone()
