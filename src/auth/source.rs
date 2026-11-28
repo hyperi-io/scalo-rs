@@ -20,12 +20,13 @@ use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arc_swap::ArcSwapOption;
 use reqwest::Method;
 use reqwest::header::HeaderName;
 use serde_json::{Map, Value};
+use tokio::time::Instant;
 
 use super::error::{AuthError, endpoint_name};
 use crate::http_client::{HttpClient, HttpClientConfig, Unsigned};
@@ -1088,6 +1089,18 @@ mod tests {
             "a margin over the lifetime cannot make every request an exchange"
         );
         assert!(credential.renew_at <= now + Duration::from_secs(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_credential_comes_due_on_the_paused_clock() {
+        let credential = Credential::new(
+            SensitiveString::from("a"),
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert!(!credential.is_due());
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(credential.is_due());
     }
 
     #[test]
