@@ -1186,7 +1186,9 @@ async fn ingest_handler(
         bytes::Bytes::from(decoded)
     };
 
-    match queue(&state, permit, body, addr) {
+    let body_len = body.len();
+    let parts = split_body(state.split.clone(), body).await;
+    match queue(&state, permit, parts, body_len, addr) {
         Ok(None) => axum::http::StatusCode::OK.into_response(),
         Ok(Some(held)) => held_answer(held.outcome().await),
         Err(refused) => refused,
@@ -1239,7 +1241,45 @@ fn admit(
     Ok((base, Some(held)))
 }
 
-/// Split `body` into its records by `framing` and queue them together.
+/// A body split into its records, each a slice of the body.
+#[cfg(feature = "http-server")]
+enum Split {
+    /// One record, the whole body.
+    Whole(bytes::Bytes),
+    /// Each record, in order.
+    Each(Vec<bytes::Bytes>),
+    /// More records than the cap.
+    TooMany(usize),
+}
+
+/// Bodies this size or larger are split on the blocking pool, where a depth
+/// scan and parse of the whole body can't hold a runtime worker.
+#[cfg(feature = "http-server")]
+const SPLIT_OFF_WORKER_BYTES: usize = 64 * 1024;
+
+/// `body` split by `split`, on the blocking pool for a large body.
+#[cfg(feature = "http-server")]
+async fn split_body(split: split::BodySplit, body: bytes::Bytes) -> Split {
+    let len = body.len();
+    let run = move || match split.parts(&body) {
+        split::BodyParts::Whole => Split::Whole(body.clone()),
+        split::BodyParts::Each(records) => Split::Each(
+            records
+                .iter()
+                .map(|record| split::slice_of(&body, record))
+                .collect(),
+        ),
+        split::BodyParts::TooMany(max) => Split::TooMany(max),
+    };
+    if len < SPLIT_OFF_WORKER_BYTES {
+        return run();
+    }
+    tokio::task::spawn_blocking(run)
+        .await
+        .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
+}
+
+/// Split the records of `parts` into messages and queue them together.
 /// `permit` holds the body's bytes of the in-flight budget.
 ///
 /// `Ok(None)` is answered 200 now, and `Ok(Some(held))` once its records are
@@ -1249,7 +1289,8 @@ fn admit(
 fn queue(
     state: &ReceiverState,
     mut permit: tokio::sync::OwnedSemaphorePermit,
-    body: bytes::Bytes,
+    parts: Split,
+    body_len: usize,
     addr: std::net::SocketAddr,
 ) -> Result<Option<Held>, axum::response::Response> {
     use axum::response::IntoResponse as _;
@@ -1264,15 +1305,14 @@ fn queue(
         timestamp_ms,
         headers: Vec::new(),
     };
-    let body_len = body.len();
-    let (messages, held): (Vec<Message<HttpToken>>, _) = match state.split.parts(&body) {
-        split::BodyParts::Whole => {
+    let (messages, held): (Vec<Message<HttpToken>>, _) = match parts {
+        Split::Whole(body) => {
             let (seq, held) = admit(state, 1, body_len as u64)?;
             (vec![message(body, seq)], held)
         }
         // An empty array: nothing to queue, and its bytes return as the permit drops.
-        split::BodyParts::Each(records) if records.is_empty() => return Ok(None),
-        split::BodyParts::Each(records) => {
+        Split::Each(records) if records.is_empty() => return Ok(None),
+        Split::Each(records) => {
             // Each record's message and source address are memory the body's bytes do not count.
             let overhead = records
                 .len()
@@ -1285,13 +1325,13 @@ fn queue(
             // found from any of its tokens.
             let (first, held) = admit(state, records.len() as u64, body_len as u64)?;
             let messages = records
-                .iter()
+                .into_iter()
                 .zip(first..)
-                .map(|(record, seq)| message(split::slice_of(&body, record), seq))
+                .map(|(record, seq)| message(record, seq))
                 .collect();
             (messages, held)
         }
-        split::BodyParts::TooMany(max) => {
+        Split::TooMany(max) => {
             let answer = format!("the body holds more than {max} records: send fewer per request");
             return Err((axum::http::StatusCode::PAYLOAD_TOO_LARGE, answer).into_response());
         }
