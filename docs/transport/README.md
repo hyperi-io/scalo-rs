@@ -215,7 +215,7 @@ routes per record, and a sink stage sends 1:1. See [routing.md](routing.md).
 | `WorkBatch<Token>` / `Record` | What `recv` returns: records + source acks + inline DLQ entries |
 | `Message<Token>` | Payload + key + token + timestamp + format |
 | `SendResult` | `Ok` / `Backpressured` / `RetryAfter(wait)` / `Reject(err)` / `FilteredDlq` / `Fatal(err)`, compared in [custom.md](custom.md#what-a-send-answers) |
-| `TransportSender::send_batch_by(&records, deadline)` | A block answered by an `Instant`, `Backpressured` once it passes |
+| `TransportSender::send_batch_by(&records, deadline)` | A block answered by a `tokio::time::Instant`, `Backpressured` once it passes |
 | `TransportBase::delivery_guarantee()` | `Acknowledged` / `Written` / `FireAndForget`, required of every transport |
 | `TransportConfig` | Top-level config struct read by the factory. `delivery: ack \| flush \| none` (default `ack`) refuses a sender below it |
 | `TransportType` | Enum: `Kafka`, `Grpc`, `Memory`, `File`, `Pipe`, `Http`, `Syslog`, `Otlp`, `Custom(name)` |

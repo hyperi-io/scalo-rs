@@ -832,7 +832,7 @@ async fn deliver<S: TransportSender>(
     let sent = if records.is_empty() {
         None
     } else {
-        let deadline = std::time::Instant::now() + send_timeout;
+        let deadline = tokio::time::Instant::now() + send_timeout;
         Some(sink.send_batch_by(&records, deadline).await)
     };
     let delivered = match sent {

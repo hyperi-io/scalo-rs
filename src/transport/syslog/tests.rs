@@ -922,7 +922,7 @@ async fn sends_answer_each_failure_with_the_result_the_caller_acts_on() {
     for (case, cfg, payloads, budget, want) in cases {
         let sender = SyslogTransport::new(&cfg).unwrap();
         let result = sender
-            .send_batch_by(&records(&payloads), Instant::now() + budget)
+            .send_batch_by(&records(&payloads), tokio::time::Instant::now() + budget)
             .await;
         assert!(
             format!("{result:?}").starts_with(want),

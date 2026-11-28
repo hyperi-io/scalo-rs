@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Instant;
 
 use super::{HttpAuth, HttpEndpoint, HttpTransport, HttpTransportConfig};
 use crate::framing::FramingConfig;

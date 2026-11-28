@@ -790,7 +790,10 @@ async fn each_collector_answer_maps_onto_a_send_result() {
         let result = match case.deadline_ms {
             Some(ms) => {
                 sender
-                    .send_batch_by(&block(), Instant::now() + Duration::from_millis(ms))
+                    .send_batch_by(
+                        &block(),
+                        tokio::time::Instant::now() + Duration::from_millis(ms),
+                    )
                     .await
             }
             None => sender.send_batch(&block()).await,

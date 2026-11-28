@@ -40,7 +40,7 @@ pub use config::{OTLP_ACCEPTS, OtlpConfig, OtlpProtocol};
 pub use metrics::OtlpMetricExporter;
 pub use record::SEVERITY_HEADER;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
 use opentelemetry_proto::tonic::collector::logs::v1::{
@@ -51,6 +51,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use prost::Message as _;
+use tokio::time::Instant;
 use tonic_types::StatusExt as _;
 
 use super::ack::{DeadLetterReason, SinkConfirmation};

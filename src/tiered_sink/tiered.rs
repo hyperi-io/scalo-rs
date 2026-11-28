@@ -889,7 +889,7 @@ impl<S: TransportSender + 'static> TieredSink<S> {
 
     /// Try to send via hot path (direct to the downstream sender, no encode).
     async fn try_hot_path(&self, records: &[Record]) -> Result<()> {
-        let deadline = std::time::Instant::now() + self.config.send_timeout_duration();
+        let deadline = tokio::time::Instant::now() + self.config.send_timeout_duration();
 
         match self.sink.send_batch_by(records, deadline).await {
             SendResult::Ok => {
