@@ -10,7 +10,7 @@
 //! `+pclmulqdq`.
 //!
 //! Such a binary dies with SIGILL on an older CPU, or on a VM whose CPU type
-//! masks AVX2, and says nothing about why. [`require_cpu_floor!`] adds a check
+//! masks AVX2, and says nothing about why. [`require_cpu_floor!`](crate::require_cpu_floor) adds a check
 //! that runs from `.init_array` before `main` and the Rust runtime. It names
 //! the missing feature group and the floor on stderr, then exits with status 1.
 //!
@@ -158,4 +158,19 @@ macro_rules! require_cpu_floor {
             options(att_syntax)
         );
     };
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every refusal ends with this line, and release gates match on it.
+    const FLOOR_LINE: &str = "This build needs an x86-64-v3 CPU with PCLMULQDQ:";
+
+    #[test]
+    fn the_floor_line_is_stable() {
+        let source = include_str!("cpu_floor.rs");
+        assert!(
+            source.contains(&format!(".ascii \\\"{FLOOR_LINE}")),
+            "the floor line changed: tell the release gates first"
+        );
+    }
 }
