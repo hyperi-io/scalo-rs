@@ -246,10 +246,20 @@ pub trait ServiceApp: Sized {
 /// - `version`: print version info and exit
 /// - `config-check`: load config, validate, print summary
 ///
+/// The logger is flushed before it returns, on success or error.
+///
 /// # Errors
 ///
 /// Returns `CliError` if any lifecycle step fails.
 pub async fn run_app<A: ServiceApp>(app: A) -> Result<(), CliError> {
+    let result = run_command(app).await;
+    #[cfg(feature = "logger")]
+    crate::logger::flush();
+    result
+}
+
+/// [`run_app`] short of the closing logger flush.
+async fn run_command<A: ServiceApp>(app: A) -> Result<(), CliError> {
     let command = app.command().cloned().unwrap_or(StandardCommand::Run);
     let args = app.common_args();
     let config_file = args.config_path(app.env_prefix());

@@ -95,20 +95,25 @@ impl Default for MaskingLayer {
 
 /// Create a masking writer factory for use with tracing-subscriber's `with_writer`.
 ///
-/// Returns a closure that produces [`MaskingWriter`] instances wrapping stderr.
-/// When the sensitive fields set is empty and no service fields are set, the
-/// writer passes through without buffering or redaction.
-pub fn make_masking_writer(
+/// Returns a closure that produces [`MaskingWriter`] instances wrapping what
+/// `inner` makes. When the sensitive fields set is empty and no service fields
+/// are set, the writer passes through without buffering or redaction.
+pub(crate) fn make_masking_writer<W, F>(
+    inner: F,
     sensitive_fields: HashSet<String>,
     is_json: bool,
     service_name: Option<String>,
     service_version: Option<String>,
-) -> impl Fn() -> MaskingWriter<io::Stderr> + Send + Sync {
+) -> impl Fn() -> MaskingWriter<W> + Send + Sync
+where
+    W: io::Write,
+    F: Fn() -> W + Send + Sync,
+{
     let matcher = Arc::new(CredentialMatcher::new(&sensitive_fields));
     let name = service_name.map(Arc::from);
     let version = service_version.map(Arc::from);
     move || MaskingWriter {
-        inner: io::stderr(),
+        inner: inner(),
         buffer: Vec::with_capacity(512),
         matcher: Arc::clone(&matcher),
         is_json,

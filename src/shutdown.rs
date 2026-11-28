@@ -259,6 +259,8 @@ fn abandon_drain(end: DrainEnd) -> ! {
                  records unacknowledged for their source to deliver again"
             ),
         }
+        #[cfg(feature = "logger")]
+        crate::logger::flush();
     }
     std::process::exit(0)
 }

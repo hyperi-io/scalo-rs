@@ -19,6 +19,8 @@
 //! - Sensitive data masking (passwords, tokens, API keys, URL passwords),
 //!   judged by [`is_credential_name`]
 //! - Environment variable overrides (LOG_LEVEL, LOG_FORMAT, LOG_COLOR, NO_COLOR)
+//! - One writer thread behind a bounded queue, so a stalled stderr drops
+//!   lines rather than blocking the thread that logs. See [`flush`]
 //!
 //! ## Example
 //!
@@ -37,6 +39,7 @@ mod credential;
 pub mod format;
 pub mod helpers;
 mod masking;
+mod queue;
 pub mod security;
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -64,6 +67,69 @@ static LOGGER_INIT: OnceLock<()> = OnceLock::new();
 
 /// The level handle of the logger [`setup`] started.
 static LEVEL_HANDLE: OnceLock<LevelHandle> = OnceLock::new();
+
+/// The queue the logger [`setup`] started writes its lines through.
+static LINE_QUEUE: OnceLock<queue::LineQueue> = OnceLock::new();
+
+/// How long [`flush`] waits for the queued lines to be written.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Wait up to one second for the lines logged so far to reach stderr.
+///
+/// The logger runs this itself at process exit and before a panic message.
+/// A process that ends by `abort`, `_exit` or a fatal signal skips both, so
+/// call it first there. It returns at once before [`setup`] has run.
+pub fn flush() {
+    if let Some(queue) = LINE_QUEUE.get() {
+        queue.flush(FLUSH_TIMEOUT);
+    }
+}
+
+/// The queue to stderr, started on first use.
+fn line_queue() -> Result<&'static queue::LineQueue, LoggerError> {
+    if let Some(queue) = LINE_QUEUE.get() {
+        return Ok(queue);
+    }
+    let queue = queue::LineQueue::spawn(std::io::stderr(), queue::CAPACITY)
+        .map_err(|e| LoggerError::SetGlobalError(format!("log writer thread: {e}")))?;
+    let mut started = false;
+    let queue = LINE_QUEUE.get_or_init(|| {
+        started = true;
+        queue
+    });
+    if started {
+        flush_on_exit();
+    }
+    Ok(queue)
+}
+
+/// Flush before a panic message and at process exit, so the lines that
+/// explain a failure reach stderr ahead of it.
+fn flush_on_exit() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        flush();
+        previous(info);
+    }));
+    #[cfg(unix)]
+    flush_at_exit();
+}
+
+/// Register [`flush`] with the C runtime, which runs it when `main` returns
+/// and on `std::process::exit`.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn flush_at_exit() {
+    extern "C" fn at_exit() {
+        flush();
+    }
+    // SAFETY: `at_exit` takes no arguments and never unwinds, since `flush`
+    // recovers a poisoned lock instead of panicking.
+    let registered = unsafe { libc::atexit(at_exit) };
+    if registered != 0 {
+        eprintln!("logger: atexit registration failed, call logger::flush() before exit");
+    }
+}
 
 /// Changes the level of a running logger: what it prints and the spans it
 /// exports. Layers passed to [`setup_with_layers`] filter for themselves.
@@ -463,9 +529,11 @@ pub fn setup_with_layers(
     #[cfg(not(feature = "otel-tracing"))]
     let otel: Option<tracing_subscriber::layer::Identity> = None;
 
+    let queue = line_queue()?;
     let stack = match format {
         LogFormat::Json => {
             let writer = masking::make_masking_writer(
+                || queue.line(),
                 sensitive,
                 true,
                 opts.service_name.clone(),
@@ -482,7 +550,8 @@ pub fn setup_with_layers(
             layer_stack(printed, throttle_filter, otel, layers, &mut level_handle)
         }
         LogFormat::Text => {
-            let writer = masking::make_masking_writer(sensitive, false, None, None);
+            let writer =
+                masking::make_masking_writer(|| queue.line(), sensitive, false, None, None);
             let ansi = colour_enabled(
                 std::env::var("LOG_COLOR").ok().as_deref(),
                 is_no_color(),

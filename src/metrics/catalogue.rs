@@ -64,6 +64,14 @@ pub(crate) fn describe_library(registry: &MetricRegistry) {
     );
     #[cfg(all(feature = "config-reload", feature = "metrics"))]
     registry.describe("app", &[config_reloads_total()]);
+    #[cfg(all(feature = "logger", feature = "metrics"))]
+    registry.describe(
+        "platform",
+        &[Series::counter(
+            "log_lines_dropped_total",
+            "Log lines dropped because the log writer's queue was full",
+        )],
+    );
     #[cfg(feature = "dlq")]
     dlq(registry);
     #[cfg(feature = "worker-pool")]
