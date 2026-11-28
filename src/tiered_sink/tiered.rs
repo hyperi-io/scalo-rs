@@ -2703,15 +2703,25 @@ mod tests {
         );
         #[cfg(feature = "metrics")]
         {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let rendered = recorder.handle().render();
-            let gauge = rendered
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("spool_oldest_age_seconds{store=\"tiered_sink\"} ")
-                })
-                .and_then(|value| value.parse::<f64>().ok());
-            assert!(gauge.is_some_and(|age| age >= 0.06), "{rendered}");
+            // The drainer sets the gauge on its first pass, which a loaded
+            // host can delay past any fixed sleep.
+            let gauge = || {
+                let rendered = recorder.handle().render();
+                let age = rendered
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("spool_oldest_age_seconds{store=\"tiered_sink\"} ")
+                    })
+                    .and_then(|value| value.parse::<f64>().ok());
+                (age, rendered)
+            };
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let (mut age, mut rendered) = gauge();
+            while !age.is_some_and(|age| age >= 0.06) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                (age, rendered) = gauge();
+            }
+            assert!(age.is_some_and(|age| age >= 0.06), "{rendered}");
         }
         tiered.inner().set_available(true);
         wait_for_drain(&tiered).await;
