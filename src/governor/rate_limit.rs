@@ -161,7 +161,12 @@ impl RateLimiter {
             return Duration::ZERO;
         };
         let started = Instant::now();
-        inner.limiter.until_ready_with_jitter(inner.jitter).await;
+        // Waits on tokio's timer, not the limiter crate's own timer thread.
+        while let Err(not_until) = inner.limiter.check() {
+            use gcra::clock::{Clock, DefaultClock};
+            let wait = not_until.wait_time_from(DefaultClock::default().now());
+            tokio::time::sleep(inner.jitter + wait).await;
+        }
         let waited = started.elapsed();
         self.record(waited);
         waited
