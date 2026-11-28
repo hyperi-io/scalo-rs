@@ -96,6 +96,7 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 // Core modules (always available)
+pub mod cpu_floor;
 pub mod crypto;
 pub mod env;
 pub mod kafka_config;

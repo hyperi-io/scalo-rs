@@ -17,6 +17,7 @@ Linux is scalo's core platform: the DFE services run there, and every feature do
 | `RuntimePaths::run_dir` | `XDG_RUNTIME_DIR`, else the temp dir | the temp dir | the temp dir |
 | `proxy: system` | the proxy environment variables | those, then the System Configuration proxies | those, then the WinHTTP machine proxy |
 | Managed config layer | none | MDM managed preferences | Group Policy in the registry |
+| CPU floor check (`require_cpu_floor!`) | x86_64 builds with AVX2 enabled refuse a CPU below x86-64-v3 + PCLMULQDQ before `main` | none | none |
 
 On Windows `process_virtual_memory_bytes` is the private commit (sysinfo's `PrivateUsage`), not the address space Linux and macOS report, so don't chart it against resident memory across OSes.
 
