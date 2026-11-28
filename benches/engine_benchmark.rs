@@ -9,10 +9,11 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use scalo::transport::{PayloadFormat, Record, RecordMeta};
 use scalo::worker::engine::{BatchEngine, BatchProcessingConfig};
+use scalo::worker::{AdaptiveWorkerPool, WorkerPoolConfig};
 
 fn make_messages(n: usize) -> Vec<Record> {
     (0..n)
@@ -123,5 +124,50 @@ fn bench_engine(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_engine);
+// Per-item limiter cost: a no-op map should cost the same per item at 1 and 16 threads.
+fn bench_pool_map_owned(c: &mut Criterion) {
+    const ITEMS: usize = 100_000;
+    let mut group = c.benchmark_group("pool_map_owned_noop");
+    group.throughput(Throughput::Elements(ITEMS as u64));
+    let items: Vec<u64> = (0..ITEMS as u64).collect();
+
+    for threads in [1, 16] {
+        let pool = AdaptiveWorkerPool::new(WorkerPoolConfig {
+            min_threads: threads,
+            max_threads: threads,
+            ..WorkerPoolConfig::default()
+        });
+        group.bench_with_input(BenchmarkId::new("threads", threads), &items, |b, items| {
+            b.iter_batched(
+                || items.clone(),
+                |batch| pool.map_owned(batch, std::hint::black_box),
+                BatchSize::LargeInput,
+            );
+        });
+        // The same map with no limiter, so the gap to `threads` is the limiter's cost.
+        group.bench_with_input(
+            BenchmarkId::new("rayon_only", threads),
+            &items,
+            |b, items| {
+                b.iter_batched(
+                    || items.clone(),
+                    |batch| {
+                        pool.install(|| {
+                            use rayon::prelude::*;
+                            batch
+                                .into_par_iter()
+                                .map(std::hint::black_box)
+                                .collect::<Vec<_>>()
+                        })
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_engine, bench_pool_map_owned);
 criterion_main!(benches);

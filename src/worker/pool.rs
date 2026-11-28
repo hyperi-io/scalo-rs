@@ -234,7 +234,9 @@ impl AdaptiveWorkerPool {
     ///
     /// Each item is processed by the provided closure on a rayon worker thread.
     /// A semaphore limits how many threads are active simultaneously (controlled
-    /// by the scaling controller). Results are returned in input order.
+    /// by the scaling controller). Each rayon split leases one permit for its run
+    /// of items, so a target change applies at split boundaries. Results are
+    /// returned in input order.
     ///
     /// Use this for: JSON parsing, transforms, compression, CEL evaluation, routing.
     /// Do NOT use for work that needs `.await` -- use [`fan_out_async`](Self::fan_out_async).
@@ -245,15 +247,16 @@ impl AdaptiveWorkerPool {
         E: Send,
         F: Fn(&T) -> Result<R, E> + Sync,
     {
+        if items.is_empty() {
+            return Vec::new();
+        }
         let sem = &self.semaphore;
         self.rayon_pool.install(|| {
             use rayon::prelude::*;
             items
                 .par_iter()
-                .map(|item| {
-                    let _permit = sem.acquire();
-                    f(item)
-                })
+                // One lease per rayon split, so the limiter lock is off the per-item path.
+                .map_init(|| sem.acquire(), |_permit, item| f(item))
                 .collect()
         })
     }
@@ -434,9 +437,9 @@ impl AdaptiveWorkerPool {
     ///
     /// Like [`process_batch`](Self::process_batch) but takes OWNED items and a
     /// closure that consumes each (so the transform may mutate its own copy),
-    /// returning an arbitrary `R` per item. The semaphore IS applied
-    /// per item, so this path obeys the scaler target -- unlike
-    /// [`install`](Self::install). Results are collected in input order.
+    /// returning an arbitrary `R` per item. Each rayon split leases one
+    /// permit for its run of items, so this path obeys the scaler target --
+    /// unlike [`install`](Self::install). Results are collected in input order.
     ///
     /// Used by `BatchEngine`'s parsed mid-tier transform so the parsed path is
     /// throttled identically to the raw path.
@@ -446,15 +449,15 @@ impl AdaptiveWorkerPool {
         R: Send,
         F: Fn(T) -> R + Sync,
     {
+        if items.is_empty() {
+            return Vec::new();
+        }
         let sem = &self.semaphore;
         self.rayon_pool.install(|| {
             use rayon::prelude::*;
             items
                 .into_par_iter()
-                .map(|item| {
-                    let _permit = sem.acquire();
-                    f(item)
-                })
+                .map_init(|| sem.acquire(), |_permit, item| f(item))
                 .collect()
         })
     }
@@ -639,5 +642,70 @@ mod semaphore_tests {
         let observed = handle.join().unwrap();
         assert!(observed >= 1, "parked acquirer proceeded after target grew");
         drop(held);
+    }
+
+    #[test]
+    fn map_owned_follows_target_changes() {
+        use std::time::{Duration, Instant};
+
+        use super::AdaptiveWorkerPool;
+        use crate::worker::WorkerPoolConfig;
+
+        let pool = AdaptiveWorkerPool::new(WorkerPoolConfig {
+            min_threads: 1,
+            max_threads: 4,
+            ..WorkerPoolConfig::default()
+        });
+        assert_eq!(pool.target_threads(), 1);
+
+        // Grow mid-run: every item waits for a second concurrent item, which target 1 never admits.
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        std::thread::scope(|scope| {
+            let run = scope.spawn(|| {
+                pool.map_owned((0..64).collect::<Vec<usize>>(), |i| {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    while peak.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    i
+                })
+            });
+            while pool.active_threads() == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            pool.semaphore.set_target(2);
+            assert_eq!(run.join().unwrap().len(), 64);
+        });
+        assert!(
+            Instant::now() < deadline,
+            "grown target admitted a second split before the deadline"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "grown target admitted a second split"
+        );
+
+        // Shrink: once the leases return, at most one split runs at a time.
+        pool.semaphore.set_target(1);
+        peak.store(0, Ordering::SeqCst);
+        let out = pool.map_owned((0..40).collect::<Vec<usize>>(), |i| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            i * 2
+        });
+        assert_eq!(out[10], 20, "map_owned keeps input order");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "shrunk target capped concurrency at 1"
+        );
+        assert_eq!(pool.active_threads(), 0, "every split returned its lease");
     }
 }
