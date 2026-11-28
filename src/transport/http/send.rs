@@ -295,7 +295,7 @@ pub(super) struct Sender {
     framing: Arc<dyn Framing>,
     /// One body codec context per send compressing at once, kept between
     /// bodies. `None` sends as framed.
-    compressors: Option<CompressorPool>,
+    compressors: Option<std::sync::Arc<CompressorPool>>,
     /// The `Content-Encoding` a compressed body goes with.
     encoding: Option<&'static str>,
     success: Vec<StatusCode>,
@@ -341,7 +341,7 @@ impl Sender {
         } else {
             let pool = CompressorPool::new(compression)
                 .map_err(|e| TransportError::Config(e.to_string()))?;
-            Some(pool)
+            Some(std::sync::Arc::new(pool))
         };
         let success = config
             .success_status
@@ -433,21 +433,30 @@ impl Sender {
         SendResult::Ok
     }
 
-    /// The body as sent, compressed when `compression` names a codec.
-    fn body(&self, framed: Vec<u8>) -> Result<bytes::Bytes, SendResult> {
-        let Some(pool) = &self.compressors else {
+    /// The body as sent, compressed on the blocking pool when `compression`
+    /// names a codec, so a large body doesn't hold a runtime worker.
+    async fn body(&self, framed: Vec<u8>) -> Result<bytes::Bytes, SendResult> {
+        let Some(pool) = self.compressors.clone() else {
             return Ok(bytes::Bytes::from(framed));
         };
-        let mut body = Vec::new();
-        pool.compress_into(&framed, &mut body)
-            .map(|()| bytes::Bytes::from(body))
-            .map_err(|e| {
-                SendResult::Fatal(TransportError::Internal(format!(
-                    "HTTP {} of a {}-byte body: {e}",
-                    pool.compression().codec,
-                    framed.len()
-                )))
-            })
+        let len = framed.len();
+        let packed = tokio::task::spawn_blocking(move || {
+            let mut body = Vec::new();
+            pool.compress_into(&framed, &mut body)
+                .map(|()| body)
+                .map_err(|e| {
+                    format!(
+                        "HTTP {} of a {len}-byte body: {e}",
+                        pool.compression().codec
+                    )
+                })
+        })
+        .await
+        .map_err(|e| format!("HTTP compression task failed: {e}"))
+        .and_then(|packed| packed);
+        packed
+            .map(bytes::Bytes::from)
+            .map_err(|e| SendResult::Fatal(TransportError::Internal(e)))
     }
 
     /// Post one body to each endpoint in turn until one stores or rejects it.
@@ -460,7 +469,7 @@ impl Sender {
         deadline: Instant,
     ) -> SendResult {
         let framed_len = framed.len();
-        let body = match self.body(framed) {
+        let body = match self.body(framed).await {
             Ok(body) => body,
             Err(fatal) => return fatal,
         };
