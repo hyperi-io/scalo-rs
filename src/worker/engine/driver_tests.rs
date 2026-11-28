@@ -3613,7 +3613,7 @@ struct HeldSource {
     releases: Arc<parking_lot::Mutex<Vec<Release>>>,
     commits: Arc<parking_lot::Mutex<Vec<u64>>>,
     hold_for: Option<Duration>,
-    received: parking_lot::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    received: parking_lot::Mutex<std::collections::HashMap<u64, tokio::time::Instant>>,
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -3683,7 +3683,7 @@ impl TransportReceiver for HeldSource {
             std::future::pending::<()>().await;
             unreachable!("pending never resolves");
         };
-        let now = tokio::time::Instant::now().into_std();
+        let now = tokio::time::Instant::now();
         let mut received = self.received.lock();
         let records = seqs
             .iter()
@@ -3732,7 +3732,7 @@ impl TransportReceiver for HeldSource {
         Ok(())
     }
 
-    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<tokio::time::Instant> {
         let hold = self.hold_for?;
         let received = self.received.lock();
         tokens

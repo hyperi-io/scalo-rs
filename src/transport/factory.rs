@@ -164,7 +164,11 @@ impl TransportSender for AnySender {
 
     /// Forward [`send_batch_by`](TransportSender::send_batch_by), so a backend
     /// that hands the deadline to its own client keeps doing so.
-    async fn send_batch_by(&self, records: &[Record], deadline: std::time::Instant) -> SendResult {
+    async fn send_batch_by(
+        &self,
+        records: &[Record],
+        deadline: tokio::time::Instant,
+    ) -> SendResult {
         each_sender!(
             self,
             t => t.send_batch_by(records, deadline).await,
@@ -953,7 +957,7 @@ impl TransportReceiver for AnyReceiver {
         )),
         allow(unused_variables)
     )]
-    fn hold_deadline(&self, tokens: &[AnyToken]) -> Option<std::time::Instant> {
+    fn hold_deadline(&self, tokens: &[AnyToken]) -> Option<tokio::time::Instant> {
         match self {
             #[cfg(feature = "transport-kafka")]
             Self::Kafka(t) => t.hold_deadline(&extract_tokens(tokens, |tok| match tok {

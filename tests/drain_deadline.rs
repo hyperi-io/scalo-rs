@@ -69,7 +69,7 @@ impl ServiceApp for ProbeApp {
 
     async fn run_service(&self, _config: (), runtime: ServiceRuntime) -> Result<(), CliError> {
         let tickets = Tickets::new("drain-probe", 1 << 20);
-        let answer_by = Instant::now() + Duration::from_secs(3600);
+        let answer_by = tokio::time::Instant::now() + Duration::from_secs(3600);
         let _held: Vec<_> = (0..HELD)
             .map(|_| tickets.admit(100, answer_by).expect("the probe admits"))
             .collect();

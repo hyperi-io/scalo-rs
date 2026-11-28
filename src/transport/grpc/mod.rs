@@ -1849,7 +1849,7 @@ impl TransportReceiver for GrpcTransport {
 
     /// The earliest instant by which a held request among `tokens` must be
     /// answered: its hold budget from admission.
-    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<tokio::time::Instant> {
         self.pending
             .as_ref()?
             .deadline(tokens.iter().map(|t| t.seq))

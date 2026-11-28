@@ -67,7 +67,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use tokio::time::Instant;
 
 use serde::de::DeserializeOwned;
 

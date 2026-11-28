@@ -47,7 +47,7 @@ pub use receive::{IpFilterConfig, IpFilterMode, SyslogListenConfig, SyslogReceiv
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustls_pki_types::ServerName;
 use tokio::io::AsyncWriteExt;
@@ -709,12 +709,16 @@ impl TransportSender for SyslogTransport {
 
     /// Send the block within `send_timeout_ms`.
     async fn send_batch(&self, records: &[Record]) -> SendResult {
-        self.send_batch_by(records, Instant::now() + self.send_timeout)
+        self.send_batch_by(records, tokio::time::Instant::now() + self.send_timeout)
             .await
     }
 
     /// Format the block, write it as one unit, and answer by `deadline`.
-    async fn send_batch_by(&self, records: &[Record], deadline: Instant) -> SendResult {
+    async fn send_batch_by(
+        &self,
+        records: &[Record],
+        deadline: tokio::time::Instant,
+    ) -> SendResult {
         if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
         }
@@ -731,24 +735,22 @@ impl TransportSender for SyslogTransport {
             }
             (Some(self.deliver(&mut state).await), count, bytes)
         };
-        let until = tokio::time::Instant::from_std(deadline);
-        let (result, count, bytes) =
-            tokio::time::timeout_at(until, work)
-                .await
-                .unwrap_or_else(|_elapsed| {
-                    tracing::warn!(
-                        address = %self.address,
-                        records = records.len(),
-                        "syslog: send deadline elapsed, the batch is sent again"
-                    );
-                    metrics::counter!(
-                        "transport_redelivered_total",
-                        "transport" => "syslog",
-                        "reason" => "deadline"
-                    )
-                    .increment(1);
-                    (Some(SendResult::Backpressured), 0, 0)
-                });
+        let (result, count, bytes) = tokio::time::timeout_at(deadline, work)
+            .await
+            .unwrap_or_else(|_elapsed| {
+                tracing::warn!(
+                    address = %self.address,
+                    records = records.len(),
+                    "syslog: send deadline elapsed, the batch is sent again"
+                );
+                metrics::counter!(
+                    "transport_redelivered_total",
+                    "transport" => "syslog",
+                    "reason" => "deadline"
+                )
+                .increment(1);
+                (Some(SendResult::Backpressured), 0, 0)
+            });
         let Some(result) = result else {
             return outcome.finish();
         };

@@ -292,12 +292,11 @@ pub trait TransportSender: TransportBase {
     fn send_batch_by(
         &self,
         records: &[Record],
-        deadline: std::time::Instant,
+        deadline: tokio::time::Instant,
     ) -> impl Future<Output = SendResult> + Send {
         async move {
-            let now = std::time::Instant::now();
-            let until = tokio::time::Instant::from_std(deadline);
-            match tokio::time::timeout_at(until, self.send_batch(records)).await {
+            let now = tokio::time::Instant::now();
+            match tokio::time::timeout_at(deadline, self.send_batch(records)).await {
                 Ok(result) => {
                     tracing::debug!(
                         transport = self.name(),
@@ -514,7 +513,7 @@ pub trait TransportReceiver: TransportBase {
     ///
     /// A push source returns its held senders' deadline, so a caller abandons a
     /// block it cannot deliver in time and releases it `Errored`.
-    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<tokio::time::Instant> {
         let _ = tokens;
         None
     }
@@ -679,7 +678,8 @@ mod send_tests {
     use super::*;
     use crate::transport::{PayloadFormat, RecordMeta};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     /// Answers each record by its payload: `reject`, `wait`, `busy`, `dlq` or
     /// `ok`, and never answers `hang`. Counts every send.
@@ -784,6 +784,26 @@ mod send_tests {
         assert!(at_once.is_ok(), "{at_once:?}");
         let late_hang = late.send_batch_by(&block(&["hang"]), Instant::now()).await;
         assert!(late_hang.is_backpressured(), "{late_hang:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deadline_expires_when_the_paused_clock_advances_past_it() {
+        // The paused clock runs ahead of the system clock from here on.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+
+        let hung = std::sync::Arc::new(Scripted::default());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let send = tokio::spawn({
+            let hung = std::sync::Arc::clone(&hung);
+            async move { hung.send_batch_by(&block(&["hang"]), deadline).await }
+        });
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(!send.is_finished(), "answered 1 s before its deadline");
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = send.await.expect("the send task ran");
+        assert!(result.is_backpressured(), "{result:?}");
     }
 }
 

@@ -36,9 +36,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 
 use super::error::TransportResult;
 use super::finalizer::{BatchFinalizer, DeliveryStatus, PieceFinalizer};
@@ -493,12 +494,10 @@ pub(crate) fn merged_channel() -> (
 
 /// When a wait on a unit with hold deadline `deadline` gives up:
 /// [`HOLD_RELEASE_MARGIN`] before it.
-pub(crate) fn give_up_at(deadline: Instant) -> tokio::time::Instant {
-    tokio::time::Instant::from_std(
-        deadline
-            .checked_sub(HOLD_RELEASE_MARGIN)
-            .unwrap_or(deadline),
-    )
+pub(crate) fn give_up_at(deadline: Instant) -> Instant {
+    deadline
+        .checked_sub(HOLD_RELEASE_MARGIN)
+        .unwrap_or(deadline)
 }
 
 /// Release `tokens` `Errored` from a `Drop`, for a unit abandoned before its
@@ -992,8 +991,7 @@ impl Ticket {
         let Some(merged) = self.merged.take() else {
             return TicketOutcome::Errored;
         };
-        let deadline = tokio::time::Instant::from_std(self.deadline);
-        let outcome = match tokio::time::timeout_at(deadline, merged).await {
+        let outcome = match tokio::time::timeout_at(self.deadline, merged).await {
             Ok(Ok(status)) => TicketOutcome::from_status(status),
             Ok(Err(_)) => TicketOutcome::Errored,
             Err(_elapsed) => TicketOutcome::Expired,

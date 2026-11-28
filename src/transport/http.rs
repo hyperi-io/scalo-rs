@@ -1442,7 +1442,7 @@ impl HttpTransport {
     async fn send_block(
         &self,
         records: impl Iterator<Item = (&str, &bytes::Bytes)>,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<tokio::time::Instant>,
     ) -> SendResult {
         if self.lifecycle.is_closed() {
             return SendResult::Fatal(TransportError::Closed);
@@ -1461,19 +1461,16 @@ impl HttpTransport {
         };
         let sent = match deadline {
             None => sender.send(&kept, None).await,
-            Some(deadline) => {
-                let until = tokio::time::Instant::from_std(deadline);
-                tokio::time::timeout_at(until, sender.send(&kept, Some(deadline)))
-                    .await
-                    .unwrap_or_else(|_elapsed| {
-                        tracing::warn!(
-                            records = kept.len(),
-                            "HTTP send deadline elapsed; the records may have arrived and are \
+            Some(deadline) => tokio::time::timeout_at(deadline, sender.send(&kept, Some(deadline)))
+                .await
+                .unwrap_or_else(|_elapsed| {
+                    tracing::warn!(
+                        records = kept.len(),
+                        "HTTP send deadline elapsed; the records may have arrived and are \
                              sent again"
-                        );
-                        SendResult::Backpressured
-                    })
-            }
+                    );
+                    SendResult::Backpressured
+                }),
         };
         if sent.is_ok() { handled } else { sent }
     }
@@ -1509,7 +1506,7 @@ impl TransportSender for HttpTransport {
     async fn send_batch_by(
         &self,
         records: &[super::work_batch::Record],
-        deadline: std::time::Instant,
+        deadline: tokio::time::Instant,
     ) -> SendResult {
         self.send_block(keyed(records), Some(deadline)).await
     }
@@ -1648,7 +1645,7 @@ impl TransportReceiver for HttpTransport {
     /// The earliest instant by which a held request among `tokens` must be
     /// answered: `max_hold_ms` from admission.
     #[cfg(feature = "http-server")]
-    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<std::time::Instant> {
+    fn hold_deadline(&self, tokens: &[Self::Token]) -> Option<tokio::time::Instant> {
         self.pending
             .as_ref()?
             .deadline(tokens.iter().map(|t| t.seq))

@@ -16,13 +16,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::StatusCode;
 use reqwest::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER,
 };
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 
 use super::{HTTP_ACCEPTS, HttpTransport, HttpTransportConfig};
 use crate::compression::CompressorPool;

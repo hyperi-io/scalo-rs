@@ -227,7 +227,7 @@ impl PendingRegistry {
     }
 
     /// The earliest answer deadline among the requests `seqs` belong to.
-    pub(crate) fn deadline<I>(&self, seqs: I) -> Option<std::time::Instant>
+    pub(crate) fn deadline<I>(&self, seqs: I) -> Option<Instant>
     where
         I: IntoIterator<Item = u64>,
     {
@@ -241,7 +241,6 @@ impl PendingRegistry {
                 entry.covers(seq - base).then_some(entry.deadline)
             })
             .min()
-            .map(Instant::into_std)
     }
 
     /// What is held now: records not yet released, and the bytes, age and
@@ -257,11 +256,7 @@ impl PendingRegistry {
                 .map(|e| e.admitted)
                 .min()
                 .map(|t| now.saturating_duration_since(t)),
-            entries
-                .values()
-                .map(|e| e.deadline)
-                .min()
-                .map(Instant::into_std),
+            entries.values().map(|e| e.deadline).min(),
         )
     }
 

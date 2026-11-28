@@ -454,7 +454,7 @@ impl CommitToken for PushToken {}
 struct HeldRequest {
     remaining: usize,
     worst: DeliveryStatus,
-    deadline: Instant,
+    deadline: tokio::time::Instant,
     answer: oneshot::Sender<bool>,
 }
 
@@ -523,7 +523,7 @@ impl PushSource {
                 HeldRequest {
                     remaining: payloads.len(),
                     worst: DeliveryStatus::Delivered,
-                    deadline: Instant::now() + self.hold,
+                    deadline: tokio::time::Instant::now() + self.hold,
                     answer,
                 },
             );
@@ -615,7 +615,7 @@ impl TransportReceiver for PushSource {
         Ok(())
     }
 
-    fn hold_deadline(&self, tokens: &[PushToken]) -> Option<Instant> {
+    fn hold_deadline(&self, tokens: &[PushToken]) -> Option<tokio::time::Instant> {
         let held = lock(&self.held);
         tokens
             .iter()
