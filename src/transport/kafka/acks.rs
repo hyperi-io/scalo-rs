@@ -411,6 +411,12 @@ impl PartitionHold {
         self.runs.extend(run);
     }
 
+    /// The held run that covers `offset`. Runs are sorted and don't overlap.
+    fn run_at(&self, offset: i64) -> Option<&Run> {
+        let at = self.runs.partition_point(|r| r.last() < offset);
+        self.runs.get(at).filter(|r| r.first() <= offset)
+    }
+
     fn release(&mut self, offset: i64) {
         self.highest_released = Some(self.highest_released.map_or(offset, |h| h.max(offset)));
         let at = self.runs.partition_point(|r| r.last() < offset);
@@ -508,11 +514,7 @@ impl KafkaAcks {
             if hold.unowned || stale {
                 continue;
             }
-            if let Some(run) = hold
-                .runs
-                .iter()
-                .find(|r| r.first() <= token.offset && token.offset <= r.last())
-            {
+            if let Some(run) = hold.run_at(token.offset) {
                 let received = run.received_at(token.offset);
                 oldest = Some(oldest.map_or(received, |o| o.min(received)));
             }
