@@ -21,3 +21,5 @@ so a reviewer sees the diff when the contract changes.
 Two things bite people, both covered in [native-deps.md](native-deps.md):
 runtime package names are release-specific, and a digest-pinned base image
 has no codename -- so set `deployment.base_distro` when you pin one.
+
+x86_64 release builds that set `-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq` get sonic-rs's SIMD paths, which it picks at compile time only. The cost is a CPU floor: Intel Haswell (2013), AMD Excavator (2015) or EPYC 7001 and later, and a VM whose CPU type exposes AVX2. Below it the binary dies with SIGILL, so put `scalo::require_cpu_floor!()` in `main.rs` to get a clear refusal instead ([../runtime/cpu-floor.md](../runtime/cpu-floor.md)). A bench built without those flags measures sonic-rs's scalar path, not what a v3 release runs.

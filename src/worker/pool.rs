@@ -240,6 +240,13 @@ impl AdaptiveWorkerPool {
     ///
     /// Use this for: JSON parsing, transforms, compression, CEL evaluation, routing.
     /// Do NOT use for work that needs `.await` -- use [`fan_out_async`](Self::fan_out_async).
+    ///
+    /// # Blocking
+    ///
+    /// This blocks the calling thread until the whole batch is done. From an
+    /// async task, call it inside `tokio::task::spawn_blocking`, or inside
+    /// `tokio::task::block_in_place` on a multi-thread runtime, as `BatchEngine`
+    /// does. Called inline it holds a tokio worker for the batch.
     pub fn process_batch<T, R, E, F>(&self, items: &[T], f: F) -> Vec<Result<R, E>>
     where
         T: Sync,
@@ -443,6 +450,13 @@ impl AdaptiveWorkerPool {
     ///
     /// Used by `BatchEngine`'s parsed mid-tier transform so the parsed path is
     /// throttled identically to the raw path.
+    ///
+    /// # Blocking
+    ///
+    /// This blocks the calling thread until the whole batch is done. From an
+    /// async task, call it inside `tokio::task::spawn_blocking`, or inside
+    /// `tokio::task::block_in_place` on a multi-thread runtime, as `BatchEngine`
+    /// does. Called inline it holds a tokio worker for the batch.
     pub fn map_owned<T, R, F>(&self, items: Vec<T>, f: F) -> Vec<R>
     where
         T: Send,
