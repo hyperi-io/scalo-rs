@@ -438,7 +438,7 @@ async fn expires_in_as_a_string_is_accepted() {
 
     // An hour out, less the renewal margin: far enough ahead that the next
     // call is a hit, which an unparsed string expiry would not be.
-    assert!(credential.renew_at > std::time::Instant::now() + Duration::from_mins(50));
+    assert!(credential.renew_at > tokio::time::Instant::now() + Duration::from_mins(50));
     let extra = credential
         .extra
         .as_deref()
@@ -464,7 +464,7 @@ async fn a_response_without_an_expiry_uses_the_fallback() {
     );
 
     let credential = source.credential().await.unwrap();
-    let now = std::time::Instant::now();
+    let now = tokio::time::Instant::now();
 
     assert!(credential.renew_at > now + Duration::from_secs(400));
     assert!(credential.renew_at <= now + Duration::from_secs(540));
@@ -1362,7 +1362,7 @@ async fn a_consumer_written_exchange_reads_a_token_response_through_the_shared_p
     assert_eq!(credential.secret.expose(), "metadata-tok-1");
     assert_eq!(state.lock().unwrap().metadata_hits, 1);
     assert!(
-        reading.renew_at(Duration::from_secs(3600)) > std::time::Instant::now(),
+        reading.renew_at(Duration::from_secs(3600)) > tokio::time::Instant::now(),
         "the renewal point is the parser's, not the consumer's arithmetic"
     );
 }
