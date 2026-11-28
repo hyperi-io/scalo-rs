@@ -15,9 +15,16 @@
 //! - **LiteralSet** (AhoCorasick over many literals): <= 500 ns
 //! - **Regex** (regex-automata fallback): bounded by the engine itself
 //!
+//! `strmatch_regex_threads` runs one shared regex-tier matcher from 1 to 16
+//! threads, each time per call, so a rise with the thread count is
+//! contention on the regex engine's shared cache pool.
+//!
 //! Run with `cargo bench --bench strmatch --features strmatch`.
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+#[path = "support/scaling.rs"]
+mod scaling;
+
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use scalo::strmatch::{MatcherTier, StrMatcher, StrMatcherSet};
 
@@ -104,6 +111,34 @@ fn bench_regex_tier(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_regex_threads(c: &mut Criterion) {
+    let mut g = c.benchmark_group("strmatch_regex_threads");
+    g.throughput(Throughput::Bytes(HAYSTACK_SHORT.len() as u64));
+
+    let m = StrMatcher::new(r"\w+@\w+").unwrap();
+    assert_eq!(m.tier(), MatcherTier::Regex);
+    for threads in scaling::THREADS {
+        g.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |b, &threads| {
+                b.iter_custom(|iters| {
+                    scaling::concurrent(
+                        threads,
+                        iters,
+                        || (),
+                        |()| {
+                            std::hint::black_box(m.is_match(std::hint::black_box(HAYSTACK_SHORT)));
+                        },
+                    )
+                });
+            },
+        );
+    }
+
+    g.finish();
+}
+
 fn bench_set_construction(c: &mut Criterion) {
     let mut g = c.benchmark_group("strmatch_set");
 
@@ -146,6 +181,7 @@ criterion_group!(
     bench_literal_tier,
     bench_literal_set_tier,
     bench_regex_tier,
+    bench_regex_threads,
     bench_set_construction,
     bench_long_haystack
 );
