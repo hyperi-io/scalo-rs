@@ -9,11 +9,19 @@
 //! Rule set evaluation per record over raw JSON bytes. `scripts/bench-gate.sh`
 //! fails a change whose median for any of these is over 5% slower than the
 //! saved baseline.
+//!
+//! `rules_regex_threads` evaluates one shared set with a regex row from 1 to 16
+//! threads, each with its own batch, so a rise in the time per record with the
+//! thread count is contention on state the threads share.
+
+#[path = "support/scaling.rs"]
+mod scaling;
 
 use std::collections::HashSet;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
+use scalo::expression::ProfileConfig;
 use scalo::rules::{
     Clamp, CompileOptions, JsonPayload, MatchConfig, RuleConfig, RuleSet, RuleSetConfig, SetAction,
 };
@@ -132,5 +140,53 @@ fn bench_cel(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_native, bench_two_targets, bench_cel);
+fn bench_regex_threads(c: &mut Criterion) {
+    let options = CompileOptions::default().with_profile(ProfileConfig {
+        allow_regex: true,
+        ..ProfileConfig::default()
+    });
+    let set = RuleSet::compile_with(
+        &RuleSetConfig::new("bench", ["_source"]).rule(
+            RuleConfig::new("db", "_source", SetAction::value("db"))
+                .matching(MatchConfig::regex("host", r"^\w+-\d+\.prod$")),
+        ),
+        &options,
+    )
+    .expect("the bench set compiles");
+    let payload = JsonPayload::new(PAYLOAD).expect("depth");
+    assert!(
+        !set.batch().evaluate(&payload).is_empty(),
+        "the row matches"
+    );
+
+    let mut group = c.benchmark_group("rules_regex_threads");
+    group.throughput(Throughput::Elements(1));
+    for threads in scaling::THREADS {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(threads),
+            &threads,
+            |b, &threads| {
+                b.iter_custom(|iters| {
+                    scaling::concurrent(
+                        threads,
+                        iters,
+                        || set.batch(),
+                        |batch| {
+                            std::hint::black_box(batch.evaluate(&payload).is_empty());
+                        },
+                    )
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_native,
+    bench_two_targets,
+    bench_cel,
+    bench_regex_threads
+);
 criterion_main!(benches);

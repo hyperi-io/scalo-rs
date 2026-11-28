@@ -43,6 +43,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 /// Circuit breaker state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
@@ -70,9 +72,10 @@ impl CircuitState {
 struct Inner {
     state: CircuitState,
     consecutive_failures: u32,
-    last_failure_ms: u64,
+    /// On the runtime's clock, so a paused test clock drives the reset timeout.
+    last_failure: Option<Instant>,
     /// HalfOpen only: when the outstanding probe was admitted.
-    probe_admitted_ms: u64,
+    probe_admitted: Option<Instant>,
 }
 
 /// Circuit breaker for protecting against unhealthy sinks.
@@ -117,8 +120,8 @@ impl CircuitBreaker {
             inner: Mutex::new(Inner {
                 state: CircuitState::Closed,
                 consecutive_failures: 0,
-                last_failure_ms: 0,
-                probe_admitted_ms: 0,
+                last_failure: None,
+                probe_admitted: None,
             }),
             failure_threshold,
             reset_timeout,
@@ -142,10 +145,9 @@ impl CircuitBreaker {
         self.health_state.store(new.code(), Ordering::Release);
     }
 
-    /// Whether the reset timeout has elapsed since `since_ms`.
-    fn reset_elapsed(&self, since_ms: u64) -> bool {
-        let now = current_epoch_millis();
-        Duration::from_millis(now.saturating_sub(since_ms)) >= self.reset_timeout
+    /// Whether the reset timeout has elapsed since `since`, or there is no `since`.
+    fn reset_elapsed(&self, since: Option<Instant>) -> bool {
+        since.is_none_or(|at| at.elapsed() >= self.reset_timeout)
     }
 
     /// Gate a request through the breaker, claiming the half-open probe permit
@@ -158,15 +160,15 @@ impl CircuitBreaker {
         let mut inner = self.lock();
         let since = match inner.state {
             CircuitState::Closed => return true,
-            CircuitState::Open => inner.last_failure_ms,
-            CircuitState::HalfOpen => inner.probe_admitted_ms,
+            CircuitState::Open => inner.last_failure,
+            CircuitState::HalfOpen => inner.probe_admitted,
         };
         if !self.reset_elapsed(since) {
             return false;
         }
         // First caller past the timeout claims the sole probe.
         self.set_state(&mut inner, CircuitState::HalfOpen);
-        inner.probe_admitted_ms = current_epoch_millis();
+        inner.probe_admitted = Some(Instant::now());
         true
     }
 
@@ -177,7 +179,7 @@ impl CircuitBreaker {
     /// permit -- only [`allow_request`](Self::allow_request) does.
     pub async fn state(&self) -> CircuitState {
         let inner = self.lock();
-        if inner.state == CircuitState::Open && self.reset_elapsed(inner.last_failure_ms) {
+        if inner.state == CircuitState::Open && self.reset_elapsed(inner.last_failure) {
             CircuitState::HalfOpen
         } else {
             inner.state
@@ -207,7 +209,7 @@ impl CircuitBreaker {
     pub async fn record_failure(&self) {
         let mut inner = self.lock();
         inner.consecutive_failures = inner.consecutive_failures.saturating_add(1);
-        inner.last_failure_ms = current_epoch_millis();
+        inner.last_failure = Some(Instant::now());
 
         if inner.consecutive_failures >= self.failure_threshold {
             self.set_state(&mut inner, CircuitState::Open);
@@ -224,7 +226,7 @@ impl CircuitBreaker {
     pub async fn reset(&self) {
         let mut inner = self.lock();
         inner.consecutive_failures = 0;
-        inner.last_failure_ms = 0;
+        inner.last_failure = None;
         self.set_state(&mut inner, CircuitState::Closed);
     }
 }
@@ -237,13 +239,6 @@ impl std::fmt::Debug for CircuitBreaker {
             .field("consecutive_failures", &self.consecutive_failures())
             .finish_non_exhaustive()
     }
-}
-
-fn current_epoch_millis() -> u64 {
-    use std::time::SystemTime;
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -382,6 +377,23 @@ mod tests {
         assert!(!cb.allow_request().await, "the probe is still out");
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(cb.allow_request().await, "a lost probe is readmitted");
+        assert!(!cb.allow_request().await, "one probe at a time");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_reset_timeout_runs_on_the_runtime_clock() {
+        let cb = CircuitBreaker::new(1, Duration::from_secs(30));
+        cb.record_failure().await;
+        assert!(
+            !cb.allow_request().await,
+            "open until the reset timeout passes"
+        );
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(
+            cb.allow_request().await,
+            "the probe is admitted once the paused clock passes the reset timeout"
+        );
         assert!(!cb.allow_request().await, "one probe at a time");
     }
 
