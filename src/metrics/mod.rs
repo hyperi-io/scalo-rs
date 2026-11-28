@@ -1386,11 +1386,22 @@ struct GaugeRefresh {
 
 impl PeriodicTask for GaugeRefresh {
     async fn tick(&mut self) -> Result<(), TickError> {
-        if let Some(pm) = &self.process_metrics {
-            pm.update();
-        }
-        if let Some(cm) = &self.container_metrics {
-            cm.update();
+        // The sysinfo refresh and cgroup reads are blocking file I/O, so on a
+        // multi-thread runtime the worker's other tasks move to another thread.
+        let refresh = || {
+            if let Some(pm) = &self.process_metrics {
+                pm.update();
+            }
+            if let Some(cm) = &self.container_metrics {
+                cm.update();
+            }
+        };
+        let multi_thread = tokio::runtime::Handle::try_current()
+            .is_ok_and(|rt| rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+        if multi_thread {
+            tokio::task::block_in_place(refresh);
+        } else {
+            refresh();
         }
         Ok(())
     }
