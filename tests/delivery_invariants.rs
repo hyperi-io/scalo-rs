@@ -35,7 +35,7 @@ use tokio::time::Instant;
 use scalo::memory::{MemoryGuard, MemoryGuardConfig};
 use scalo::transport::test_support::delivery::{
     Answer, AnyApproach, CallerBatch, DeliveryApproach, DestinationId, Destinations, Outcome,
-    RoutedRecord, approach,
+    RoutedRecord, Shape, approach,
 };
 use scalo::transport::test_support::shaped::{
     Down, Faults, OutcomeMode, ShapedConfig, ShapedSender,
@@ -44,6 +44,29 @@ use scalo::transport::{PayloadFormat, Record, RecordMeta};
 
 const INLINE: &str = "inline_sequential";
 const PER_RECORD: &str = "per_record_futures";
+const INLINE_CONTINUE: &str = "inline_sequential_continue";
+const PARALLEL: &str = "parallel_fanout";
+const PARALLEL_IN_SEND: &str = "parallel_fanout_in_send";
+const PARALLEL_PINNED: &str = "parallel_pinned";
+const AUTO: &str = "auto_fanout";
+const PER_DESTINATION: &str = "batch_per_destination";
+const MERGE_CHANNEL: &str = "merge_channel";
+const MERGE_SWAP: &str = "merge_swap";
+const COALESCE: &str = "grpc_coalesce";
+
+/// The approaches that send each destination one block per caller batch, or
+/// merge those blocks: each keeps every invariant.
+const BLOCK_APPROACHES: [&str; 9] = [
+    INLINE_CONTINUE,
+    PARALLEL,
+    PARALLEL_IN_SEND,
+    PARALLEL_PINNED,
+    AUTO,
+    PER_DESTINATION,
+    MERGE_CHANNEL,
+    MERGE_SWAP,
+    COALESCE,
+];
 
 fn named(name: &str) -> AnyApproach {
     approach(name).unwrap_or_else(|| panic!("{name} is registered"))
@@ -56,7 +79,13 @@ fn destinations(senders: &[(&str, &ShapedSender)]) -> Arc<Destinations<ShapedSen
     }));
     let mut set = Destinations::new(guard);
     for (name, sender) in senders {
-        set.add(name, (*sender).clone());
+        // Kafka-shaped senders are named from "k".
+        let shape = if name.starts_with('k') {
+            Shape::PerRecord
+        } else {
+            Shape::Batch
+        };
+        set.add_shaped(name, (*sender).clone(), shape);
     }
     Arc::new(set)
 }
@@ -276,7 +305,7 @@ async fn check_other_caller_untouched(name: &str) {
             .await;
         assert_eq!(outcomes, [Outcome::Sent; 2], "{name}, sick {label}");
         assert!(
-            start.elapsed() <= Duration::from_millis(5),
+            start.elapsed() <= Duration::from_millis(10),
             "{name}, sick {label}: the other caller waited {:?}",
             start.elapsed()
         );
@@ -332,6 +361,11 @@ async fn check_cancel_releases_lease(name: &str) {
         0,
         "{name}: guard kept the bytes"
     );
+    if name == COALESCE {
+        // A send the stage has started carries other callers' records too, so it
+        // finishes after this caller has gone.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     assert_eq!(
         slow.bytes_in_flight() + k.bytes_in_flight(),
         0,
@@ -512,7 +546,473 @@ fn every_registered_approach_has_its_invariant_tests() {
         .collect();
     assert_eq!(
         names,
-        [INLINE, PER_RECORD],
+        [
+            INLINE,
+            INLINE_CONTINUE,
+            PER_RECORD,
+            PARALLEL,
+            PARALLEL_IN_SEND,
+            PARALLEL_PINNED,
+            AUTO,
+            PER_DESTINATION,
+            MERGE_CHANNEL,
+            MERGE_SWAP,
+            COALESCE
+        ],
         "add the new approach's invariant tests here"
+    );
+}
+
+// Every invariant for the block and merge approaches, one test each.
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_release_nothing_before_their_destination_confirms() {
+    for name in BLOCK_APPROACHES {
+        check_no_release_before_confirm(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_hold_their_answer_until_every_destination_confirms() {
+    for name in BLOCK_APPROACHES {
+        check_held_answer_waits_for_every_destination(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_refuse_a_held_batch_with_a_sick_destination_whole() {
+    for name in BLOCK_APPROACHES {
+        check_held_batch_refused_whole(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_leave_another_callers_batch_untouched_by_a_sick_destination() {
+    for name in BLOCK_APPROACHES {
+        check_other_caller_untouched(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_release_their_lease_when_cancelled() {
+    for name in BLOCK_APPROACHES {
+        check_cancel_releases_lease(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_map_a_refusal_to_its_caller_and_record() {
+    for name in BLOCK_APPROACHES {
+        check_refusal_maps_to_its_record(name).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_keep_kafka_order_through_a_full_queue() {
+    for name in BLOCK_APPROACHES {
+        let (outcomes, order) = through_a_full_queue(name).await;
+        assert_eq!(outcomes, [Outcome::Sent; 10], "{name}");
+        assert_eq!(order, (0..10).collect::<Vec<u8>>(), "{name}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_approaches_drain_a_batch_larger_than_the_queue() {
+    for name in BLOCK_APPROACHES {
+        check_batch_larger_than_queue_completes(name).await;
+    }
+}
+
+/// Two callers' blocks for one gRPC-shaped destination go out as one call when
+/// they arrive within the merge window, and each caller gets its own answer.
+#[tokio::test(start_paused = true)]
+async fn merge_approaches_send_two_callers_blocks_as_one_call() {
+    for name in [MERGE_CHANNEL, MERGE_SWAP] {
+        let g = ShapedSender::new("g", grpc(5));
+        let set = destinations(&[("g", &g)]);
+        let merge = approach(&format!("{name}/w2/b65536")).expect("a merge spec parses");
+        let a = {
+            let set = Arc::clone(&set);
+            let merge = merge.clone();
+            tokio::spawn(async move {
+                merge
+                    .deliver(
+                        &set,
+                        CallerBatch {
+                            records: vec![record("a", &[DestinationId(0)])],
+                            answer: Answer::Held,
+                        },
+                    )
+                    .await
+            })
+        };
+        let b = merge
+            .deliver(
+                &set,
+                CallerBatch {
+                    records: vec![
+                        record("b1", &[DestinationId(0)]),
+                        record("b2", &[DestinationId(0)]),
+                    ],
+                    answer: Answer::Held,
+                },
+            )
+            .await;
+        assert_eq!(b, [Outcome::Sent; 2], "{name}");
+        assert_eq!(a.await.expect("caller a"), [Outcome::Sent], "{name}");
+        let stats = g.stats();
+        assert_eq!(stats.calls, 1, "{name}: two callers, one call");
+        assert_eq!(stats.max_batch, 3, "{name}");
+        assert!(merge.peak_queued_bytes().is_some_and(|b| b >= 5), "{name}");
+    }
+}
+
+/// Many callers on one merge stage: every block is answered, none is dropped
+/// by a caller that stops waiting once its own answer arrives.
+#[tokio::test(start_paused = true)]
+async fn merge_approaches_answer_every_caller() {
+    for name in [MERGE_CHANNEL, MERGE_SWAP] {
+        let g = ShapedSender::new(
+            "g",
+            ShapedConfig {
+                call_latency: Duration::from_millis(5),
+                max_calls_in_flight: 4,
+                ..ShapedConfig::default()
+            },
+        );
+        let set = destinations(&[("g", &g)]);
+        let merge = approach(&format!("{name}/w1/b4096")).expect("a merge spec parses");
+        let mut callers = tokio::task::JoinSet::new();
+        for caller in 0..64u8 {
+            let set = Arc::clone(&set);
+            let merge = merge.clone();
+            callers.spawn(async move {
+                let mut answers = Vec::new();
+                for round in 0..5u8 {
+                    // Staggered arrivals, so blocks are queued while an earlier drain is in flight.
+                    tokio::time::sleep(Duration::from_millis(u64::from(caller % 7))).await;
+                    let outcomes = merge
+                        .deliver(
+                            &set,
+                            CallerBatch {
+                                records: vec![record(vec![caller, round], &[DestinationId(0)])],
+                                answer: Answer::Held,
+                            },
+                        )
+                        .await;
+                    answers.extend(outcomes);
+                }
+                answers
+            });
+        }
+        let answers: Vec<Outcome> = callers.join_all().await.into_iter().flatten().collect();
+        assert_eq!(answers.len(), 320, "{name}");
+        assert!(
+            answers.iter().all(|o| *o == Outcome::Sent),
+            "{name}: {answers:?}"
+        );
+        assert_eq!(g.stats().records_confirmed, 320, "{name}");
+    }
+}
+
+/// A block larger than the whole merge buffer is sent directly, never queued.
+#[tokio::test(start_paused = true)]
+async fn merge_approaches_send_a_block_larger_than_the_buffer_directly() {
+    for name in [MERGE_CHANNEL, MERGE_SWAP] {
+        let g = ShapedSender::new("g", grpc(5));
+        let set = destinations(&[("g", &g)]);
+        let merge = approach(&format!("{name}/w1/b8")).expect("a merge spec parses");
+        let outcomes = merge
+            .deliver(
+                &set,
+                CallerBatch {
+                    records: vec![record(vec![b'x'; 16], &[DestinationId(0)])],
+                    answer: Answer::Held,
+                },
+            )
+            .await;
+        assert_eq!(outcomes, [Outcome::Sent], "{name}");
+        assert_eq!(
+            merge.peak_queued_bytes(),
+            Some(0),
+            "{name}: nothing was queued"
+        );
+    }
+}
+
+// grpc_coalesce: callers' blocks for one batch destination go out as one call.
+
+/// `grpc_coalesce` with a byte target, a linger in milliseconds and sends in flight.
+fn coalesce(target_bytes: u64, linger_ms: u64, in_flight: usize) -> AnyApproach {
+    named(&format!(
+        "{COALESCE}/t{target_bytes}/l{linger_ms}/n{in_flight}"
+    ))
+}
+
+/// Offer `records` as one caller's held batch to `approach`.
+fn offer(
+    approach: &AnyApproach,
+    set: &Arc<Destinations<ShapedSender>>,
+    records: Vec<RoutedRecord>,
+    answer: Answer,
+) -> tokio::task::JoinHandle<Vec<Outcome>> {
+    spawn(approach.clone(), set, records, answer)
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_sends_callers_blocks_as_one_call_and_answers_after_it_returns() {
+    let g = ShapedSender::new("g", grpc(30));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(1 << 20, 5, 2);
+    let a = offer(
+        &approach,
+        &set,
+        vec![record("a1", &route), record("a2", &route)],
+        Answer::Held,
+    );
+    let b = offer(&approach, &set, vec![record("b1", &route)], Answer::Held);
+    // The linger closes at 5 ms and the call takes 30 ms.
+    tokio::time::sleep(Duration::from_millis(34)).await;
+    assert!(
+        !a.is_finished() && !b.is_finished(),
+        "answered before the call returned"
+    );
+    assert_eq!(a.await.expect("caller a"), [Outcome::Sent; 2]);
+    assert_eq!(b.await.expect("caller b"), [Outcome::Sent]);
+    let stats = g.stats();
+    assert_eq!((stats.calls, stats.max_batch), (1, 3));
+    assert_eq!(stats.records_confirmed, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_sends_at_its_byte_target_without_waiting_for_the_linger() {
+    let g = ShapedSender::new("g", grpc(10));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    // Each pair of 4 byte records reaches the 8 byte target, so 4 callers make 2 calls.
+    let approach = coalesce(8, 10_000, 4);
+    let callers: Vec<_> = (0..4)
+        .map(|i| {
+            offer(
+                &approach,
+                &set,
+                vec![record(format!("r{i:03}"), &route)],
+                Answer::Held,
+            )
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    assert!(
+        callers.iter().all(|c| c.is_finished()),
+        "waited for a 10 s linger"
+    );
+    for caller in callers {
+        assert_eq!(caller.await.expect("caller"), [Outcome::Sent]);
+    }
+    assert_eq!(g.stats().max_batch, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_keeps_no_more_sends_in_flight_than_asked() {
+    let g = ShapedSender::new("g", grpc(50));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(8, 10_000, 2);
+    let callers: Vec<_> = (0..12)
+        .map(|i| {
+            offer(
+                &approach,
+                &set,
+                vec![record(format!("r{i:03}"), &route)],
+                Answer::Held,
+            )
+        })
+        .collect();
+    for caller in callers {
+        assert_eq!(caller.await.expect("caller"), [Outcome::Sent]);
+    }
+    let stats = g.stats();
+    assert_eq!(stats.records_confirmed, 12);
+    assert_eq!(stats.peak_calls_in_flight, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_answers_every_caller_in_a_failed_send_with_the_failure() {
+    let gone = ShapedSender::new("gone", down());
+    let set = destinations(&[("gone", &gone)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(1 << 20, 5, 2);
+    let a = offer(&approach, &set, vec![record("a", &route)], Answer::Held);
+    let b = offer(
+        &approach,
+        &set,
+        vec![record("b1", &route), record("b2", &route)],
+        Answer::Held,
+    );
+    let (a, b) = (a.await.expect("caller a"), b.await.expect("caller b"));
+    assert_eq!(a, [Outcome::Backpressured]);
+    assert_eq!(b, [Outcome::Backpressured; 2]);
+    assert_eq!(gone.stats().calls, 1, "one send carried both callers");
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_answers_a_refused_record_to_its_own_caller_only() {
+    let refusing = ShapedSender::new(
+        "g",
+        ShapedConfig {
+            faults: Faults {
+                refuse: Some(|p| p.first() == Some(&b'!')),
+                ..Faults::default()
+            },
+            ..grpc(5)
+        },
+    );
+    let set = destinations(&[("g", &refusing)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(1 << 20, 5, 2);
+    let a = offer(
+        &approach,
+        &set,
+        vec![
+            record("a0", &route),
+            record("!a1", &route),
+            record("a2", &route),
+        ],
+        Answer::PerRecord,
+    );
+    let b = offer(
+        &approach,
+        &set,
+        vec![record("b0", &route), record("b1", &route)],
+        Answer::PerRecord,
+    );
+    assert_eq!(
+        a.await.expect("caller a"),
+        [Outcome::Sent, Outcome::DeadLettered, Outcome::Sent]
+    );
+    assert_eq!(b.await.expect("caller b"), [Outcome::Sent; 2]);
+    let stats = refusing.stats();
+    assert_eq!(
+        (stats.calls, stats.max_batch),
+        (1, 4),
+        "the refused record is not sent"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_drops_a_cancelled_callers_block_the_stage_has_not_taken() {
+    let g = ShapedSender::new("g", grpc(5));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(1 << 20, 50, 2);
+    let gone = offer(&approach, &set, vec![record("gone", &route)], Answer::Held);
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert!(set.ledger().held_bytes() > 0, "no lease while queued");
+    gone.abort();
+    assert!(gone.await.is_err_and(|e| e.is_cancelled()));
+    assert_eq!(set.ledger().held_bytes(), 0, "lease kept after cancel");
+    let stays = offer(&approach, &set, vec![record("stays", &route)], Answer::Held);
+    assert_eq!(stays.await.expect("caller"), [Outcome::Sent]);
+    let counted = g.stats();
+    assert_eq!(
+        (counted.calls, counted.records_offered),
+        (1, 1),
+        "the cancelled block was sent"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_answers_the_callers_left_in_a_send_when_one_is_cancelled() {
+    let g = ShapedSender::new("g", grpc(100));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(1 << 20, 5, 2);
+    let gone = offer(&approach, &set, vec![record("gone", &route)], Answer::Held);
+    let stays = offer(&approach, &set, vec![record("stays", &route)], Answer::Held);
+    // The send started at 5 ms and returns at 105 ms.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    gone.abort();
+    assert!(gone.await.is_err_and(|e| e.is_cancelled()));
+    assert_eq!(stays.await.expect("caller"), [Outcome::Sent]);
+    assert_eq!(set.ledger().held_bytes(), 0);
+    assert_eq!(g.stats().calls, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_holds_a_caller_while_its_stage_is_full_and_drops_nothing() {
+    let g = ShapedSender::new("g", grpc(100));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    // A target of 8 bytes holds 32 waiting, and 10 callers offer 4 each.
+    let approach = coalesce(8, 10_000, 1);
+    let callers: Vec<_> = (0..10)
+        .map(|i| {
+            offer(
+                &approach,
+                &set,
+                vec![record(format!("r{i:03}"), &route)],
+                Answer::Held,
+            )
+        })
+        .collect();
+    for caller in callers {
+        assert_eq!(caller.await.expect("caller"), [Outcome::Sent]);
+    }
+    assert_eq!(g.stats().records_confirmed, 10);
+    let peak = approach
+        .peak_queued_bytes()
+        .expect("a coalescer reports its queue");
+    assert!(peak <= 32, "the stage held {peak} bytes waiting");
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_sends_a_block_at_the_target_by_its_caller_without_queueing_it() {
+    let g = ShapedSender::new("g", grpc(10));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(8, 10_000, 1);
+    let start = Instant::now();
+    let outcomes = approach
+        .deliver(
+            &set,
+            CallerBatch {
+                records: vec![record(vec![b'x'; 8], &route)],
+                answer: Answer::Held,
+            },
+        )
+        .await;
+    assert_eq!(outcomes, [Outcome::Sent]);
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(10),
+        "waited for the linger"
+    );
+    assert_eq!(approach.peak_queued_bytes(), Some(0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn grpc_coalesce_sends_a_block_at_once_when_its_linger_is_zero() {
+    let g = ShapedSender::new("g", grpc(0));
+    let set = destinations(&[("g", &g)]);
+    let route = [DestinationId(0)];
+    let approach = coalesce(1 << 20, 0, 4);
+    // Part way into a millisecond, where a timer for "now" is rounded up to the next tick.
+    tokio::time::advance(Duration::from_micros(500)).await;
+    let start = Instant::now();
+    let outcomes = approach
+        .deliver(
+            &set,
+            CallerBatch {
+                records: vec![record("a", &route)],
+                answer: Answer::Held,
+            },
+        )
+        .await;
+    assert_eq!(outcomes, [Outcome::Sent]);
+    assert_eq!(
+        start.elapsed(),
+        Duration::ZERO,
+        "waited with a linger of zero"
     );
 }

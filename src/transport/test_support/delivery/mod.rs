@@ -26,7 +26,13 @@
 //! A held batch ([`Answer::Held`]) is answered all or nothing: when any record
 //! is not delivered, every record not dead-lettered gets the worst outcome.
 
+mod auto_fanout;
+mod batch_per_destination;
+mod grpc_coalesce;
 mod inline_sequential;
+mod merge;
+mod parallel_fanout;
+mod parallel_pinned;
 mod per_record_futures;
 
 use std::future::Future;
@@ -36,17 +42,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::memory::MemoryGuard;
 use crate::transport::{Record, SendResult, TransportSender};
 
+pub use auto_fanout::AutoFanout;
+pub use batch_per_destination::BatchPerDestination;
+pub use grpc_coalesce::GrpcCoalesce;
 pub use inline_sequential::InlineSequential;
+pub use merge::{Merge, MergeStore};
+pub use parallel_fanout::ParallelFanout;
+pub use parallel_pinned::ParallelPinned;
 pub use per_record_futures::PerRecordFutures;
 
 /// Index of a destination in a [`Destinations`] set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DestinationId(pub usize);
 
+/// How a destination takes records, which an approach that treats the two
+/// kinds apart reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// One call carries a batch, as a gRPC `RouteBatch` does.
+    Batch,
+    /// Records are queued one by one and confirmed on their own, as a Kafka
+    /// producer does.
+    PerRecord,
+}
+
 /// The named destinations a batch can be routed to, and the memory guard every
 /// delivery leases its bytes from.
 pub struct Destinations<S> {
-    entries: Vec<(Arc<str>, S)>,
+    entries: Vec<(Arc<str>, Arc<S>, Shape)>,
     ledger: Ledger,
 }
 
@@ -64,8 +87,24 @@ impl<S: TransportSender> Destinations<S> {
     /// adding, which is the order an approach that sends one destination after
     /// another uses.
     pub fn add(&mut self, name: &str, sender: S) -> DestinationId {
-        self.entries.push((Arc::from(name), sender));
+        self.add_shaped(name, sender, Shape::Batch)
+    }
+
+    /// Add `sender` under `name` with the shape it takes records in.
+    pub fn add_shaped(&mut self, name: &str, sender: S, shape: Shape) -> DestinationId {
+        self.entries
+            .push((Arc::from(name), Arc::new(sender), shape));
         DestinationId(self.entries.len() - 1)
+    }
+
+    /// The destination's shape.
+    ///
+    /// # Panics
+    ///
+    /// When `id` is not from this set.
+    #[must_use]
+    pub fn shape(&self, id: DestinationId) -> Shape {
+        self.entries[id.0].2
     }
 
     /// The id of the destination called `name`.
@@ -73,7 +112,7 @@ impl<S: TransportSender> Destinations<S> {
     pub fn id(&self, name: &str) -> Option<DestinationId> {
         self.entries
             .iter()
-            .position(|(n, _)| &**n == name)
+            .position(|(n, _, _)| &**n == name)
             .map(DestinationId)
     }
 
@@ -97,12 +136,23 @@ impl<S: TransportSender> Destinations<S> {
         &self.entries[id.0].1
     }
 
+    /// The destination's sender, shared, for an approach that sends from a task
+    /// of its own.
+    ///
+    /// # Panics
+    ///
+    /// When `id` is not from this set.
+    #[must_use]
+    pub fn sender_arc(&self, id: DestinationId) -> Arc<S> {
+        Arc::clone(&self.entries[id.0].1)
+    }
+
     /// Every destination, in id order.
     pub fn iter(&self) -> impl Iterator<Item = (DestinationId, &str, &S)> {
         self.entries
             .iter()
             .enumerate()
-            .map(|(i, (name, sender))| (DestinationId(i), &**name, sender))
+            .map(|(i, (name, sender, _))| (DestinationId(i), &**name, &**sender))
     }
 
     /// Number of destinations.
@@ -261,6 +311,98 @@ impl Outcome {
     }
 }
 
+/// The records of `batch` routed to `id` that `sender` would take, with their
+/// places in the batch. Those it would dead-letter are marked in `outcomes`.
+fn block_for<S: TransportSender>(
+    batch: &CallerBatch,
+    id: DestinationId,
+    sender: &S,
+    outcomes: &mut [Outcome],
+) -> (Vec<Record>, Vec<usize>) {
+    let split = split_for(batch, id, sender);
+    for i in split.dead_lettered {
+        outcomes[i] = outcomes[i].max(Outcome::DeadLettered);
+    }
+    (split.block, split.places)
+}
+
+/// One destination's share of a caller batch.
+struct Split {
+    block: Vec<Record>,
+    places: Vec<usize>,
+    dead_lettered: Vec<usize>,
+}
+
+/// Split `batch` for `id`: the records `sender` would take, their places, and
+/// the places of those it would dead-letter. Sized up front, as
+/// [`InlineSequential`] sizes its block.
+fn split_for<S: TransportSender>(batch: &CallerBatch, id: DestinationId, sender: &S) -> Split {
+    let routed = batch
+        .records
+        .iter()
+        .filter(|r| r.routes.contains(&id))
+        .count();
+    let mut split = Split {
+        block: Vec::with_capacity(routed),
+        places: Vec::with_capacity(routed),
+        dead_lettered: Vec::new(),
+    };
+    for (i, routed) in batch.records.iter().enumerate() {
+        if !routed.routes.contains(&id) {
+            continue;
+        }
+        if sender.dead_letter_reason(&routed.record).is_some() {
+            split.dead_lettered.push(i);
+        } else {
+            split.block.push(routed.record.clone());
+            split.places.push(i);
+        }
+    }
+    split
+}
+
+/// Send `records` in one `send_batch` and return each record's outcome. A
+/// `FilteredDlq` answer names no record, so each is then sent on its own.
+async fn send_block<S: TransportSender>(sender: &S, records: &[Record]) -> Vec<Outcome> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let result = sender.send_batch(records).await;
+    if matches!(result, SendResult::FilteredDlq) {
+        let mut outcomes = Vec::with_capacity(records.len());
+        for record in records {
+            outcomes.push(Outcome::from_send(&sender.send_record(record).await));
+        }
+        return outcomes;
+    }
+    vec![Outcome::from_send(&result); records.len()]
+}
+
+/// One destination's send: the places in the batch of its `block`, and the
+/// outcome of each record in it. A future built here is large, so an approach
+/// that holds several boxes each one rather than let a collection of them
+/// move it by value.
+pub async fn destination_send<S: TransportSender>(
+    sender: &S,
+    block: Vec<Record>,
+    places: Vec<usize>,
+) -> (Vec<usize>, Vec<Outcome>) {
+    let outcomes = send_block(sender, &block).await;
+    (places, outcomes)
+}
+
+/// Fold the results of [`destination_send`] into the batch's outcomes.
+fn merge_results(
+    outcomes: &mut [Outcome],
+    sent: impl IntoIterator<Item = (Vec<usize>, Vec<Outcome>)>,
+) {
+    for (places, results) in sent {
+        for (i, outcome) in places.into_iter().zip(results) {
+            outcomes[i] = outcomes[i].max(outcome);
+        }
+    }
+}
+
 /// Apply the caller's answer rule to per-record outcomes: a held batch with any
 /// undelivered record gives every record not dead-lettered the worst outcome.
 #[must_use]
@@ -286,7 +428,7 @@ pub trait DeliveryApproach: Send + Sync {
     /// Deliver `batch` to its routes in `destinations` and return one outcome
     /// per record, in the batch's order. Every byte held meanwhile is leased
     /// from [`Destinations::ledger`].
-    fn deliver<'a, S: TransportSender>(
+    fn deliver<'a, S: TransportSender + 'static>(
         &'a self,
         destinations: &'a Destinations<S>,
         batch: CallerBatch,
@@ -294,12 +436,37 @@ pub trait DeliveryApproach: Send + Sync {
 }
 
 /// Every approach, dispatched by enum.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum AnyApproach {
     /// [`InlineSequential`].
     InlineSequential(InlineSequential),
     /// [`PerRecordFutures`].
     PerRecordFutures(PerRecordFutures),
+    /// [`ParallelFanout`].
+    ParallelFanout(ParallelFanout),
+    /// [`ParallelPinned`].
+    ParallelPinned(ParallelPinned),
+    /// [`AutoFanout`].
+    AutoFanout(AutoFanout),
+    /// [`BatchPerDestination`].
+    BatchPerDestination(BatchPerDestination),
+    /// [`Merge`], with a channel or a swapped buffer.
+    Merge(Merge),
+    /// [`GrpcCoalesce`].
+    GrpcCoalesce(GrpcCoalesce),
+}
+
+impl AnyApproach {
+    /// Most payload bytes waiting in a merge buffer at once, for an approach
+    /// that has one.
+    #[must_use]
+    pub fn peak_queued_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Merge(a) => Some(a.peak_queued_bytes()),
+            Self::GrpcCoalesce(a) => Some(a.peak_queued_bytes()),
+            _ => None,
+        }
+    }
 }
 
 impl DeliveryApproach for AnyApproach {
@@ -307,10 +474,16 @@ impl DeliveryApproach for AnyApproach {
         match self {
             Self::InlineSequential(a) => a.name(),
             Self::PerRecordFutures(a) => a.name(),
+            Self::ParallelFanout(a) => a.name(),
+            Self::ParallelPinned(a) => a.name(),
+            Self::AutoFanout(a) => a.name(),
+            Self::BatchPerDestination(a) => a.name(),
+            Self::Merge(a) => a.name(),
+            Self::GrpcCoalesce(a) => a.name(),
         }
     }
 
-    async fn deliver<'a, S: TransportSender>(
+    async fn deliver<'a, S: TransportSender + 'static>(
         &'a self,
         destinations: &'a Destinations<S>,
         batch: CallerBatch,
@@ -318,6 +491,12 @@ impl DeliveryApproach for AnyApproach {
         match self {
             Self::InlineSequential(a) => a.deliver(destinations, batch).await,
             Self::PerRecordFutures(a) => a.deliver(destinations, batch).await,
+            Self::ParallelFanout(a) => a.deliver(destinations, batch).await,
+            Self::ParallelPinned(a) => a.deliver(destinations, batch).await,
+            Self::AutoFanout(a) => a.deliver(destinations, batch).await,
+            Self::BatchPerDestination(a) => a.deliver(destinations, batch).await,
+            Self::Merge(a) => a.deliver(destinations, batch).await,
+            Self::GrpcCoalesce(a) => a.deliver(destinations, batch).await,
         }
     }
 }
@@ -326,20 +505,83 @@ impl DeliveryApproach for AnyApproach {
 /// default.
 pub const REGISTRY: &[(&str, fn() -> AnyApproach)] = &[
     (InlineSequential::NAME, || {
-        AnyApproach::InlineSequential(InlineSequential)
+        AnyApproach::InlineSequential(InlineSequential::default())
+    }),
+    (InlineSequential::CONTINUE, || {
+        AnyApproach::InlineSequential(InlineSequential {
+            stop_at_failure: false,
+        })
     }),
     (PerRecordFutures::NAME, || {
         AnyApproach::PerRecordFutures(PerRecordFutures::default())
     }),
+    (ParallelFanout::NAME, || {
+        AnyApproach::ParallelFanout(ParallelFanout::default())
+    }),
+    (ParallelFanout::IN_SEND, || {
+        AnyApproach::ParallelFanout(ParallelFanout {
+            build_in_send: true,
+        })
+    }),
+    (ParallelPinned::NAME, || {
+        AnyApproach::ParallelPinned(ParallelPinned)
+    }),
+    (AutoFanout::NAME, || AnyApproach::AutoFanout(AutoFanout)),
+    (BatchPerDestination::NAME, || {
+        AnyApproach::BatchPerDestination(BatchPerDestination)
+    }),
+    (Merge::CHANNEL, || {
+        AnyApproach::Merge(Merge::new(MergeStore::Channel))
+    }),
+    (Merge::SWAP, || {
+        AnyApproach::Merge(Merge::new(MergeStore::Swap))
+    }),
+    (GrpcCoalesce::NAME, || {
+        AnyApproach::GrpcCoalesce(GrpcCoalesce::new())
+    }),
 ];
 
-/// The approach registered as `name`.
+/// The approach a spec names: a registry name, then for a merge approach
+/// `/w<milliseconds>` for its merge window and `/b<bytes>` for its buffer, as
+/// in `merge_channel/w1/b262144`, and for `grpc_coalesce` `/t<bytes>` for its
+/// byte target, `/l<milliseconds>` for its linger and `/n<count>` for the sends
+/// it keeps in flight, as in `grpc_coalesce/t131072/l2/n4`.
 #[must_use]
-pub fn approach(name: &str) -> Option<AnyApproach> {
-    REGISTRY
+pub fn approach(spec: &str) -> Option<AnyApproach> {
+    let mut parts = spec.split('/');
+    let name = parts.next()?;
+    let mut found = REGISTRY
         .iter()
         .find(|(n, _)| *n == name)
-        .map(|(_, make)| make())
+        .map(|(_, make)| make())?;
+    for part in parts {
+        match &mut found {
+            AnyApproach::Merge(merge) => {
+                if let Some(ms) = part.strip_prefix('w') {
+                    merge.window = milliseconds(ms)?;
+                } else {
+                    merge.buffer_bytes = part.strip_prefix('b')?.parse().ok()?;
+                }
+            }
+            AnyApproach::GrpcCoalesce(coalesce) => {
+                if let Some(bytes) = part.strip_prefix('t') {
+                    coalesce.target_bytes = bytes.parse().ok().filter(|b| *b > 0)?;
+                } else if let Some(ms) = part.strip_prefix('l') {
+                    coalesce.linger = milliseconds(ms)?;
+                } else {
+                    coalesce.in_flight = part.strip_prefix('n')?.parse().ok().filter(|n| *n > 0)?;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(found)
+}
+
+/// `text` as a number of milliseconds, never negative.
+fn milliseconds(text: &str) -> Option<std::time::Duration> {
+    let ms: f64 = text.parse().ok()?;
+    (ms >= 0.0 && ms.is_finite()).then(|| std::time::Duration::from_secs_f64(ms / 1000.0))
 }
 
 #[cfg(test)]
@@ -364,6 +606,29 @@ mod tests {
         assert_eq!(per_record, [Outcome::Sent, Outcome::Failed]);
         let delivered = answer(vec![Outcome::Sent, Outcome::DeadLettered], Answer::Held);
         assert_eq!(delivered, [Outcome::Sent, Outcome::DeadLettered]);
+    }
+
+    #[test]
+    fn a_coalesce_spec_sets_its_target_linger_and_sends_in_flight() {
+        let Some(AnyApproach::GrpcCoalesce(c)) = approach("grpc_coalesce/t65536/l0.5/n8") else {
+            panic!("a coalesce spec parses");
+        };
+        assert_eq!(c.target_bytes, 65536);
+        assert_eq!(c.linger, std::time::Duration::from_micros(500));
+        assert_eq!(c.in_flight, 8);
+        let Some(AnyApproach::GrpcCoalesce(zero)) = approach("grpc_coalesce/t65536/l0/n4") else {
+            panic!("a zero linger parses");
+        };
+        assert!(zero.linger.is_zero());
+        for bad in [
+            "grpc_coalesce/t0",
+            "grpc_coalesce/n0",
+            "grpc_coalesce/l-1",
+            "grpc_coalesce/x1",
+            "inline_sequential/t1",
+        ] {
+            assert!(approach(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

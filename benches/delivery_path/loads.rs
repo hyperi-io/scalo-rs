@@ -1,6 +1,6 @@
 // Project:   scalo
 // File:      benches/delivery_path/loads.rs
-// Purpose:   The named loads W1 to W7: caller groups and destination faults
+// Purpose:   The named loads W1 to W7, W1k, W2k and W1g to W3g: caller groups and destination faults
 // Language:  Rust
 //
 // License:   Apache-2.0
@@ -51,9 +51,15 @@ pub enum Load {
     W5,
     W6,
     W7,
+    W1k,
+    W2k,
+    W1g,
+    W2g,
+    W3g,
 }
 
 impl Load {
+    /// The loads a run takes by default.
     pub const ALL: [Self; 7] = [
         Self::W1,
         Self::W2,
@@ -64,8 +70,24 @@ impl Load {
         Self::W7,
     ];
 
+    /// Every load `--loads` accepts, the single-destination ones included.
+    const NAMED: [Self; 12] = [
+        Self::W1,
+        Self::W2,
+        Self::W3,
+        Self::W4,
+        Self::W5,
+        Self::W6,
+        Self::W7,
+        Self::W1k,
+        Self::W2k,
+        Self::W1g,
+        Self::W2g,
+        Self::W3g,
+    ];
+
     pub fn parse(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|l| l.id() == id)
+        Self::NAMED.into_iter().find(|l| l.id() == id)
     }
 
     pub fn id(self) -> &'static str {
@@ -77,6 +99,11 @@ impl Load {
             Self::W5 => "W5",
             Self::W6 => "W6",
             Self::W7 => "W7",
+            Self::W1k => "W1k",
+            Self::W2k => "W2k",
+            Self::W1g => "W1g",
+            Self::W2g => "W2g",
+            Self::W3g => "W3g",
         }
     }
 
@@ -89,6 +116,11 @@ impl Load {
             Self::W5 => "W3 with grpc-b down",
             Self::W6 => "W3 with a 4 MiB kafka producer queue",
             Self::W7 => "W2 with one 1.2 MiB record per batch refused by grpc-a",
+            Self::W1k => "512 callers x 1 record x 200 B to kafka alone",
+            Self::W2k => "8 callers x 1000 records x 1 KiB to kafka alone",
+            Self::W1g => "512 callers x 1 record x 200 B to one gRPC destination",
+            Self::W2g => "8 callers x 1000 records x 1 KiB to one gRPC destination",
+            Self::W3g => "W1g and W2g together",
         }
     }
 
@@ -101,11 +133,35 @@ impl Load {
     }
 
     fn small(self) -> bool {
-        !matches!(self, Self::W2 | Self::W7)
+        !matches!(self, Self::W2 | Self::W7 | Self::W2k | Self::W2g)
     }
 
     fn bulk(self) -> bool {
-        self != Self::W1
+        !matches!(self, Self::W1 | Self::W1k | Self::W1g)
+    }
+
+    /// Whether every group sends to kafka alone.
+    fn kafka_only(self) -> bool {
+        matches!(self, Self::W1k | Self::W2k)
+    }
+
+    /// Whether every group sends to one gRPC destination alone, which a tier 2
+    /// cell serves from a listener process of its own and with no broker.
+    pub fn grpc_only(self) -> bool {
+        matches!(self, Self::W1g | Self::W2g | Self::W3g)
+    }
+
+    /// The destinations a group of this load routes to.
+    fn routes(self, group: &'static str) -> &'static [&'static str] {
+        if self.kafka_only() {
+            &[KAFKA]
+        } else if self.grpc_only() {
+            &[GRPC_A]
+        } else if group == "small" {
+            &[KAFKA, GRPC_A]
+        } else {
+            &[KAFKA, GRPC_A, GRPC_B]
+        }
     }
 }
 
@@ -133,7 +189,14 @@ pub fn topology(load: Load, seed: u64) -> [(&'static str, ShapedConfig); 3] {
         }
         Load::W6 => kafka.queue_cap_bytes = W6_QUEUE_BYTES,
         Load::W7 => grpc_a.faults.refuse = Some(|p| p.first() == Some(&REFUSED_MARK)),
-        Load::W1 | Load::W2 | Load::W3 => {}
+        Load::W1
+        | Load::W2
+        | Load::W3
+        | Load::W1k
+        | Load::W2k
+        | Load::W1g
+        | Load::W2g
+        | Load::W3g => {}
     }
     [(KAFKA, kafka), (GRPC_A, grpc_a), (GRPC_B, grpc_b)]
 }
@@ -164,7 +227,7 @@ pub fn groups<S: TransportSender>(load: Load, destinations: &Destinations<S>) ->
             512,
             1,
             200,
-            &[KAFKA, GRPC_A],
+            load.routes("small"),
             0,
         ));
     }
@@ -176,7 +239,7 @@ pub fn groups<S: TransportSender>(load: Load, destinations: &Destinations<S>) ->
             8,
             1000,
             1024,
-            &[KAFKA, GRPC_A, GRPC_B],
+            load.routes("bulk"),
             refused,
         ));
     }

@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use scalo::transport::test_support::delivery::REGISTRY;
+use scalo::transport::test_support::delivery::{REGISTRY, approach};
 
 use crate::drive::Retry;
 use crate::loads::Load;
@@ -19,7 +19,8 @@ usage: delivery_path [--approaches a[+retry][@control],b] [--retry none|bounded|
                      [--control] [--loads W1,W2] [--tier 1|2] [--seconds N] [--runs N]
                      [--open-loop F,F] [--workers N] [--seed N] [--allocs] [--save FILE]
                      [--compare FILE] [--max-regression F]
-                     [--cpus LIST] [--broker-cpus LIST] [--stop-file FILE] [--warmup SECONDS]
+                     [--cpus LIST] [--broker-cpus LIST] [--listener-cpus LIST]
+                     [--listener-workers N] [--stop-file FILE] [--warmup SECONDS]
                      [--calibrate] [--order-check]";
 
 /// Exit code of `--compare` when the run cannot be compared.
@@ -63,7 +64,7 @@ impl Spec {
             ),
             None => (body, retry),
         };
-        if !REGISTRY.iter().any(|(n, _)| *n == name) {
+        if approach(name).is_none() {
             let known: Vec<&str> = REGISTRY.iter().map(|(n, _)| *n).collect();
             return Err(format!("no approach {name}: known {}", known.join(",")));
         }
@@ -104,6 +105,12 @@ pub struct Args {
     pub cpus: Option<String>,
     /// The tier 2 broker container's cpuset, as `docker update --cpuset-cpus` takes it.
     pub broker_cpus: Option<String>,
+    /// CPUs the listener process of a gRPC-only load is pinned to.
+    pub listener_cpus: Option<String>,
+    /// Runtime worker threads of that listener process.
+    pub listener_workers: usize,
+    /// Set in a listener process: serve scalo's gRPC receive server until stdin closes.
+    pub listener: bool,
     /// Set in a child process: run this one cell and print its JSON line.
     pub cell_run: Option<usize>,
     /// Set in a child: the offered rate of an open-loop cell, records per second.
@@ -137,6 +144,9 @@ impl Args {
             warmup: -1.0,
             cpus: None,
             broker_cpus: None,
+            listener_cpus: None,
+            listener_workers: 2,
+            listener: false,
             cell_run: None,
             rate: None,
             mode: "closed".to_string(),
@@ -193,6 +203,9 @@ impl Args {
                 "--stop-file" => args.stop_file = Some(PathBuf::from(value()?)),
                 "--cpus" => args.cpus = Some(value()?),
                 "--broker-cpus" => args.broker_cpus = Some(value()?),
+                "--listener-cpus" => args.listener_cpus = Some(value()?),
+                "--listener-workers" => args.listener_workers = number(&value()?)?,
+                "--listener" => args.listener = true,
                 "--cell-run" => args.cell_run = Some(number(&value()?)?),
                 "--rate" => args.rate = Some(number(&value()?)?),
                 "--mode" => args.mode = value()?,
@@ -240,6 +253,12 @@ impl Args {
         }
         if let Some(list) = &args.broker_cpus {
             cpu_list(list)?;
+        }
+        if let Some(list) = &args.listener_cpus {
+            cpu_list(list)?;
+        }
+        if args.listener_workers == 0 {
+            return Err("--listener-workers is at least 1".into());
         }
         if !(args.seconds > 0.0 && args.seconds.is_finite()) {
             return Err("--seconds must be positive".into());
@@ -299,6 +318,12 @@ impl Args {
             line.push("--bootstrap".to_string());
             line.push(bootstrap.clone());
         }
+        if let Some(cpus) = &self.listener_cpus {
+            line.push("--listener-cpus".to_string());
+            line.push(cpus.clone());
+        }
+        line.push("--listener-workers".to_string());
+        line.push(self.listener_workers.to_string());
         line
     }
 }

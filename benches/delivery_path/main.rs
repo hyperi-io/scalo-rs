@@ -37,6 +37,10 @@
 //! where latency is compared. `--retry none|bounded|hold` is the caller's
 //! policy for every approach, and `name+policy` sets one approach's own.
 //! `--control` adds the first approach a second time as a same-code control.
+//! W1g, W2g and W3g send to one gRPC destination and start no broker. A cell
+//! serves it from scalo's receive server in a child process of this binary, on
+//! the CPUs of `--listener-cpus` with `--listener-workers` threads, and reports
+//! that process's CPU per record as `listener_cpu_us_per_record`.
 //! Approaches are chosen on tier 2: tier 1 is the fast loop and the regression
 //! gate, comparing an approach with its own saved baseline. `--compare` exits
 //! 3 when the run cannot be compared: stopped, partial, a cell missing from
@@ -88,6 +92,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    if args.listener {
+        return listen(&args);
+    }
     if args.cell_run.is_some() {
         return cell::main(&args);
     }
@@ -104,9 +111,30 @@ fn main() -> ExitCode {
     runtime.block_on(parent(args))
 }
 
+/// Run as the listener process of a gRPC-only load's cell.
+#[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]
+fn listen(args: &Args) -> ExitCode {
+    if let Some(list) = &args.listener_cpus {
+        // Before the runtime starts, so its workers inherit it.
+        if let Err(e) = args::cpu_list(list).and_then(|cpus| host::pin(&cpus)) {
+            eprintln!("delivery_path listener: pin to CPUs {list}: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    listener::serve(args.listener_workers)
+}
+
+#[cfg(not(all(feature = "testcontainers", feature = "transport-grpc", unix)))]
+fn listen(_args: &Args) -> ExitCode {
+    eprintln!(
+        "delivery_path: a listener needs --features transport-test-support,testcontainers,transport-grpc on Unix"
+    );
+    ExitCode::from(2)
+}
+
 async fn parent(mut args: Args) -> ExitCode {
     println!(
-        "# delivery_path tier {} presets {} workers {} runs {} seconds {} modes {} allocs {} cpus {} allowed_cpus {} broker_cpus {} load_avg_start {}",
+        "# delivery_path tier {} presets {} workers {} runs {} seconds {} modes {} allocs {} cpus {} allowed_cpus {} broker_cpus {} listener_cpus {} load_avg_start {}",
         args.tier.number(),
         if PRESETS_CALIBRATED {
             "calibrated"
@@ -121,6 +149,7 @@ async fn parent(mut args: Args) -> ExitCode {
         args.cpus.as_deref().unwrap_or("all"),
         host::allowed_cpus().map_or_else(|| "unknown".to_string(), |n| n.to_string()),
         args.broker_cpus.as_deref().unwrap_or("all"),
+        args.listener_cpus.as_deref().unwrap_or("all"),
         host::load_average()
     );
     println!(
@@ -284,6 +313,10 @@ async fn run_cell(exe: &std::path::Path, line: Vec<String>) -> Option<String> {
 
 #[cfg(all(feature = "testcontainers", feature = "transport-grpc", unix))]
 async fn tier_two(args: &mut Args) -> Option<Collected> {
+    // A gRPC-only load has a listener process and no broker.
+    if !(args.calibrate || args.order_check || args.loads.iter().any(|l| !l.grpc_only())) {
+        return cells(args).await;
+    }
     let stack = tier2::Stack::start(args.broker_cpus.as_deref()).await?;
     let empty = || Collected {
         cells: Vec::new(),
